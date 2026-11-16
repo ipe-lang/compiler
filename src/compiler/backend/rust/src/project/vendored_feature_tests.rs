@@ -1148,8 +1148,11 @@ fn auth_wrappers_follow_auth_and_db() {
 }
 
 /// The dependency names `manifest`'s cross-platform `[dependencies]` table
-/// declares, and those its `[target.…]` tables declare, read by a TOML parser.
-fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+/// declares, and those its `[target.…]` tables declare as `(cfg, name)`, read
+/// by a TOML parser.
+type DependencyTables = (BTreeSet<String>, BTreeSet<(String, String)>);
+
+fn dependency_tables(manifest: &str) -> Result<DependencyTables, String> {
     let parsed: toml::Table = manifest.parse().map_err(|e| format!("not TOML: {e}"))?;
     let keys = |deps: Option<&toml::Value>| -> BTreeSet<String> {
         deps.and_then(toml::Value::as_table)
@@ -1162,8 +1165,12 @@ fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<Strin
         .and_then(toml::Value::as_table)
         .map(|targets| {
             targets
-                .values()
-                .flat_map(|t| keys(t.get("dependencies")))
+                .iter()
+                .flat_map(|(cfg, t)| {
+                    keys(t.get("dependencies"))
+                        .into_iter()
+                        .map(|dep| (cfg.clone(), dep))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1172,8 +1179,10 @@ fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<Strin
 
 /// Every dependency an augmenter adds lands in the cross-platform
 /// `[dependencies]` table, alone and composed in emit order, so no target's
-/// build loses a crate its vendored sources name; and every composition is
-/// valid TOML (no duplicate key).
+/// build loses a crate its vendored sources name — unless the runtime manifest
+/// declares that dependency under that same `[target.…]` key, the only cfg
+/// under which the vendored sources name it; and every composition is valid
+/// TOML (no duplicate key).
 #[test]
 fn augmenter_dependencies_land_in_the_main_table() {
     let async_base = async_runtime_cargo_toml(CARGO_TOML, &tokio_base_features())
@@ -1184,13 +1193,22 @@ fn augmenter_dependencies_land_in_the_main_table() {
         "precondition: the base carries both a main and a target-only dependency \
          table: {base_tables:?}"
     );
+    let runtime_tables = dependency_tables(RUNTIME_CARGO_TOML);
+    assert!(
+        matches!(&runtime_tables, Ok((_, target)) if !target.is_empty()),
+        "precondition: the runtime manifest carries a target-only dependency: {runtime_tables:?}"
+    );
+    let runtime_target = runtime_tables.map(|(_, target)| target).unwrap_or_default();
     let mut drift = Vec::new();
     let mut check = |name: &str, mode: &str, before: &str, after: &str| match (
         dependency_tables(before),
         dependency_tables(after),
     ) {
         (Ok((main_before, target_before)), Ok((main_after, target_after))) => {
-            for dep in target_after.difference(&target_before) {
+            for dep in target_after
+                .difference(&target_before)
+                .filter(|dep| !runtime_target.contains(*dep))
+            {
                 drift.push(format!("{name} ({mode}): {dep:?} landed in a target table"));
             }
             for dep in main_before.difference(&main_after) {
@@ -1245,7 +1263,7 @@ fn dependency_splice_targets_the_main_table() {
         .map_err(|e| format!("{e:?}"))
         .and_then(dependency_tables);
     assert!(
-        matches!(&tables, Ok((main, target)) if main.contains("c") && !target.contains("c")),
+        matches!(&tables, Ok((main, target)) if main.contains("c") && !target.iter().any(|(_, dep)| dep == "c")),
         "{tables:?}"
     );
     let no_newline = super::append_dependencies("[dependencies]\na = \"1\"", "c = \"1\"", "test");
@@ -1487,14 +1505,23 @@ fn feature_edge_drift_is_refused() {
         "{vendored}"
     );
     assert!(
-        lines.contains(&r#"webview-shell = ["dep:wry", "dep:tao", "browser-open"]"#),
+        lines.contains(&r#"webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]"#),
         "{vendored}"
+    );
+    let table = vendored
+        .split_once("\n[target.'cfg(target_os = \"linux\")'.dependencies]\n")
+        .map(|(_, table)| table);
+    assert_eq!(
+        table,
+        Some("gtk = { version = \"0.18\", optional = true }\n"),
+        "gtk is a Linux-only optional dependency, as the runtime crate declares it: {vendored}"
     );
     assert!(!lines.contains(&"webview = []"), "{vendored}");
     for drifted in [
         CARGO_TOML.replacen("\nwebview = []\n", "\n", 1),
         CARGO_TOML.replacen("\nwebview = []\n", "\nwebview = []\nwebview = []\n", 1),
         CARGO_TOML.replacen("\nwebview-shell = [\"browser-open\"]\n", "\n", 1),
+        format!("{CARGO_TOML}\n[target.'cfg(target_os = \"linux\")'.dependencies]\n"),
     ] {
         assert_ne!(drifted, CARGO_TOML, "precondition: the fixture drifts");
         let refused = webview_cargo_toml(&drifted);

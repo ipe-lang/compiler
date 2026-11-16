@@ -4320,8 +4320,11 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
 /// 1. Adding `"web-core"` and `"webview"` to the `default` feature list.
 /// 2. Rewriting the inert `webview` and `webview-shell` declarations to the
 ///    runtime crate's own edges: `webview = ["webview-shell", "web-core"]` and
-///    `webview-shell = ["dep:wry", "dep:tao", "browser-open"]`.
+///    `webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]`.
 /// 3. Appending `wry` and `tao` as optional dependencies to the `[dependencies]` table.
+/// 4. Appending `gtk` as an optional dependency in a Linux-only table, as the
+///    runtime crate declares it (`webview::shell::WindowSystem::open` starts
+///    GTK fallibly before tao).
 ///
 /// A vendored webview build therefore enables exactly the features a
 /// runtime-crate `webview` selection enables among those the vendored
@@ -4339,15 +4342,22 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
     const WEBVIEW_INERT: &str = "webview = []";
     const WEBVIEW_ACTIVE: &str = r#"webview = ["webview-shell", "web-core"]"#;
     const SHELL_INERT: &str = r#"webview-shell = ["browser-open"]"#;
-    const SHELL_ACTIVE: &str = r#"webview-shell = ["dep:wry", "dep:tao", "browser-open"]"#;
-    // wry + tao are declared optional so a manifest that leaves `webview-shell`
-    // off never downloads or links them. Versions + names from the SSOT.
+    const SHELL_ACTIVE: &str =
+        r#"webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]"#;
+    const LINUX_DEPS: &str = r#"[target.'cfg(target_os = "linux")'.dependencies]"#;
+    // wry, tao and gtk are declared optional so a manifest that leaves
+    // `webview-shell` off never downloads or links them. Versions + names from
+    // the SSOT.
+    let optional = |spec: crate_specs::CrateSpec| {
+        format!(
+            "{} = {{ version = \"{}\", optional = true }}\n",
+            spec.name, spec.version
+        )
+    };
     let webview_native_deps = format!(
-        "{} = {{ version = \"{}\", optional = true }}\n{} = {{ version = \"{}\", optional = true }}\n\n",
-        crate_specs::WRY.name,
-        crate_specs::WRY.version,
-        crate_specs::TAO.name,
-        crate_specs::TAO.version,
+        "{}{}\n",
+        optional(crate_specs::WRY),
+        optional(crate_specs::TAO)
     );
 
     // Step 1 — promote `webview` to the default feature list (generic
@@ -4381,7 +4391,36 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
     let step3 = replace_feature_line(&step2, SHELL_INERT, SHELL_ACTIVE, WHERE)?;
 
     // Step 3 — append wry + tao as optional deps to the `[dependencies]` table.
-    append_dependencies(&step3, &webview_native_deps, WHERE)
+    let step4 = append_dependencies(&step3, &webview_native_deps, WHERE)?;
+
+    // Step 4 — gtk, Linux-only, in a table of its own at the end.
+    append_table(&step4, LINUX_DEPS, &optional(crate_specs::GTK), WHERE)
+}
+
+/// Append the table `header` holding `entries` at the end of `base`.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when `base`
+/// already declares `header`: a second declaration of one table is a TOML
+/// error the emitted build would only meet in cargo.
+fn append_table(base: &str, header: &str, entries: &str, where_: &'static str) -> DResult<String> {
+    if base.lines().any(|line| line.trim() == header) {
+        return Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!("Cargo.toml already declares {header:?} — golden drifted"),
+        });
+    }
+    let mut out = String::with_capacity(base.len() + header.len() + entries.len() + 3);
+    out.push_str(base);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(header);
+    out.push('\n');
+    out.push_str(entries);
+    Ok(out)
 }
 
 /// Replace the one line of `base` equal to `inert` with `active`.

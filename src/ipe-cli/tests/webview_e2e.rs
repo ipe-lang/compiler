@@ -686,3 +686,46 @@ fn client_desktop_shell_refuses_a_symlinked_storage_dir() -> Result<(), BoxError
     let _ = std::fs::remove_dir_all(&scratch);
     Ok(())
 }
+
+/// With no display to answer, the shell exits 1 with the typed no-display
+/// refusal, never a GTK panic (exit 101).
+///
+/// The child runs with `DISPLAY`, `WAYLAND_DISPLAY` and `GDK_BACKEND` removed
+/// and `XDG_RUNTIME_DIR` an empty directory, so neither X11 nor a default
+/// Wayland socket is reachable. Without `WindowSystem::open`'s fallible GTK
+/// start, tao's event loop builder panics here.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn client_desktop_shell_refuses_without_a_display() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "client_desktop_no_display";
+    let (_fixture, binary) = built_client_desktop(test_name)?;
+    let scratch = private_scratch(test_name)?;
+    let xdg = scratch.join("data");
+    let runtime = scratch.join("runtime");
+    std::fs::create_dir(&xdg)?;
+    std::fs::create_dir(&runtime)?;
+    let result = std::process::Command::new("timeout")
+        .arg("10")
+        .arg(&binary)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("GDK_BACKEND")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_DATA_HOME", &xdg)
+        .current_dir(&scratch)
+        .output()?;
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert_eq!(result.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("no graphical display is available (")),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let _ = std::fs::remove_dir_all(&scratch);
+    Ok(())
+}

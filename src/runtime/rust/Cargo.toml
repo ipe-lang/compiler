@@ -191,6 +191,12 @@ crossterm = { version = "0.29", optional = true }
 wry = { version = "0.55", optional = true }
 tao = { version = "0.35", optional = true }
 
+# Linux-only: the GTK tao and wry already build on, named directly for its
+# fallible `gtk::init` (`webview::shell::WindowSystem::open`); tao's own init
+# panics when no display answers.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
+
 # Unix-only syscalls go through rustix's safe wrappers — no hand-written `unsafe`
 # FFI. `pty` + `termios`: `Ipe.Process.runInPty` allocates a pseudo-terminal
 # (openpt / grantpt / unlockpt / ptsname) and sizes it (tcsetwinsize), and
@@ -477,8 +483,9 @@ webview = ["webview-shell", "web-core", "tokio", "random"]
 # The `client desktop` shell: a native window serving an embedded bundle under
 # the shell's custom scheme, with no async runtime and no server. `encoding`
 # carries the bundle path grammar; `browser-open` the system-browser opener
-# its link policy hands public `https` links to.
-webview-shell = ["wry", "tao", "encoding", "browser-open"]
+# its link policy hands public `https` links to. `gtk` (Linux) starts the window
+# system fallibly before tao, so a missing display is a typed refusal.
+webview-shell = ["wry", "tao", "dep:gtk", "encoding", "browser-open"]
 # The system-browser opener: a typed URL per origin and the platform opener,
 # started through the hardened spawner. Std-only.
 browser-open = []

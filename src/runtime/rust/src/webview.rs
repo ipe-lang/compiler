@@ -18,7 +18,7 @@
 //! never runs off the main thread. macOS REQUIRES this (tao/winit + Cocoa's
 //! `NSApplication` assert the main thread — a hard requirement with no
 //! any-thread escape); Windows expects it; GTK on Linux is happy on it. So the
-//! loop is built uniformly (`EventLoopBuilder::build()`), with no per-OS
+//! loop is built uniformly (`shell::WindowSystem::open`), with no per-OS
 //! `with_any_thread(true)` branch. The webview itself is built per-OS:
 //! `build(&window)` (raw-window-handle) off Linux, `build_gtk(...)` on Linux.
 //!
@@ -357,11 +357,229 @@ mod tests {
             2
         );
     }
+
+    /// `source` without its test module: the code before the module's
+    /// `#[cfg(all(test, …))]` line and after the module's closing brace.
+    fn production(source: &'static str) -> Option<String> {
+        let (head, rest) = source.split_once(concat!(
+            "#[cfg(all(test, ",
+            "not(target_arch = \"wasm32\")))]\nmod tests {"
+        ))?;
+        let (_, tail) = rest.split_once("\n}\n")?;
+        Some(format!("{head}{tail}"))
+    }
+
+    /// The identifier tokens of `text`: maximal runs of `[A-Za-z0-9_]`.
+    fn tokens(text: &str) -> Vec<&str> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|token| !token.is_empty())
+            .collect()
+    }
+
+    /// The byte offset of the one occurrence of `needle` in `text`.
+    fn sole_offset(text: &str, needle: &str) -> Option<usize> {
+        (text.matches(needle).count() == 1)
+            .then(|| text.find(needle))
+            .flatten()
+    }
+
+    /// No GTK-backed object exists before the window system is up, and a
+    /// missing display is a typed refusal on every webview entry point.
+    ///
+    /// On Linux GTK's constructors panic until GTK is initialized, and tao's
+    /// event loop builder initializes it with a panic when no display
+    /// answers. Only `shell::WindowSystem::open` builds an event loop, after
+    /// the fallible `gtk::init()`; a web context is built only from an open
+    /// `WindowSystem`; and both hosts open it before any window or web
+    /// context, the bundle shell after its storage and site refusals (which
+    /// therefore hold on a host with no display).
+    #[test]
+    fn no_native_object_precedes_the_window_system() {
+        let mut outside = Vec::new();
+        for (name, source) in [
+            ("webview.rs", include_str!("webview.rs")),
+            ("nav_policy.rs", include_str!("webview/nav_policy.rs")),
+            ("bundle_site.rs", include_str!("webview/bundle_site.rs")),
+        ] {
+            let Some(code) = production(source) else {
+                outside.push(format!("{name}: no test module found"));
+                continue;
+            };
+            let code = match code.split_once(concat!("\nmod ", "shell {\n")) {
+                Some((head, rest)) => match rest.split_once("\n}\n") {
+                    Some((_, tail)) => format!("{head}{tail}"),
+                    None => {
+                        outside.push(format!("{name}: the shell module is unclosed"));
+                        continue;
+                    }
+                },
+                None => code,
+            };
+            for token in tokens(&code) {
+                if ["EventLoopBuilder", "EventLoop", "WebContext", "gtk"].contains(&token) {
+                    outside.push(format!("{name}: `{token}` outside the shell module"));
+                }
+            }
+        }
+        assert_eq!(
+            outside,
+            Vec::<String>::new(),
+            "only the shell module names the native constructors"
+        );
+
+        let source = include_str!("webview.rs");
+        let shell = item_body(source, concat!("\nmod ", "shell {\n"), "\n}\n");
+        let Some(shell) = shell else {
+            assert!(shell.is_some(), "the shell module is defined in webview.rs");
+            return;
+        };
+        let open = item_body(
+            shell,
+            concat!("pub fn ", "open() -> Result<Self, WindowSystemRefused> {"),
+            "\n        }\n",
+        );
+        let Some(open) = open else {
+            assert!(open.is_some(), "WindowSystem::open is defined");
+            return;
+        };
+        let init = sole_offset(
+            open,
+            concat!("gtk::", "init().map_err(WindowSystemRefused::Gtk)?;"),
+        );
+        let build = sole_offset(
+            open,
+            concat!("EventLoop", "Builder::<T>::with_user_event().build()"),
+        );
+        assert!(
+            matches!((init, build), (Some(i), Some(b)) if i < b),
+            "GTK starts fallibly before tao builds the event loop: {init:?} {build:?}"
+        );
+        let shell_tokens = tokens(shell);
+        for (token, count) in [("EventLoopBuilder", 1), ("WebContext", 2)] {
+            assert_eq!(
+                shell_tokens.iter().filter(|t| **t == token).count(),
+                count,
+                "the shell module names `{token}` {count} times"
+            );
+        }
+        assert_eq!(
+            shell.matches(concat!("gtk::", "init(")).count(),
+            1,
+            "the shell module calls GTK init exactly once"
+        );
+        assert_eq!(shell.matches(concat!("Self { ", "event_loop }")).count(), 1);
+        assert_eq!(
+            shell
+                .matches(concat!("pub fn ", "web_context(&self, "))
+                .count(),
+            1,
+            "a web context is built only from an open window system"
+        );
+
+        let bundle = bundle_app_body();
+        let Some(bundle) = bundle else {
+            assert!(bundle.is_some(), "bundle_app is defined in webview.rs");
+            return;
+        };
+        let order = [
+            sole_offset(bundle, concat!("BundleSite::", "parse(")),
+            sole_offset(bundle, concat!("AppDataRoot::", "from_env()")),
+            sole_offset(bundle, concat!("StoragePlan::", "resolve(")),
+            sole_offset(bundle, concat!("WindowSystem::<()>::", "open()")),
+            sole_offset(bundle, concat!("system.", "web_context(")),
+            sole_offset(bundle, concat!("WindowBuilder::", "new()")),
+        ];
+        assert!(
+            order.iter().all(Option::is_some) && order.is_sorted(),
+            "bundle_app refuses its site and storage, then opens the window system, \
+             then builds the web context and the window: {order:?}"
+        );
+        let worker = item_body(
+            source,
+            concat!(
+                "pub fn ",
+                "webview_app<Model, Msg, E, FInit, FUpdate, FView, FSubs>(\n        init:"
+            ),
+            "\n    }\n",
+        );
+        let Some(worker) = worker else {
+            assert!(worker.is_some(), "the native webview_app is defined");
+            return;
+        };
+        let order = [
+            sole_offset(worker, concat!("WindowSystem::<UserEvent>::", "open()")),
+            sole_offset(worker, concat!("WindowBuilder::", "new()")),
+        ];
+        assert!(
+            order.iter().all(Option::is_some) && order.is_sorted(),
+            "webview_app opens the window system before its window: {order:?}"
+        );
+    }
 }
 
 /// The window and webview steps both hosts share.
 #[cfg(feature = "webview-shell")]
 mod shell {
+    /// The native window system, up on this thread: the one value every
+    /// event loop, window and web context is built from.
+    ///
+    /// On Linux GTK backs all three, and GTK's constructors panic until GTK is
+    /// initialized; tao's event loop builder initializes it and panics when no
+    /// display answers. [`WindowSystem::open`] runs GTK's fallible
+    /// `gtk_init_check` first, which makes tao's own init a no-op, so a missing
+    /// display is a [`WindowSystemRefused`] and no GTK object exists before
+    /// the window system does.
+    pub struct WindowSystem<T: 'static> {
+        event_loop: tao::event_loop::EventLoop<T>,
+    }
+
+    /// Why the window system could not start.
+    #[derive(Debug)]
+    pub enum WindowSystemRefused {
+        /// GTK could not initialize: no display answered.
+        #[cfg(target_os = "linux")]
+        Gtk(gtk::glib::BoolError),
+    }
+
+    impl std::fmt::Display for WindowSystemRefused {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match *self {
+                #[cfg(target_os = "linux")]
+                Self::Gtk(ref cause) => {
+                    write!(f, "no graphical display is available ({cause})")
+                }
+            }
+        }
+    }
+
+    impl<T: 'static> WindowSystem<T> {
+        /// Start the window system on the calling (main) thread.
+        ///
+        /// # Errors
+        /// [`WindowSystemRefused`] when no display answers.
+        pub fn open() -> Result<Self, WindowSystemRefused> {
+            #[cfg(target_os = "linux")]
+            gtk::init().map_err(WindowSystemRefused::Gtk)?;
+            let event_loop = tao::event_loop::EventLoopBuilder::<T>::with_user_event().build();
+            Ok(Self { event_loop })
+        }
+
+        /// The event loop windows are built on.
+        pub const fn event_loop(&self) -> &tao::event_loop::EventLoop<T> {
+            &self.event_loop
+        }
+
+        /// A web context keeping its data in `dir`, or the engine's own store.
+        pub fn web_context(&self, dir: Option<std::path::PathBuf>) -> wry::WebContext {
+            wry::WebContext::new(dir)
+        }
+
+        /// The event loop, to run.
+        pub fn into_event_loop(self) -> tao::event_loop::EventLoop<T> {
+            self.event_loop
+        }
+    }
+
     /// Build `builder`'s webview into `window`.
     ///
     /// Off Linux through the raw window handle; on Linux packed into the
@@ -391,6 +609,8 @@ mod shell {
 #[cfg(feature = "webview-shell")]
 #[derive(Debug)]
 pub enum BundleShellError {
+    /// No display answered.
+    NoDisplay(shell::WindowSystemRefused),
     /// The window could not be created.
     Window(tao::error::OsError),
     /// The webview could not be created.
@@ -407,6 +627,7 @@ pub enum BundleShellError {
 impl std::fmt::Display for BundleShellError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NoDisplay(refusal) => write!(f, "{refusal}"),
             Self::Window(e) => write!(f, "the window could not open: {e}"),
             Self::Webview(e) => write!(f, "the webview could not start: {e}"),
             Self::BadSite(refusal) => write!(f, "the embedded app is malformed: {refusal}"),
@@ -421,6 +642,7 @@ mod bundle_imp {
     use super::BundleShellError;
     use super::bundle_site::{BundleSite, SiteConfig};
     use super::nav_policy::{ExternalOpener, LocalOrigin};
+    use super::shell::WindowSystem;
     use crate::app_data::{AppDataRoot, StoragePlan, StorageRefusal};
     use crate::csp::{APP_SCHEME, SchemeSpelling};
     use std::borrow::Cow;
@@ -454,9 +676,9 @@ mod bundle_imp {
     /// The [`BundleShellError`] of the first step that failed.
     pub fn bundle_app(config: &SiteConfig) -> Result<(), BundleShellError> {
         use tao::event::{Event, WindowEvent};
-        use tao::event_loop::{ControlFlow, EventLoopBuilder};
+        use tao::event_loop::ControlFlow;
         use tao::window::WindowBuilder;
-        use wry::{WebContext, WebViewBuilder};
+        use wry::WebViewBuilder;
 
         let native = SchemeSpelling::native();
         let site =
@@ -465,7 +687,8 @@ mod bundle_imp {
             .map_err(|refusal| BundleShellError::Storage(StorageRefusal::Root(refusal)))?;
         let plan =
             StoragePlan::resolve(&root, site.storage_key()).map_err(BundleShellError::Storage)?;
-        let mut context = WebContext::new(match plan {
+        let system = WindowSystem::<()>::open().map_err(BundleShellError::NoDisplay)?;
+        let mut context = system.web_context(match plan {
             StoragePlan::Private(dir) => Some(dir.as_path().to_path_buf()),
             StoragePlan::BundleStore => None,
         });
@@ -473,10 +696,9 @@ mod bundle_imp {
             ExternalOpener::start().map_err(|e| BundleShellError::ThreadRefused(e.kind()))?;
         let start = site.start_url(native);
 
-        let event_loop = EventLoopBuilder::new().build();
         let window = WindowBuilder::new()
             .with_title(site.title())
-            .build(&event_loop)
+            .build(system.event_loop())
             .map_err(BundleShellError::Window)?;
         let builder = WebViewBuilder::new_with_web_context(&mut context)
             .with_custom_protocol(APP_SCHEME.to_owned(), move |_id, request| {
@@ -491,17 +713,19 @@ mod bundle_imp {
         let webview =
             super::shell::attach_webview(builder, &window).map_err(BundleShellError::Webview)?;
 
-        event_loop.run(move |event, _target, control_flow| {
-            let _keep = (&webview, &context);
-            *control_flow = ControlFlow::Wait;
-            if let Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } = event
-            {
-                *control_flow = ControlFlow::Exit;
-            }
-        })
+        system
+            .into_event_loop()
+            .run(move |event, _target, control_flow| {
+                let _keep = (&webview, &context);
+                *control_flow = ControlFlow::Wait;
+                if let Event::WindowEvent {
+                    event: WindowEvent::CloseRequested,
+                    ..
+                } = event
+                {
+                    *control_flow = ControlFlow::Exit;
+                }
+            })
     }
 }
 
@@ -642,7 +866,7 @@ mod imp {
         Box::pin(async move {
             use tao::dpi::LogicalSize;
             use tao::event::{Event, WindowEvent};
-            use tao::event_loop::{ControlFlow, EventLoopBuilder};
+            use tao::event_loop::ControlFlow;
             use tao::window::WindowBuilder;
             use wry::WebViewBuilder;
 
@@ -653,14 +877,18 @@ mod imp {
 
             // The entry drives a Ipe.WebView app via `block_on_current_thread`
             // (see task.rs), so this future is polled on the process's TRUE main
-            // thread on EVERY OS. tao/winit's `EventLoop` + Cocoa's
+            // thread on EVERY OS. tao/winit's event loop + Cocoa's
             // `NSApplication` require the main thread on macOS (hard Cocoa
             // requirement); Windows expects it too; GTK on Linux is happy on the
             // main thread. So the event loop is built uniformly on the main
             // thread — no per-OS `with_any_thread(true)` escape hatch is needed
             // (that was only required when the loop was constructed OFF the main
             // thread, which no longer happens).
-            let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+            let system = match super::shell::WindowSystem::<UserEvent>::open() {
+                Ok(system) => system,
+                Err(e) => return IpeResult::Err(format!("Webview.app: {e}").into()),
+            };
+            let event_loop = system.into_event_loop();
             let (w, h) = window.size;
             // `with_inner_size` maps `size` to the content/inner area — the
             // drawable region — not the outer OS frame. On macOS this calls
