@@ -1265,17 +1265,17 @@ fn webview_vendored_cargo_builds() -> DResult<()> {
 
     let emitted = RustBackend::new(&interner).emit(&prog)?;
     match seal_e2e::build_emitted(&emitted, &runtime, "ipe_webview_vendored_e2e")? {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(e) if e.contains("pkg-config exited with status code 1") => {
             println!(
                 "LOUD-SKIP: vendored webview SEAL — system `webkit2gtk`/`glib` dev \
                  packages not installed on this host; install \
                  `libwebkit2gtk-4.1-dev libglib2.0-dev` to run it for real."
             );
+            Ok(())
         }
-        Err(e) => panic!("a vendored webview program must cargo build: {e}"),
+        Err(e) => Err(seal_e2e::build_bug(e)),
     }
-    Ok(())
 }
 
 // ── the shared cfg grammar's refusals ───────────────────────────────────────
