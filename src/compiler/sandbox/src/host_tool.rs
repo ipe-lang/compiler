@@ -34,18 +34,6 @@ pub enum HostTool {
     Timeout,
     /// `sandbox-exec`, the macOS Seatbelt jail.
     SandboxExec,
-    /// `jail(8)`, the FreeBSD jail.
-    Jail,
-    /// `rctl(8)`, the FreeBSD jail's process cap.
-    Rctl,
-    /// `chown(8)`, the FreeBSD jail's scratch ownership.
-    Chown,
-    /// `mount_nullfs(8)`, the FreeBSD jail's read-only root view.
-    MountNullfs,
-    /// `mount(8)`, the FreeBSD jail's devfs mount.
-    Mount,
-    /// `umount(8)`, the FreeBSD jail's teardown.
-    Umount,
     /// Windows PowerShell, the probe interpreter the Windows jail runs.
     PowerShell,
     /// `cargo`.
@@ -83,12 +71,6 @@ impl HostTool {
             Self::Prlimit => "prlimit",
             Self::Timeout => "timeout",
             Self::SandboxExec => "sandbox-exec",
-            Self::Jail => "jail",
-            Self::Rctl => "rctl",
-            Self::Chown => "chown",
-            Self::MountNullfs => "mount_nullfs",
-            Self::Mount => "mount",
-            Self::Umount => "umount",
             Self::PowerShell => "powershell",
             Self::Cargo => "cargo",
             Self::Rustc => "rustc",
@@ -370,6 +352,53 @@ pub fn resolve_in_dirs(
     })
 }
 
+/// Every [`HostTool`], in declaration order.
+#[cfg(test)]
+pub(crate) const EVERY_HOST_TOOL: [HostTool; 17] = [
+    HostTool::Bwrap,
+    HostTool::Prlimit,
+    HostTool::Timeout,
+    HostTool::SandboxExec,
+    HostTool::PowerShell,
+    HostTool::Cargo,
+    HostTool::Rustc,
+    HostTool::Rustup,
+    HostTool::Rustfmt,
+    HostTool::CargoDeny,
+    HostTool::Sccache,
+    HostTool::FfiInspector,
+    HostTool::WasmBindgen,
+    HostTool::WasmOpt,
+    HostTool::Git,
+    HostTool::Curl,
+    HostTool::Sh,
+];
+
+/// The index `tool` has in [`EVERY_HOST_TOOL`]; a variant missing here
+/// does not compile.
+#[cfg(test)]
+const fn listed_at(tool: HostTool) -> usize {
+    match tool {
+        HostTool::Bwrap => 0,
+        HostTool::Prlimit => 1,
+        HostTool::Timeout => 2,
+        HostTool::SandboxExec => 3,
+        HostTool::PowerShell => 4,
+        HostTool::Cargo => 5,
+        HostTool::Rustc => 6,
+        HostTool::Rustup => 7,
+        HostTool::Rustfmt => 8,
+        HostTool::CargoDeny => 9,
+        HostTool::Sccache => 10,
+        HostTool::FfiInspector => 11,
+        HostTool::WasmBindgen => 12,
+        HostTool::WasmOpt => 13,
+        HostTool::Git => 14,
+        HostTool::Curl => 15,
+        HostTool::Sh => 16,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,32 +629,8 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_bare_name() {
-        const TOOLS: [HostTool; 23] = [
-            HostTool::Bwrap,
-            HostTool::Prlimit,
-            HostTool::Timeout,
-            HostTool::SandboxExec,
-            HostTool::Jail,
-            HostTool::Rctl,
-            HostTool::Chown,
-            HostTool::MountNullfs,
-            HostTool::Mount,
-            HostTool::Umount,
-            HostTool::PowerShell,
-            HostTool::Cargo,
-            HostTool::Rustc,
-            HostTool::Rustup,
-            HostTool::Rustfmt,
-            HostTool::CargoDeny,
-            HostTool::Sccache,
-            HostTool::FfiInspector,
-            HostTool::WasmBindgen,
-            HostTool::WasmOpt,
-            HostTool::Git,
-            HostTool::Curl,
-            HostTool::Sh,
-        ];
-        for tool in TOOLS {
+        for (index, tool) in EVERY_HOST_TOOL.into_iter().enumerate() {
+            assert_eq!(listed_at(tool), index, "{tool:?}");
             let name = tool.name();
             assert!(!name.is_empty());
             assert!(

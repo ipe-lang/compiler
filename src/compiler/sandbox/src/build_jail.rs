@@ -640,6 +640,21 @@ pub fn build_in_jail(
     freebsd_jail::build_in_jail(profile, mounts, payload)
 }
 
+/// Confirm `jail(8)` is present at the one absolute spelling the FreeBSD
+/// [`build_in_jail`] runs it by, with every directory above it root's alone.
+///
+/// The invoker's `PATH` is never consulted, so this check and the jail
+/// itself judge the same file.
+///
+/// # Errors
+///
+/// [`RunJailDefect::PrimitiveUnavailable`] when the file is absent, or
+/// [`RunJailDefect::Spawn`] when a user other than root can change it.
+#[cfg(target_os = "freebsd")]
+pub fn require_jail_primitive() -> Result<(), RunJailDefect> {
+    freebsd_jail::resolve_primitive(Primitive::Jail).map(drop)
+}
+
 /// Off Linux (x86_64/aarch64), macOS, Windows, and FreeBSD the returning build jail is a
 /// documented refuse-gap, mirroring [`crate::run_jail::exec_in_run_jail`].
 #[cfg(not(any(
@@ -3087,7 +3102,7 @@ mod freebsd_jail {
     ///
     /// [`RunJailDefect::PrimitiveUnavailable`] when the file is absent, or
     /// [`RunJailDefect::Spawn`] when [`primitive_verdict`] refuses it.
-    fn resolve_primitive(primitive: Primitive) -> Result<PathBuf, RunJailDefect> {
+    pub(super) fn resolve_primitive(primitive: Primitive) -> Result<PathBuf, RunJailDefect> {
         let spelling = primitive.spelling();
         let path = PathBuf::from(spelling);
         let unavailable = || RunJailDefect::PrimitiveUnavailable {
@@ -6110,6 +6125,21 @@ mod chain_tests {
                 primitive_verdict(&base, DirFacts { kind, ..root_file }),
                 Err(PrimitiveRefusal::NotRegular),
                 "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_freebsd_primitive_resolves_through_the_invokers_path() {
+        for (primitive, spelling) in FREEBSD_PRIMITIVES {
+            let file = Path::new(spelling)
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str);
+            assert!(
+                crate::host_tool::EVERY_HOST_TOOL
+                    .iter()
+                    .all(|tool| Some(tool.name()) != file),
+                "{primitive:?} has a PATH-resolved host tool"
             );
         }
     }
