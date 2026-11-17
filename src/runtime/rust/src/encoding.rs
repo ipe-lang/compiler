@@ -1135,12 +1135,12 @@ pub const FRAME_HEADER_BUDGET: usize = 6144;
 /// `frames.rs` asserts at build time that this equals the table's count.
 pub const FRAME_WIDENED_DIRECTIVES: usize = 24;
 
-/// The bytes a non-empty list adds whatever its origins: `self` inside each
-/// capability-gated directive, and each undisclosed directive written as
-/// `, <feature>=(self)`.
+/// The bytes a non-empty list adds whatever its origins: each undisclosed
+/// directive written as `, <feature>=(self)`. A granted capability-gated
+/// directive is already `(self)` without a list, so it adds only origins.
 ///
 /// `frames.rs` asserts at build time that this equals the sum over the table.
-pub const FRAME_LIST_FIXED_COST: usize = 492;
+pub const FRAME_LIST_FIXED_COST: usize = 480;
 
 /// The header bytes one listed origin adds, `len` being its written length:
 /// ` <origin>` in `frame-src` and in `object-src`, and ` "<origin>"` in every
