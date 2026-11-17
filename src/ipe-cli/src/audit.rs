@@ -2114,34 +2114,38 @@ const GATE_DENY_POLICY: &str = include_str!("../../../deny.toml");
 /// beside the emitted project, and returns its path.
 ///
 /// # Errors
-/// [`CliError::Io`] on a write failure.
+/// [`CliError::PackageAudit`] with [`Check::SupplyChain`] when the embedded
+/// policy is not TOML (no policy is written, so cargo-deny never runs on its
+/// defaults); [`CliError::Io`] on a write failure.
 fn derive_deny_config(emitted_dir: &Path) -> Result<PathBuf, CliError> {
     let derived = emitted_dir.join("ipe-audit-deny.toml");
-    std::fs::write(&derived, emitted_deny_policy(GATE_DENY_POLICY)).map_err(|e| CliError::Io {
+    let policy = emitted_deny_policy(GATE_DENY_POLICY).map_err(|e| {
+        reject(
+            Check::SupplyChain,
+            format!(
+                "the gate's embedded supply-chain policy is not TOML ({e}); no audit can run on it"
+            ),
+        )
+    })?;
+    std::fs::write(&derived, policy).map_err(|e| CliError::Io {
         path: derived.clone(),
         source: e,
     })?;
     Ok(derived)
 }
 
-/// `policy` without its `[graph]` table (up to the next top-level `[section]`).
+/// `policy` without its `graph` table, however spelled: a `[graph]` header, a
+/// `[graph.<key>]` or `[[graph.<key>]]` sub-table, or a dotted `graph.<key>`.
 ///
 /// The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
-/// are the emitted-project-independent policy the gate applies.
-fn emitted_deny_policy(policy: &str) -> String {
-    let mut out = String::with_capacity(policy.len());
-    let mut in_graph = false;
-    for line in policy.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            in_graph = trimmed.starts_with("[graph]");
-        }
-        if !in_graph {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    out
+/// are the emitted-project-independent policy the gate applies, kept as written.
+///
+/// # Errors
+/// The parse error when `policy` is not TOML.
+fn emitted_deny_policy(policy: &str) -> Result<String, toml_edit::TomlError> {
+    let mut doc = policy.parse::<toml_edit::DocumentMut>()?;
+    doc.remove("graph");
+    Ok(doc.to_string())
 }
 
 /// Refuse a package whose own module set claims a reserved namespace (`Ipe.*`,
@@ -4330,7 +4334,7 @@ mod tests {
                 .and_then(|path| std::fs::read_to_string(path).ok());
             assert_eq!(
                 written.as_deref(),
-                Some(emitted_deny_policy(GATE_DENY_POLICY).as_str()),
+                emitted_deny_policy(GATE_DENY_POLICY).ok().as_deref(),
                 "the derived config is the compiler's own policy, whatever the disk holds"
             );
             let policy = written.unwrap_or_default();
@@ -4345,25 +4349,52 @@ mod tests {
         fn the_emitted_policy_drops_only_the_graph_table() {
             let policy = "[graph]\nfeatures = [\"full\"]\n[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n";
             assert_eq!(
-                emitted_deny_policy(policy),
-                "[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n",
+                emitted_deny_policy(policy).ok().as_deref(),
+                Some("[advisories]\nignore = []\n[sources]\nunknown-git = \"deny\"\n"),
                 "the runtime crate's feature graph is dropped; every policy table is kept"
             );
         }
 
+        fn parsed(text: Option<&str>) -> Option<toml_edit::DocumentMut> {
+            text.and_then(|text| text.parse::<toml_edit::DocumentMut>().ok())
+        }
+
+        #[test]
+        fn the_emitted_policy_drops_every_spelling_of_the_graph_table() {
+            for policy in [
+                "graph.features = [\"full\"]\n[advisories]\nignore = []\n",
+                "[advisories]\nignore = []\n[graph.exclude-dev]\nx = 1\n",
+                "[advisories]\nignore = []\n[[graph.targets]]\ntriple = \"x86_64-unknown-linux-gnu\"\n",
+                "[ graph ]\nfeatures = [\"full\"]\n[advisories]\nignore = []\n",
+            ] {
+                let emitted = emitted_deny_policy(policy).ok();
+                assert!(
+                    parsed(emitted.as_deref()).is_some_and(
+                        |doc| !doc.contains_key("graph") && doc.contains_key("advisories")
+                    ),
+                    "the workspace graph is dropped and the policy kept: {policy:?} -> {emitted:?}"
+                );
+            }
+        }
+
         #[test]
         fn the_emitted_policy_names_no_workspace_feature() {
-            let emitted = emitted_deny_policy(GATE_DENY_POLICY);
-            let leaked: Vec<&str> = emitted
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.starts_with('#'))
-                .filter(|line| line.starts_with("[graph") || line.contains("ipe/"))
-                .collect();
+            let emitted = emitted_deny_policy(GATE_DENY_POLICY).ok();
             assert!(
-                leaked.is_empty(),
-                "a package audit's policy carries no compiler-workspace graph or feature: {leaked:?}"
+                parsed(emitted.as_deref()).is_some_and(|doc| !doc.contains_key("graph")),
+                "a package audit's policy carries no compiler-workspace graph: {emitted:?}"
             );
+            assert!(
+                emitted
+                    .as_deref()
+                    .is_some_and(|text| !text.contains("wasi_run")),
+                "a package audit's policy names no compiler-workspace feature: {emitted:?}"
+            );
+        }
+
+        #[test]
+        fn a_policy_that_is_not_toml_is_refused() {
+            assert!(emitted_deny_policy("[advisories\nignore = []\n").is_err());
         }
 
         /// Names whose qualified mention in production code is an ambient read:
