@@ -638,7 +638,7 @@ pub fn render_type_at(
         // Shape opaque app leaves — render to qualified runtime paths.
         // On the browser target `Web.tea` lowers to `wasm::wasm_app(...)` (see
         // `emit_web`), which returns an `IpeTask` the wasm epilogue drives via
-        // `run_start(ipe_main())` — so the leaf renders as that task type, not the
+        // its deferred `run_start` entry — so the leaf renders as that task type, not the
         // native-only `WebApp` handle (absent on wasm32).
         IrType::WebApp if ctx.target == ipe_ir::Target::WasmClient => "IpeTask<()>".to_owned(),
         // A `Web.tea` handle renders to the served `WebApp` unless the delivery

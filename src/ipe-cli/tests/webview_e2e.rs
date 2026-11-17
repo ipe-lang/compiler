@@ -267,7 +267,7 @@ fn is_missing_linux_webview_system_libs(err: &str) -> bool {
 ///
 /// Assertions:
 /// - emit: a webview-hosted `Web.tea` renders the `WebViewApp` executor with the
-///   delivery-host window, and the `fn main` epilogue switches to `run_blocking`.
+///   delivery-host window, and the `fn main` epilogue switches to `run_blocking_entry`.
 /// - manifest: the emitted crate promotes `"webview"` to its default features,
 ///   wires `webview` to the runtime crate's own feature edges (its
 ///   `webview-shell` pulling the native webview dependencies), and the runtime

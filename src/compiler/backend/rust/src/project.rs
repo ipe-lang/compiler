@@ -604,22 +604,37 @@ fn unclassified_wrapper(path: &str) -> Diagnostic {
     }
 }
 
+/// The `WasmClient` entry task: `ipe_main` is built on the task's first poll,
+/// so a program whose startup `run_start` refuses evaluates none of it, and a
+/// trip while building it is a trap under the installed panic hook.
+macro_rules! wasm_deferred_entry {
+    () => {
+        "let entry: IpeTask<()> = Box::pin(async { ipe_main().await });"
+    };
+}
+const WASM_DEFERRED_ENTRY: &str = wasm_deferred_entry!();
+
 /// The `WasmClient` entry: `#[wasm_bindgen(start)]` replacing `fn main`.
 /// The panic hook makes a residual trap die with a classified console error;
 /// the entry task runs on the browser microtask queue.
-const WASM_ENTRY: &str = "\
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn ipe_start() {
-    ipe_runtime::wasm::install_panic_hook();
-    ipe_runtime::wasm::run_start(ipe_main());
-}
-";
+const WASM_ENTRY: &str = concat!(
+    "#[wasm_bindgen::prelude::wasm_bindgen(start)]\n",
+    "pub fn ipe_start() {\n",
+    "    ipe_runtime::wasm::install_panic_hook();\n",
+    "    ",
+    wasm_deferred_entry!(),
+    "\n",
+    "    ipe_runtime::wasm::run_start(entry);\n",
+    "}\n",
+);
 
 /// The `[wasm] mode = "hydrate"` second entry: parses island JSON as the
 /// user-declared `HydrationState` type, converts via `fromHydrationState`
-/// (`main_from_hydration_state`), and adopts the server-rendered DOM.  On any
-/// parse error it falls back to a clean `ipe_main()` init (fault-tolerant: no
-/// white screen on a tampered or stale island blob).
+/// (`main_from_hydration_state`), and adopts the server-rendered DOM. The
+/// conversion and the adoption run inside the task `run_start` judges, so a
+/// program whose startup was refused evaluates neither.  On any
+/// parse error it falls back to a clean init through the deferred entry
+/// (fault-tolerant: no white screen on a tampered or stale island blob).
 ///
 /// `hydration_state_ty` is the Rust type name resolved by
 /// [`EmitCtx::resolve_hydration_state_rust_name`] — the SAME name the emitted
@@ -642,21 +657,24 @@ fn wasm_hydrate_entry(hydration_state_ty: &str) -> String {
 pub fn hydrate(model_json: &str) {{
     match serde_json::from_str::<crate::{hydration_state_ty}>(model_json) {{
         Ok(hs) => {{
-            let model = crate::main_from_hydration_state(hs);
-            ipe_runtime::wasm::run_start(ipe_runtime::wasm::wasm_adopt_app::<
-                String, _, _, _, _, _,
-            >(
-                model,
-                crate::main_update,
-                {wrapped_view},
-                crate::main_subscriptions,
-            ));
+            let adopt: ipe_runtime::IpeTask<String, ()> = Box::pin(async move {{
+                let model = crate::main_from_hydration_state(hs);
+                ipe_runtime::wasm::wasm_adopt_app::<String, _, _, _, _, _>(
+                    model,
+                    crate::main_update,
+                    {wrapped_view},
+                    crate::main_subscriptions,
+                )
+                .await
+            }});
+            ipe_runtime::wasm::run_start(adopt);
         }}
         Err(e) => {{
             ipe_runtime::wasm::console_warn(&format!(
                 \"hydrate: island JSON rejected ({{e}}); falling back to clean init\"
             ));
-            ipe_runtime::wasm::run_start(ipe_main());
+            {WASM_DEFERRED_ENTRY}
+            ipe_runtime::wasm::run_start(entry);
         }}
     }}
 }}
@@ -998,13 +1016,12 @@ fn switch_shape_app_entry(out: &str, where_: &'static str) -> Result<String, Dia
     Ok(switched)
 }
 
-/// `ipe_main`'s RETURN-TYPE render for each shape-app leaf. The entry switch
-/// fires only when `ipe_main`'s own signature returns a leaf — NOT merely when a
-/// leaf constructor appears anywhere in the body. A `Server.mountApp
-/// (Web.embed { … })` program builds a `WebApp(…)` value inside `ipe_main`'s
-/// body but `ipe_main` itself returns `IpeTask<()>` (`Server.listen`), so it is
-/// a Program (`block_on_entry`), not a shape app. Keying on the return type keeps the
-/// two apart.
+/// `ipe_main`'s rendered signature for each shape-app leaf.
+///
+/// The entry switch is decided from the IR ([`ipe_ir::EntryRun`]); these
+/// renders are the independent second check that the single-file emit agrees
+/// with it, so a drift between the IR's run form and the emitted signature is a
+/// `CompilerBug` at `ipe` time, never an entry line `cargo` refuses.
 const SHAPE_APP_RETURN_TYPES: &[&str] = &[
     "fn ipe_main() -> ipe_runtime::tea::WebViewApp",
     "fn ipe_main() -> ipe_runtime::tea::WebApp",
@@ -2074,27 +2091,32 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         file.push(&epilogue_for_target(ctx)?);
         let mut out = file.render();
 
-        // Shape-app entry switch (Native and WASI).
-        //
-        // When `ipe_main` RETURNS a shape-app leaf (`WebApp` / `TuiApp` /
-        // `CliApp` / `WorkerApp`; a `Web.tea` under a webview host renders
-        // `WebViewApp`), `emit_func` already emits that return type from the IR.
-        // Only the epilogue's `fn main` entry line needs updating:
-        // `match block_on_entry(ipe_main) {` → `match run_blocking_entry(ipe_main) {`.
-        // Detection keys on `ipe_main`'s rendered signature, which naturally
-        // handles `CliApp` (which sets no shape flag in `EmitCtx`).
-        //
-        // WASM: `epilogue_wasm` has a different entry — no `block_on_entry`
-        // call and a different `ipe_main` signature — so the switch is skipped.
+        // Shape-app entry switch (Native and WASI): an entry whose run form is
+        // `EntryRun::ShapeApp` swaps the epilogue's
+        // `match block_on_entry(ipe_main) {` for
+        // `match run_blocking_entry(ipe_main) {`. WASM's epilogue has no
+        // `block_on_entry` line, so it never switches.
         if matches!(
             ctx.target,
             ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
-        ) && SHAPE_APP_RETURN_TYPES.iter().any(|sig| out.contains(sig))
-        {
-            out = switch_shape_app_entry(
-                &out,
-                "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
-            )?;
+        ) {
+            let shape_app = ipe_ir::EntryRun::ShapeApp.is_entry_of(program);
+            let renders_shape_app = SHAPE_APP_RETURN_TYPES.iter().any(|sig| out.contains(sig));
+            if shape_app != renders_shape_app {
+                return Err(Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
+                    detail: format!(
+                        "shape-app entry-switch: the IR entry run form says shape app = \
+                         {shape_app}, the emitted `ipe_main` signature says {renders_shape_app}"
+                    ),
+                });
+            }
+            if shape_app {
+                out = switch_shape_app_entry(
+                    &out,
+                    "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
+                )?;
+            }
         }
 
         rust_sources.push((RelPath::new("src/main.rs")?, out));
@@ -3837,32 +3859,12 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     file.push(&epilogue_for_target(ctx)?);
     let mut out = file.render();
 
-    // Shape-app epilogue switch in the spine (Native only).
-    //
-    // In the split layout `ipe_main` lives in a module file; its return type
-    // is already correct from the IR. Only the epilogue's `fn main` body needs
-    // updating: swap `match block_on_entry(ipe_main) {` for
-    // `match run_blocking_entry(ipe_main) {`.
-    //
-    // The switch fires iff the program's ENTRY function itself RETURNS a shape
-    // leaf (`WebApp`/`TuiApp`/`CliApp`/`WorkerApp`; a `WebApp` renders `WebViewApp` under a
-    // webview host) — read directly from the IR,
-    // NOT from the coarse `uses_web` flag. A `Server.listen [ Server.mountApp
-    // (Web.embed { … }) … ]` program sets `uses_web` (it builds an embedded
-    // `WebApp` value) yet its `main` returns `IpeTask<()>`; it is a Program
-    // (`block_on_entry`), not a shape app. Keying on the entry's return type keeps the
-    // two apart (and covers `CliApp`, which sets no shape flag).
-    let main_returns_shape_leaf = program.modules.iter().any(|m| {
-        m.entry.is_some_and(|eid| {
-            m.funcs.iter().any(|f| {
-                f.id == eid
-                    && matches!(
-                        f.ret,
-                        IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
-                    )
-            })
-        })
-    });
+    // Shape-app entry switch in the spine (Native and WASI): `ipe_main` lives
+    // in a module file, so the run form is read from the IR alone — the same
+    // `EntryRun` the single-file layout and the lowerer's admissibility read.
+    // A `Server.listen [ Server.mountApp (Web.embed { … }) … ]` program sets
+    // `uses_web` yet its `main` returns a task, so it runs as a task.
+    let main_returns_shape_leaf = ipe_ir::EntryRun::ShapeApp.is_entry_of(program);
     if main_returns_shape_leaf
         && matches!(
             ctx.target,
@@ -7289,6 +7291,35 @@ mod shape_entry_switch_tests {
         assert_eq!(entry_lines(&shaped, SHAPE_APP_RUN_BLOCKING), 1);
         assert_eq!(entry_lines(&shaped, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
         Ok(())
+    }
+
+    /// Both browser entries build `ipe_main` only inside the deferred entry
+    /// task, so a program whose startup `run_start` refuses evaluates none of
+    /// it: outside that one line no `ipe_main()` call remains.
+    #[test]
+    fn the_wasm_entries_build_ipe_main_only_when_polled() {
+        for entry in [
+            super::WASM_ENTRY.to_owned(),
+            super::wasm_hydrate_entry("MainHydrationState"),
+        ] {
+            assert_eq!(
+                entry_lines(&entry, super::WASM_DEFERRED_ENTRY),
+                1,
+                "the entry must carry the deferred entry line once: {entry}"
+            );
+            let rest = entry.replace(super::WASM_DEFERRED_ENTRY, "");
+            assert!(
+                !rest.contains("ipe_main()"),
+                "the entry builds `ipe_main` before `run_start` judges startup: {entry}"
+            );
+        }
+        let hydrate = super::wasm_hydrate_entry("MainHydrationState");
+        let deferred = hydrate.find("Box::pin(async move {");
+        let converted = hydrate.find("crate::main_from_hydration_state(hs)");
+        assert!(
+            matches!((deferred, converted), (Some(d), Some(c)) if d < c),
+            "the hydrate entry converts the island before `run_start` judges startup: {hydrate}"
+        );
     }
 
     #[test]
