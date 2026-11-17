@@ -1343,7 +1343,7 @@ pub enum NativeFinish<'a> {
 
 impl NativeFinish<'_> {
     /// The build posture: it picks the cargo profile the crate is built with.
-    const fn build_posture(&self) -> BuildPosture {
+    pub const fn build_posture(&self) -> BuildPosture {
         match self {
             Self::Dev => BuildPosture::Dev,
             Self::Release { .. } => BuildPosture::Release,
@@ -1550,12 +1550,17 @@ pub fn compile_and_finalize_native_build(
     } else {
         None
     };
-    let target_dir =
-        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
+    let finish = NativeFinish::Dev;
+    let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+        cargo_bin.path(),
+        finish.build_posture(),
+        out_dir,
+        None,
+    )?;
     let build = FlooredBuild {
         cargo: &cargo_bin,
         crate_dir,
-        finish: NativeFinish::Dev,
+        finish,
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
@@ -2161,6 +2166,7 @@ pub fn release_pipeline(
 
                 let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
                     cargo_bin.path(),
+                    BuildPosture::Release,
                     crate_dir.path(),
                     None,
                 )?;
@@ -2248,18 +2254,20 @@ pub fn release_pipeline(
 
             // The build directory is resolved once, before cargo runs, and the app
             // binary is read back from that same value.
+            let app_finish = NativeFinish::Release {
+                consented: release.consented(),
+                driver,
+            };
             let app_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
                 cargo_bin.path(),
+                app_finish.build_posture(),
                 app_dir.path(),
                 None,
             )?;
             let app_build = FlooredBuild {
                 cargo: &cargo_bin,
                 crate_dir: &app_dir,
-                finish: NativeFinish::Release {
-                    consented: release.consented(),
-                    driver,
-                },
+                finish: app_finish,
                 target: CargoTarget::Static(triple),
                 target_dir: &app_target_dir,
                 output: CargoOutput::Human(Verbosity::Progress),
@@ -2291,8 +2299,10 @@ pub fn release_pipeline(
                 binary: &app_binary,
                 profile: &profile_src,
             });
+            let wrapper_posture = BuildPosture::Release;
             let wrapper_target_dir = crate::target_dir::LinkableTargetDir::for_crate(
                 cargo_bin.path(),
+                wrapper_posture,
                 wrapper_source.root(),
                 None,
             )?;
@@ -2302,7 +2312,7 @@ pub fn release_pipeline(
                     source: &wrapper_source,
                     embed,
                 },
-                posture: BuildPosture::Release,
+                posture: wrapper_posture,
                 target: CargoTarget::Static(wrapper_static_plan.triple),
                 target_dir: &wrapper_target_dir,
                 output: CargoOutput::Human(Verbosity::Progress),
@@ -2676,7 +2686,7 @@ fn bundle_wasm_with<T>(
     // enrichment only, never a gate — the missing-path-dependency error cargo
     // itself raises is already fail-closed).
     let target_dir =
-        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), posture, out_dir, None)?;
     let build = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
@@ -2999,7 +3009,7 @@ pub fn bundle_wasi(crate_dir: &OwnedDir, posture: BuildPosture) -> Result<PathBu
     // target-dir guess that a toggled `CARGO_TARGET_DIR` or a relocated
     // `cargo metadata` can invalidate.
     let target_dir =
-        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), out_dir, None)?;
+        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), posture, out_dir, None)?;
     let build = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
@@ -3639,12 +3649,17 @@ pub fn run_run_with_args(args: cli_args::RunArgs) -> Result<(), CliError> {
     } else {
         None
     };
-    let target_dir =
-        crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), crate_dir.path(), None)?;
+    let finish = NativeFinish::Dev;
+    let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+        cargo_bin.path(),
+        finish.build_posture(),
+        crate_dir.path(),
+        None,
+    )?;
     let build = FlooredBuild {
         cargo: &cargo_bin,
         crate_dir: &crate_dir,
-        finish: NativeFinish::Dev,
+        finish,
         target: static_plan
             .as_ref()
             .map_or(CargoTarget::Host, |plan| CargoTarget::Static(plan.triple)),
