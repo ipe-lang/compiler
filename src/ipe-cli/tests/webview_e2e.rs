@@ -406,10 +406,16 @@ fn client_desktop_fixture(test_name: &str, mobile: &str) -> Result<ipe::RootFixt
         .map_err(|e| -> BoxError { format!("{test_name}: fixture: {e}").into() })
 }
 
+/// A link argument the host's linker driver accepts and the wasm32 `rust-lld`
+/// rejects, as a host linking through its own flags exports.
+const HOST_ONLY_RUSTFLAGS: &str = "-C link-arg=-Wl,-O1";
+
 /// `ipe dev build <project> web client desktop`, its output captured.
 ///
 /// The build runs in an exclusive target: `ipe dev build` emits fixed package
-/// names a concurrent build in the shared target would collide with.
+/// names a concurrent build in the shared target would collide with. The
+/// ambient `RUSTFLAGS` are [`HOST_ONLY_RUSTFLAGS`]: the shell links for the
+/// host under them, and the wasm client build must not see them.
 fn dev_build_client_desktop(project: &std::path::Path) -> Result<std::process::Output, BoxError> {
     let isolated =
         e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
@@ -422,6 +428,8 @@ fn dev_build_client_desktop(project: &std::path::Path) -> Result<std::process::O
         .args(["dev", "build"])
         .arg(project)
         .args(["web", "client", "desktop"])
+        .env("RUSTFLAGS", HOST_ONLY_RUSTFLAGS)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .output()?)
 }
 
