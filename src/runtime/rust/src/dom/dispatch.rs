@@ -1,7 +1,9 @@
 use crate::csp::{STYLE_NONCE_BYTES, StyleNonce};
 use crate::dom::diff::{Patch, diff};
 use crate::entropy::{EntropyError, fill_entropy};
-use crate::html::{Attribute, Event, FormData, Html, RenderCtx, StampedHtml, render_stamped};
+use crate::html::{
+    Attribute, Event, FormData, Html, RenderCtx, SessionMarks, StampedHtml, render_stamped,
+};
 use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -152,11 +154,15 @@ pub struct Incarnation(u128);
 ///
 /// They are its [`Incarnation`] and the [`StyleNonce`] its renders are
 /// stamped with. [`Self::mint`] is the one place either is drawn, and it draws
-/// them separately, so neither value says anything about the other.
+/// them separately, so neither value says anything about the other. The keys
+/// also carry the mount base the history's page links are joined to, the root
+/// unless [`Self::under`] names another.
 #[derive(Debug)]
 pub struct SessionKeys {
     incarnation: Incarnation,
     style_nonce: StyleNonce,
+    #[cfg(feature = "web-core")]
+    base: crate::encoding::EncodedBase,
 }
 
 impl SessionKeys {
@@ -181,7 +187,24 @@ impl SessionKeys {
         Ok(Self {
             incarnation: Incarnation(u128::from_be_bytes(incarnation)),
             style_nonce: StyleNonce::from_random_bytes(style_nonce),
+            #[cfg(feature = "web-core")]
+            base: crate::encoding::MountBase::root().encoded(),
         })
+    }
+
+    /// These keys, with the history's page links joined to `base`.
+    #[cfg(feature = "web-core")]
+    #[must_use]
+    pub fn under(self, base: crate::encoding::EncodedBase) -> Self {
+        Self { base, ..self }
+    }
+
+    /// The marks every render of the history carries.
+    fn marks(self) -> (Incarnation, SessionMarks) {
+        let marks = SessionMarks::new(self.style_nonce);
+        #[cfg(feature = "web-core")]
+        let marks = marks.under(self.base);
+        (self.incarnation, marks)
     }
 }
 
@@ -196,6 +219,8 @@ impl SessionKeys {
             style_nonce: StyleNonce::from_random_bytes(
                 (n.rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15_f39c_c060_5ced_c834).to_be_bytes(),
             ),
+            #[cfg(feature = "web-core")]
+            base: crate::encoding::MountBase::root().encoded(),
         }
     }
 }
@@ -408,7 +433,7 @@ type RetainedRender<M> = (NonZeroU64, HandlerIndex<M>, Option<Bytes>);
 /// [`Self::resident_bytes`] reads those measures and walks no tree.
 pub struct Rendered<M> {
     incarnation: Incarnation,
-    style_nonce: StyleNonce,
+    marks: SessionMarks,
     current: NonZeroU64,
     last_view: Html<M>,
     /// The measure of `last_view`, written only where `last_view` is.
@@ -449,6 +474,7 @@ impl<M: RetainedBytes> Rendered<M> {
     ) -> Option<Bytes> {
         let spare = self.history.capacity().checked_sub(self.history.len())?;
         let base = Bytes::inline::<Self>()?
+            .checked_add(self.marks.held_bytes()?)?
             .checked_add(Bytes::slots::<RetainedRender<M>>(spare)?)?
             .checked_add(view?)?;
         self.history.iter().try_fold(base, |acc, render| {
@@ -477,17 +503,14 @@ impl<M: Clone + RetainedBytes> Rendered<M> {
     }
 
     fn starting_at(keys: SessionKeys, n: NonZeroU64, tree: Html<M>, route: PageUrl) -> Self {
-        let SessionKeys {
-            incarnation,
-            style_nonce,
-        } = keys;
+        let (incarnation, marks) = keys.marks();
         let index = build_index(&tree);
         let index_bytes = index.resident_bytes();
         let mut history = VecDeque::with_capacity(RENDER_HISTORY_DEPTH.get());
         history.push_back((n, index, index_bytes));
         Self {
             incarnation,
-            style_nonce,
+            marks,
             current: n,
             view_bytes: tree.view_bytes(),
             last_view: tree,
@@ -556,23 +579,26 @@ impl<M: Clone> Rendered<M> {
     /// commit takes the session lock again.
     #[must_use]
     pub fn stamp(&self) -> StyleNonce {
-        self.style_nonce.clone()
+        self.marks.nonce.clone()
+    }
+
+    /// A copy of the history's render marks, for a render made before its
+    /// commit takes the session lock again.
+    #[must_use]
+    pub fn marks(&self) -> SessionMarks {
+        self.marks.clone()
     }
 
     /// The current view as the session's stamped markup.
     #[must_use]
     pub fn page(&self) -> StampedHtml {
-        render_stamped(&self.last_view, &self.style_nonce)
+        render_stamped(&self.last_view, &self.marks)
     }
 
     /// The patches from the current view to `tree`, stamped for this session.
     #[must_use]
     pub fn diff_to(&self, tree: &Html<M>) -> Vec<Patch> {
-        diff(
-            &self.last_view,
-            tree,
-            &RenderCtx::Session(&self.style_nonce),
-        )
+        diff(&self.last_view, tree, &RenderCtx::Session(&self.marks))
     }
 
     fn index_at(&self, at: &RenderEpoch) -> Result<&HandlerIndex<M>, StaleEpoch> {
@@ -960,6 +986,8 @@ mod tests {
         SessionKeys {
             incarnation: INCARNATION,
             style_nonce: StyleNonce::from_random_bytes([0x5c; STYLE_NONCE_BYTES]),
+            #[cfg(feature = "web-core")]
+            base: crate::encoding::MountBase::root().encoded(),
         }
     }
 
