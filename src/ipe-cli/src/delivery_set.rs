@@ -175,6 +175,9 @@ pub fn ship_constructor(builder: &str) -> String {
 pub enum BundleHost {
     /// `web desktop` — a self-contained per-OS desktop bundle for the host OS.
     Desktop,
+    /// `web client desktop` — the wasm client bundle in a fixed native shell
+    /// for the host OS.
+    ClientDesktop,
     /// `web client ios` / `web client android` — a native mobile system-webview shell.
     Mobile(MobileOs),
 }
@@ -199,9 +202,8 @@ pub enum ReleaseRoute {
 /// runtime forces a decision here.
 ///
 /// # Errors
-/// [`DeliveryError::ClientDesktopHasNoPacker`] for `web client desktop`, which
-/// no packer builds; [`DeliveryError::ServedHostNotMobile`] for a served mobile
-/// host, which [`Delivery::resolve`] never admits.
+/// [`DeliveryError::ServedHostNotMobile`] for a served mobile host, which
+/// [`Delivery::resolve`] never admits.
 pub const fn release_route(delivery: Delivery) -> Result<ReleaseRoute, DeliveryError> {
     match (delivery.host(), delivery.runtime()) {
         (Host::Default, Some(Runtime::Served) | None) => Ok(ReleaseRoute::Native),
@@ -209,7 +211,9 @@ pub const fn release_route(delivery: Delivery) -> Result<ReleaseRoute, DeliveryE
         (Host::Desktop, Some(Runtime::Served) | None) => {
             Ok(ReleaseRoute::Bundle(BundleHost::Desktop))
         }
-        (Host::Desktop, Some(Runtime::Client)) => Err(DeliveryError::ClientDesktopHasNoPacker),
+        (Host::Desktop, Some(Runtime::Client)) => {
+            Ok(ReleaseRoute::Bundle(BundleHost::ClientDesktop))
+        }
         (Host::Ios, Some(Runtime::Client)) => {
             Ok(ReleaseRoute::Bundle(BundleHost::Mobile(MobileOs::Ios)))
         }
@@ -1070,7 +1074,7 @@ mod tests {
                         == (Host::Desktop, Some(Runtime::Client))
                     {
                         assert!(
-                            matches!(route, Err(DeliveryError::ClientDesktopHasNoPacker)),
+                            matches!(route, Ok(ReleaseRoute::Bundle(BundleHost::ClientDesktop))),
                             "{delivery}: {route:?}"
                         );
                     } else {

@@ -283,6 +283,20 @@ pub mod home_core;
 pub mod scratch_core;
 pub mod scratch_host;
 
+// The `client desktop` shell's storage key and private app-data directory,
+// keyed by the bundle id; the packer parses the same key through
+// `browser-open`.
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(feature = "webview-shell", feature = "browser-open", test)
+))]
+pub mod app_data;
+
+// The one way to hand a URL to the system browser: a typed URL grammar per
+// origin and the platform opener started through the hardened spawner.
+#[cfg(all(feature = "browser-open", not(target_arch = "wasm32")))]
+pub mod browser_open;
+
 pub mod path;
 pub use path::*;
 
@@ -686,7 +700,10 @@ pub mod ui;
 // wry/tao window backend needs the system webview dev libs. It imports `tea`, so
 // it follows `tea`'s feature gate; the real wry/tao arm is behind the opt-in
 // `webview` feature, so a wasm build compiles only the tokio-free `Err` stub.
-#[cfg(feature = "tokio")]
+//
+// The `client desktop` bundle shell (`webview::bundle_app`) rides the same
+// module behind `webview-shell`, which needs no async runtime.
+#[cfg(any(feature = "tokio", feature = "webview-shell"))]
 pub mod webview;
 #[cfg(feature = "tokio")]
 pub use webview::{WebViewAppCfg, WebViewWindowCfg, webview_app};

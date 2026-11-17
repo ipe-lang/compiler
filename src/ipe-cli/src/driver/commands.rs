@@ -2272,9 +2272,9 @@ pub fn release_pipeline(
             let release_bin_name = emitted_bin_filename(app_dir.path())?;
             let app_binary = app_artifacts.join(&release_bin_name);
             if !app_binary.is_file() {
-                return Err(CliError::Usage(text::msg::release_app_binary_missing(
-                    &app_binary.display(),
-                )));
+                return Err(CliError::ProjectRefused(
+                    text::msg::release_app_binary_missing(&app_binary.display()),
+                ));
             }
             let profile_src = app_dir.path().join(RELEASE_PROFILE);
 
@@ -2619,9 +2619,11 @@ const WASM_BINDGEN_VERSION: &str = "0.2.126";
 /// [`crate::bundle_www::publish_www`], and returns its path.
 ///
 /// # Errors
+/// [`CliError::ToolchainMissing`] when `cargo` or the `wasm-bindgen` CLI is
+/// not on the `PATH`, checked before the build starts;
 /// [`CliError::EmittedBuildFailed`] when the wasm `cargo build` fails;
-/// [`CliError::Usage`] when cargo's record names no `.wasm` module, or when
-/// `wasm-bindgen` fails;
+/// [`CliError::Usage`] when cargo's record names no `.wasm` module;
+/// [`CliError::ProjectRefused`] when `wasm-bindgen` fails;
 /// [`CliError::LocalLimitExceeded`] when `wasm-bindgen` crosses its ceiling;
 /// [`CliError::OutputRefused`] when `crate_dir` was replaced since its claim;
 /// [`CliError::ProjectRefused`] when the crate's `www/` cannot be published.
@@ -2662,6 +2664,9 @@ fn bundle_wasm_with<T>(
     // Fail closed before the cross-compile: a missing toolchain becomes a clear
     // root-cause message rather than an opaque OS spawn error.
     let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::BundleWasm)?;
+    // The post-link CLI is resolved before the cross-compile too: a host without
+    // it is refused by name, never after a full wasm build.
+    let bindgen = toolchain::require_wasm_bindgen(WASM_BINDGEN_VERSION)?;
 
     // Step 1: compile to .wasm
     // The wasm build uses the SAME dependency-model runtime crate the native path
@@ -2691,7 +2696,7 @@ fn bundle_wasm_with<T>(
     bundle_wasm_pkg_with(
         crate_dir,
         &wasm_path,
-        &WasmTools::for_posture(posture),
+        &WasmTools::for_posture(posture, bindgen.path()),
         crate::remote_ingest::WASM_TOOL_LIMITS,
         || home.claim(),
         publish,
@@ -2706,12 +2711,12 @@ struct WasmTools<'a> {
     opt: Option<&'a Path>,
 }
 
-impl WasmTools<'static> {
-    /// The tools on `PATH` a `posture` bundle runs: a development bundle
-    /// skips the `wasm-opt` size pass.
-    fn for_posture(posture: BuildPosture) -> Self {
+impl<'a> WasmTools<'a> {
+    /// The tools a `posture` bundle runs: the resolved `bindgen`, then, for a
+    /// release bundle only, the `wasm-opt` size pass on the `PATH`.
+    fn for_posture(posture: BuildPosture, bindgen: &'a Path) -> Self {
         Self {
-            bindgen: Path::new("wasm-bindgen"),
+            bindgen,
             opt: match posture {
                 BuildPosture::Dev => None,
                 BuildPosture::Release => Some(Path::new("wasm-opt")),
@@ -2745,9 +2750,11 @@ enum WasmOptSkip {
 /// absent `wasm-opt` leaves the bundle exactly as `wasm-bindgen` wrote it.
 ///
 /// # Errors
-/// [`CliError::Usage`] when `wasm-bindgen` fails; [`CliError::LocalLimitExceeded`]
-/// when `wasm-bindgen` crosses `ceiling`; [`CliError::OutputRefused`] when
-/// `crate_dir` was replaced before or while either tool ran; [`CliError::Io`]
+/// [`CliError::ProjectRefused`] when `wasm-bindgen` fails;
+/// [`CliError::ToolchainMissing`] when `tools.bindgen` is gone when spawned;
+/// [`CliError::LocalLimitExceeded`] when `wasm-bindgen` crosses `ceiling`;
+/// [`CliError::OutputRefused`] when `crate_dir` was replaced before or while
+/// either tool ran; [`CliError::Io`]
 /// on a filesystem or spawn failure; as [`crate::bundle_www::publish_www`]
 /// when the finished `www/` is published into the directory `into` claims.
 #[cfg(test)]
@@ -2791,8 +2798,20 @@ fn bundle_wasm_pkg_with<T>(
         .arg(wasm_path)
         .args(["--target", "web", "--no-typescript", "--out-dir"])
         .arg(&pkg_dir);
-    let bound = run_local(bindgen, ceiling, LocalSource::WasmTool)
-        .map_err(|e| crate::cargo_step::local_run_error(tools.bindgen, e))?;
+    let bound = run_local(bindgen, ceiling, LocalSource::WasmTool).map_err(|e| match e {
+        // Resolved, then gone by the spawn: still the missing tool by name,
+        // never an I/O error that reads as a missing source file.
+        RunError::Spawn(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            CliError::ToolchainMissing(toolchain::ToolchainMissing {
+                tool: toolchain::Tool::WasmBindgen {
+                    version: WASM_BINDGEN_VERSION,
+                },
+                intent: toolchain::ToolIntent::BundleWasm,
+                disposition: toolchain::Disposition::NotInstalled,
+            })
+        }
+        other => crate::cargo_step::local_run_error(tools.bindgen, other),
+    })?;
     if !bound.status.success() {
         let stderr = bound.stderr.to_terminal();
         if !stderr.as_str().is_empty() {
@@ -2803,7 +2822,7 @@ fn bundle_wasm_pkg_with<T>(
             );
         }
         let code = bound.status.code().unwrap_or(1);
-        return Err(CliError::Usage(text::msg::wasm_bindgen_failed(
+        return Err(CliError::ProjectRefused(text::msg::wasm_bindgen_failed(
             &code,
             &WASM_BINDGEN_VERSION,
         )));
@@ -5211,7 +5230,31 @@ mod held_crate_tests {
         let (base, crate_dir) = scratch("bindgen-fail");
         let bundled = bundle_with(&base, &crate_dir, "echo boom >&2; exit 3", "exit 0");
         assert!(
-            matches!(bundled, Err(CliError::Usage(_))),
+            matches!(bundled, Err(CliError::ProjectRefused(_))),
+            "a failed tool is no command misuse, so it gains no usage page: {bundled:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A `wasm-bindgen` gone by the time it is spawned is the missing tool by
+    /// name, never an I/O error read as a missing source file.
+    #[test]
+    fn a_vanished_wasm_bindgen_is_the_missing_tool() {
+        let (base, crate_dir) = scratch("bindgen-gone");
+        let opt = stub(&base, "wasm-opt", "exit 0");
+        let bundled = bundle_within(
+            &crate_dir,
+            &base,
+            &base.join("no-such-wasm-bindgen"),
+            &opt,
+            WASM_TOOL_LIMITS,
+        );
+        assert!(
+            matches!(
+                &bundled,
+                Err(CliError::ToolchainMissing(missing))
+                    if matches!(missing.tool, crate::toolchain::Tool::WasmBindgen { .. })
+            ),
             "got {bundled:?}"
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -5844,9 +5887,14 @@ mod wasm_locate_tests {
     /// Only a release bundle runs the `wasm-opt -Oz` size pass.
     #[test]
     fn only_a_release_bundle_runs_wasm_opt() {
-        assert!(WasmTools::for_posture(BuildPosture::Dev).opt.is_none());
+        let bindgen = Path::new("/bin/wasm-bindgen");
+        assert!(
+            WasmTools::for_posture(BuildPosture::Dev, bindgen)
+                .opt
+                .is_none()
+        );
         assert_eq!(
-            WasmTools::for_posture(BuildPosture::Release).opt,
+            WasmTools::for_posture(BuildPosture::Release, bindgen).opt,
             Some(Path::new("wasm-opt"))
         );
     }
@@ -6282,8 +6330,11 @@ mod declared_delivery_tests {
     };
     use crate::CliError;
     use crate::cli_args::{self, DeliveryArgs};
-    use crate::delivery::{Delivery, Host, Shape, TargetTriple};
-    use crate::delivery_set::{BinaryTarget, DeclaredDeliveries, PlannedDelivery, ShipEntry};
+    use crate::delivery::{Delivery, DeliveryError, Host, Runtime, Shape, TargetTriple};
+    use crate::delivery_set::{
+        BinaryTarget, BundleHost, DeclaredDeliveries, PlannedDelivery, ReleaseRoute, ShipEntry,
+        release_route,
+    };
     use crate::verb::Verb;
     use ipe_backend_rust::static_build::StaticTriple;
 
@@ -6561,19 +6612,84 @@ mod declared_delivery_tests {
         }
     }
 
-    /// A declared `web client desktop`, which no packer builds, is refused
-    /// before anything is built, by every command that would select it.
+    /// A `web client desktop` release lands under its own slug, never the served desktop's.
     #[test]
-    fn declared_client_desktop_is_refused_before_any_build() {
-        let ships = [ShipEntry::Desktop, ShipEntry::ClientDesktop];
-        let got = declared(&ships).for_release(Verb::RELEASE_BUILD.name(), None, None);
-        assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
+    fn client_desktop_release_lands_under_its_slug() {
+        let slugs = release_slugs(&[ShipEntry::Desktop, ShipEntry::ClientDesktop], None);
+        assert_eq!(slugs, ["web-desktop", "web-client-desktop"], "{slugs:?}");
+        assert_eq!(
+            release_slugs(&[ShipEntry::ClientDesktop], None),
+            ["web-client-desktop"]
+        );
+    }
+
+    /// `ipe dev run` of a `web client desktop` is refused as a client bundle
+    /// with no dev run: the admission names the delivery, and the run's
+    /// refusal carries that same error, so a run never falls back to the bare
+    /// browser client.
+    #[test]
+    fn dev_run_web_client_desktop_stays_refused() {
+        let ships = [ShipEntry::ClientDesktop];
+        let built = resolve_delivery(
+            &declared(&ships),
+            &DeliveryArgs::Unstated,
+            None,
+            false,
+            Verb::DEV_BUILD.name(),
+            ADMIT_ANY,
+        );
+        let Ok(delivery) = built else {
+            assert!(built.is_ok(), "{built:?}");
+            return;
+        };
+        assert_eq!(
+            (delivery.runtime(), delivery.host()),
+            (Some(Runtime::Client), Host::Desktop)
+        );
+        let refusal = DeliveryError::ClientHostHasNoDevRun { delivery };
+        assert_eq!(admit_dev_run(delivery), Err(refusal.clone()));
+        let run = super::refuse_client_host_run(delivery);
+        let expected = crate::text::msg::command_refusal(&Verb::DEV_RUN, &refusal);
+        assert!(
+            matches!(&run, Err(CliError::Usage(message)) if *message == expected),
+            "{run:?}"
+        );
+        let resolved = resolve_delivery(
+            &declared(&ships),
+            &DeliveryArgs::Unstated,
+            None,
+            false,
+            Verb::DEV_RUN.name(),
+            admit_dev_run,
+        );
+        let expected = crate::text::msg::command_refusal(&Verb::DEV_RUN.name(), &refusal);
+        assert!(
+            matches!(&resolved, Err(CliError::ProjectRefused(message)) if *message == expected),
+            "the sole declared delivery has no dev run: {resolved:?}"
+        );
+    }
+
+    /// A declared `web client desktop` routes to its own packer: the release
+    /// plans it as its own member, and the dev build admits it as a bundle.
+    #[test]
+    fn release_route_routes_web_client_desktop_to_its_packer() {
+        let ships = [ShipEntry::ClientDesktop];
         let run = declared(&ships).sole_release_member(
             Verb::RELEASE_RUN.name(),
             None,
             Verb::RELEASE_BUILD.name(),
         );
-        assert!(matches!(run, Err(CliError::ProjectRefused(_))), "{run:?}");
+        let Ok(member) = run else {
+            assert!(run.is_ok(), "{run:?}");
+            return;
+        };
+        assert!(
+            matches!(
+                release_route(member.delivery()),
+                Ok(ReleaseRoute::Bundle(BundleHost::ClientDesktop))
+            ),
+            "{member:?}"
+        );
         let dev = resolve_delivery(
             &declared(&ships),
             &DeliveryArgs::Unstated,
@@ -6582,7 +6698,13 @@ mod declared_delivery_tests {
             Verb::DEV_BUILD.name(),
             ADMIT_ANY,
         );
-        assert!(matches!(dev, Err(CliError::ProjectRefused(_))), "{dev:?}");
+        assert!(
+            matches!(
+                dev.map(release_route),
+                Ok(Ok(ReleaseRoute::Bundle(BundleHost::ClientDesktop)))
+            ),
+            "{ships:?}"
+        );
     }
 
     /// A remedy line carries the project dir after its verb, so the printed

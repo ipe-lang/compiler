@@ -303,12 +303,6 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "driver/commands.rs",
-        "bundle_wasm_pkg_with",
-        1,
-        "built in a file another lane owns; its route is decided there",
-    ),
-    (
-        "driver/commands.rs",
         "copy_native_artifact",
         1,
         "built in a file another lane owns; its route is decided there",
@@ -376,7 +370,7 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     (
         "driver/commands.rs",
         "release_pipeline",
-        4,
+        3,
         "built in a file another lane owns; its route is decided there",
     ),
     (
@@ -429,12 +423,6 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "driver/commands_pkg.rs",
-        "BundleAssembler::assemble_desktop",
-        1,
-        "built in a file another lane owns; its route is decided there",
-    ),
-    (
-        "driver/commands_pkg.rs",
         "BundleAssembler::assemble_mobile",
         1,
         "built in a file another lane owns; its route is decided there",
@@ -455,12 +443,6 @@ const UNROUTED: &[(&str, &str, usize, &str)] = &[
         "driver/commands_pkg.rs",
         "build_under_pinned_manifest",
         1,
-        "built in a file another lane owns; its route is decided there",
-    ),
-    (
-        "driver/commands_pkg.rs",
-        "build_wasm_for_mobile",
-        2,
         "built in a file another lane owns; its route is decided there",
     ),
     (

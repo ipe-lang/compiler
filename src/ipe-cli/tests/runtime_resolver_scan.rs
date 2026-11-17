@@ -112,6 +112,12 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "emit_desktop",
         1,
     ),
+    (
+        "RuntimeSource::resolve",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "shell_runtime",
+        1,
+    ),
     ("RuntimeSource::resolve", HEALTH, "check_runtime", 1),
     ("RuntimeEmit::from_env", PIPELINE, "from_env", 1),
     ("RuntimeEmit::from_env", COMMANDS, "run_watch", 1),

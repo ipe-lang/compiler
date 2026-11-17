@@ -657,6 +657,8 @@ jobs:
       # GLib/GTK/WebKit pkg-config files.
       - uses: ./.github/actions/webview-link-deps
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,time-core,uuid,webview --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features webview-shell --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features browser-open --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,encoding,json,jwt,secret,uuid --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,url,websocket_client --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,email,encoding,http_client,random,url --all-targets -- -D warnings
@@ -1505,6 +1507,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
+      # `client desktop` goldens build the `web client` bundle their packed shell
+      # hosts, and a host without the CLI refuses that build by name.
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
       # The shard driver is `cargo nextest run`; the runner has no nextest unless
       # this installs it (every other nextest-driven job installs it too).
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest

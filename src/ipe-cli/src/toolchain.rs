@@ -26,6 +26,7 @@ use crate::remote_ingest::{
     LocalCeiling, LocalRefusal, LocalSource, RUSTC_QUERY_LIMITS, RunError, Stream, run_local,
 };
 use crate::style::TerminalSafe;
+use ipe_sandbox::host_tool::{self, HostTool};
 
 /// A `cargo` executable resolved on the `PATH`.
 ///
@@ -97,12 +98,50 @@ pub enum Disposition {
     NotOnPath { found_in: TerminalSafe },
 }
 
+/// A host program the driver shells out to, resolved on the `PATH` before use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tool {
+    /// `cargo`, which drives `rustc`.
+    Cargo,
+    /// The `wasm-bindgen` CLI a `web client` bundle runs after its wasm link,
+    /// at the exact `version` the runtime's `wasm-bindgen` crate pins.
+    WasmBindgen {
+        /// The pinned `wasm-bindgen-cli` version.
+        version: &'static str,
+    },
+}
+
+impl Tool {
+    /// The program's file name before the host's executable suffix.
+    const fn program(self) -> &'static str {
+        match self {
+            Self::Cargo => "cargo",
+            Self::WasmBindgen { .. } => "wasm-bindgen",
+        }
+    }
+
+    /// The program's executable file name on this host.
+    fn exe(self) -> String {
+        crate::health::exe_name(self.program(), ipe_path_core::HOST)
+    }
+
+    /// The program in the closed set the one `PATH` resolver admits.
+    const fn host_tool(self) -> HostTool {
+        match self {
+            Self::Cargo => HostTool::Cargo,
+            Self::WasmBindgen { .. } => HostTool::WasmBindgen,
+        }
+    }
+}
+
 /// The typed "toolchain absent" error.
 ///
-/// Carries which command needed the toolchain and why it could not be reached.
-/// Rendered by [`crate::CliError`]'s `Display`.
+/// Carries which program is absent, which command needed it, and why it could
+/// not be reached. Rendered by [`crate::CliError`]'s `Display`.
 #[derive(Debug, Clone)]
 pub struct ToolchainMissing {
+    /// The program that was not found.
+    pub tool: Tool,
     /// What the command was trying to do.
     pub intent: ToolIntent,
     /// Not installed at all, versus installed but unreachable.
@@ -112,37 +151,53 @@ pub struct ToolchainMissing {
 impl std::fmt::Display for ToolchainMissing {
     /// Render the human-facing message through the CLI's look SSOT
     /// ([`crate::style`]): a failure glyph, the root cause, why Ipê needs the
-    /// toolchain (naming THIS command's task), and the per-disposition fix.
+    /// program (naming THIS command's task), and the per-disposition fix.
     /// Self-guttered — the caller prints it as-is, without re-wrapping.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use crate::style::{self, GUTTER};
         let task = self.intent.task_phrase();
-        write!(
-            f,
-            "{GUTTER}{} Rust and Cargo were not found.\n\
-             {GUTTER}    Ipê compiles your program to Rust and then runs Cargo to {task},\n\
-             {GUTTER}    so it needs the Rust toolchain installed and reachable.\n",
-            style::outcome_glyph(style::Outcome::Failure)
-        )?;
-        match &self.disposition {
-            Disposition::NotInstalled => write!(
+        let glyph = style::outcome_glyph(style::Outcome::Failure);
+        let name = match self.tool {
+            Tool::Cargo => {
+                write!(
+                    f,
+                    "{GUTTER}{glyph} Rust and Cargo were not found.\n\
+                     {GUTTER}    Ipê compiles your program to Rust and then runs Cargo to {task},\n\
+                     {GUTTER}    so it needs the Rust toolchain installed and reachable.\n"
+                )?;
+                "Cargo"
+            }
+            Tool::WasmBindgen { version } => {
+                write!(
+                    f,
+                    "{GUTTER}{glyph} wasm-bindgen was not found.\n\
+                     {GUTTER}    Ipê runs the wasm-bindgen CLI after Cargo to {task},\n\
+                     {GUTTER}    so it needs wasm-bindgen-cli {version}, the version the runtime pins.\n"
+                )?;
+                "wasm-bindgen"
+            }
+        };
+        match (&self.disposition, self.tool) {
+            (Disposition::NotInstalled, Tool::Cargo) => write!(
                 f,
                 "{GUTTER}    Install it once with rustup, then try again:\n\
                  {GUTTER}        https://rustup.rs"
             ),
-            Disposition::NotOnPath { found_in } => write!(
+            (Disposition::NotInstalled, Tool::WasmBindgen { version }) => write!(
                 f,
-                "{GUTTER}    Cargo is installed at {found_in} but that directory is not on your PATH.\n\
-                 {GUTTER}    Add it to your PATH, then try again:\n\
-                 {GUTTER}        export PATH=\"{found_in}:$PATH\""
+                "{GUTTER}    Install it once, then try again:\n\
+                 {GUTTER}        cargo install wasm-bindgen-cli --version {version} --locked"
             ),
+            (Disposition::NotOnPath { found_in }, Tool::Cargo | Tool::WasmBindgen { .. }) => {
+                write!(
+                    f,
+                    "{GUTTER}    {name} is installed at {found_in} but that directory is not on your PATH.\n\
+                     {GUTTER}    Add it to your PATH, then try again:\n\
+                     {GUTTER}        export PATH=\"{found_in}:$PATH\""
+                )
+            }
         }
     }
-}
-
-/// The executable file name of `cargo` on this host.
-fn cargo_exe() -> String {
-    crate::health::exe_name("cargo", ipe_path_core::HOST)
 }
 
 /// Resolve `cargo`, or produce a typed [`ToolchainMissing`].
@@ -156,10 +211,43 @@ fn cargo_exe() -> String {
 /// # Errors
 /// [`ToolchainMissing`] when no `cargo` executable is found on the `PATH`.
 pub fn require_cargo(intent: ToolIntent) -> Result<CargoBin, ToolchainMissing> {
+    require(Tool::Cargo, intent).map(CargoBin)
+}
+
+/// A `wasm-bindgen` executable resolved on the `PATH`.
+///
+/// Holding one is proof the presence check passed before the wasm build
+/// started; the wrapped path is the one the bundle step runs.
+#[derive(Debug, Clone)]
+pub struct WasmBindgenBin(PathBuf);
+
+impl WasmBindgenBin {
+    /// The resolved absolute path to `wasm-bindgen`, ready to hand to `Command::new`.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// Resolve the `wasm-bindgen` CLI a `web client` bundle runs, or produce a
+/// typed [`ToolchainMissing`] naming it and its pinned `version`.
+///
+/// Searched exactly as [`require_cargo`] searches for `cargo`: `cargo install`
+/// places the CLI in the same `bin` directory.
+///
+/// # Errors
+/// [`ToolchainMissing`] when no `wasm-bindgen` executable is found on the `PATH`.
+pub fn require_wasm_bindgen(version: &'static str) -> Result<WasmBindgenBin, ToolchainMissing> {
+    require(Tool::WasmBindgen { version }, ToolIntent::BundleWasm).map(WasmBindgenBin)
+}
+
+/// Resolve `tool` on the `PATH`, or the typed [`ToolchainMissing`] for `intent`.
+fn require(tool: Tool, intent: ToolIntent) -> Result<PathBuf, ToolchainMissing> {
     let path_var = ipe_env::var_os("PATH").unwrap_or_default();
-    match resolve(&path_var, &known_install_dirs()) {
-        Resolution::Found(path) => Ok(CargoBin(path)),
+    match resolve(tool, &path_var, &known_install_dirs()) {
+        Resolution::Found(path) => Ok(path),
         Resolution::Missing(disposition) => Err(ToolchainMissing {
+            tool,
             intent,
             disposition,
         }),
@@ -188,34 +276,32 @@ pub enum Probe {
 #[must_use]
 pub fn probe_cargo() -> Probe {
     let path_var = ipe_env::var_os("PATH").unwrap_or_default();
-    match resolve(&path_var, &known_install_dirs()) {
+    match resolve(Tool::Cargo, &path_var, &known_install_dirs()) {
         Resolution::Found(path) => Probe::Found(path),
         Resolution::Missing(disposition) => Probe::Missing(disposition),
     }
 }
 
-/// The outcome of searching for `cargo`: the resolved path, or why it is absent.
+/// The outcome of searching for a program: the resolved path, or why it is absent.
 /// A pure value over its inputs so the resolution logic is testable without
 /// mutating the process environment.
 enum Resolution {
-    /// `cargo` was found on the `PATH` at this path.
+    /// The program was found on the `PATH` at this path.
     Found(PathBuf),
-    /// `cargo` was not on the `PATH`; this is why.
+    /// The program was not on the `PATH`; this is why.
     Missing(Disposition),
 }
 
-/// Search `path_var` (an OS `PATH` string) for `cargo`; when absent, fall back
-/// to `install_dirs` to tell "not installed" from "installed but not on the
+/// Search `path_var` (an OS `PATH` string) for `tool` through the one `PATH`
+/// resolver, which admits only absolute entries; when absent, fall back to
+/// `install_dirs` to tell "not installed" from "installed but not on the
 /// `PATH`". Pure over its inputs — it reads only the filesystem, never the
 /// environment — so callers and tests supply the search space explicitly.
-fn resolve(path_var: &OsString, install_dirs: &[PathBuf]) -> Resolution {
-    let exe = cargo_exe();
-    if let Some(found) = std::env::split_paths(path_var)
-        .map(|dir| dir.join(&exe))
-        .find(|candidate| is_executable_file(candidate))
-    {
-        return Resolution::Found(found);
+fn resolve(tool: Tool, path_var: &OsString, install_dirs: &[PathBuf]) -> Resolution {
+    if let Ok(found) = host_tool::resolve_in(path_var, tool.host_tool(), ipe_path_core::HOST) {
+        return Resolution::Found(found.as_path());
     }
+    let exe = tool.exe();
     let disposition = install_dirs
         .iter()
         .find(|dir| is_executable_file(&dir.join(&exe)))
@@ -564,6 +650,11 @@ impl Drop for StubRustc {
 mod tests {
     use super::*;
 
+    /// The executable file name of `cargo` on this host.
+    fn cargo_exe() -> String {
+        Tool::Cargo.exe()
+    }
+
     /// A temp directory holding a dummy `cargo` executable, cleaned on drop.
     struct ProbeDir(PathBuf);
 
@@ -602,7 +693,7 @@ mod tests {
     fn no_cargo_anywhere_is_not_installed() {
         // An empty PATH and no install dirs: cargo is nowhere, so the
         // resolution is NotInstalled — never a fall-through to a spawn.
-        match resolve(&OsString::from(""), &[]) {
+        match resolve(Tool::Cargo, &OsString::from(""), &[]) {
             Resolution::Missing(Disposition::NotInstalled) => {}
             Resolution::Missing(other) => panic!("expected NotInstalled, got {other:?}"),
             Resolution::Found(p) => panic!("expected missing, resolved {p:?}"),
@@ -615,7 +706,7 @@ mod tests {
         let probe = ProbeDir::with_cargo("offpath");
         let install_dirs = [probe.dir().to_path_buf()];
         // Empty PATH, but the install dir holds cargo → NotOnPath naming it.
-        match resolve(&OsString::from(""), &install_dirs) {
+        match resolve(Tool::Cargo, &OsString::from(""), &install_dirs) {
             Resolution::Missing(Disposition::NotOnPath { found_in }) => {
                 assert_eq!(found_in.as_str(), probe.dir().display().to_string());
             }
@@ -629,10 +720,84 @@ mod tests {
     fn cargo_on_path_resolves_to_that_path() {
         let probe = ProbeDir::with_cargo("onpath");
         let path_var = OsString::from(probe.dir());
-        match resolve(&path_var, &[]) {
+        match resolve(Tool::Cargo, &path_var, &[]) {
             Resolution::Found(found) => assert_eq!(found, probe.dir().join(cargo_exe())),
             Resolution::Missing(d) => panic!("expected a resolved cargo, got {d:?}"),
         }
+    }
+
+    /// A relative `PATH` entry is never searched: a program there is the
+    /// working directory's, which may be an untrusted project's.
+    #[test]
+    #[allow(clippy::panic)] // a wrong resolution variant in a unit test IS the failure
+    fn cargo_under_a_relative_path_entry_is_not_resolved() {
+        let probe = ProbeDir::with_cargo("relative");
+        let cwd = std::env::current_dir();
+        let Ok(cwd) = cwd else {
+            panic!("working directory: {cwd:?}");
+        };
+        // `../` up to the root, then the probe's absolute path below it: a
+        // relative entry that names the probe from the working directory.
+        let mut relative = PathBuf::new();
+        for _ in cwd.components().skip(1) {
+            relative.push("..");
+        }
+        relative.extend(probe.dir().components().skip(1));
+        assert!(
+            relative.is_relative() && relative.join(cargo_exe()).is_file(),
+            "the relative entry {relative:?} names the probe"
+        );
+        match resolve(Tool::Cargo, &relative.into_os_string(), &[]) {
+            Resolution::Missing(Disposition::NotInstalled) => {}
+            Resolution::Missing(other) => panic!("expected NotInstalled, got {other:?}"),
+            Resolution::Found(p) => panic!("a relative PATH entry resolved {p:?}"),
+        }
+    }
+
+    /// `wasm-bindgen` is searched by its own name: a `PATH` holding only
+    /// `cargo` does not resolve it.
+    #[test]
+    #[allow(clippy::panic)] // a wrong resolution variant in a unit test IS the failure
+    fn wasm_bindgen_beside_cargo_only_is_not_installed() {
+        let probe = ProbeDir::with_cargo("bindgen-absent");
+        let path_var = OsString::from(probe.dir());
+        let bindgen = Tool::WasmBindgen { version: "0.2.126" };
+        match resolve(bindgen, &path_var, &[]) {
+            Resolution::Missing(Disposition::NotInstalled) => {}
+            Resolution::Missing(other) => panic!("expected NotInstalled, got {other:?}"),
+            Resolution::Found(p) => panic!("expected missing, resolved {p:?}"),
+        }
+    }
+
+    /// A missing `wasm-bindgen` names the tool, its pinned version and the
+    /// install command — never a missing source file.
+    #[test]
+    fn a_missing_wasm_bindgen_names_the_tool_and_its_install() {
+        let missing = ToolchainMissing {
+            tool: Tool::WasmBindgen { version: "0.2.126" },
+            intent: ToolIntent::BundleWasm,
+            disposition: Disposition::NotInstalled,
+        };
+        let text = missing.to_string();
+        assert!(text.contains("wasm-bindgen was not found"), "{text}");
+        assert!(text.contains("wasm-bindgen-cli 0.2.126"), "{text}");
+        assert!(
+            text.contains("cargo install wasm-bindgen-cli --version 0.2.126 --locked"),
+            "{text}"
+        );
+        assert!(!text.contains("source file"), "{text}");
+        assert!(!text.contains("Rust and Cargo"), "{text}");
+        let off_path = ToolchainMissing {
+            disposition: Disposition::NotOnPath {
+                found_in: TerminalSafe::sanitize("/home/u/.cargo/bin"),
+            },
+            ..missing
+        };
+        let text = off_path.to_string();
+        assert!(
+            text.contains("wasm-bindgen is installed at /home/u/.cargo/bin"),
+            "{text}"
+        );
     }
 
     #[test]

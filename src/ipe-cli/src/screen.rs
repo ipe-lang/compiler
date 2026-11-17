@@ -808,6 +808,7 @@ mod tests {
         assert!(out.contains("/tmp/foo.ipe"), "{out:?}");
 
         let toolchain = CliError::ToolchainMissing(crate::toolchain::ToolchainMissing {
+            tool: crate::toolchain::Tool::Cargo,
             intent: crate::toolchain::ToolIntent::Build,
             disposition: crate::toolchain::Disposition::NotOnPath {
                 found_in: TerminalSafe::sanitize(&format!("/opt/{HOSTILE}")),

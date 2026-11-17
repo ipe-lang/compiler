@@ -223,6 +223,11 @@ pub const TAO: CrateSpec = CrateSpec {
     name: "tao",
     version: "0.35",
 };
+/// Linux-only: the GTK tao and wry build on, named for its fallible init.
+pub const GTK: CrateSpec = CrateSpec {
+    name: "gtk",
+    version: "0.18",
+};
 /// The `WebSocket` handshake only: the runtime owns the `wss://` TLS through
 /// [`TOKIO_RUSTLS`], so tungstenite carries no TLS or root-store feature.
 pub const TOKIO_TUNGSTENITE: PinnedCrate = PinnedCrate {
@@ -422,6 +427,7 @@ pub const ALL: &[CrateSpec] = &[
     UNICODE_WIDTH,
     WRY,
     TAO,
+    GTK,
     TOKIO_TUNGSTENITE.spec,
     TOKIO_RUSTLS.spec,
     RUSTLS.spec,
@@ -487,7 +493,7 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 38, "expected 38 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 39, "expected 39 surgery-emitted crate specs");
         for pinned in ALL_PINNED {
             assert!(
                 ALL.iter().any(|spec| spec.name == pinned.spec.name),

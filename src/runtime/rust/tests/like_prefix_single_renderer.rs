@@ -23,14 +23,12 @@
 //! (`"LI" ++ "KE"`) is outside what a lexical scan can see.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::{self, Visit};
 use syn::{
-    Arm, Attribute, Expr, ImplItem, ImplItemFn, Item, ItemFn, ItemMod, LitStr, Macro, Meta, Stmt,
-    TraitItem,
+    Arm, Attribute, Expr, ImplItem, ImplItemFn, Item, ItemFn, LitStr, Macro, Stmt, TraitItem,
 };
 
 #[path = "support/cfg_scan.rs"]
@@ -40,6 +38,11 @@ use cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_ite
 #[path = "support/source_tree.rs"]
 mod source_tree;
 use source_tree::rust_sources;
+
+#[allow(dead_code)] // `production_sources` serves the secret-Debug scan
+#[path = "support/test_modules.rs"]
+mod test_modules;
+use test_modules::{ModDecl, child_files, file_decls, test_only_files};
 
 /// The one runtime function that renders SQL `LIKE` text.
 const THE_RENDERER: (&str, &str) = ("db.rs", "like_escape_sql");
@@ -68,30 +71,12 @@ fn renders_sql_like(text: &str) -> bool {
     false
 }
 
-/// One out-of-line `mod name;` declaration.
-#[derive(Debug, PartialEq, Eq)]
-struct ModDecl {
-    /// The inline `mod … { }` blocks enclosing the declaration, outermost first.
-    inline: Vec<String>,
-    name: String,
-    /// The `#[path = "…"]` value, if any.
-    path: Option<String>,
-    /// Whether the declaration is `#[cfg(test)]`-only.
-    test: bool,
-}
-
-/// One file's production `LIKE` renderings and its out-of-line modules.
+/// One file's production `LIKE` renderings.
 #[derive(Default)]
 struct Scan {
     fn_stack: Vec<String>,
-    /// The inline modules enclosing the visitor's position, outermost first.
-    mod_stack: Vec<String>,
     /// The enclosing function of each production literal that renders `LIKE`.
     renders: Vec<String>,
-    /// Every out-of-line `mod` declaration outside test-only code, plus each
-    /// out-of-line `#[cfg(test)] mod` (an out-of-line `mod` inside a test-only
-    /// inline module is not recorded, so its file stays scanned).
-    mods: Vec<ModDecl>,
 }
 
 impl Scan {
@@ -101,15 +86,6 @@ impl Scan {
             .last()
             .map_or_else(|| "<item>".to_owned(), Clone::clone);
         self.renders.push(site);
-    }
-
-    fn declare(&mut self, module: &ItemMod, test: bool) {
-        self.mods.push(ModDecl {
-            inline: self.mod_stack.clone(),
-            name: module.ident.to_string(),
-            path: path_attr(&module.attrs),
-            test,
-        });
     }
 
     fn scan_tokens(&mut self, tokens: TokenStream) {
@@ -127,47 +103,18 @@ impl Scan {
     }
 }
 
-/// The `#[path = "…"]` value among `attrs`, if any.
-fn path_attr(attrs: &[Attribute]) -> Option<String> {
-    attrs.iter().find_map(|attr| {
-        if let Meta::NameValue(nv) = &attr.meta
-            && nv.path.is_ident("path")
-            && let Expr::Lit(lit) = &nv.value
-            && let syn::Lit::Str(value) = &lit.lit
-        {
-            Some(value.value())
-        } else {
-            None
-        }
-    })
-}
-
 impl<'ast> Visit<'ast> for Scan {
     // Doc comments and `cfg` predicates are attributes, never rendered SQL.
     fn visit_attribute(&mut self, _attr: &'ast Attribute) {}
 
     fn visit_item(&mut self, item: &'ast Item) {
         if cfg_test_only(item_attrs(item)) {
-            if let Item::Mod(module) = item
-                && module.content.is_none()
-            {
-                self.declare(module, true);
-            }
             return;
         }
         if let Item::Verbatim(tokens) = item {
             self.scan_tokens(tokens.clone());
         }
         visit::visit_item(self, item);
-    }
-
-    fn visit_item_mod(&mut self, module: &'ast ItemMod) {
-        if module.content.is_none() {
-            self.declare(module, false);
-        }
-        self.mod_stack.push(module.ident.to_string());
-        visit::visit_item_mod(self, module);
-        self.mod_stack.pop();
     }
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
@@ -256,89 +203,13 @@ fn scan(name: &str, src: &str) -> Scan {
     scan
 }
 
-/// `rel` under `dir`, with `.` and `..` components resolved lexically.
-fn join(dir: &str, rel: &str) -> String {
-    let mut parts: Vec<&str> = Vec::new();
-    for part in dir.split('/').chain(rel.split('/')) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            _ => parts.push(part),
-        }
-    }
-    parts.join("/")
-}
-
-/// The files `decl`, declared in `parent`, may load.
-///
-/// A file named `mod.rs` / `lib.rs` / `main.rs` owns its directory; any other
-/// file owns the directory named after its stem, unless it was itself loaded
-/// through `#[path]`, when it owns its own directory. Which applies is not
-/// known per file, so `broad` yields both readings (the production side, where
-/// a wider set keeps more files scanned) and the narrow reading takes the stem
-/// rule only (the test side, where a wider set would drop more).
-fn child_files(parent: &str, decl: &ModDecl, broad: bool) -> Vec<String> {
-    let (dir, file) = parent.rsplit_once('/').unwrap_or(("", parent));
-    let stem = file.strip_suffix(".rs").unwrap_or(file);
-    let mut owned = Vec::new();
-    if matches!(stem, "mod" | "lib" | "main") {
-        owned.push(dir.to_owned());
-    } else {
-        owned.push(join(dir, stem));
-        if broad {
-            owned.push(dir.to_owned());
-        }
-    }
-    let inline = decl.inline.join("/");
-    match (&decl.path, decl.inline.is_empty()) {
-        (Some(path), true) => vec![join(dir, path)],
-        (Some(path), false) => owned
-            .iter()
-            .map(|base| join(&join(base, &inline), path))
-            .collect(),
-        (None, _) => owned
-            .iter()
-            .flat_map(|base| {
-                let base = join(base, &inline);
-                [
-                    join(&base, &format!("{}.rs", decl.name)),
-                    join(&base, &format!("{}/mod.rs", decl.name)),
-                ]
-            })
-            .collect(),
-    }
-}
-
-/// The files only a `#[cfg(test)]` module loads: each named by a test-only
-/// declaration and by no production one.
-fn test_only_files(scans: &[(&str, Scan)]) -> BTreeSet<String> {
-    let named = |test: bool| -> BTreeSet<String> {
-        scans
-            .iter()
-            .flat_map(|(name, scan)| {
-                scan.mods
-                    .iter()
-                    .filter(move |decl| decl.test == test)
-                    .flat_map(move |decl| child_files(name, decl, !test))
-            })
-            .collect()
-    };
-    let production = named(false);
-    named(true)
-        .into_iter()
-        .filter(|file| !production.contains(file))
-        .collect()
-}
-
 /// Every production `LIKE` rendering across `sources`, as `(file, fn)`.
 fn renderings(sources: &[(String, String)]) -> Vec<(String, String)> {
     let scans: Vec<(&str, Scan)> = sources
         .iter()
         .map(|(name, src)| (name.as_str(), scan(name, src)))
         .collect();
-    let test_only = test_only_files(&scans);
+    let test_only = test_only_files(sources);
     scans
         .into_iter()
         .filter(|(name, _)| !test_only.contains(*name))
@@ -454,8 +325,12 @@ mod db_tests;
 "#;
     let scanned = scan("fixture", src);
     assert_eq!(scanned.renders, Vec::<String>::new());
+    let parsed = syn::parse_file(src);
+    assert!(parsed.is_ok(), "the fixture parses");
     assert_eq!(
-        scanned.mods,
+        parsed
+            .map(|file| file_decls(&file).mods)
+            .unwrap_or_default(),
         vec![ModDecl {
             inline: Vec::new(),
             name: "db_tests".to_owned(),
