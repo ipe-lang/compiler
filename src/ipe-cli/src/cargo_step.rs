@@ -1713,18 +1713,19 @@ mod tests {
                 target,
                 CargoOutput::JsonStream(Verbosity::Quiet),
             );
-            let cleared = match target.rustflags_env() {
-                None => Env::Inherited,
-                Some(scoped) => {
-                    assert_eq!(env(&build, scoped), Env::Removed, "{target:?}");
-                    Env::Removed
-                }
-            };
             assert_eq!(
+                target.rustflags_env().is_some(),
                 target.triple().is_some(),
-                cleared == Env::Removed,
                 "{target:?}"
             );
+            if let Some(scoped) = target.rustflags_env() {
+                assert_eq!(env(&build, scoped), Env::Removed, "{target:?}");
+            }
+            let cleared = if target.triple().is_some() {
+                Env::Removed
+            } else {
+                Env::Inherited
+            };
             assert_eq!(env(&build, "RUSTFLAGS"), cleared, "{target:?}");
             assert_eq!(
                 env(&build, "CARGO_ENCODED_RUSTFLAGS"),
