@@ -58,6 +58,13 @@ ignore = [
     # `-wal` where an Ipê program opens them. Accepted until sqlx publishes a
     # release that admits libsqlite3-sys >= 0.39; then upgrade and drop this line.
     "RUSTSEC-2026-0459",
+    # RUSTSEC-2026-0543 — chrono unmaintained; the advisory's Solution field
+    # says no safe upgrade is available. An unmaintained notice, not a known
+    # vulnerability. chrono is the runtime's calendar and clock (Ipe.Time, Log,
+    # Db, Web), and the emitted Cargo template pins it, so every program that
+    # reaches those surfaces depends on it. Accepted until the runtime moves to
+    # a maintained date/time crate behind the unchanged Ipe.Time API.
+    "RUSTSEC-2026-0543",
 ]
 
 # https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html
