@@ -5261,6 +5261,80 @@ fn page_link_unreadable_table_refused() {
     }
 }
 
+/// The emitted Rust of a build whose output lives in `out`: `src/main.rs` plus
+/// every `src/ipe_mods/*.rs` a split build writes.
+#[allow(clippy::expect_used)] // an unreadable emitted tree is the test failure
+fn emitted_source(out: &std::path::Path) -> String {
+    let src = out.join("src");
+    let mut combined =
+        std::fs::read_to_string(src.join("main.rs")).expect("the build emits src/main.rs");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(src.join("ipe_mods"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    for path in files {
+        combined.push('\n');
+        combined.push_str(&std::fs::read_to_string(&path).expect("an emitted module is readable"));
+    }
+    combined
+}
+
+/// Assert `src` defines exactly one page renderer and names it `mentions`
+/// times in all, its definition included.
+#[track_caller]
+fn assert_one_page_renderer(name: &str, src: &str, mentions: usize) {
+    assert_eq!(
+        src.matches("fn __ipe_render_page_").count(),
+        1,
+        "{name}: one table emits one crate-level renderer"
+    );
+    assert_eq!(
+        src.matches("__ipe_render_page_").count(),
+        mentions,
+        "{name}: every link and the routed app render through the one renderer"
+    );
+    assert!(
+        !src.contains("move |__page:"),
+        "{name}: no inline renderer is emitted beside the table's item"
+    );
+}
+
+/// Two page links over one table share one crate-level renderer, which the
+/// routed app over that table passes as its URL renderer too, in the
+/// single-file layout and the per-module split alike.
+#[test]
+fn page_links_over_one_table_share_one_renderer() {
+    let name = "page_link_shared_renderer";
+    let view = format!(
+        "view model = Ui.column [] [ Web.pageLink appRoutes [] {PAGE_LINK_CFG}, \
+         Web.pageLink appRoutes [] {{ to = HomePage, current = model.page, label = Ui.text \"Home\" }} ]"
+    );
+    assert_compiles(name, &page_link_fixture("appRoutes", "", &view));
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-out")
+        .join(name);
+    // One definition, two renders per link, and the routed app's render.
+    assert_one_page_renderer(name, &emitted_source(&out), 6);
+
+    let split = "page_link_shared_renderer_split";
+    assert_page_link_without_app_compiles(
+        split,
+        "linkRoutes : List (WebRoute Page)\n\
+         linkRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+        "Ui.column [] [ Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }, \
+         Web.pageLink linkRoutes [] { to = HomePage, current = HomePage, label = Ui.text \"Home\" } ]",
+    );
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-proj-out")
+        .join(split);
+    // One definition and two renders per link.
+    assert_one_page_renderer(split, &emitted_source(&out), 5);
+}
+
 /// A table with no route, or over a page type that is not a closed custom
 /// type, is refused with IPE-L0165; the annotated table with every
 /// constructor routed compiles.

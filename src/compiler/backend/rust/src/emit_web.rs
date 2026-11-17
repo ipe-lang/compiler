@@ -885,7 +885,11 @@ fn route_rows<'a>(
     Ok(rows)
 }
 
-/// Emit the page renderer a routed app hands its runtime entry:
+/// Emit the page renderer a routed app hands its runtime entry.
+///
+/// A `routes` naming the program's page-link table passes that table's one
+/// crate-level renderer item ([`page_renderer_item`]), so the URL sync and
+/// every link render through one function. Any other `routes` gets
 /// `move |page: &Page| -> Result<RoutePath, RenderRefusal>`, the inverse of
 /// the table's builders. Each page constructor renders through the FIRST
 /// route that builds it (its canonical route), one `RenderArg` per payload
@@ -901,6 +905,11 @@ fn emit_route_render(
 ) -> DResult<String> {
     if !matches!(page_ty, IrType::Enum { .. }) {
         return Err(route_refusal(LowerError::RoutedPageNotCustomType));
+    }
+    if let Some(plan) = ctx.page_link_table.as_ref()
+        && crate::kernel_walk::nullary_func(routes_e) == Some(plan.id)
+    {
+        return Ok(plan.name.clone());
     }
     let arms = route_render_arms(
         ctx,
@@ -990,15 +999,29 @@ fn route_render_arms(
 
 // ── `Web.pageLink` ───────────────────────────────────────────────────────────
 
-/// The program's one `Web.pageLink` table and the renderer every link emits.
+/// The program's one `Web.pageLink` table and its one crate-level renderer.
 pub struct PageLinkTable {
     /// The nullary top-level binding whose body is the table.
     id: FuncId,
     /// The table's closed page type.
     page: IrType,
-    /// The renderer item, `fn __ipe_render_page(&Page) -> Result<RoutePath, _>`,
-    /// over the table held once in a `LazyLock`.
-    renderer: String,
+    /// The renderer's crate path, `crate::__ipe_render_page_<id>`, which every
+    /// link and the routed app over the table call.
+    name: String,
+    /// The renderer item, `fn __ipe_render_page_<id>(&Page) -> Result<RoutePath, _>`,
+    /// over the table held once in a `LazyLock`, emitted once at the crate root.
+    item: String,
+}
+
+/// The crate-root renderer item of the program's page-link table, or `""`
+/// when the program holds no page link.
+///
+/// Emitted once per crate, so every link and the routed app over the table
+/// share one renderer.
+pub fn page_renderer_item(ctx: &EmitCtx) -> &str {
+    ctx.page_link_table
+        .as_ref()
+        .map_or("", |plan| plan.item.as_str())
 }
 
 /// Decide the program's one `Web.pageLink` table, once, before any emission.
@@ -1060,8 +1083,9 @@ pub fn plan_page_link_table(ctx: &EmitCtx, program: &Program) -> DResult<Option<
     let arms = route_render_arms(ctx, items, page_ty, "__routes")?;
     let table = crate::emit_expr::callee_name(ctx, &Callee::Func(id))?;
     let route_s = format!("ipe_runtime::web::route::Route<{page_ty_s}>");
-    let renderer = format!(
-        "fn __ipe_render_page(__page: &{page_ty_s}) -> ::std::result::Result<\
+    let ident = format!("__ipe_render_page_{}", id.as_raw());
+    let item = format!(
+        "pub(crate) fn {ident}(__page: &{page_ty_s}) -> ::std::result::Result<\
          ipe_runtime::web::route::RoutePath, ipe_runtime::web::route::RenderRefusal> {{ \
          static __ROUTES: ::std::sync::LazyLock<::std::vec::Vec<{route_s}>> = \
          ::std::sync::LazyLock::new(|| {table}()); \
@@ -1071,7 +1095,8 @@ pub fn plan_page_link_table(ctx: &EmitCtx, program: &Program) -> DResult<Option<
     Ok(Some(PageLinkTable {
         id,
         page: page_ty.clone(),
-        renderer,
+        name: format!("crate::{ident}"),
+        item,
     }))
 }
 
@@ -1166,7 +1191,7 @@ fn closed_route_table<'p>(
 /// Emit `Web.pageLink table attrs cfg`.
 ///
 /// The table is not evaluated here: [`plan_page_link_table`] resolved every
-/// link to the program's one table, whose renderer item this call carries.
+/// link to the program's one table, whose crate-root renderer this call names.
 /// `to` and `current` render through it; the runtime keeps `href` and
 /// `aria-current` for the rendered target alone. A literal cfg binds its
 /// fields in source order; any other cfg (a residual closure's parameter, a
@@ -1194,11 +1219,11 @@ fn emit_web_page_link(
         _ => return Err(bug("a page link's table is not the planned table")),
     }
     let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
-    let renderer = &plan.renderer;
+    let renderer = &plan.name;
     let call = |to: &str, current: &str, label: &str| {
         format!(
             "ipe_runtime::ui::helpers::web_page_link(__ipe_page_attrs, \
-             __ipe_render_page(&{to}), __ipe_render_page(&{current}), {label})"
+             {renderer}(&{to}), {renderer}(&{current}), {label})"
         )
     };
     if let Expr::Record { fields, .. } = cfg_e {
@@ -1221,7 +1246,7 @@ fn emit_web_page_link(
         let binds = binds.join(" ");
         let call = call("__ipe_page_to", "__ipe_page_current", "__ipe_page_label");
         return Ok(format!(
-            "{{ let __ipe_page_attrs = {attrs_s}; {binds} {renderer} {call} }}"
+            "{{ let __ipe_page_attrs = {attrs_s}; {binds} {call} }}"
         ));
     }
     // The cfg is bound to a local named by the `to` field symbol, which the
@@ -1261,7 +1286,7 @@ fn emit_web_page_link(
     let label_s = read(label, label_ty)?;
     let call = call(&to_s, &current_s, &label_s);
     Ok(format!(
-        "{{ let __ipe_page_attrs = {attrs_s}; let {local} = {cfg_s}; {renderer} {call} }}"
+        "{{ let __ipe_page_attrs = {attrs_s}; let {local} = {cfg_s}; {call} }}"
     ))
 }
 
