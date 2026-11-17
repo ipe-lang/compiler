@@ -1133,7 +1133,9 @@ mod tests {
     /// The wasm client renders every frame of a mounted app, live, navigated
     /// or scrubbed by the debugger, through `render_frame`, which takes the
     /// page URL from the model it renders; `commit_view` commits that frame
-    /// and writes its URL, and the location has one writer.
+    /// and writes its URL, and the location has one writer. A page-link click
+    /// enters its path through `navigate_to`, whose frame pushes the URL, and
+    /// popstate rewrites the entry the browser moved to.
     ///
     /// The wasm module compiles only for the browser, so its source is read.
     #[test]
@@ -1198,9 +1200,31 @@ mod tests {
         let navigate = body_of("fn navigate_to<");
         assert!(
             navigate.contains(
-                "match frozen_step(app) {\n        None => commit_view(app, render_frame(app, new_model), None, false),"
+                "match frozen_step(app) {\n        None => commit_view(app, render_frame(app, new_model), None, push),"
             ),
             "a navigation commits the live page only while no step is scrubbed"
+        );
+        assert_eq!(
+            src.matches("navigate_to(").count(),
+            2,
+            "a navigation is entered by the popstate and page-link listeners only"
+        );
+        let link = body_of("fn attach_page_link_listener<");
+        assert!(
+            link.contains(
+                "if navigate_to(&app, &crate::web::route::located(Some(&href), &base), true) {\n            ev.prevent_default();\n        }"
+            ),
+            "a page-link click enters its href as a pushed navigation, and takes the click from the browser only when a route entered it"
+        );
+        assert!(
+            !link.contains("history") && !link.contains("_state"),
+            "a page-link click writes no URL of its own"
+        );
+        assert!(
+            body_of("fn attach_popstate_listener<").contains(
+                "&crate::web::route::located(raw.as_deref(), &base),\n                false,"
+            ),
+            "popstate rewrites the entry the browser moved to"
         );
         assert!(
             navigate.contains("Some(step) => flush_overlay_scrub(app, Some(step)),"),
