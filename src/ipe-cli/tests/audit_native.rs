@@ -1889,10 +1889,11 @@ mod real_jail {
         );
     }
 
-    /// The binary `ipe dev run` built from the crate it emitted under `out`:
-    /// the crate's one bin target, in the target directory cargo reports for it.
+    /// The binary `ipe dev run` built from the crate it emitted under `out`
+    /// into the pinned build directory `target`: the crate's one bin target,
+    /// in the target directory cargo reports for it under that pin.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn dev_run_binary(out: &std::path::Path) -> PathBuf {
+    fn dev_run_binary(out: &std::path::Path, target: &std::path::Path) -> PathBuf {
         let crate_dir = out.join("rust");
         let mut cmd = std::process::Command::new(e2e_support::target::cargo_program());
         cmd.args([
@@ -1903,6 +1904,7 @@ mod real_jail {
             "--offline",
         ])
         .current_dir(&crate_dir)
+        .env("CARGO_TARGET_DIR", target)
         .stdin(std::process::Stdio::null());
         let meta = super::run_child(cmd).expect("run cargo metadata");
         assert!(
@@ -1964,12 +1966,14 @@ mod real_jail {
         )
         .expect("Main.ipe");
         let out = base.join("out");
+        let target = base.join("target");
         let mut cmd = std::process::Command::new(super::support::ipe_bin());
         cmd.args(["dev", "run"])
             .arg(&project)
             .arg("--out")
             .arg(&out)
             .current_dir(&project)
+            .env("CARGO_TARGET_DIR", &target)
             .env(
                 "IPE_RUNTIME_DIR",
                 e2e_support::require_runtime().into_path_buf(),
@@ -1983,7 +1987,7 @@ mod real_jail {
             String::from_utf8_lossy(&ran.stderr)
         );
         let (dir, _) = floor_bundle(&base, &[]);
-        std::fs::copy(dev_run_binary(&out), dir.join("ipe-app"))
+        std::fs::copy(dev_run_binary(&out, &target), dir.join("ipe-app"))
             .expect("the dev run's binary becomes the bundle's app");
         std::fs::write(
             dir.join("ipe.profile"),

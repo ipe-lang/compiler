@@ -159,7 +159,7 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
             for (key, value) in extra {
                 cmd.env(key, value);
             }
-            let out = cmd.output().expect("spawn ipe build");
+            let out = cmd.output().expect("spawn ipe");
             (
                 out.status.success(),
                 String::from_utf8_lossy(&out.stderr).into_owned(),
