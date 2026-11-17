@@ -3397,7 +3397,7 @@ mod tests {
         let mut files = std::collections::BTreeMap::new();
         files.insert(
             ipe_backend::RelPath::new("src/main.rs").expect("valid rel path"),
-            "fn main() { ipe_main().run_blocking(); }".to_owned(),
+            "fn main() { run_blocking_entry(ipe_main); }".to_owned(),
         );
         files.insert(
             ipe_backend::RelPath::new("src/ipe_mods/ipe_mod_main.rs").expect("valid rel path"),

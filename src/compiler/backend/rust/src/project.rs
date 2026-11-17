@@ -889,23 +889,121 @@ const RUNTIME_MOD_RS_CSV_APPEND: &str = "pub mod csv;\npub use csv::*;\n";
 
 // ── Shape-app entry-switch anchors ────────────────────────────────────────────
 //
-// When `ipe_main` returns a shape-app leaf (WebApp / TuiApp / CliApp — and a
-// `Web.tea` under a webview-native host renders `WebViewApp`), `emit_func`
-// emits the correct return type from the IR — no return-type rewrite is needed.
-// Only the epilogue `fn main` body needs updating:
-// `block_on(ipe_main())` → `ipe_main().run_blocking()`. Hoisted to module
-// scope so no `const` item appears after a statement.
+// When `ipe_main` returns a shape-app leaf (WebApp / TuiApp / CliApp / WorkerApp
+// — and a `Web.tea` under a webview-native host renders `WebViewApp`),
+// `emit_func` emits the correct return type from the IR — no return-type
+// rewrite is needed. Only the epilogue `fn main` entry line needs updating:
+// `match block_on_entry(ipe_main) {` → `match run_blocking_entry(ipe_main) {`.
+// Both hand `ipe_main` over unbuilt, so everything it evaluates runs inside the
+// entry's catch. Hoisted to module scope so no `const` item appears after a
+// statement.
 
-/// The `block_on(ipe_main())` call in `fn main`'s epilogue body.
-const SHAPE_APP_BLOCK_ON_ANCHOR: &str = "block_on(ipe_main())";
-/// Replacement: calls the leaf type's `run_blocking()` method.
-const SHAPE_APP_RUN_BLOCKING: &str = "ipe_main().run_blocking()";
+/// `fn main`'s entry line in the epilogue, matched as a whole trimmed line.
+const SHAPE_APP_BLOCK_ON_ANCHOR: &str = "match block_on_entry(ipe_main) {";
+/// Replacement: the shape-app entry, which builds and drives the leaf.
+const SHAPE_APP_RUN_BLOCKING: &str = "match run_blocking_entry(ipe_main) {";
+
+// The template carries the entry line exactly once and never the shape-app
+// spelling, so the switch has exactly one line to swap and the switched output
+// has exactly one entry: a drifted template breaks the build, not the emit.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template stops holding the `fn main` entry line exactly once [ledger #boundary]
+const _: () = assert!(
+    count_entry_lines(GOLDEN.as_bytes(), SHAPE_APP_BLOCK_ON_ANCHOR.as_bytes()) == 1,
+    "templates/main.rs must hold the `fn main` entry line exactly once"
+);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template gains the shape-app entry line the switch writes [ledger #boundary]
+const _: () = assert!(
+    count_entry_lines(GOLDEN.as_bytes(), SHAPE_APP_RUN_BLOCKING.as_bytes()) == 0,
+    "templates/main.rs must not hold the shape-app entry line"
+);
+
+/// How many lines of `text` equal `line` once their indentation is skipped.
+const fn count_entry_lines(text: &[u8], line: &[u8]) -> usize {
+    let mut count: usize = 0;
+    let mut rest = text;
+    loop {
+        // Skip the line's indentation.
+        while let [b' ' | b'\t', tail @ ..] = rest {
+            rest = tail;
+        }
+        if is_line_then_end(rest, line) {
+            count = count.saturating_add(1);
+        }
+        // Advance past the next newline, to the start of the following line.
+        loop {
+            match rest {
+                [] => return count,
+                [b'\n', tail @ ..] => {
+                    rest = tail;
+                    break;
+                }
+                [_, tail @ ..] => rest = tail,
+            }
+        }
+    }
+}
+
+/// Whether `text` begins with `line`, then optional trailing blanks, then a
+/// newline or the end of `text`.
+const fn is_line_then_end(text: &[u8], line: &[u8]) -> bool {
+    let mut rest = text;
+    let mut want = line;
+    while let [w, want_tail @ ..] = want {
+        let [r, rest_tail @ ..] = rest else {
+            return false;
+        };
+        if *r != *w {
+            return false;
+        }
+        rest = rest_tail;
+        want = want_tail;
+    }
+    while let [b' ' | b'\t' | b'\r', tail @ ..] = rest {
+        rest = tail;
+    }
+    matches!(rest, [] | [b'\n', ..])
+}
+
+/// Swap the one `fn main` entry line for the shape-app entry, keeping its indent.
+///
+/// The line must occur exactly once as a whole trimmed line; zero or several
+/// occurrences are a drifted template, reported as `CompilerBug` at `where_`
+/// rather than an emit that keeps the eager entry or doubles it.
+fn switch_shape_app_entry(out: &str, where_: &'static str) -> Result<String, Diagnostic> {
+    let is_entry = |line: &str| line.trim() == SHAPE_APP_BLOCK_ON_ANCHOR;
+    let hits = out.split_inclusive('\n').filter(|l| is_entry(l)).count();
+    if hits != 1 {
+        return Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!(
+                "shape-app entry-switch: the entry line {SHAPE_APP_BLOCK_ON_ANCHOR:?} occurs \
+                 {hits} times in the emitted output, expected exactly once — the epilogue \
+                 template has drifted"
+            ),
+        });
+    }
+    let mut switched =
+        String::with_capacity(out.len().saturating_add(SHAPE_APP_RUN_BLOCKING.len()));
+    for line in out.split_inclusive('\n') {
+        if is_entry(line) {
+            let body = line.trim_end();
+            let indent_len = body.len().saturating_sub(body.trim_start().len());
+            switched.push_str(body.get(..indent_len).unwrap_or_default());
+            switched.push_str(SHAPE_APP_RUN_BLOCKING);
+            switched.push_str(line.get(body.len()..).unwrap_or_default());
+        } else {
+            switched.push_str(line);
+        }
+    }
+    Ok(switched)
+}
+
 /// `ipe_main`'s RETURN-TYPE render for each shape-app leaf. The entry switch
 /// fires only when `ipe_main`'s own signature returns a leaf — NOT merely when a
 /// leaf constructor appears anywhere in the body. A `Server.mountApp
 /// (Web.embed { … })` program builds a `WebApp(…)` value inside `ipe_main`'s
 /// body but `ipe_main` itself returns `IpeTask<()>` (`Server.listen`), so it is
-/// a Program (`block_on`), not a shape app. Keying on the return type keeps the
+/// a Program (`block_on_entry`), not a shape app. Keying on the return type keeps the
 /// two apart.
 const SHAPE_APP_RETURN_TYPES: &[&str] = &[
     "fn ipe_main() -> ipe_runtime::tea::WebViewApp",
@@ -1976,51 +2074,27 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         file.push(&epilogue_for_target(ctx)?);
         let mut out = file.render();
 
-        // Shape-app entry switch (Native only).
+        // Shape-app entry switch (Native and WASI).
         //
-        // When `ipe_main` returns a shape app leaf (`WebApp` / `TuiApp` /
-        // `CliApp`; a `Web.tea` under a webview host renders `WebViewApp`) its
-        // emitted body contains the corresponding
-        // `ipe_runtime::tea::<Leaf>(...)` constructor. The template declares
-        // `ipe_main() -> IpeTask<()>` and `match block_on(ipe_main()) { ... }` —
-        // both must be updated to use the concrete leaf type and its
-        // `run_blocking()` method.
+        // When `ipe_main` RETURNS a shape-app leaf (`WebApp` / `TuiApp` /
+        // `CliApp` / `WorkerApp`; a `Web.tea` under a webview host renders
+        // `WebViewApp`), `emit_func` already emits that return type from the IR.
+        // Only the epilogue's `fn main` entry line needs updating:
+        // `match block_on_entry(ipe_main) {` → `match run_blocking_entry(ipe_main) {`.
+        // Detection keys on `ipe_main`'s rendered signature, which naturally
+        // handles `CliApp` (which sets no shape flag in `EmitCtx`).
         //
-        // Detection is done by scanning the emitted body for the four known
-        // leaf constructors; this avoids a dependency on per-shape `uses_*` flags
-        // (CliApp programs, for example, do not set any shape flag in EmitCtx).
-        //
-        // WASM: `epilogue_wasm` has a different entry — no `block_on` call and
-        // a different `ipe_main` signature — so the switch is skipped there.
-        // Shape-app epilogue switch (Native only).
-        //
-        // When `ipe_main` returns a shape-app leaf (WebApp / TuiApp / CliApp; a
-        // `Web.tea` under a webview host renders WebViewApp), `emit_func` already
-        // emits the correct return type from the IR — no return-type rewrite is
-        // needed. Only the epilogue `fn main` body
-        // needs updating: `block_on(ipe_main())` → `ipe_main().run_blocking()`.
-        //
-        // Detection scans the emitted text for a known leaf constructor call; this
-        // naturally handles CliApp (which sets no shape flag in EmitCtx).
-        //
-        // WASM: `epilogue_wasm` uses a different entry without `block_on`, so
-        // the switch is skipped there.
+        // WASM: `epilogue_wasm` has a different entry — no `block_on_entry`
+        // call and a different `ipe_main` signature — so the switch is skipped.
         if matches!(
             ctx.target,
             ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
         ) && SHAPE_APP_RETURN_TYPES.iter().any(|sig| out.contains(sig))
         {
-            let replaced = out.replacen(SHAPE_APP_BLOCK_ON_ANCHOR, SHAPE_APP_RUN_BLOCKING, 1);
-            if replaced == out {
-                return Err(Diagnostic::CompilerBug {
-                    where_: "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
-                    detail: format!(
-                        "shape-app entry-switch: anchor {SHAPE_APP_BLOCK_ON_ANCHOR:?} \
-                         not found in emitted output — epilogue golden has drifted"
-                    ),
-                });
-            }
-            out = replaced;
+            out = switch_shape_app_entry(
+                &out,
+                "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
+            )?;
         }
 
         rust_sources.push((RelPath::new("src/main.rs")?, out));
@@ -3767,20 +3841,25 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     //
     // In the split layout `ipe_main` lives in a module file; its return type
     // is already correct from the IR. Only the epilogue's `fn main` body needs
-    // updating: swap `block_on(ipe_main())` for `ipe_main().run_blocking()`.
+    // updating: swap `match block_on_entry(ipe_main) {` for
+    // `match run_blocking_entry(ipe_main) {`.
     //
     // The switch fires iff the program's ENTRY function itself RETURNS a shape
-    // leaf (`WebApp`/`TuiApp`/`CliApp`; a `WebApp` renders `WebViewApp` under a
+    // leaf (`WebApp`/`TuiApp`/`CliApp`/`WorkerApp`; a `WebApp` renders `WebViewApp` under a
     // webview host) — read directly from the IR,
     // NOT from the coarse `uses_web` flag. A `Server.listen [ Server.mountApp
     // (Web.embed { … }) … ]` program sets `uses_web` (it builds an embedded
     // `WebApp` value) yet its `main` returns `IpeTask<()>`; it is a Program
-    // (`block_on`), not a shape app. Keying on the entry's return type keeps the
-    // two apart (and subsumes the old `CliApp`-has-no-flag special case).
+    // (`block_on_entry`), not a shape app. Keying on the entry's return type keeps the
+    // two apart (and covers `CliApp`, which sets no shape flag).
     let main_returns_shape_leaf = program.modules.iter().any(|m| {
         m.entry.is_some_and(|eid| {
             m.funcs.iter().any(|f| {
-                f.id == eid && matches!(f.ret, IrType::WebApp | IrType::TuiApp | IrType::CliApp)
+                f.id == eid
+                    && matches!(
+                        f.ret,
+                        IrType::WebApp | IrType::TuiApp | IrType::CliApp | IrType::WorkerApp
+                    )
             })
         })
     });
@@ -3790,17 +3869,10 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
             ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
         )
     {
-        let replaced = out.replacen(SHAPE_APP_BLOCK_ON_ANCHOR, SHAPE_APP_RUN_BLOCKING, 1);
-        if replaced == out {
-            return Err(Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
-                detail: format!(
-                    "shape-app entry-switch: anchor {SHAPE_APP_BLOCK_ON_ANCHOR:?} not found \
-                     in emitted spine — epilogue golden has drifted"
-                ),
-            });
-        }
-        out = replaced;
+        out = switch_shape_app_entry(
+            &out,
+            "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
+        )?;
     }
 
     Ok(out)
@@ -7179,5 +7251,100 @@ mod test_runner_key_tests {
             open_main_with(&format!("a\n{NATIVE_MAIN_ANCHOR}}}\n"), "    x();\n").ok(),
             Some(format!("a\n{NATIVE_MAIN_ANCHOR}    x();\n}}\n"))
         );
+    }
+}
+
+#[cfg(test)]
+mod shape_entry_switch_tests {
+    use super::{
+        GOLDEN, SHAPE_APP_BLOCK_ON_ANCHOR, SHAPE_APP_RUN_BLOCKING, count_entry_lines,
+        switch_shape_app_entry,
+    };
+    use ipe_diagnostics::Diagnostic;
+
+    const WHERE: &str = "shape_entry_switch_tests";
+
+    fn entry_lines(text: &str, line: &str) -> usize {
+        count_entry_lines(text.as_bytes(), line.as_bytes())
+    }
+
+    fn is_drift(got: &Result<String, Diagnostic>) -> bool {
+        matches!(got, Err(Diagnostic::CompilerBug { where_: WHERE, .. }))
+    }
+
+    /// The emitted entry hands `ipe_main` over unbuilt: no epilogue form calls
+    /// `ipe_main()` itself on the bare main thread, before any catch exists.
+    #[test]
+    fn the_epilogue_never_calls_ipe_main_eagerly() -> ipe_diagnostics::DResult<()> {
+        let tail = crate::preamble::epilogue()?;
+        assert!(
+            !tail.contains("ipe_main()"),
+            "the epilogue calls `ipe_main()` before the entry catch: {tail}"
+        );
+        let shaped = switch_shape_app_entry(&tail, WHERE)?;
+        assert!(
+            !shaped.contains("ipe_main()"),
+            "the shape-app epilogue calls `ipe_main()` before the entry catch: {shaped}"
+        );
+        assert_eq!(entry_lines(&shaped, SHAPE_APP_RUN_BLOCKING), 1);
+        assert_eq!(entry_lines(&shaped, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn the_template_holds_the_entry_line_exactly_once() {
+        assert_eq!(entry_lines(GOLDEN, SHAPE_APP_BLOCK_ON_ANCHOR), 1);
+        assert_eq!(entry_lines(GOLDEN, SHAPE_APP_RUN_BLOCKING), 0);
+    }
+
+    #[test]
+    fn the_switch_keeps_the_entry_line_indent_and_newline() {
+        let out = format!("fn main() {{\n    {SHAPE_APP_BLOCK_ON_ANCHOR}\n    }}\n}}\n");
+        assert_eq!(
+            switch_shape_app_entry(&out, WHERE).ok(),
+            Some(format!(
+                "fn main() {{\n    {SHAPE_APP_RUN_BLOCKING}\n    }}\n}}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_switch_refuses_a_missing_entry_line() {
+        let got = switch_shape_app_entry("fn main() {\n    run();\n}\n", WHERE);
+        assert!(is_drift(&got), "a missing entry line is a drifted template");
+    }
+
+    #[test]
+    fn the_switch_refuses_a_doubled_entry_line() {
+        let out = format!("{SHAPE_APP_BLOCK_ON_ANCHOR}\n  {SHAPE_APP_BLOCK_ON_ANCHOR}\n");
+        let got = switch_shape_app_entry(&out, WHERE);
+        assert!(is_drift(&got), "a doubled entry line is a drifted template");
+    }
+
+    /// A mention of the entry inside other text is not the entry line.
+    #[test]
+    fn the_switch_ignores_a_mention_that_is_not_the_whole_line() {
+        let out = format!(
+            "// prose: {SHAPE_APP_BLOCK_ON_ANCHOR}\nlet s = \"{SHAPE_APP_BLOCK_ON_ANCHOR}\";\n"
+        );
+        let got = switch_shape_app_entry(&out, WHERE);
+        assert!(
+            is_drift(&got),
+            "a mention is not the entry line, so no line is switched"
+        );
+        assert_eq!(entry_lines(&out, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
+        let with_entry = format!("{out}  {SHAPE_APP_BLOCK_ON_ANCHOR}\n");
+        assert_eq!(
+            switch_shape_app_entry(&with_entry, WHERE).ok(),
+            Some(format!("{out}  {SHAPE_APP_RUN_BLOCKING}\n"))
+        );
+    }
+
+    /// The entry line is matched whole: a line that only starts with it is not it.
+    #[test]
+    fn a_line_that_extends_the_entry_is_not_the_entry() {
+        let out = format!("{SHAPE_APP_BLOCK_ON_ANCHOR} x\n");
+        assert_eq!(entry_lines(&out, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
+        assert!(is_drift(&switch_shape_app_entry(&out, WHERE)));
     }
 }

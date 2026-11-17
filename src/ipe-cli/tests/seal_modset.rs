@@ -96,8 +96,8 @@ const BARE: &str = "module Main exposing (main)\n\
 /// Minimal `Cli.tea` (`CliApp` shape) program.
 ///
 /// `Cli.tea` emits `ipe_runtime::tea::CliApp(console_app(...))`.
-/// The `fn main` epilogue must call `ipe_main().run_blocking()` rather than
-/// `block_on(ipe_main())` — `CliApp` is not an `IpeTask` and `block_on`
+/// The `fn main` epilogue must call `run_blocking_entry(ipe_main)` rather than
+/// `block_on_entry(ipe_main)` — `CliApp` is not an `IpeTask` and `block_on_entry`
 /// does not accept it. A missing or misrouted epilogue switch produces E0277
 /// or E0308 at `cargo build` (ipe exit 0 — SEAL breach). This test is the
 /// always-run gate that catches that class without requiring a full `IPE_E2E`
@@ -261,8 +261,8 @@ fn bare_shape_builds() {
 }
 
 /// A `Cli.tea` program emits `ipe_runtime::tea::CliApp(console_app(...))`.
-/// The epilogue `fn main` must call `ipe_main().run_blocking()` — `CliApp` is
-/// not an `IpeTask`, so `block_on(ipe_main())` does not type-check (E0277/E0308).
+/// The epilogue `fn main` must call `run_blocking_entry(ipe_main)` — `CliApp` is
+/// not an `IpeTask`, so `block_on_entry(ipe_main)` does not type-check (E0277/E0308).
 /// This test is the always-run gate for that SEAL class: a misrouted or missing
 /// epilogue switch causes a `cargo build` failure here despite `ipe` exiting 0.
 #[test]
@@ -272,7 +272,8 @@ fn cli_app_lines_builds() {
     }
     emit_and_build("cli_app_lines", CLI_APP_LINES).expect(
         "Cli.tea must emit and cargo-build \
-         (ipe_main must return CliApp and fn main must call run_blocking, not block_on)",
+         (ipe_main must return CliApp and fn main must call run_blocking_entry, \
+         not block_on_entry)",
     );
 }
 

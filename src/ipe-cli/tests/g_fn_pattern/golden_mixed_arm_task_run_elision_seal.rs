@@ -43,7 +43,7 @@ fn built_main_rs(root: &Path, out: &Path) -> (Result<(), ipe::CliError>, Option<
 }
 
 /// `ipe_main` must return `IpeTask<…>` (the wrapped shape the
-/// `block_on(ipe_main())` epilogue requires), never `IpeResult<…>` — even
+/// `block_on_entry(ipe_main)` epilogue requires), never `IpeResult<…>` — even
 /// though the body's arms are a genuine MIX of `Task.run` calls and plain
 /// `Result` expressions, so `elide_task_run_tail` cannot elide.
 #[test]
@@ -60,7 +60,7 @@ fn mixed_arm_entry_point_wraps_to_ipetask() {
     assert!(
         main_rs.contains("fn ipe_main() -> IpeTask<"),
         "ipe_main must return IpeTask<…> when its case arms all return \
-         Result expressions — the block_on(ipe_main()) epilogue requires \
+         Result expressions — the block_on_entry(ipe_main) epilogue requires \
          a Task, not a Result. Got signature region:\n{}",
         main_rs
             .lines()

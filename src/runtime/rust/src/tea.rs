@@ -1481,8 +1481,9 @@ where
 //
 // Each entry builder (`Web.tea`, `Tui.tea`, `Cli.tea`) returns one of these
 // opaque handles instead of
-// `IpeTask<E, ()>`. The handle wraps the underlying task and exposes a single
-// `run_blocking` method consumed by the emitted `fn main()`. This erases the
+// `IpeTask<E, ()>`. The handle wraps the underlying task and is driven only
+// through its `ShapeApp` entry, which the emitted `fn main()` reaches by
+// `run_blocking_entry(ipe_main)`. This erases the
 // msg/model type parameters from the program's `main` type signature while
 // keeping the emit path concrete (no `dyn`).
 
@@ -1514,7 +1515,7 @@ crate::stringify::show_row!("WebApp", Internals, [] WebApp, |_| "<Ipe.Web.App>".
 /// The two run modes a `WebApp` leaf can carry.
 ///
 /// * `Standalone` — from `Web.tea`: a fully-built server task that binds its
-///   own listener. `run_blocking` drives it.
+///   own listener. Its `ShapeApp` entry drives it.
 /// * `Mountable` — from `Web.embed`: carries BOTH a standalone `serve` task (so
 ///   a top-level `main = Web.embed { … }` still runs on its own port) AND a
 ///   `router` builder that `Server.mountApp` nests under a prefix on the shared
@@ -1529,16 +1530,53 @@ pub enum WebAppKind {
     },
 }
 
+/// A shape-app leaf the process entry drives.
+///
+/// `fn main` of a shape app calls [`run_blocking_entry`] with `ipe_main` itself,
+/// so the leaf is built inside the catch of the entry that drives it: a runtime
+/// trip raised while `ipe_main` builds the leaf ends as its typed error and
+/// exit 1, never a raw panic on the bare main thread.
+#[cfg(not(target_arch = "wasm32"))]
+pub trait ShapeApp: Sized + 'static {
+    /// Build the leaf `entry` returns and drive its task, both inside one catch.
+    fn run_blocking_entry<F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+    where
+        F: FnOnce() -> Self + Send + 'static;
+}
+
+/// The shape-app process entry: build the leaf `entry` returns and drive it.
+///
+/// The one entry spelling a shape app's `fn main` uses; the leaf type picks the
+/// driver (a spawned entry thread, or the main thread for the webview).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn run_blocking_entry<S, F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+where
+    S: ShapeApp,
+    F: FnOnce() -> S + Send + 'static,
+{
+    S::run_blocking_entry(entry)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ShapeApp for WebApp {
+    /// Drives the leaf's task on the entry thread. A mountable handle used
+    /// top-level runs its standalone `serve` task (binds its own port).
+    fn run_blocking_entry<F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        crate::task::block_on_entry(move || entry().into_serve_task())
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 impl WebApp {
-    /// Blocking entry: drives the underlying task to completion on a
-    /// fresh tokio runtime. Returns the task's `IpeResult`. A mountable handle
-    /// used top-level runs its standalone `serve` task (binds its own port).
-    pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
+    /// The task a top-level run of this handle drives.
+    fn into_serve_task(self) -> IpeTask<crate::error::IpeError, ()> {
         match self.0 {
-            WebAppKind::Standalone(task) => crate::task::block_on(task),
+            WebAppKind::Standalone(task) => task,
             #[cfg(feature = "web")]
-            WebAppKind::Mountable { serve, .. } => crate::task::block_on(serve),
+            WebAppKind::Mountable { serve, .. } => serve,
         }
     }
 
@@ -1558,7 +1596,7 @@ impl WebApp {
 }
 
 /// Opaque app handle for the webview-native host of a `Web.tea` (a `web desktop`
-/// delivery). Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking` on
+/// delivery). Backed by a boxed `IpeTask<IpeError, ()>`; run via its `ShapeApp` entry on
 /// the current thread (tao/Cocoa mandates the process main thread on macOS).
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WebViewApp(pub IpeTask<crate::error::IpeError, ()>);
@@ -1567,15 +1605,18 @@ pub struct WebViewApp(pub IpeTask<crate::error::IpeError, ()>);
 crate::stringify::show_row!("WebApp", Internals, [] WebViewApp, |_| "<Ipe.Web.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
-impl WebViewApp {
-    /// Blocking entry on the CURRENT thread (required by tao/Cocoa on macOS).
-    pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
-        crate::task::block_on_current_thread(self.0)
+impl ShapeApp for WebViewApp {
+    /// Drives the leaf on the CURRENT thread (required by tao/Cocoa on macOS).
+    fn run_blocking_entry<F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        crate::task::block_on_current_thread_entry(move || entry().0)
     }
 }
 
 /// Opaque app handle returned by `Tui.tea`.
-/// Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking`.
+/// Backed by a boxed `IpeTask<IpeError, ()>`; run via its `ShapeApp` entry.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct TuiApp(pub IpeTask<crate::error::IpeError, ()>);
 
@@ -1583,15 +1624,18 @@ pub struct TuiApp(pub IpeTask<crate::error::IpeError, ()>);
 crate::stringify::show_row!("TuiApp", Internals, [] TuiApp, |_| "<Ipe.Tui.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
-impl TuiApp {
-    /// Blocking entry: drives the underlying task to completion.
-    pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
-        crate::task::block_on(self.0)
+impl ShapeApp for TuiApp {
+    /// Drives the leaf's task on the entry thread.
+    fn run_blocking_entry<F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        crate::task::block_on_entry(move || entry().0)
     }
 }
 
 /// Opaque app handle returned by `Cli.tea`.
-/// Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking`.
+/// Backed by a boxed `IpeTask<IpeError, ()>`; run via its `ShapeApp` entry.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct CliApp(pub IpeTask<crate::error::IpeError, ()>);
 
@@ -1599,10 +1643,13 @@ pub struct CliApp(pub IpeTask<crate::error::IpeError, ()>);
 crate::stringify::show_row!("CliApp", Internals, [] CliApp, |_| "<Ipe.Cli.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
-impl CliApp {
-    /// Blocking entry: drives the underlying task to completion.
-    pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
-        crate::task::block_on(self.0)
+impl ShapeApp for CliApp {
+    /// Drives the leaf's task on the entry thread.
+    fn run_blocking_entry<F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        crate::task::block_on_entry(move || entry().0)
     }
 }
 
@@ -1804,7 +1851,7 @@ where
 }
 
 /// Opaque app handle returned by `Ipe.Tea.Worker.tea`.
-/// Backed by a boxed `IpeTask<IpeError, ()>`; run via `run_blocking`.
+/// Backed by a boxed `IpeTask<IpeError, ()>`; run via its `ShapeApp` entry.
 #[cfg(not(target_arch = "wasm32"))]
 pub struct WorkerApp(pub IpeTask<crate::error::IpeError, ()>);
 
@@ -1812,10 +1859,13 @@ pub struct WorkerApp(pub IpeTask<crate::error::IpeError, ()>);
 crate::stringify::show_row!("WorkerApp", Internals, [] WorkerApp, |_| "<Ipe.Worker.App>".to_owned());
 
 #[cfg(not(target_arch = "wasm32"))]
-impl WorkerApp {
-    /// Blocking entry: drives the underlying task to completion.
-    pub fn run_blocking(self) -> crate::IpeResult<crate::error::IpeError, ()> {
-        crate::task::block_on(self.0)
+impl ShapeApp for WorkerApp {
+    /// Drives the leaf's task on the entry thread.
+    fn run_blocking_entry<F>(entry: F) -> crate::IpeResult<crate::error::IpeError, ()>
+    where
+        F: FnOnce() -> Self + Send + 'static,
+    {
+        crate::task::block_on_entry(move || entry().0)
     }
 }
 
@@ -2046,7 +2096,7 @@ mod map_tests {
 // it — there is no view to patch. This is excluded by construction, not
 // silently attempted: `worker_app`'s config is exactly `(init, update,
 // subscriptions)` with NO `view` argument, and `WorkerApp` exposes only
-// `run_blocking` (no appearance-apply entry). The recorder above the worker
+// its `ShapeApp` entry (no appearance-apply entry). The recorder above the worker
 // sink still applies for replay/inspection; update/subscription edits are a
 // structural rebuild by definition.
 #[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
@@ -2117,18 +2167,76 @@ mod worker_appearance_na_tests {
         let _ = (w_init, w_update, w_subs);
     }
 
-    // The worker's opaque app handle exposes exactly one entry — `run_blocking`
-    // — and NO appearance-apply surface. Constructing one and confirming the
-    // only consuming method is `run_blocking` pins that no hot-appearance path
-    // exists on the worker handle.
+    // The worker's opaque app handle exposes exactly one entry — its
+    // `ShapeApp` entry — and NO appearance-apply surface. Naming that entry as
+    // the only way to drive the handle pins that no hot-appearance path exists
+    // on the worker handle.
     #[test]
-    fn worker_app_handle_has_only_run_blocking() {
+    fn worker_app_handle_has_only_its_shape_entry() {
         let handle: WorkerApp = WorkerApp(Box::pin(async { ok_res(()) }));
-        // The sole consuming method. If an appearance-apply method were added it
-        // would be a second consumer; there is none.
-        let _run: fn(WorkerApp) -> crate::IpeResult<crate::error::IpeError, ()> =
-            WorkerApp::run_blocking;
+        // The sole driver. If an appearance-apply method were added it would be
+        // a second consumer; there is none.
+        let _run: fn(fn() -> WorkerApp) -> crate::IpeResult<crate::error::IpeError, ()> =
+            <WorkerApp as ShapeApp>::run_blocking_entry::<fn() -> WorkerApp>;
         let _ = handle;
+    }
+}
+
+// A shape app's `fn main` hands `ipe_main` to `run_blocking_entry` unbuilt, so
+// a trip raised while `ipe_main` builds the leaf ends typed, on every leaf.
+#[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
+mod shape_entry_tests {
+    use super::*;
+    use crate::core::{RuntimeTrip, trip};
+
+    fn assert_recursion_limit(got: IpeResult<crate::error::IpeError, ()>) {
+        assert!(matches!(got, IpeResult::Err(_)), "a trip must end as Err");
+        let IpeResult::Err(err) = got else { return };
+        assert_eq!(
+            crate::ipe_error_kind(err.clone()),
+            crate::IpeErrorKind::LimitExceeded
+        );
+        assert_eq!(
+            crate::ipe_error_message(err),
+            RuntimeTrip::RECURSION_LIMIT_MESSAGE
+        );
+    }
+
+    fn cli_trips_while_built() -> CliApp {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    fn tui_trips_while_built() -> TuiApp {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    fn worker_trips_while_built() -> WorkerApp {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    fn web_trips_while_built() -> WebApp {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    fn webview_trips_while_built() -> WebViewApp {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    #[test]
+    fn every_shape_leaf_types_a_trip_raised_while_it_is_built() {
+        assert_recursion_limit(run_blocking_entry(cli_trips_while_built));
+        assert_recursion_limit(run_blocking_entry(tui_trips_while_built));
+        assert_recursion_limit(run_blocking_entry(worker_trips_while_built));
+        assert_recursion_limit(run_blocking_entry(web_trips_while_built));
+        assert_recursion_limit(run_blocking_entry(webview_trips_while_built));
+    }
+
+    #[test]
+    fn a_built_leaf_runs_its_task() {
+        let ran = run_blocking_entry(|| CliApp(Box::pin(async { ok_res(()) })));
+        assert!(matches!(ran, IpeResult::Ok(())), "a built leaf runs to Ok");
+        let ran = run_blocking_entry(|| WebViewApp(Box::pin(async { ok_res(()) })));
+        assert!(matches!(ran, IpeResult::Ok(())), "a built leaf runs to Ok");
     }
 }
 
