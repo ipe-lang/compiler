@@ -1,0 +1,11 @@
+-- A CUSTOMELEMENT.FROMFILE USE IS MALFORMED OR ITS WIDGET-HOOK FILE IS REFUSED - test.ipe
+
+I can't use the widget-hook file `js/b.js`.
+
+ --> test.ipe:7:28
+  |
+7 |     CustomElement.fromFile "js/b.js"
+  |                            ^^^^^^^^^ `js/a.js` and `js/b.js` both map to the custom-element tag `ipe-ce-0123456789abcdef`; rename one of the two files
+  |
+
+IPE-N0044 · run `ipe doc IPE-N0044`

@@ -657,6 +657,8 @@ jobs:
       # GLib/GTK/WebKit pkg-config files.
       - uses: ./.github/actions/webview-link-deps
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,time-core,uuid,webview --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features webview-shell --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features browser-open --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,encoding,json,jwt,secret,uuid --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,url,websocket_client --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,email,encoding,http_client,random,url --all-targets -- -D warnings
@@ -1505,6 +1507,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/mold
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
+      # `client desktop` goldens build the `web client` bundle their packed shell
+      # hosts, and a host without the CLI refuses that build by name.
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
       # The shard driver is `cargo nextest run`; the runner has no nextest unless
       # this installs it (every other nextest-driven job installs it too).
       - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
@@ -1764,11 +1772,17 @@ jobs:
           packages: bubblewrap python3
           no-install-recommends: "true"
 
-      # Fail-closed primitive check: an absent bwrap or python3 is a hard failure,
-      # not a skip — the seccomp+bwrap jail cannot be verified without them, and an
-      # unverified platform is NEVER counted as admitted (refuse-to-certify).
+      # Fail-closed primitive check: an absent bwrap, prlimit or python3 is a hard
+      # failure, not a skip — the seccomp+bwrap jail cannot be verified without
+      # them (the suite skips only where the primitive is absent, so this step is
+      # what keeps that skip off this job), and an unverified platform is NEVER
+      # counted as admitted (refuse-to-certify).
       - name: Assert the Linux jail primitives are present (refuse-to-certify)
         run: |
+          if ! command -v prlimit >/dev/null 2>&1; then
+            echo "ERROR: prlimit absent — the Tier-2 jail cannot bound its build; refusing to certify (hard failure, never a skip-green)." >&2
+            exit 1
+          fi
           if ! command -v bwrap >/dev/null 2>&1; then
             echo "ERROR: bubblewrap (bwrap) absent on this runner — the Tier-2 jail cannot be verified; refusing to certify (this is a hard failure, never a skip-green)." >&2
             exit 1
@@ -1777,7 +1791,7 @@ jobs:
             echo "ERROR: python3 absent — the seccomp BPF filter cannot be generated, so the network-denial layer cannot be established; refusing to certify (hard failure, never a skip-green)." >&2
             exit 1
           fi
-          echo "bwrap present: $(command -v bwrap); python3 present: $(command -v python3)"
+          echo "bwrap present: $(command -v bwrap); prlimit present: $(command -v prlimit); python3 present: $(command -v python3)"
 
       - name: Make admission scripts executable
         run: chmod +x tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
@@ -1792,14 +1806,15 @@ jobs:
 
       # Enforce (INSIDE the jail): net + fs-escape must be DENIED. Paired with the
       # control above, this is the duality that proves the denial is the jail's.
-      # `sudo -E` matches the admission-sandbox linux invocation (bwrap needs the
-      # user-namespace setup the hosted runner grants under sudo); -E forwards the
-      # ESCAPE_PATH/timeout env into the jail wrapper.
+      # `sudo` matches the admission-sandbox linux invocation (bwrap needs the
+      # user-namespace setup the hosted runner grants under sudo). The
+      # ESCAPE_PATH/timeout knobs pass as explicit `env` argv, never through
+      # `-E`: sudo-rs ignores `-E`, and the wrapper refuses an unset ESCAPE_PATH.
       - name: Admission enforce (jailed — forbidden actions must be blocked)
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
-        run: sudo -E tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
 
       # The real reconciler through the real bwrap+seccomp jail (the linux-x64
       # build_in_jail path): used-but-undeclared rejects, benign certifies.

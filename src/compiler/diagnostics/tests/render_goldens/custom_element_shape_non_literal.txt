@@ -1,0 +1,11 @@
+-- A CUSTOMELEMENT.FROMFILE USE IS MALFORMED OR ITS WIDGET-HOOK FILE IS REFUSED - test.ipe
+
+I can't read this `CustomElement.fromFile` — it isn't in the one shape I accept.
+
+ --> test.ipe:7:28
+  |
+7 |     CustomElement.fromFile whichFile
+  |                            ^^^^^^^^^ this `CustomElement.fromFile` is malformed: the `CustomElement.fromFile` argument must be a single string literal, not a variable or expression (the path is read at build time). The one accepted shape is a `CustomElement`-annotated binding whose whole body is `CustomElement.fromFile "<js-path>"` — a single string literal naming a widget-hook JS file inside your project (no `..` escape), and the file must exist
+  |
+
+IPE-N0044 · run `ipe doc IPE-N0044`

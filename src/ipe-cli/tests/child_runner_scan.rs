@@ -7,7 +7,8 @@
 //! descriptor floor. The runners are a closed set: `run_local` and
 //! `run_local_fed` under a named `LocalCeiling`, the `Git`/`Curl` transfers,
 //! the cargo owner, `run_inherited` under a named `InheritedRole`,
-//! `exec_naming`, the browser opener and `run_probe`.
+//! `exec_naming` and `run_probe`. The browser opener is the runtime's
+//! (`ipe_runtime_rust::browser_open`), so this crate starts none itself.
 //!
 //! The scan walks the crate's module tree from each crate root, parsing every
 //! reached file with `syn`. An item, impl item, trait item or `mod` whose `cfg`
@@ -95,8 +96,6 @@ enum Runner {
     Inherited(&'static str),
     /// `exec_naming`, which replaces the process.
     Replace,
-    /// The browser opener, `browser.rs::open_url`.
-    Opener,
     /// `remote_ingest::run_probe`, the attached signal-mask probe.
     Probe,
     /// The named fn, itself a [`RUNNER_BODIES`] row of the same file.
@@ -129,7 +128,6 @@ const SITES: &[SiteRow] = &[
         Runner::Local("SUPPLY_CHAIN_SCAN_LIMITS"),
         1,
     ),
-    ("browser.rs", "open_url", "program", Runner::Opener, 1),
     (
         "build_plan.rs",
         "installed_targets_of",
@@ -297,7 +295,6 @@ const SITES: &[SiteRow] = &[
 
 /// Every runner body: the fns that start a child directly, by the sink they call.
 const RUNNER_BODIES: &[NameRow] = &[
-    ("browser.rs", "run_opener", "spawn_hardened", 1),
     ("cargo_step.rs", "spawn_cargo", "spawn", 1),
     ("driver/commands.rs", "exec_program", "exec_naming", 1),
     ("driver/commands.rs", "run_run_with_args", "exec_naming", 1),
@@ -1839,7 +1836,7 @@ fn reaches(world: &World<'_>, file: &str, fun: &str, runner: Runner) -> Result<(
                     .any(|(f, within, ..)| *f == file && *within == body),
             &format!("`{fun}` is not the runner body `{body}`"),
         ),
-        Runner::Transfer | Runner::Cargo | Runner::Opener => rule(
+        Runner::Transfer | Runner::Cargo => rule(
             false,
             "a located runner is proved by its site, not by a call",
         ),
@@ -1850,10 +1847,6 @@ fn reaches(world: &World<'_>, file: &str, fun: &str, runner: Runner) -> Result<(
 fn proof(world: &World<'_>, row: &SiteRow) -> Result<(), String> {
     let (file, within, _, runner, _) = *row;
     match runner {
-        Runner::Opener => rule(
-            file == "browser.rs" && within == "open_url",
-            "an opener runs only in `browser.rs::open_url`",
-        ),
         Runner::Cargo => rule(
             file == "cargo_step.rs",
             "a cargo child is built only in `cargo_step.rs`",
@@ -3068,7 +3061,6 @@ fn a_row_naming_the_wrong_runner_is_refused() {
         Runner::Inherited("UserProgram"),
         Runner::Replace,
         Runner::Probe,
-        Runner::Opener,
         Runner::Cargo,
         Runner::Transfer,
         Runner::Body("query"),

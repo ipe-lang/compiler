@@ -124,6 +124,7 @@ relayable!(
     crate::pack::mobile::MobileRefusal,
     crate::bundle_www::BundleError,
     crate::pack::desktop::DesktopRefusal,
+    crate::driver::ClientDesktopRefusal,
     crate::ffi::WrapperRefusal,
     crate::ffi::BuildScriptsBanner,
     ipe_watch::ScopeError,
@@ -655,6 +656,12 @@ messages! {
     port_invalid(command, value) = "port-invalid";
     /// `ipe fix` without its path.
     fix_usage = "fix-usage";
+    /// `ipe fix` found every backup slot taken.
+    fix_backups_full(file, dir, slots) = "fix-backups-full";
+    /// One entry `ipe fix` could not fix, among several.
+    fix_entry_failed(error) = "fix-entry-failed";
+    /// `ipe fix` left more than one entry unfixed.
+    fix_entries_failed(count) = "fix-entries-failed";
     /// `ipe lsp` given any arguments.
     lsp_takes_no_arguments = "lsp-takes-no-arguments";
     /// `ipe lint` given more than one path.
@@ -763,6 +770,8 @@ messages! {
     package_manifest_deps_brace_not_found = "package-manifest-deps-brace-not-found";
     /// `ipe add` found the `package` record's closing brace out of range.
     package_manifest_deps_brace_out_of_range = "package-manifest-deps-brace-out-of-range";
+    /// `ipe add`/`ipe remove` found `package.ipe` changed after reading it.
+    package_manifest_changed = "package-manifest-changed";
     /// `ipe health --yes` with a data form.
     health_yes_with_format = "health-yes-with-format";
     /// `ipe fmt --stdin` with a path.
@@ -851,8 +860,6 @@ messages! {
     delivery_client_host_has_no_dev_run(delivery, host) = "delivery-client-host-has-no-dev-run";
     /// `ipe dev watch` was handed a `client` delivery, which has no server to restart.
     delivery_watch_serves_only(delivery) = "delivery-watch-serves-only";
-    /// A `web client desktop` delivery was asked to build, and no packer builds it.
-    delivery_client_desktop_has_no_packer = "delivery-client-desktop-has-no-packer";
     /// A co-located WASI build was asked for a non-`Direct` shape.
     delivery_wasi_requires_direct_shape(shape) = "delivery-wasi-requires-direct-shape";
     /// A co-located WASI engine was asked for a non-WASI triple.
@@ -1170,6 +1177,12 @@ messages! {
     lock_local_source_device(package, raw) = "lock-local-source-device";
     /// A path dependency's path is not valid UTF-8.
     lock_non_utf8_local_path(package, path) = "lock-non-utf8-local-path";
+    /// `ipe.lock` changed after it was read for a rewrite.
+    lock_changed = "lock-changed";
+    /// `package.ipe` was written but `ipe.lock` was not.
+    lock_behind_manifest = "lock-behind-manifest";
+    /// A file was written, but syncing its directory after the rename failed.
+    write_unsynced(path, kind) = "write-unsynced";
     /// A version string that is not valid semver.
     version_refused_malformed(raw, reason) = "version-refused-malformed";
     /// A version carrying build metadata.
@@ -1370,11 +1383,39 @@ messages! {
     /// An `ipe health` install command exited non-zero.
     health_install_failed(program) = "health-install-failed";
     /// `ipe health` refused to overwrite a malformed config.
-    health_config_not_toml(path, detail) = "health-config-not-toml";
+    health_config_not_toml(path, line) = "health-config-not-toml";
+    /// `ipe health` refused to overwrite a malformed config the parser named no line of.
+    health_config_not_toml_unplaced(path) = "health-config-not-toml-unplaced";
     /// `ipe health`'s edited config did not re-parse.
     health_config_edit_unparsable(path) = "health-config-edit-unparsable";
+    /// `ipe health`'s config changed between its read and the replace.
+    health_config_changed(path) = "health-config-changed";
+    /// `ipe health` found every backup slot of a config taken.
+    health_config_backups_full(path, dir, slots) = "health-config-backups-full";
+    /// Where `ipe health` kept a replaced config's original.
+    health_config_original_kept(path) = "health-config-original-kept";
     /// `ipe lint --fix` with a data form.
     lint_fix_with_format = "lint-fix-with-format";
+    /// `ipe lint --fix` rewrote a module with no project file.
+    lint_fix_no_file(module) = "lint-fix-no-file";
+    /// `ipe lint --fix` found a file changed since the lint read it.
+    lint_fix_changed(path) = "lint-fix-changed";
+    /// `ipe lint --fix` found every backup slot of a file taken.
+    lint_fix_backups_full(path, dir, slots) = "lint-fix-backups-full";
+    /// `lint --fix` on one file withheld signature fixes that rewrite other modules.
+    lint_fix_sig_withheld = "lint-fix-sig-withheld";
+    /// `lint --fix` found nothing to apply.
+    lint_fix_none = "lint-fix-none";
+    /// `lint --fix` applied exactly one fix.
+    lint_fix_applied_one = "lint-fix-applied-one";
+    /// `lint --fix` applied several fixes.
+    lint_fix_applied(count) = "lint-fix-applied";
+    /// A signature fix `lint --fix` leaves to the author.
+    lint_fix_manual_review(symbol, rule, reason) = "lint-fix-manual-review";
+    /// A file `lint --fix` rewrote.
+    lint_fix_rewrote(path) = "lint-fix-rewrote";
+    /// Where `lint --fix` kept the rewritten file's original.
+    lint_fix_kept(backup) = "lint-fix-kept";
     /// The language server failed.
     lsp_failed(detail) = "lsp-failed";
     /// `ipe dev watch` could not start its filesystem watcher.
@@ -1923,6 +1964,12 @@ messages! {
     wasm_ipe_binary_unknown(detail) = "wasm-ipe-binary-unknown";
     /// The mobile shell's `web client` bundle build failed.
     mobile_wasm_build_failed(code) = "mobile-wasm-build-failed";
+    /// A `web client desktop` project accepts push or names push identifiers.
+    client_desktop_push = "client-desktop-push";
+    /// A `web client desktop` bundle id cannot key the app's storage directory.
+    client_desktop_storage_key(id, reason) = "client-desktop-storage-key";
+    /// A `web client desktop` project pins a loopback server.
+    client_desktop_local_origin(origin) = "client-desktop-local-origin";
     /// `--emit-permissions` failed.
     emit_permissions_failed(verb, detail) = "emit-permissions-failed";
     /// `ipe package validate-entry` was given more than one path.
@@ -1985,6 +2032,8 @@ messages! {
     output_reparse_point(path) = "output-reparse-point";
     /// An entry another program holds open, so ipe cannot remove or replace it.
     output_in_use(path) = "output-in-use";
+    /// A file the system refuses to let ipe replace.
+    output_replace_denied(path) = "output-replace-denied";
     /// An output directory another ipe process is still claiming past the wait bound.
     output_claim_busy(path, waited, claim) = "output-claim-busy";
     /// An output directory on a filesystem that refused the claim's file lock.

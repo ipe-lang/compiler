@@ -35,7 +35,9 @@ use ipe_runtime_rust::encoding::{MountBase, ServerOrigin};
 use ipe_runtime_rust::js_port_glue::native_bridge;
 
 use crate::CliError;
-use crate::bundle_www::{AssetPath, BundleError, HeldSpa, SpaBundle, SpaRoot};
+use crate::bundle_www::{
+    AssetPath, BundleError, HeldSpa, PolicySwap, SpaBundle, SpaRoot, swapped_policy,
+};
 use crate::driver::BundleProfile;
 use crate::output_dir::OwnedDir;
 use crate::project::{BundleId, MobileDelivery, ProjectManifest, PushDelivery, ScreenOrientation};
@@ -380,6 +382,21 @@ impl ManifestPin {
             .collect()
     }
 
+    /// Each policy meta the wasm build may have rendered for this pin, paired
+    /// with the same policy rendered for a bundle with `reach`.
+    #[must_use]
+    pub fn policy_swaps(&self, reach: &BundleReach<'_>) -> Vec<PolicySwap> {
+        self.served_policies()
+            .into_iter()
+            .map(|(worker, served)| {
+                PolicySwap::new(
+                    served,
+                    ContentSecurityPolicy::for_bundle(reach, worker).meta_element(),
+                )
+            })
+            .collect()
+    }
+
     /// The push identifiers the shell registers with, when the manifest names them.
     #[must_use]
     pub const fn push(&self) -> Option<&PushDelivery> {
@@ -542,15 +559,6 @@ pub enum ShellContent {
     Icon,
 }
 
-/// One bundle policy meta and its shell-host form, for one worker choice.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicySwap {
-    /// The meta the wasm build renders for a web server.
-    served: String,
-    /// The same policy rendered for the shell's host.
-    hosted: String,
-}
-
 /// How a bundled asset at `asset` is laid out for a shell whose bundle has
 /// `reach`.
 ///
@@ -559,14 +567,7 @@ fn bundle_content(asset: &AssetPath, pin: &ManifestPin, reach: &BundleReach<'_>)
     if !asset.is_index_html() {
         return ShellContent::Asset(asset.clone());
     }
-    let swaps = pin
-        .served_policies()
-        .into_iter()
-        .map(|(worker, served)| PolicySwap {
-            served,
-            hosted: ContentSecurityPolicy::for_bundle(reach, worker).meta_element(),
-        })
-        .collect();
+    let swaps = pin.policy_swaps(reach);
     ShellContent::PolicedIndex {
         asset: asset.clone(),
         swaps,
@@ -590,25 +591,6 @@ fn policed_index(
 ) -> Result<String, BundleError> {
     let bytes = www.read_index(asset)?;
     swapped_policy(&www.shown(asset), bytes, swaps)
-}
-
-/// `bytes`, the page at `shown`, with its one policy meta swapped.
-///
-/// # Errors
-/// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
-/// hold exactly one meta of exactly one of `swaps`.
-fn swapped_policy(
-    shown: &Path,
-    bytes: Vec<u8>,
-    swaps: &[PolicySwap],
-) -> Result<String, BundleError> {
-    let mismatch = || BundleError::PolicyMismatch {
-        path: shown.to_path_buf(),
-    };
-    let page = String::from_utf8(bytes).map_err(|_| mismatch())?;
-    let swap = crate::bundle_www::sole_policy(&page, swaps, |swap| swap.served.as_str())
-        .ok_or_else(mismatch)?;
-    Ok(page.replacen(&swap.served, &swap.hosted, 1))
 }
 
 /// One file the native shell project lays down: its project-relative path and

@@ -362,8 +362,9 @@ fcm_identifier! {
     FcmSenderId,
 }
 
-/// The longest bundle identifier [`BundleId::parse`] admits, in bytes.
-pub const MAX_BUNDLE_ID_LEN: usize = 128;
+/// The longest bundle identifier [`BundleId::parse`] admits, in bytes: the
+/// runtime's storage-key ceiling, so every bundle id fits the key's length.
+pub use ipe_runtime_rust::app_data::MAX_BUNDLE_ID_LEN;
 
 /// The prefix of every [`BundleId::derived`] identifier.
 const DERIVED_PREFIX: &str = "com.ipe.";

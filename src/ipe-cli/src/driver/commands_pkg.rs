@@ -1,13 +1,14 @@
 use super::{
     BuildOptions, CliError, EmittedCrate, FlooredBuild, HeldBuild, NativeFinish, OutTarget,
     SourceGraph, analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
-    attribute_post_link_error, build_root_into, build_test_into,
+    attribute_post_link_error, backend_invariant_err, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
     emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
     lowering_check_query, lowering_check_target, program_constructs_a_widget, run_build,
-    runtime_context_for_message, working_dir,
+    runtime_context_for_message, working_dir, write_emitted_project,
 };
 use crate::cargo_step::{CargoOutput, CargoTarget, TestRunKey, Verbosity};
+use crate::output_dir::held::{BACKUP_SLOTS, BackedUp, HeldDir, RelativeLeaf};
 use crate::output_dir::{
     EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
 };
@@ -105,6 +106,17 @@ impl<'a> BundleFinish<'a> {
         }
     }
 
+    /// The client desktop shell crate's place, `client-shell/` under the root
+    /// or the member, claimed when the crate is written.
+    fn shell_target(&self) -> EmitTarget {
+        match self {
+            Self::Dev { output } => EmitTarget::Area(output.area(&[OutputArea::ClientShell])),
+            Self::Release { member, .. } => {
+                EmitTarget::Member(member.area(OutputArea::ClientShell))
+            }
+        }
+    }
+
     /// Claim the directory the packaged bundles go in: `dist/` under the
     /// root or the member.
     fn dist_dir(&self) -> Result<OwnedDir, CliError> {
@@ -167,8 +179,10 @@ impl<'a> BundleFinish<'a> {
 /// delivery — the single entry point `build`/`release` call once they know the
 /// bundle host and profile.
 ///
-/// `web desktop` lays out a webview-native desktop bundle; `web client ios|android`
-/// builds the client-wasm SPA and lays out a native mobile system-webview shell.
+/// `web desktop` lays out a webview-native desktop bundle; `web client desktop`
+/// builds the client-wasm SPA and packs it into a fixed native desktop shell;
+/// `web client ios|android` builds the client-wasm SPA and lays out a native
+/// mobile system-webview shell.
 /// The permission-manifest derivation ([`pack::permissions`]) remains the single
 /// source of truth for what each bundle may do — this routing never authors a
 /// permission, only chooses which packager runs.
@@ -184,6 +198,7 @@ pub fn bundle_delivery(
 ) -> Result<(), CliError> {
     match host {
         BundleHost::Desktop => pack_desktop(finish, held),
+        BundleHost::ClientDesktop => pack_client_desktop(finish, held),
         BundleHost::Mobile(os) => pack_mobile(os, finish, held),
     }
 }
@@ -304,6 +319,120 @@ pub fn validate_mobile_pack(
     Ok(())
 }
 
+/// Why a `web client desktop` bundle is refused before any build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientDesktopRefusal {
+    /// The project accepts push or names push identifiers: a custom scheme is
+    /// not a secure context for a push service worker on every desktop
+    /// webview, so a push worker has no desktop representation.
+    Push,
+    /// The bundle id cannot name the app's private storage directory.
+    StorageKey {
+        /// The refused bundle id.
+        id: String,
+        /// Why it is not a storage key.
+        reason: ipe_runtime_rust::app_data::StorageKeyRefusal,
+    },
+    /// `delivery.servers` names an origin the shell's local origin would be
+    /// one with.
+    LocalOrigin {
+        /// The refused origin, in its `https` form.
+        origin: String,
+    },
+}
+
+impl std::fmt::Display for ClientDesktopRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Push => f.write_str(text::client_desktop_push()),
+            Self::StorageKey { id, reason } => {
+                f.write_str(&text::client_desktop_storage_key(id, reason))
+            }
+            Self::LocalOrigin { origin } => f.write_str(&text::client_desktop_local_origin(origin)),
+        }
+    }
+}
+
+impl ClientDesktopRefusal {
+    /// The refusal as the project refusal the command reports.
+    fn into_cli(self) -> CliError {
+        CliError::ProjectRefused(text::Message::relay(&self))
+    }
+}
+
+/// Every refusal [`BundleAssembler::gate_client_desktop`] runs before it
+/// mints a [`GatedClientDesktop`]: the client bundle shape gate
+/// ([`validate_mobile_shape`], the one check every client-bundle packer runs),
+/// then push, then the storage key the bundle id must parse as.
+///
+/// Returns the parsed storage key, the only form the shell is handed.
+///
+/// # Errors
+/// [`CliError::Usage`] wrapping a [`pack::mobile::MobileRefusal`] when the
+/// shape is not a `Web` app; [`CliError::ProjectRefused`] carrying
+/// [`ClientDesktopRefusal::Push`] when the project accepts push or
+/// names push identifiers, and [`ClientDesktopRefusal::StorageKey`]
+/// when the bundle id is not a storage key.
+pub fn validate_client_desktop_pack(
+    manifest: &project::ProjectManifest,
+    built: delivery::Shape,
+) -> Result<ipe_runtime_rust::app_data::StorageKey, CliError> {
+    validate_mobile_shape(manifest.default_program().and_then(|p| p.shape), built)?;
+    // Read through the pin the pack later builds from, so the refusal and the
+    // pack judge one reading of the manifest.
+    let pin = pack::mobile::ManifestPin::of(manifest);
+    let accepts_push = pin
+        .accepts()
+        .contains(&ipe_ir::Capability::JsPort(ipe_ir::WebCapability::Push));
+    if accepts_push || pin.push().is_some() {
+        return Err(ClientDesktopRefusal::Push.into_cli());
+    }
+    let id = client_desktop_bundle_id(manifest);
+    ipe_runtime_rust::app_data::StorageKey::parse(id.as_str()).map_err(|reason| {
+        ClientDesktopRefusal::StorageKey {
+            id: id.as_str().to_owned(),
+            reason,
+        }
+        .into_cli()
+    })
+}
+
+/// The bundle id of a `web client desktop` app: the declared
+/// `delivery.mobile.bundleId`, else the one derived from the name, as every
+/// app bundle resolves it.
+fn client_desktop_bundle_id(manifest: &project::ProjectManifest) -> project::BundleId {
+    manifest
+        .delivery
+        .mobile
+        .bundle_id
+        .clone()
+        .unwrap_or_else(|| project::BundleId::derived(&manifest.name))
+}
+
+/// The summary a packed desktop bundle prints: what was packed, where, the
+/// webview runtime note and, off Linux, the runner note.
+fn desktop_summary(name: &str, os: pack::desktop::DesktopOs, root: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let mut body = format!(
+        "packaged `{name}` for {} → {}\n  {}\n",
+        os.as_str(),
+        root.display(),
+        os.webview_runtime_note()
+    );
+    if os != pack::desktop::DesktopOs::Linux {
+        let _ = writeln!(
+            body,
+            "  note: the {} bundle layout is written here, but a signed, runnable {} \
+             artifact must be produced on a {} runner (unsigned; cross-tooling out of scope).",
+            os.as_str(),
+            os.as_str(),
+            os.as_str()
+        );
+    }
+    body
+}
+
 // ── Assembly seam ─────────────────────────────────────────────────────────────
 //
 // `BundleAssembler` owns the cargo-spawn and filesystem I/O that must happen
@@ -339,6 +468,28 @@ pub struct GatedDesktop<'a> {
 /// [`BundleAssembler::gate_mobile`], which runs the gate first; its
 /// [`assemble`](GatedMobile::assemble) is the sole entry to mobile assembly.
 pub struct GatedMobile<'a>(BundleAssembler<'a>);
+
+/// A client-desktop gate witness: proof that [`validate_client_desktop_pack`]
+/// passed for the wrapped assembler, carrying the storage key it parsed. The
+/// ONLY way to obtain one is [`BundleAssembler::gate_client_desktop`]; its
+/// [`assemble`](GatedClientDesktop::assemble) is the sole entry to
+/// client-desktop assembly.
+pub struct GatedClientDesktop<'a> {
+    assembler: BundleAssembler<'a>,
+    storage_key: ipe_runtime_rust::app_data::StorageKey,
+}
+
+impl GatedClientDesktop<'_> {
+    /// Build the wasm SPA and pack it into the desktop shell. Reachable only
+    /// by holding this witness, so the gate is already proven passed.
+    ///
+    /// # Errors
+    /// As [`BundleAssembler::assemble_client_desktop`].
+    pub fn assemble(self, os: pack::desktop::DesktopOs) -> Result<(), CliError> {
+        self.assembler
+            .assemble_client_desktop(os, &self.storage_key)
+    }
+}
 
 impl GatedDesktop<'_> {
     /// Emit + compile the app and materialise the desktop bundle. Reachable
@@ -443,6 +594,23 @@ impl<'a> BundleAssembler<'a> {
         Ok(GatedMobile(Self::new(held, finish)))
     }
 
+    /// Run the client-desktop gate ([`validate_client_desktop_pack`]) and,
+    /// only when it passes, mint a [`GatedClientDesktop`] witness. The sole
+    /// constructor of a runnable client-desktop assembler.
+    ///
+    /// # Errors
+    /// As [`validate_client_desktop_pack`].
+    pub fn gate_client_desktop(
+        held: &'a HeldBuild,
+        finish: BundleFinish<'a>,
+    ) -> Result<GatedClientDesktop<'a>, CliError> {
+        let storage_key = validate_client_desktop_pack(held.root().manifest(), held.shape())?;
+        Ok(GatedClientDesktop {
+            assembler: Self::new(held, finish),
+            storage_key,
+        })
+    }
+
     /// Emit the desktop app's crate into `out` for the webview host `webview`
     /// proves.
     ///
@@ -488,8 +656,6 @@ impl<'a> BundleAssembler<'a> {
         os: pack::desktop::DesktopOs,
         webview: delivery::WebViewProof,
     ) -> Result<(), CliError> {
-        use std::fmt::Write as _;
-
         let manifest = self.manifest();
         let identity = pack::desktop::BundleIdentity::new(
             &manifest.name,
@@ -538,7 +704,7 @@ impl<'a> BundleAssembler<'a> {
         let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = artifacts.join(&bin_name);
         if !binary.is_file() {
-            return Err(CliError::Usage(text::msg::app_binary_missing(
+            return Err(CliError::ProjectRefused(text::msg::app_binary_missing(
                 &binary.display(),
             )));
         }
@@ -546,23 +712,7 @@ impl<'a> BundleAssembler<'a> {
         let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
 
-        let mut body = format!(
-            "packaged `{}` for {} → {}\n  {}\n",
-            manifest.name,
-            os.as_str(),
-            bundle_root.display(),
-            os.webview_runtime_note()
-        );
-        if os != pack::desktop::DesktopOs::Linux {
-            let _ = writeln!(
-                body,
-                "  note: the {} bundle layout is written here, but a signed, runnable {} \
-                 artifact must be produced on a {} runner (unsigned; cross-tooling out of scope).",
-                os.as_str(),
-                os.as_str(),
-                os.as_str()
-            );
-        }
+        let body = desktop_summary(&manifest.name, os, &bundle_root);
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(crate::screen::Tone::Text, &body)
             .emit();
@@ -625,6 +775,190 @@ impl<'a> BundleAssembler<'a> {
             .emit();
         Ok(())
     }
+
+    /// The runtime the desktop shell crate links and the floor its `main`
+    /// carries, both of this build's profile.
+    ///
+    /// # Errors
+    /// The runtime resolver's refusal.
+    fn shell_runtime(
+        &self,
+    ) -> Result<
+        (
+            crate::runtime_embed::RuntimeSource,
+            crate::run_sandbox::EmitFloor,
+        ),
+        CliError,
+    > {
+        let runtime_origin = match self.finish {
+            BundleFinish::Dev { .. } => crate::runtime_embed::RuntimeOrigin::Developer,
+            BundleFinish::Release { .. } => crate::runtime_embed::RuntimeOrigin::Release,
+        };
+        let runtime = crate::runtime_embed::RuntimeSource::resolve(
+            runtime_origin,
+            None,
+            crate::runtime_embed::RuntimeRemedy::EnvOnly,
+        )?;
+        let floor =
+            crate::run_sandbox::EmitFloor::of(self.profile.build_intent(), ipe_ir::Target::Native);
+        Ok((runtime, floor))
+    }
+
+    /// Build the wasm SPA, pack it into the fixed desktop shell crate, build
+    /// the shell, and lay the desktop bundle out around its binary. Private:
+    /// reached only through a [`GatedClientDesktop`] witness.
+    ///
+    /// The bundle's page policy and the shell's `Content-Security-Policy`
+    /// header are one rendered value: the page's served meta is swapped for
+    /// it, and the shell table carries it as the header.
+    ///
+    /// # Errors
+    /// [`CliError::ProjectRefused`] carrying
+    /// [`ClientDesktopRefusal::LocalOrigin`] for a pinned loopback
+    /// server; the wasm build's own errors; [`CliError::Usage`] wrapping
+    /// [`pack::mobile::MobileRefusal::ManifestChanged`] when a pinned manifest
+    /// field changed during the build; [`CliError::ProjectRefused`] carrying
+    /// the [`crate::bundle_www::BundleError`] the policed publish refuses; the
+    /// shell build's errors; [`CliError::Io`] on any filesystem failure.
+    fn assemble_client_desktop(
+        &self,
+        os: pack::desktop::DesktopOs,
+        storage_key: &ipe_runtime_rust::app_data::StorageKey,
+    ) -> Result<(), CliError> {
+        let manifest = self.manifest();
+        let pin = pack::mobile::ManifestPin::of(manifest);
+        let (swaps, header) = client_desktop_policy(&pin, os)?;
+
+        let project = ProjectPaths::from_manifest(manifest);
+        let wasm_root = self.finish.wasm_root()?;
+        let manifest_path = self.held.manifest_path();
+        build_under_pinned_manifest(manifest_path, &pin, || {
+            build_wasm_for_mobile(manifest_path, &wasm_root, self.profile)
+        })?;
+        let wasm_crate = self.finish.wasm_crate(&project)?;
+
+        // The shell crate is written first, then its `www/` from one held
+        // read of the bundle; the table names exactly the paths that read
+        // published, so the embedded files and the table cannot disagree.
+        let (runtime, floor) = self.shell_runtime()?;
+        let shell_target = self.finish.shell_target();
+        let shell_dir = shell_target.claim()?;
+        let (_, paths) = crate::bundle_www::publish_policed_www(&wasm_crate, &shell_dir, &swaps)?;
+        let site = client_shell_site(&manifest.name, storage_key, &pin, &header, paths)?;
+        let emitted = ipe_backend_rust::client_shell::emit_client_shell(&site)
+            .map_err(backend_invariant_err)?;
+        let crate_dir = write_emitted_project(
+            &emitted,
+            &crate::output_dir::EmitTarget::Claimed(shell_dir),
+            &runtime,
+            None,
+            false,
+            floor,
+        )?;
+
+        let identity = pack::desktop::BundleIdentity::new(
+            &manifest.name,
+            manifest
+                .version
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            client_desktop_bundle_id(manifest),
+        );
+        let icon = manifest.icon.as_deref();
+        let layout = pack::desktop::layout(os, &identity, pin.accepts(), icon)?;
+
+        let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
+        let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
+            cargo_bin.path(),
+            crate_dir.path(),
+            None,
+        )?;
+        let build = FlooredBuild {
+            cargo: &cargo_bin,
+            crate_dir: &crate_dir,
+            finish: self.finish.native(),
+            target: CargoTarget::Host,
+            target_dir: &target_dir,
+            output: CargoOutput::Human(Verbosity::Progress),
+            what: "the desktop shell",
+            runtime: None,
+        };
+        let artifacts = build.artifact_dir();
+        build.run()?;
+        let binary = artifacts.join(emitted_bin_filename(crate_dir.path())?);
+        if !binary.is_file() {
+            return Err(CliError::ProjectRefused(text::msg::app_binary_missing(
+                &binary.display(),
+            )));
+        }
+
+        let dist = self.finish.dist_dir()?.child(os.as_str())?;
+        let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
+        let body = desktop_summary(&manifest.name, os, &bundle_root);
+        crate::screen::Screen::new(crate::screen::Stream::Stdout)
+            .line(crate::screen::Tone::Text, &body)
+            .emit();
+        Ok(())
+    }
+}
+
+/// The client desktop page's policy swaps and its shell's header, rendered from one reach.
+///
+/// The header is the worker-free bundle policy. The gate refuses push, so the
+/// one served meta the page can hold is the worker-free one, and its swap
+/// renders the same value the header carries.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] carrying [`ClientDesktopRefusal::LocalOrigin`]
+/// for a pinned loopback server, or relaying the reach's other refusal.
+fn client_desktop_policy(
+    pin: &pack::mobile::ManifestPin,
+    os: pack::desktop::DesktopOs,
+) -> Result<(Vec<crate::bundle_www::PolicySwap>, String), CliError> {
+    use ipe_runtime_rust::csp;
+
+    let reach = pin
+        .reach(csp::BundleHost::DesktopScheme(os.scheme_spelling()))
+        .map_err(|refusal| match refusal {
+            pack::mobile::MobileRefusal::AssetOriginListed { origin } => {
+                ClientDesktopRefusal::LocalOrigin {
+                    origin: origin.https(),
+                }
+                .into_cli()
+            }
+            other => CliError::ProjectRefused(text::Message::relay(&other)),
+        })?;
+    let header =
+        csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None).header_value();
+    Ok((pin.policy_swaps(&reach), header))
+}
+
+/// The shell table for the bundle published at `paths`, keyed by `storage_key`.
+///
+/// # Errors
+/// A compiler bug when the published bundle is not a shell table: a
+/// published `www/` always holds `index.html` and no path twice.
+fn client_shell_site(
+    name: &str,
+    storage_key: &ipe_runtime_rust::app_data::StorageKey,
+    pin: &pack::mobile::ManifestPin,
+    header: &str,
+    paths: Vec<ipe_runtime_rust::encoding::BundlePath>,
+) -> Result<ipe_backend_rust::client_shell::ShellSite, CliError> {
+    ipe_backend_rust::client_shell::ShellSite::new(
+        name,
+        storage_key,
+        pin.base().clone(),
+        header,
+        paths,
+    )
+    .map_err(|refusal| {
+        backend_invariant_err(ipe_diagnostics::Diagnostic::CompilerBug {
+            where_: "client desktop shell table",
+            detail: format!("the published bundle is not a shell table: {refusal}"),
+        })
+    })
 }
 
 /// The note shown under a materialised mobile shell: the platform note, and —
@@ -719,6 +1053,24 @@ pub fn pack_mobile(
     BundleAssembler::gate_mobile(held, finish)?.assemble(os)
 }
 
+/// `build|release web client desktop [<path>]` — build the client-wasm SPA
+/// and pack it into a fixed native desktop shell for the host OS.
+///
+/// The shell serves the bundle from memory on one local origin; it holds no
+/// path, opens no file and registers no IPC. A non-`Web` shape, a push
+/// configuration, and a bundle id that cannot key the app's storage are
+/// refused before any build.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] wrapping a [`pack::desktop::DesktopRefusal`] on
+/// a host that is not a desktop; the refusals of [`validate_client_desktop_pack`]
+/// and [`BundleAssembler::assemble_client_desktop`].
+pub fn pack_client_desktop(finish: BundleFinish<'_>, held: &HeldBuild) -> Result<(), CliError> {
+    let os = pack::desktop::resolve_os(None)
+        .map_err(|r| CliError::ProjectRefused(crate::text::Message::relay(&r)))?;
+    BundleAssembler::gate_client_desktop(held, finish)?.assemble(os)
+}
+
 /// The delivery the mobile bundle build is re-invoked with: the browser
 /// `web client` bundle the shell loads. Its argv is [`delivery::Delivery::words`].
 pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_client();
@@ -735,16 +1087,16 @@ pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_c
 /// carries through so a `release web client <os>` shell hosts the production SPA.
 ///
 /// # Errors
-/// [`CliError::Usage`] when this binary's path cannot be resolved or the
-/// wasm build exits non-zero; [`CliError::Io`] when the build cannot be spawned
-/// or waited on.
+/// [`CliError::ProjectRefused`] when this binary's path cannot be resolved or
+/// the wasm build exits non-zero (the child already rendered its own refusal);
+/// [`CliError::Io`] when the build cannot be spawned or waited on.
 pub fn build_wasm_for_mobile(
     manifest_path: &Path,
     output_root: &Path,
     profile: BundleProfile,
 ) -> Result<(), CliError> {
     let exe = std::env::current_exe()
-        .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
+        .map_err(|e| CliError::ProjectRefused(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let mut build = std::process::Command::new(&exe);
     build
@@ -761,9 +1113,9 @@ pub fn build_wasm_for_mobile(
             }
         })?;
     if !status.success() {
-        return Err(CliError::Usage(text::msg::mobile_wasm_build_failed(
-            &status.code().unwrap_or(1),
-        )));
+        return Err(CliError::ProjectRefused(
+            text::msg::mobile_wasm_build_failed(&status.code().unwrap_or(1)),
+        ));
     }
     Ok(())
 }
@@ -3802,8 +4154,9 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// [`SourceSnapshot`](crate::source_snapshot::SourceSnapshot) of `root` —
 /// never by a reduced single-module resolution, so a name the build binds
 /// through an import is never "corrected". No file names every entry of the
-/// project, each fixed in turn. A diagnostic another module owns is reported,
-/// never patched.
+/// project, each fixed in turn: an entry's refusal never stops the next, and
+/// the refusals are returned once every entry was tried. A diagnostic another
+/// module owns is reported, never patched.
 ///
 /// `auto` (set by `--yes` / `--fix`) is durable authorization to apply every
 /// edit without prompting; otherwise each edit is confirmed interactively on
@@ -3819,7 +4172,8 @@ pub fn line_col(src: &str, offset: usize) -> (usize, usize) {
 /// The refusal of a project context that cannot be built (an unreadable or
 /// malformed manifest, a module that cannot be read); [`CliError::Io`] on a
 /// filesystem failure; [`CliError::ThreadRefused`] when the OS refuses the
-/// compile thread.
+/// compile thread; past the entries, the one entry's refusal, or
+/// [`CliError::ProjectRefused`] when several entries were left unfixed.
 pub fn apply_fixes_cmd<W: Write + Send>(
     root: &ProjectRoot,
     file: Option<&FileArg>,
@@ -3828,11 +4182,40 @@ pub fn apply_fixes_cmd<W: Write + Send>(
 ) -> Result<(), CliError> {
     let target = analysis_target(root, file)?;
     crate::threads::run_compile(|| {
-        for graph in analysis_graphs(&target)? {
-            fix_entry(graph, auto, w)?;
-        }
-        Ok(())
+        let failed: Vec<CliError> = analysis_graphs(&target)?
+            .into_iter()
+            .filter_map(|graph| fix_entry(graph, auto, w).err())
+            .collect();
+        entries_outcome(failed, w)
     })?
+}
+
+/// The outcome of fixing every entry, each tried whatever another's fate: the one refusal as it is, several reported on `w` and refused together.
+///
+/// # Errors
+/// The lone entry's own refusal; [`CliError::ProjectRefused`] naming how many
+/// entries were left unfixed when more than one was.
+pub(super) fn entries_outcome<W: Write>(
+    mut failed: Vec<CliError>,
+    w: &mut W,
+) -> Result<(), CliError> {
+    match failed.len() {
+        0 => Ok(()),
+        1 => failed.pop().map_or(Ok(()), Err),
+        count => {
+            for error in failed {
+                writeln!(w, "{}", text::msg::fix_entry_failed(&error)).map_err(|e| {
+                    CliError::Io {
+                        path: PathBuf::from("<stdout>"),
+                        source: e,
+                    }
+                })?;
+            }
+            Err(CliError::ProjectRefused(text::msg::fix_entries_failed(
+                &count,
+            )))
+        }
+    }
 }
 
 /// Fix the entry of one source graph; every report names the entry's file.
@@ -3889,9 +4272,7 @@ fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<
         return Ok(());
     }
 
-    let IfUnchanged::Written(backup) =
-        rewrite_user_file_if_unchanged(&entry_real, &source, &patched, RewriteKind::Lossy)?
-    else {
+    let FixWrite::Applied(backup) = write_fix(entry, &entry_real, &source, &patched)? else {
         writeln!(
             w,
             "fix: {} changed while it was being fixed — file left unchanged",
@@ -3907,10 +4288,60 @@ fn fix_entry<W: Write>(mut graph: SourceGraph, auto: bool, w: &mut W) -> Result<
         entry.display()
     )
     .map_err(|e| io_err(entry, e))?;
-    if let Some(backup) = backup {
-        writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
-    }
+    writeln!(w, "fix: original kept at {}", backup.display()).map_err(|e| io_err(entry, e))?;
     Ok(())
+}
+
+/// What writing one fix did.
+#[derive(Debug, PartialEq, Eq)]
+enum FixWrite {
+    /// The patch is in place; the diagnosed source is kept at this backup.
+    Applied(PathBuf),
+    /// The file no longer is the file holding the diagnosed source; nothing was written.
+    Changed,
+}
+
+/// Replace the fixed file at `real` with `patched`, only while it still is a file holding the diagnosed `source`.
+///
+/// The file is judged at write time, through its held parent: its bytes are
+/// compared with `source` and its identity handed to the writer, which keeps
+/// the judged bytes (never the file as it is by then) in a backup slot and
+/// replaces the file only while it still is the one judged. `shown` is the
+/// path the user named, for the refusal.
+///
+/// # Errors
+/// [`CliError::ProjectRefused`] when every backup slot is taken;
+/// [`crate::output_dir::OutputRefusal::Symlink`] for a linked backup
+/// directory; otherwise the read's or the writer's own refusal.
+fn write_fix(shown: &Path, real: &Path, source: &str, patched: &str) -> Result<FixWrite, CliError> {
+    let parent_path = real.parent().unwrap_or(real);
+    let leaf = RelativeLeaf::under(parent_path, real)?;
+    let parent = HeldDir::open_following(parent_path)?
+        .ok_or_else(|| io_err(parent_path, std::io::ErrorKind::NotFound.into()))?;
+    let name = leaf.leaf();
+    let (now, id) = parent.read_file_capped_identified(name, crate::io_bounded::SOURCE_CAP)?;
+    if now != source {
+        return Ok(FixWrite::Changed);
+    }
+    let backups = parent.path().join(BACKUP_DIR);
+    match parent.replace_backed_up(
+        name.as_os_str(),
+        id,
+        source,
+        crate::io_bounded::SOURCE_CAP,
+        |staged| staged.write_all(patched.as_bytes()),
+    )? {
+        BackedUp::Done { backup, durability } => {
+            durability.report(shown);
+            Ok(FixWrite::Applied(backups.join(backup.slot().as_os_str())))
+        }
+        BackedUp::Changed => Ok(FixWrite::Changed),
+        BackedUp::BackupSlotsFull => Err(CliError::ProjectRefused(text::msg::fix_backups_full(
+            &shown.display(),
+            &backups.display(),
+            &BACKUP_SLOTS,
+        ))),
+    }
 }
 
 /// The diagnostic `ipe fix` may answer from `check`, or `None` once it has said why there is none.
@@ -4024,237 +4455,8 @@ pub fn read_yes_no_default(default: bool) -> bool {
     crate::prompt_reply::read_stdin_yes_no().consents(default, default)
 }
 
-/// Replace a user-owned file atomically.
-///
-/// Used for `ipe.lock`, a rewritten source, and a health config.
-///
-/// A sibling temp file is created exclusively and renamed over `target`
-/// (atomic on a single filesystem); on failure the temp file is removed.
-/// Build products never come here — they go through
-/// [`crate::output_dir::OwnedPath`]. Retries once, recreating the parent
-/// directory, when the write or rename fails with `NotFound`.
-///
-/// # Errors
-/// [`CliError::Io`] on a filesystem failure.
-pub fn write_atomic(target: &Path, contents: &str) -> Result<(), CliError> {
-    // Unique per process, call, and instant: the temp file is created
-    // exclusively, so a stale leftover of an earlier run can never collide.
-    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
-    let name = target.file_name().map_or_else(
-        || String::from("source.ipe"),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos());
-    let tmp_name = format!(".{name}.ipec-fix.{}.{seq}.{nanos}.tmp", std::process::id());
-    let tmp = match dir {
-        Some(d) => d.join(tmp_name),
-        None => PathBuf::from(tmp_name),
-    };
-
-    match write_and_rename(&tmp, target, contents) {
-        Ok(()) => Ok(()),
-        Err(CliError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(d) = dir {
-                fs::create_dir_all(d).map_err(|e| io_err(d, e))?;
-            }
-            write_and_rename(&tmp, target, contents)
-        }
-        Err(e) => Err(e),
-    }
-}
-
-/// Write `contents` to `tmp`, then rename it over `target`.
-///
-/// On a rename failure the temp file is removed so no debris is left behind.
-///
-/// `tmp` is created exclusively (`create_new`): a pre-existing file or symlink
-/// at that name is never truncated or written through. The replacement keeps
-/// `target`'s permission bits, so a rewrite never changes a file's mode.
-pub fn write_and_rename(tmp: &Path, target: &Path, contents: &str) -> Result<(), CliError> {
-    let written = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
-        .and_then(|mut file| {
-            file.write_all(contents.as_bytes())?;
-            if let Ok(meta) = fs::metadata(target) {
-                file.set_permissions(meta.permissions())?;
-            }
-            Ok(())
-        });
-    if let Err(e) = written {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            let _ = fs::remove_file(tmp);
-        }
-        return Err(io_err(tmp, e));
-    }
-    if let Err(e) = fs::rename(tmp, target) {
-        let _ = fs::remove_file(tmp);
-        return Err(io_err(target, e));
-    }
-    Ok(())
-}
-
-/// Whether rewriting a user file can lose information the user may want back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RewriteKind {
-    /// Layout only, proven meaning-preserving (`ipe fmt`'s round-trip guard).
-    Lossless,
-    /// A change to the code itself (`ipe fix`, `lint --fix`, `init --force`).
-    ///
-    /// The original is copied to a backup first.
-    Lossy,
-}
-
 /// The directory, beside a rewritten file, that holds ipe's backup copies.
 pub const BACKUP_DIR: &str = ".ipe-backup";
-
-/// The most backup names tried for one file within the same nanosecond.
-const BACKUP_NAME_ATTEMPTS: u32 = 16;
-
-/// Rewrite a user-owned file the user named explicitly.
-///
-/// A symlink is resolved to the real file (the file the user edits); the
-/// original is copied to a backup first when the rewrite is
-/// [`RewriteKind::Lossy`]; then the file is replaced atomically — never
-/// truncated in place, so a crash mid-write leaves the original intact. Returns
-/// the backup path when one was made.
-///
-/// # Errors
-/// [`CliError::Io`] when the backup or the replacement fails; the original is
-/// untouched in either case.
-pub fn rewrite_user_file(
-    path: &Path,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<Option<PathBuf>, CliError> {
-    let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
-    rewrite_real_file(&real, contents, kind)
-}
-
-/// A rewrite conditioned on the file still holding the bytes it was judged by.
-#[derive(Debug, PartialEq, Eq)]
-pub enum IfUnchanged {
-    /// The file was replaced; carries the backup path when one was made.
-    Written(Option<PathBuf>),
-    /// The file no longer holds the expected bytes and was left as it is.
-    Changed,
-}
-
-/// Rewrite the user-named file at `path` only while it still holds `expected`.
-///
-/// The file is re-read immediately before it is backed up and replaced, so an
-/// edit made to it after it was judged is never overwritten.
-///
-/// # Errors
-/// The re-read's own refusal; otherwise as [`rewrite_user_file`].
-pub fn rewrite_user_file_if_unchanged(
-    path: &Path,
-    expected: &str,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<IfUnchanged, CliError> {
-    let real = fs::canonicalize(path).map_err(|e| io_err(path, e))?;
-    let current = crate::io_bounded::read_user_named(&real, crate::io_bounded::SOURCE_CAP)?;
-    if current != expected {
-        return Ok(IfUnchanged::Changed);
-    }
-    rewrite_real_file(&real, contents, kind).map(IfUnchanged::Written)
-}
-
-/// Rewrite a user-owned file a directory walk under `root` reached.
-///
-/// As [`rewrite_user_file`], but the file must resolve inside `root`: a
-/// symlink leading out of the project is refused, never followed.
-///
-/// # Errors
-/// [`crate::output_dir::OutputRefusal::OutsideProject`] for a file escaping
-/// `root`; otherwise as [`rewrite_user_file`].
-pub fn rewrite_walked_file(
-    root: &Path,
-    path: &Path,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<Option<PathBuf>, CliError> {
-    let real = crate::output_dir::contained_in(root, path)?;
-    rewrite_real_file(&real, contents, kind)
-}
-
-/// Back `real` up when `kind` is lossy, then replace it atomically.
-fn rewrite_real_file(
-    real: &Path,
-    contents: &str,
-    kind: RewriteKind,
-) -> Result<Option<PathBuf>, CliError> {
-    let backup = match kind {
-        RewriteKind::Lossless => None,
-        RewriteKind::Lossy => Some(backup_user_file(real)?),
-    };
-    write_atomic(real, contents)?;
-    Ok(backup)
-}
-
-/// Copy `real` to `<its dir>/.ipe-backup/<name>.<nanos>.<n>`.
-///
-/// Each backup name is created exclusively, so no existing backup is replaced.
-/// The copy is created owner-only and then given the original's permission
-/// bits, so a private file never has a more readable backup, even briefly. A
-/// symlinked `.ipe-backup` is refused.
-///
-/// # Errors
-/// [`CliError::OutputRefused`] for a symlinked backup directory;
-/// [`CliError::Io`] on any filesystem failure, or when every candidate name is
-/// taken.
-pub fn backup_user_file(real: &Path) -> Result<PathBuf, CliError> {
-    let dir = real
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let name = real.file_name().map_or_else(
-        || String::from("source"),
-        |n| n.to_string_lossy().into_owned(),
-    );
-    let backup_dir = dir.join(BACKUP_DIR);
-    if fs::symlink_metadata(&backup_dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err(crate::output_dir::OutputRefusal::Symlink(backup_dir).into());
-    }
-    fs::create_dir_all(&backup_dir).map_err(|e| io_err(&backup_dir, e))?;
-    let permissions = fs::metadata(real)
-        .map_err(|e| io_err(real, e))?
-        .permissions();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    for attempt in 0..BACKUP_NAME_ATTEMPTS {
-        let dest = backup_dir.join(format!("{name}.{stamp}.{attempt}"));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        match options.open(&dest) {
-            Ok(mut copy) => {
-                let mut original = fs::File::open(real).map_err(|e| io_err(real, e))?;
-                std::io::copy(&mut original, &mut copy).map_err(|e| io_err(&dest, e))?;
-                copy.set_permissions(permissions)
-                    .map_err(|e| io_err(&dest, e))?;
-                return Ok(dest);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(io_err(&dest, e)),
-        }
-    }
-    Err(io_err(
-        &backup_dir,
-        std::io::Error::from(std::io::ErrorKind::AlreadyExists),
-    ))
-}
 
 pub fn io_err(path: &Path, source: std::io::Error) -> CliError {
     CliError::Io {
@@ -4720,6 +4922,106 @@ mod mobile_base_tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
+    /// A `web client desktop` pack of a project that accepts push, or names
+    /// push identifiers, is refused by the gate itself, before any build.
+    #[test]
+    fn client_desktop_refuses_a_push_configuration_before_any_build() {
+        let refusal = text::Message::relay(&ClientDesktopRefusal::Push);
+        let configured = push_project(
+            "client_desktop_push_configured",
+            "{ bundleId = \"io.acme.app\", push = { apns = Development, fcm = { \
+             projectId = \"example-app\", applicationId = \"1:123:android:abc\", \
+             apiKey = \"AIza-key_1\", senderId = \"123\" } } }",
+        );
+        let unconfigured = push_project(
+            "client_desktop_push_unconfigured",
+            "{ bundleId = \"io.acme.app\" }",
+        );
+        for manifest in [configured, unconfigured] {
+            let result = validate_client_desktop_pack(&manifest, delivery::Shape::Web);
+            assert!(
+                matches!(&result, Err(CliError::ProjectRefused(shown)) if *shown == refusal),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// The manifest of a `Web` project named `x` whose `delivery.mobile` is
+    /// the record `mobile`.
+    fn client_desktop_project(test_name: &str, mobile: &str) -> project::ProjectManifest {
+        let manifest = write_project(test_name, "/");
+        std::fs::write(
+            &manifest,
+            format!(
+                "module Package exposing (package)\n\npackage =\n    {{ name = \"x\"\n    \
+                 , delivery = {{ mobile = {mobile} }}\n    }}\n"
+            ),
+        )
+        .expect("write package.ipe");
+        let parsed = project::parse_manifest(&manifest);
+        let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
+        parsed.expect("a client desktop manifest reads")
+    }
+
+    /// The storage key is the bundle id, case-folded; a bundle id the bundle
+    /// grammar admits but no OS can name a directory by is refused before any
+    /// build.
+    #[test]
+    fn client_desktop_storage_key_is_the_bundle_id_or_a_refusal() {
+        let declared =
+            client_desktop_project("client_desktop_key", "{ bundleId = \"io.Acme.App\" }");
+        let key = validate_client_desktop_pack(&declared, delivery::Shape::Web);
+        assert!(
+            matches!(&key, Ok(key) if &**key == "io.acme.app"),
+            "{key:?}"
+        );
+
+        let device = client_desktop_project("client_desktop_device", "{ bundleId = \"con.acme\" }");
+        assert!(project::BundleId::parse("con.acme").is_ok());
+        let result = validate_client_desktop_pack(&device, delivery::Shape::Web);
+        let Err(reason) = ipe_runtime_rust::app_data::StorageKey::parse("con.acme") else {
+            assert!(ipe_runtime_rust::app_data::StorageKey::parse("con.acme").is_err());
+            return;
+        };
+        let refusal = text::Message::relay(&ClientDesktopRefusal::StorageKey {
+            id: "con.acme".to_owned(),
+            reason,
+        });
+        assert!(
+            matches!(&result, Err(CliError::ProjectRefused(shown)) if *shown == refusal),
+            "{result:?}"
+        );
+    }
+
+    /// Every derived bundle id is a storage key, so a project that declares no
+    /// bundle id is never refused for its storage directory.
+    #[test]
+    fn derived_bundle_ids_are_storage_keys() {
+        for name in [
+            "x",
+            "My Shop",
+            "con",
+            "aux",
+            "1st",
+            "class",
+            "n".repeat(400).as_str(),
+        ] {
+            let id = project::BundleId::derived(name);
+            let key = ipe_runtime_rust::app_data::StorageKey::parse(id.as_str());
+            assert!(key.is_ok(), "{name}: {id:?} -> {key:?}");
+        }
+    }
+
+    /// The bundle a shell crate embeds is published in the directory its table
+    /// names.
+    #[test]
+    fn client_shell_www_is_the_published_www() {
+        assert_eq!(
+            OutputArea::Www.dir_name(),
+            ipe_backend_rust::client_shell::SHELL_WWW_DIR
+        );
+    }
+
     /// An unchanged base passes once the build has run.
     #[test]
     fn mobile_pack_accepts_an_unchanged_base_after_the_build() {
@@ -4732,6 +5034,295 @@ mod mobile_base_tests {
         let _ = std::fs::remove_dir_all(manifest.parent().expect("project root"));
         assert!(result.is_ok(), "{result:?}");
         assert!(built.get(), "the build step runs before the re-read");
+    }
+
+    /// The bundle id grammar implies the storage key grammar, refused only as a device name.
+    ///
+    /// Over a generated corpus (every one- to three-label join of labels that
+    /// cover each refusal class, ids at the length ceiling, foreign bytes, and
+    /// a seeded sweep over the bundle id alphabet), an id `BundleId` accepts is
+    /// a `StorageKey` or is refused only as a DOS device name; and an id
+    /// `BundleId` refuses for a reason the two grammars share is refused by
+    /// `StorageKey` for that same reason.
+    #[test]
+    fn bundle_id_grammar_implies_storage_key() {
+        use ipe_runtime_rust::app_data::{MAX_BUNDLE_ID_LEN, StorageKey, StorageKeyRefusal};
+        use ipe_runtime_rust::path_core::ElementRefusal;
+        use project::BundleIdRefusal;
+
+        const LABELS: &[&str] = &[
+            "", "a", "acme", "Acme", "1st", "a1", "con", "CON", "Con", "nul", "aux", "prn", "com1",
+            "COM9", "lpt1", "com0", "conx", "class", "java", "x", "Z9",
+        ];
+        const ALPHABET: &[u8] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789....";
+        let mut corpus: Vec<String> = Vec::new();
+        for a in LABELS {
+            corpus.push((*a).to_owned());
+            for b in LABELS {
+                corpus.push(format!("{a}.{b}"));
+                for c in LABELS {
+                    corpus.push(format!("{a}.{b}.{c}"));
+                }
+            }
+        }
+        for len in [MAX_BUNDLE_ID_LEN, MAX_BUNDLE_ID_LEN + 1] {
+            corpus.push(format!("a.{}", "b".repeat(len - 2)));
+            corpus.push(format!("con.{}", "b".repeat(len - 4)));
+        }
+        for foreign in [
+            "a-b.c",
+            "a_b.c",
+            "a b.c",
+            "a/b.c",
+            "a\\b.c",
+            "caf\u{e9}.a",
+            "a:b.c",
+        ] {
+            corpus.push(foreign.to_owned());
+        }
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            usize::try_from(state >> 33).unwrap_or_default()
+        };
+        for _ in 0..20_000 {
+            let len = next() % 24 + 1;
+            let id: String = (0..len)
+                .filter_map(|_| {
+                    ALPHABET
+                        .get(next() % ALPHABET.len())
+                        .copied()
+                        .map(char::from)
+                })
+                .collect();
+            corpus.push(id);
+        }
+
+        let (mut accepted, mut devices) = (0_usize, 0_usize);
+        for id in &corpus {
+            let key = StorageKey::parse(id);
+            match project::BundleId::parse(id) {
+                Ok(_) => {
+                    accepted += 1;
+                    if key == Err(StorageKeyRefusal::Element(ElementRefusal::DosDevice)) {
+                        devices += 1;
+                    } else {
+                        assert!(key.is_ok(), "{id:?} is a bundle id: {key:?}");
+                    }
+                }
+                Err(refusal) => {
+                    let shared = match refusal {
+                        BundleIdRefusal::Empty => Some(StorageKeyRefusal::Empty),
+                        BundleIdRefusal::TooLong { .. } => Some(StorageKeyRefusal::TooLong),
+                        BundleIdRefusal::Byte { .. } => Some(StorageKeyRefusal::Byte),
+                        BundleIdRefusal::EmptyLabel => Some(StorageKeyRefusal::EmptyLabel),
+                        BundleIdRefusal::OneLabel => Some(StorageKeyRefusal::OneLabel),
+                        BundleIdRefusal::LabelStartsWithDigit
+                        | BundleIdRefusal::ReservedWord { .. }
+                        | BundleIdRefusal::JavaPlatformPackage
+                        | BundleIdRefusal::StoreReserved { .. } => None,
+                    };
+                    if let Some(expected) = shared {
+                        assert_eq!(key, Err(expected), "{id:?} is refused as {refusal:?}");
+                    }
+                }
+            }
+        }
+        assert!(
+            devices > 0,
+            "the corpus reaches a device name the bundle grammar admits"
+        );
+        assert!(
+            accepted > devices,
+            "the corpus reaches an admitted storage key"
+        );
+    }
+
+    /// A claimed wasm crate whose `www/` holds `index.html` as `page` plus `extra`, and a claimed shell crate.
+    fn client_bundle(
+        tag: &str,
+        page: &str,
+        extra: &[&str],
+    ) -> (
+        PathBuf,
+        crate::output_dir::OwnedDir,
+        crate::output_dir::OwnedDir,
+    ) {
+        let root = ipe_test_temp::temp_root()
+            .join(format!("ipe_client_desktop_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create the scratch root");
+        let wasm_crate =
+            crate::output_dir::OwnedDir::claim(&root.join("rust")).expect("claim the wasm crate");
+        let www = wasm_crate.path().join("www");
+        std::fs::create_dir_all(&www).expect("create www/");
+        std::fs::write(www.join("index.html"), page).expect("write index.html");
+        for name in extra {
+            std::fs::write(www.join(name), b"x").expect("write the asset");
+        }
+        let shell =
+            crate::output_dir::OwnedDir::claim(&root.join("shell")).expect("claim the shell");
+        (root, wasm_crate, shell)
+    }
+
+    /// The page a client desktop's wasm build renders: its served bundle policy meta, worker-free.
+    fn served_page(pin: &pack::mobile::ManifestPin) -> Option<String> {
+        use ipe_runtime_rust::csp;
+        let reach = pin.reach(csp::BundleHost::Served).ok()?;
+        let meta =
+            csp::ContentSecurityPolicy::for_bundle(&reach, csp::BundleWorker::None).meta_element();
+        Some(format!("<html><head>{meta}</head><body></body></html>"))
+    }
+
+    /// The value of the one `<meta http-equiv="Content-Security-Policy">` in `page`.
+    fn meta_policy(page: &str) -> Option<&str> {
+        let (_, after) = page.split_once("http-equiv=\"Content-Security-Policy\" content=\"")?;
+        after.split_once('"').map(|(value, _)| value)
+    }
+
+    /// The packed page's policy meta and the shell's header carry one value, on every desktop OS.
+    ///
+    /// The page holds the meta the wasm build renders; the client desktop's
+    /// own publish swaps it under the swaps [`client_desktop_policy`] returns,
+    /// and the swapped meta's value is the header it returns beside them.
+    #[test]
+    fn client_desktop_page_and_header_carry_one_policy() {
+        let manifest = client_desktop_project(
+            "client_desktop_one_policy",
+            "{ bundleId = \"io.acme.app\" }",
+        );
+        let gated = validate_client_desktop_pack(&manifest, delivery::Shape::Web);
+        assert!(gated.is_ok(), "{gated:?}");
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        let Some(page) = served_page(&pin) else {
+            assert!(served_page(&pin).is_some());
+            return;
+        };
+        for os in [
+            pack::desktop::DesktopOs::Linux,
+            pack::desktop::DesktopOs::MacOs,
+            pack::desktop::DesktopOs::Windows,
+        ] {
+            let policy = client_desktop_policy(&pin, os);
+            let Ok((swaps, header)) = policy else {
+                assert!(policy.is_ok(), "{os:?}: {policy:?}");
+                return;
+            };
+            let (root, wasm_crate, shell) =
+                client_bundle(&format!("one_policy_{}", os.as_str()), &page, &[]);
+            let published = crate::bundle_www::publish_policed_www(&wasm_crate, &shell, &swaps);
+            let packed = published
+                .as_ref()
+                .ok()
+                .and_then(|(www, _)| std::fs::read_to_string(www.join("index.html")).ok());
+            let _ = std::fs::remove_dir_all(&root);
+            let Some(packed) = packed else {
+                assert!(published.is_ok(), "{os:?}: {published:?}");
+                return;
+            };
+            let shown = ipe_runtime_rust::escape::html_attr(&header);
+            assert_eq!(
+                meta_policy(&packed),
+                Some(shown.as_str()),
+                "{os:?}: {packed}"
+            );
+            assert_eq!(
+                packed
+                    .matches("http-equiv=\"Content-Security-Policy\"")
+                    .count(),
+                1,
+                "{packed}"
+            );
+        }
+    }
+
+    /// The client desktop's publish refuses an asset whose name the bundle path grammar cannot carry.
+    ///
+    /// The refusal is the exact `NotABundlePath` for that name, and no `www/`
+    /// is published into the shell crate.
+    #[test]
+    fn client_desktop_refuses_an_asset_outside_the_bundle_path_grammar() {
+        use ipe_runtime_rust::encoding::BundlePathRefusal;
+        let manifest =
+            client_desktop_project("client_desktop_bad_asset", "{ bundleId = \"io.acme.app\" }");
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        let policy = client_desktop_policy(&pin, pack::desktop::DesktopOs::Linux);
+        let (Some(page), Ok((swaps, _))) = (served_page(&pin), &policy) else {
+            assert!(policy.is_ok(), "{policy:?}");
+            assert!(served_page(&pin).is_some());
+            return;
+        };
+        for (tag, name, byte) in [
+            ("space", "a b.js", b' '),
+            ("non_ascii", "caf\u{e9}.js", 0xC3),
+        ] {
+            let (root, wasm_crate, shell) =
+                client_bundle(&format!("bad_asset_{tag}"), &page, &[name]);
+            let published = crate::bundle_www::publish_policed_www(&wasm_crate, &shell, swaps);
+            let www_published = shell.path().join("www").exists();
+            let _ = std::fs::remove_dir_all(&root);
+            let refusal = text::Message::relay(&crate::bundle_www::BundleError::NotABundlePath {
+                path: name.to_owned(),
+                reason: BundlePathRefusal::Reserved { byte },
+            });
+            assert!(
+                matches!(&published, Err(CliError::ProjectRefused(shown)) if shown.as_str() == refusal.as_str()),
+                "{name}: {published:?}"
+            );
+            assert!(!www_published, "{name}: nothing is published");
+        }
+    }
+
+    /// The shell table carries the folded storage key the gate proved, never the bundle id as written.
+    #[test]
+    fn client_desktop_site_carries_the_storage_key() {
+        let manifest =
+            client_desktop_project("client_desktop_site_key", "{ bundleId = \"io.Acme.App\" }");
+        let key = validate_client_desktop_pack(&manifest, delivery::Shape::Web);
+        let Ok(key) = key else {
+            assert!(key.is_ok(), "{key:?}");
+            return;
+        };
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        let index = ipe_runtime_rust::encoding::BundlePath::parse("index.html");
+        let Ok(index) = index else {
+            assert!(index.is_ok(), "{index:?}");
+            return;
+        };
+        let site = client_shell_site(
+            &manifest.name,
+            &key,
+            &pin,
+            "default-src 'none'",
+            vec![index],
+        );
+        let emitted = site
+            .as_ref()
+            .ok()
+            .and_then(|site| ipe_backend_rust::client_shell::emit_client_shell(site).ok());
+        let Some(emitted) = emitted else {
+            assert!(site.is_ok(), "{site:?}");
+            return;
+        };
+        let site_rs = emitted
+            .files
+            .iter()
+            .find(|(path, _)| path.as_str() == "src/site.rs")
+            .map(|(_, text)| text.as_str())
+            .unwrap_or_default();
+        let line = format!(
+            "    storage_key: {},",
+            ipe_intern::rust_str_lit("io.acme.app")
+        );
+        assert_eq!(
+            site_rs.lines().filter(|l| *l == line).count(),
+            1,
+            "{site_rs}"
+        );
+        assert!(!site_rs.contains("io.Acme.App"), "{site_rs}");
     }
 }
 
@@ -5713,5 +6304,144 @@ mod upgrade_agents_tests {
         for status in [GuideStatus::Current, GuideStatus::Unread(Unread::Link)] {
             assert!(guide_suggestion(&status).is_none(), "{status:?} is silent");
         }
+    }
+}
+
+#[cfg(test)]
+mod fix_tests {
+    use super::*;
+    use crate::output_dir::OutputRefusal;
+    use crate::output_dir::held::{Synced, set_sync_hook};
+
+    const DIAGNOSED: &str = "diagnosed\n";
+    const PATCHED: &str = "patched\n";
+
+    /// A fresh scratch directory holding `Main.ipe` with the diagnosed source, and that file.
+    fn project(name: &str) -> (PathBuf, PathBuf) {
+        let dir = ipe_test_temp::temp_root().join(format!("ipe-fix-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        assert!(fs::create_dir_all(&dir).is_ok(), "{}", dir.display());
+        let file = dir.join("Main.ipe");
+        assert!(fs::write(&file, DIAGNOSED).is_ok());
+        (dir, file)
+    }
+
+    /// How many entries `dir` lists.
+    fn entries(dir: &Path) -> usize {
+        fs::read_dir(dir).map_or(0, Iterator::count)
+    }
+
+    /// A fix of an unchanged file is written, the diagnosed source kept in a backup slot.
+    #[test]
+    fn fix_written_with_backup() {
+        let (dir, file) = project("written");
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        let backup = dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), PATCHED);
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file edited since it was diagnosed is left as it is, and no backup is made.
+    #[test]
+    fn fix_changed_left_alone() {
+        let (dir, file) = project("changed");
+        assert!(fs::write(&file, "edited\n").is_ok());
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert_eq!(res.ok(), Some(FixWrite::Changed));
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), "edited\n");
+        assert_eq!(entries(&dir.join(BACKUP_DIR)), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The backup holds the bytes the fix was judged against, not the file as it was while the backup was made.
+    ///
+    /// The file is edited in place once the patch is staged and restored once
+    /// the backup slot is synced: a backup copied from the file would hold the
+    /// edit, the judged bytes never do.
+    #[test]
+    fn backup_from_judged_bytes() {
+        let (dir, file) = project("judged");
+        let edited = file.clone();
+        let mut restored = false;
+        set_sync_hook(Some(Box::new(move |synced, _| match synced {
+            Synced::Staged => {
+                let _ = fs::write(&edited, "edited\n");
+            }
+            Synced::Directory if !restored => {
+                restored = true;
+                let _ = fs::write(&edited, DIAGNOSED);
+            }
+            Synced::Directory => {}
+        })));
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        set_sync_hook(None);
+        let backup = dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), PATCHED);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file named through a link is fixed at its real location, the link left a link.
+    ///
+    /// The backup sits beside the real file, never beside the link.
+    #[cfg(unix)]
+    #[test]
+    fn named_link_fix_writes_the_real_file() {
+        let (dir, real) = project("named-link");
+        let named = dir.join("named");
+        assert!(fs::create_dir_all(&named).is_ok());
+        let link = named.join("Link.ipe");
+        assert!(std::os::unix::fs::symlink(&real, &link).is_ok());
+        let resolved = fs::canonicalize(&link).unwrap_or_default();
+        let real_dir = resolved.parent().map(Path::to_path_buf).unwrap_or_default();
+        let res = write_fix(&link, &resolved, DIAGNOSED, PATCHED);
+        let backup = real_dir.join(BACKUP_DIR).join("Main.ipe.bak");
+        assert_eq!(res.ok(), Some(FixWrite::Applied(backup.clone())));
+        assert_eq!(fs::read_to_string(&real).unwrap_or_default(), PATCHED);
+        assert_eq!(fs::read_to_string(&backup).unwrap_or_default(), DIAGNOSED);
+        assert!(fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()));
+        assert_eq!(entries(&named), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A backup directory that is a link is refused, the file and the link's target untouched.
+    #[cfg(unix)]
+    #[test]
+    fn backup_dir_link_refused() {
+        let (dir, file) = project("backup-link");
+        let elsewhere = dir.join("elsewhere");
+        assert!(fs::create_dir_all(&elsewhere).is_ok());
+        assert!(std::os::unix::fs::symlink(&elsewhere, dir.join(BACKUP_DIR)).is_ok());
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert!(
+            matches!(res, Err(CliError::OutputRefused(OutputRefusal::Symlink(_)))),
+            "{res:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(entries(&elsewhere), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Every backup slot taken refuses the fix, the file untouched and no slot added.
+    #[test]
+    fn slots_full_refused() {
+        let (dir, file) = project("slots-full");
+        let backups = dir.join(BACKUP_DIR);
+        assert!(fs::create_dir_all(&backups).is_ok());
+        assert!(fs::write(backups.join("Main.ipe.bak"), "old\n").is_ok());
+        for n in 1..BACKUP_SLOTS {
+            assert!(fs::write(backups.join(format!("Main.ipe.bak.{n}")), "old\n").is_ok());
+        }
+        let res = write_fix(&file, &file, DIAGNOSED, PATCHED);
+        assert!(
+            matches!(&res, Err(CliError::ProjectRefused(m)) if m.contains(BACKUP_DIR) && m.contains("Main.ipe")),
+            "{res:?}"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap_or_default(), DIAGNOSED);
+        assert_eq!(entries(&backups), usize::from(BACKUP_SLOTS));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -100,6 +100,18 @@ ipe {command}: --port `{value}` is not a port number (1-65535)
 
 usage: ipe fix <path> [--yes]
 
+## fix-backups-full
+
+no free backup name for {file} in `{dir}/` ({slots} taken); file left unchanged; remove old backups there and run `ipe fix` again
+
+## fix-entry-failed
+
+fix: {error}
+
+## fix-entries-failed
+
+ipe fix: {count} entries were left unfixed (each reported above); the other entries were fixed as reported
+
 ## lsp-takes-no-arguments
 
 ipe lsp takes no arguments
@@ -308,6 +320,10 @@ package.ipe: could not locate the `package` record's closing `}` to add a depend
 
 package.ipe: the `package` record's closing `}` is out of range
 
+## package-manifest-changed
+
+package.ipe changed while ipe was editing its dependencies; nothing was written; run the command again
+
 ## init-shape-needs-value
 
 ipe init: `--shape` requires a value: script, tui, cli, worker, server, web
@@ -498,10 +514,6 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 ## delivery-watch-serves-only
 
 `ipe dev watch` rebuilds and restarts a served program, and `{delivery}` is a browser bundle with no server to restart. Build the bundle with `ipe dev build {delivery}`.
-
-## delivery-client-desktop-has-no-packer
-
-`web client desktop` names a desktop shell around the self-contained client, and no packer builds that shell yet, so nothing is built. Build the browser client with `web client`, or the desktop app with `web desktop`.
 
 ## delivery-wasi-requires-direct-shape
 
@@ -1157,6 +1169,18 @@ package `{package}`: path dependency "{raw}" names a Windows device (`CON`, `NUL
 
 package `{package}`: path dependency `{path}` is not valid UTF-8 and cannot be recorded in ipe.lock
 
+## lock-changed
+
+ipe.lock changed while ipe was writing it; nothing was written to it; run the command again
+
+## lock-behind-manifest
+
+package.ipe was updated but ipe.lock was not; run the command again to bring ipe.lock in line
+
+## write-unsynced
+
+{path} was written, but syncing its directory failed ({kind}); a crash before the system flushes it may still lose the change
+
 # Version refusals
 
 ## version-refused-malformed
@@ -1382,6 +1406,10 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 {path} is held open by another program (an editor, a file indexer, or antivirus) — close it there or let that program finish, then run the command again
 
+## output-replace-denied
+
+{path} cannot be replaced: it is read-only or its permissions refuse this user; it was left as it was — clear its read-only attribute or fix its permissions, then run the command again
+
 ## output-claim-busy
 
 {path} is being claimed by another ipe process, still in progress after {waited}s — let that run finish, then run the command again; if no ipe process is active, another program holds `{claim}` locked: delete `{claim}` in {path} and run the command again
@@ -1572,15 +1600,71 @@ health: `{program}` exited non-zero — nothing was changed
 
 ## health-config-not-toml
 
-health: {path} is not valid TOML ({detail}); refusing to overwrite it
+health: {path} is not valid TOML (line {line}); refusing to overwrite it
+
+## health-config-not-toml-unplaced
+
+health: {path} is not valid TOML; refusing to overwrite it
 
 ## health-config-edit-unparsable
 
 health: the edited config for {path} did not re-parse; no change was made
 
+## health-config-changed
+
+health: {path} changed while it was being edited; nothing was written — run `ipe health` again
+
+## health-config-backups-full
+
+health: no free backup name for {path} in `{dir}/` ({slots} taken); nothing was written; remove old backups there and run `ipe health` again
+
+## health-config-original-kept
+
+original kept at {path}
+
 ## lint-fix-with-format
 
 ipe lint: --fix and a data form (--json/--plain) are mutually exclusive — a data form reports without mutating
+
+## lint-fix-no-file
+
+lint --fix: module `{module}` has no project file this run read; no file was rewritten
+
+## lint-fix-changed
+
+lint --fix: {path} changed while it was being fixed — it and every file not reported as rewritten were left unchanged; run lint --fix again
+
+## lint-fix-sig-withheld
+
+lint --fix: signature fixes withheld: they rewrite modules other than the one named; run lint --fix without a file to apply them
+
+## lint-fix-none
+
+lint --fix: no machine-applicable fixes
+
+## lint-fix-applied-one
+
+lint --fix: applied 1 fix
+
+## lint-fix-applied
+
+lint --fix: applied {count} fixes
+
+## lint-fix-manual-review
+
+lint --fix: manual review needed for `{symbol}` ({rule}) — {reason}
+
+## lint-fix-rewrote
+
+lint --fix: rewrote {path}
+
+## lint-fix-kept
+
+lint --fix: original kept at {backup}
+
+## lint-fix-backups-full
+
+lint --fix: no free backup name for {path} in `{dir}/` ({slots} taken); it and every file not reported as rewritten were left unchanged; remove old backups there and run lint --fix again
 
 ## lsp-failed
 
@@ -2726,7 +2810,19 @@ cannot locate the ipe binary to build wasm: {detail}
 
 ## mobile-wasm-build-failed
 
-the `web client` build failed (exit {code}) — the mobile shell hosts that bundle, so it must build first
+the `web client` build failed (exit {code}) — the packed shell hosts that bundle, so it must build first
+
+## client-desktop-push
+
+`web client desktop` serves its bundle from a custom scheme, which is not a secure context for a push service worker on every desktop webview, so a project that accepts `JsPort Push` or names `delivery.mobile.push` is not packed. Ship push through `web client`, `web client ios` or `web client android`.
+
+## client-desktop-storage-key
+
+the bundle id `{id}` cannot name the desktop app's storage directory: {reason}. Declare another `delivery.mobile.bundleId` in package.ipe.
+
+## client-desktop-local-origin
+
+`delivery.servers` names `{origin}`, a loopback or `localhost` origin the `web client desktop` shell cannot tell apart from its own local origin. Name the server by its public host.
 
 ## emit-permissions-failed
 

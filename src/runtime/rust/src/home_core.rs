@@ -66,9 +66,11 @@ pub enum HomeRefusal {
     WindowsUnc,
 }
 
-impl std::fmt::Display for HomeRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let reason = match self {
+impl HomeRefusal {
+    /// The phrase that follows the refused variable's name.
+    #[must_use]
+    pub const fn reason(self) -> &'static str {
+        match self {
             Self::Unset => "is unset",
             Self::NotUtf8 => "is not valid UTF-8",
             Self::ContainsNul => "contains a NUL byte",
@@ -76,8 +78,13 @@ impl std::fmt::Display for HomeRefusal {
             Self::ParentComponent => "contains a `..` component",
             Self::WindowsDeviceOrVerbatim => "is a Windows device or verbatim path",
             Self::WindowsUnc => "is a network (UNC) path",
-        };
-        write!(f, "`{HOME_VAR}` {reason}")
+        }
+    }
+}
+
+impl std::fmt::Display for HomeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "`{HOME_VAR}` {}", self.reason())
     }
 }
 

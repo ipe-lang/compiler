@@ -48,23 +48,6 @@ fn emit_target(out: &Path) -> EmitTarget {
 }
 
 #[test]
-fn widget_tag_collision_from_distinct_paths_is_refused() {
-    let mut origins: BTreeMap<String, String> = BTreeMap::new();
-    // First path claims the tag.
-    assert!(record_widget_tag_origin(&mut origins, "ipe-ce-dead", "src/Widget/A.js").is_ok());
-    // The SAME path (a second view node of one widget) is the legitimate
-    // dedup case.
-    assert!(record_widget_tag_origin(&mut origins, "ipe-ce-dead", "src/Widget/A.js").is_ok());
-    // A DIFFERENT path colliding onto the same tag must fail closed.
-    let collision = record_widget_tag_origin(&mut origins, "ipe-ce-dead", "src/Widget/B.js")
-        .expect_err("a distinct path on an occupied tag must be refused");
-    assert_eq!(collision.existing_path, "src/Widget/A.js");
-    assert_eq!(collision.new_path, "src/Widget/B.js");
-    // A distinct tag is unaffected.
-    assert!(record_widget_tag_origin(&mut origins, "ipe-ce-beef", "src/Widget/B.js").is_ok());
-}
-
-#[test]
 fn bluegreen_defaults_on_when_no_env_set() {
     // No opt-out, no explicit choice → on (the new default).
     assert!(bluegreen_from_env_values(None, None));
@@ -646,6 +629,85 @@ fn ipe_fix_corrects_a_misspelling_no_import_binds() {
     );
 }
 
+/// A report sink whose first write fails, every later one kept.
+struct FailingOnce {
+    failed: bool,
+    kept: Vec<u8>,
+}
+
+impl std::io::Write for FailingOnce {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.failed {
+            std::io::Write::write(&mut self.kept, buf)
+        } else {
+            self.failed = true;
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One entry's refusal never stops the next: the other entry is fixed, the refusal still returned.
+#[test]
+fn ipe_fix_tries_every_entry_past_a_refusal() {
+    let dir = fix_project(
+        "fix_every_entry",
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"fix\", exposedModules = [ \"Clean\", \"Helpers\" ] }\n",
+        &[
+            ("Clean.ipe", "module Clean exposing (y)\n\ny : Int\ny = 1\n"),
+            ("Helpers.ipe", HELPERS_MISSPELLING_LENGTH),
+        ],
+    );
+    let mut out = FailingOnce {
+        failed: false,
+        kept: Vec::new(),
+    };
+    let fixed = analysis_root(&dir, None)
+        .and_then(|(root, file)| apply_fixes_cmd(&root, file.as_ref(), true, &mut out));
+    let helpers_after = fs::read_to_string(dir.join("src").join("Helpers.ipe")).ok();
+    let _ = fs::remove_dir_all(&dir);
+    let out = String::from_utf8_lossy(&out.kept);
+    assert!(
+        matches!(&fixed, Err(CliError::Io { path, .. }) if path.ends_with("Clean.ipe")),
+        "the first entry's refusal is returned: {fixed:?}\n{out}"
+    );
+    assert_eq!(
+        helpers_after.as_deref(),
+        Some("module Helpers exposing (x)\n\nlength : Int\nlength = 2\n\nx = length\n"),
+        "the entry after the refused one is still fixed: {out}"
+    );
+}
+
+/// Several entries left unfixed are each reported, then refused together.
+#[test]
+fn ipe_fix_reports_every_unfixed_entry() {
+    let mut out = Vec::new();
+    let refused = |name: &str| CliError::Io {
+        path: PathBuf::from(name),
+        source: std::io::ErrorKind::NotFound.into(),
+    };
+    let none = super::commands_pkg::entries_outcome(Vec::new(), &mut out);
+    assert!(none.is_ok(), "{none:?}");
+    let one = super::commands_pkg::entries_outcome(vec![refused("a.ipe")], &mut out);
+    assert!(
+        matches!(&one, Err(CliError::Io { path, .. }) if path == Path::new("a.ipe")),
+        "{one:?}"
+    );
+    assert!(out.is_empty(), "a lone refusal is returned, not reported");
+    let two =
+        super::commands_pkg::entries_outcome(vec![refused("a.ipe"), refused("b.ipe")], &mut out);
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        matches!(&two, Err(CliError::ProjectRefused(m))
+            if *m == crate::text::msg::fix_entries_failed(&2)),
+        "{two:?}"
+    );
+    assert!(out.contains("a.ipe") && out.contains("b.ipe"), "{out}");
+}
+
 /// A project whose context cannot be built is refused with the manifest's own
 /// typed error, never diagnosed by a reduced resolution: the file is untouched.
 #[test]
@@ -826,42 +888,6 @@ fn the_patched_edit_end_counts_every_earlier_edit() {
         13
     );
     assert_eq!(patched_edit_end(&[]), 0);
-}
-
-/// A file that changed after it was diagnosed is never overwritten.
-#[test]
-fn a_fix_rewrite_refuses_a_file_changed_since_it_was_read() {
-    let dir = session_scratch("fix_lost_update");
-    let file = dir.join("Main.ipe");
-    assert!(fs::write(&file, "edited meanwhile\n").is_ok(), "write file");
-    let outcome =
-        rewrite_user_file_if_unchanged(&file, "diagnosed\n", "patched\n", RewriteKind::Lossy);
-    let after = fs::read_to_string(&file).ok();
-    let backup_made = dir.join(BACKUP_DIR).exists();
-    let _ = fs::remove_dir_all(&dir);
-    assert!(
-        matches!(outcome, Ok(IfUnchanged::Changed)),
-        "a changed file must be refused: {outcome:?}"
-    );
-    assert_eq!(after.as_deref(), Some("edited meanwhile\n"));
-    assert!(!backup_made, "a refused rewrite makes no backup");
-}
-
-/// Control for the lost-update refusal: an unchanged file is rewritten.
-#[test]
-fn a_fix_rewrite_replaces_a_file_still_holding_the_diagnosed_bytes() {
-    let dir = session_scratch("fix_unchanged");
-    let file = dir.join("Main.ipe");
-    assert!(fs::write(&file, "diagnosed\n").is_ok(), "write file");
-    let outcome =
-        rewrite_user_file_if_unchanged(&file, "diagnosed\n", "patched\n", RewriteKind::Lossy);
-    let after = fs::read_to_string(&file).ok();
-    let _ = fs::remove_dir_all(&dir);
-    assert!(
-        matches!(outcome, Ok(IfUnchanged::Written(Some(_)))),
-        "an unchanged file must be rewritten with a backup: {outcome:?}"
-    );
-    assert_eq!(after.as_deref(), Some("patched\n"));
 }
 
 #[test]
@@ -5060,101 +5086,6 @@ fn emitting_into_a_user_directory_is_refused_untouched() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-/// A lossy rewrite backs the original up before the atomic replace.
-///
-/// This covers `ipe fix` and `lint --fix`; a backup name is never reused.
-#[test]
-fn lossy_rewrite_backs_up_the_original() {
-    let dir = user_project("lossy");
-    let main = dir.join("src").join("Main.ipe");
-    let first = rewrite_user_file(
-        &main,
-        "module Main exposing (main)\n-- v2\n",
-        RewriteKind::Lossy,
-    )
-    .expect("rewrite");
-    let second = rewrite_user_file(
-        &main,
-        "module Main exposing (main)\n-- v3\n",
-        RewriteKind::Lossy,
-    )
-    .expect("rewrite again");
-    let (Some(first), Some(second)) = (first, second) else {
-        assert!(false_marker(), "a lossy rewrite must report its backup");
-        return;
-    };
-    assert_ne!(first, second, "each rewrite keeps its own backup");
-    assert_eq!(
-        fs::read_to_string(&first).unwrap_or_default(),
-        "module Main exposing (main)\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&second).unwrap_or_default(),
-        "module Main exposing (main)\n-- v2\n"
-    );
-    assert_eq!(
-        fs::read_to_string(&main).unwrap_or_default(),
-        "module Main exposing (main)\n-- v3\n"
-    );
-    let lossless = rewrite_user_file(
-        &main,
-        "module Main exposing (main)\n",
-        RewriteKind::Lossless,
-    )
-    .expect("lossless rewrite");
-    assert!(lossless.is_none(), "a lossless rewrite takes no backup");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// A symlinked source file is rewritten at its real location.
-///
-/// That is the file the user edits; the link is kept, not replaced by a
-/// detached copy.
-#[cfg(unix)]
-#[test]
-fn rewrite_follows_a_symlinked_source_to_the_real_file() {
-    let dir = user_project("symlink");
-    let real = dir.join("real.ipe");
-    fs::write(&real, "module Main exposing (main)\n").expect("write real");
-    let link = dir.join("src").join("Link.ipe");
-    std::os::unix::fs::symlink(&real, &link).expect("make link");
-    rewrite_user_file(
-        &link,
-        "module Main exposing (main)\n-- new\n",
-        RewriteKind::Lossless,
-    )
-    .expect("rewrite through link");
-    assert!(
-        fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()),
-        "the link stays a link"
-    );
-    assert_eq!(
-        fs::read_to_string(&real).unwrap_or_default(),
-        "module Main exposing (main)\n-- new\n"
-    );
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// The atomic writer's temp file is created exclusively.
-///
-/// A symlink planted at the temp name is never written through.
-#[cfg(unix)]
-#[test]
-fn atomic_write_never_writes_through_a_planted_temp_symlink() {
-    let dir = user_project("tmp_symlink");
-    let victim = dir.join("victim.txt");
-    fs::write(&victim, "keep").expect("write victim");
-    let tmp = dir.join("planted.tmp");
-    std::os::unix::fs::symlink(&victim, &tmp).expect("plant link");
-    let result = write_and_rename(&tmp, &dir.join("target.txt"), "payload");
-    assert!(
-        matches!(result, Err(CliError::Io { .. })),
-        "an existing temp path must be refused, got {result:?}"
-    );
-    assert_eq!(fs::read_to_string(&victim).unwrap_or_default(), "keep");
-    let _ = fs::remove_dir_all(&dir);
-}
-
 /// An emit target that is, or holds, the project is refused before any write.
 ///
 /// This is `write_emitted_project` reached without a caller-proven target: the
@@ -5308,60 +5239,6 @@ fn emitting_into_a_marked_dir_with_planted_links_is_refused() {
         "the link target survives byte-for-byte"
     );
     let _ = fs::remove_dir_all(&base);
-}
-
-/// A backup keeps the original's permission bits.
-///
-/// An owner-only source never gets a more readable copy.
-#[cfg(unix)]
-#[test]
-fn backup_preserves_a_private_files_mode() {
-    use std::os::unix::fs::PermissionsExt as _;
-    let dir = user_project("private_backup");
-    let main = dir.join("src").join("Main.ipe");
-    fs::set_permissions(&main, fs::Permissions::from_mode(0o600)).expect("chmod 600");
-    let backup = rewrite_user_file(
-        &main,
-        "module Main exposing (main)\n-- v2\n",
-        RewriteKind::Lossy,
-    )
-    .expect("rewrite");
-    let Some(backup) = backup else {
-        assert!(false_marker(), "a lossy rewrite must report its backup");
-        return;
-    };
-    let mode = fs::metadata(&backup).map_or(0, |m| m.permissions().mode() & 0o777);
-    assert_eq!(mode, 0o600, "the backup must stay owner-only");
-    let _ = fs::remove_dir_all(&dir);
-}
-
-/// A directory walk refuses to rewrite a file that resolves outside the project.
-///
-/// An explicitly named file may still be followed.
-#[cfg(unix)]
-#[test]
-fn walked_rewrite_refuses_a_file_outside_the_project() {
-    let dir = user_project("walk_escape");
-    let outside = dir.with_extension("outside.ipe");
-    fs::write(&outside, "module Other\n").expect("outside file");
-    let link = dir.join("src").join("Other.ipe");
-    std::os::unix::fs::symlink(&outside, &link).expect("link");
-    let result = rewrite_walked_file(
-        &dir,
-        &link,
-        "module Other\n-- evil\n",
-        RewriteKind::Lossless,
-    );
-    assert!(
-        matches!(result, Err(CliError::OutputRefused(_))),
-        "a walked file escaping the project must be refused, got {result:?}"
-    );
-    assert_eq!(
-        fs::read_to_string(&outside).unwrap_or_default(),
-        "module Other\n"
-    );
-    let _ = fs::remove_file(&outside);
-    let _ = fs::remove_dir_all(&dir);
 }
 
 fn redundant_red_branch_at(lo: u32) -> Diagnostic {

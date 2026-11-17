@@ -887,19 +887,23 @@ pub enum NameError {
     /// un-enforced CSRF posture, an unset secret), so it is rejected here rather
     /// than compiled into an app that ignores it. [IPE-N0043]
     DiscardedConfig,
-    /// The reserved `CustomElement.fromFile "<js-path>"` constructor is malformed at its
-    /// use site. Like the `Kernel.kernel` literal gate, `CustomElement.fromFile` is legal ONLY
-    /// as the entire body of a `CustomElement`-annotated binding, applied to a
-    /// SINGLE STRING LITERAL naming the author's widget-hook JS file. Rejected
-    /// fail-closed when: the argument is not a string literal (a variable, an
-    /// expression — the file cannot be resolved at build time); the constructor is
-    /// referenced bare / unapplied or from any other position; the path escapes the
-    /// project root (`..` traversal); or the named file does not exist. The JS
-    /// source is a VALUE argument, never a type parameter — the two seal params are
-    /// the down/up types only. `detail` names the specific rule broken (Security
-    /// #5, fail-closed: a build-time path is cleaned + in-project-checked +
-    /// required to exist before the widget can be registered). [IPE-N0044]
-    CustomElementCtorMalformed { detail: Box<str> },
+    /// A `CustomElement.fromFile "<js-path>"` use is refused, for its shape or for its file.
+    ///
+    /// Like the `Kernel.kernel` literal gate, `CustomElement.fromFile` is legal
+    /// ONLY as the entire body of a `CustomElement`-annotated binding, applied
+    /// to a SINGLE STRING LITERAL naming the author's widget-hook JS file. The
+    /// JS source is a VALUE argument, never a type parameter — the two seal
+    /// params are the down/up types only. `cause` is one of two families:
+    /// * [`CustomElementRefusal::Shape`] — canon refuses the use site itself (a
+    ///   non-literal argument, a bare or nested reference, a missing or other
+    ///   annotation, a parameterised binding, a rooted path);
+    /// * [`CustomElementRefusal::File`] — the shape is right, and the build stage
+    ///   that owns the project root refuses the file it names (outside the
+    ///   project, missing, unreadable, or sharing its tag with another file).
+    ///
+    /// Fail-closed (Security #1): a build-time path is cleaned, contained,
+    /// read whole and proven unique before the widget can be registered. [IPE-N0044]
+    CustomElementCtorMalformed { cause: CustomElementRefusal },
     /// `main` selects its shape at runtime: after peeling application, `let`, and
     /// `\… ->` the head of `main`'s body is an `if` / `case` whose branches reach
     /// app entries (`Web.tea` / `Tui.tea` / `Cli.tea`). A program's shape is
@@ -1113,6 +1117,103 @@ pub enum CodecAutoRejection {
     /// carrier, or otherwise has no derivable leaf codec. The escape is an
     /// explicit `Codec` (`taggedUnion`/`varN` for a data ADT).
     UnsupportedField,
+}
+
+/// Why an IPE-N0044 `CustomElement.fromFile` use is refused.
+///
+/// Carried by [`NameError::CustomElementCtorMalformed`] and rendered in one
+/// place, so no producer lays out its own prose.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CustomElementRefusal {
+    /// The use site is not the one accepted shape (canon).
+    Shape(CustomElementShape),
+    /// The shape is right; the widget-hook file it names is refused (build stage).
+    File {
+        /// The cleaned widget path, relative to the entry module's directory.
+        path: Box<str>,
+        /// Why the file is refused.
+        refusal: WidgetFileRefusal,
+    },
+}
+
+/// The shape rule a `CustomElement.fromFile` use site breaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CustomElementShape {
+    /// Referenced bare, nested, or applied outside a binding's whole body.
+    Unapplied,
+    /// The binding carries parameters.
+    TakesParameters,
+    /// The binding has no type annotation.
+    NoAnnotation,
+    /// The binding is annotated with a type other than `CustomElement`.
+    NotCustomElementAnnotation,
+    /// The constructor is not applied to exactly one argument.
+    ArgumentCount,
+    /// The one argument is not a string literal.
+    NonLiteralArgument,
+    /// The literal is a rooted path under some separator regime.
+    RootedPath,
+}
+
+/// Why the build stage refuses a well-shaped `CustomElement.fromFile` file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum WidgetFileRefusal {
+    /// The path resolves outside the project directory.
+    Escapes(WidgetPathEscape),
+    /// No file exists at the path.
+    Missing,
+    /// The file exists but cannot be read whole.
+    Unreadable(WidgetUnreadable),
+    /// Another widget-hook file maps to the same custom-element tag.
+    TagCollision {
+        /// The path that first claimed the tag.
+        other_path: Box<str>,
+        /// The shared custom-element tag.
+        tag: Box<str>,
+    },
+}
+
+/// How a widget-hook path leaves the project directory.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WidgetPathEscape {
+    /// A `..` component climbs out.
+    ParentTraversal,
+    /// The path is absolute.
+    Absolute,
+    /// A link on the way resolves above the project root.
+    OutsideRoot,
+}
+
+/// Why an existing widget-hook file cannot be read.
+///
+/// Holds no host path and no OS message, so the diagnostic is the same on
+/// every build machine.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WidgetUnreadable {
+    /// A link stands where none is followed.
+    Link,
+    /// The entry is not a regular file (a FIFO, device, socket or directory).
+    NotRegularFile,
+    /// The open is denied.
+    Denied,
+    /// Another program holds the file open without sharing it.
+    InUse,
+    /// The file is longer than the read cap.
+    TooLarge {
+        /// The cap in bytes.
+        cap_bytes: u64,
+    },
+    /// A directory on the way holds more entries than the cap.
+    TooManyEntries {
+        /// The cap in entries.
+        cap: u64,
+    },
+    /// A level of the path is not one plain entry name.
+    NotPlainName,
+    /// The content is not valid UTF-8.
+    NotUtf8,
+    /// Another filesystem failure, of this kind.
+    Io(std::io::ErrorKind),
 }
 
 /// Why a `CustomElement` boundary type parameter fails the SEAL.

@@ -1,0 +1,11 @@
+-- A CUSTOMELEMENT.FROMFILE USE IS MALFORMED OR ITS WIDGET-HOOK FILE IS REFUSED - test.ipe
+
+I can't use the widget-hook file `js/editor.js`.
+
+ --> test.ipe:7:28
+  |
+7 |     CustomElement.fromFile "js/editor.js"
+  |                            ^^^^^^^^^^^^^^ `js/editor.js` does not exist; create it beside the entry module at that relative path, or correct the path
+  |
+
+IPE-N0044 · run `ipe doc IPE-N0044`

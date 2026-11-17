@@ -1216,6 +1216,68 @@ fn email_parse_address_only_cargo_builds() -> DResult<()> {
     Ok(())
 }
 
+/// THE SEAL for the vendored webview surface: a webview program emitted with
+/// the vendored runtime tree must `cargo build`.
+///
+/// The webview window installs the shared link policy (`webview::nav_policy`)
+/// and the window steps (`webview::shell`), both behind `webview-shell`, and the
+/// policy reaches `browser_open`; the vendored manifest and module tree must
+/// enable and declare all of them, exactly as the runtime crate's `webview`
+/// feature does.
+///
+/// Gated on `IPE_E2E=1`. On a Linux host without the system `webkit2gtk` /
+/// `glib` dev packages the wry/tao build stops in `pkg-config`; that one
+/// signature is reported as a loud skip, any other failure fails the test.
+#[test]
+fn webview_vendored_cargo_builds() -> DResult<()> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let runtime = e2e_support::require_runtime().into_path_buf();
+
+    let mut interner = Interner::new();
+    let main_mod = interner.intern("Main")?;
+    let main_sym = interner.intern("main")?;
+    let main_fn = Func {
+        id: FuncId::from_raw(0),
+        name: main_sym,
+        home: ModPath(vec![main_mod]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![],
+        ret: IrType::Task(Box::new(IrType::Unit)),
+        body: Expr::Call {
+            callee: Callee::Kernel(KernelFn::IoPrintln),
+            args: vec![Expr::Str(String::new())],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        },
+    };
+    let mut module = module_for_mask(main_mod, 1 << 5);
+    assert!(module.uses_webview, "bit 5 is the webview surface");
+    module.funcs = vec![main_fn];
+    module.entry = Some(FuncId::from_raw(0));
+    let prog = Program {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        modules: vec![module],
+    };
+
+    let emitted = RustBackend::new(&interner).emit(&prog)?;
+    match seal_e2e::build_emitted(&emitted, &runtime, "ipe_webview_vendored_e2e")? {
+        Ok(_) => Ok(()),
+        Err(e) if e.contains("pkg-config exited with status code 1") => {
+            println!(
+                "LOUD-SKIP: vendored webview SEAL — system `webkit2gtk`/`glib` dev \
+                 packages not installed on this host; install \
+                 `libwebkit2gtk-4.1-dev libglib2.0-dev` to run it for real."
+            );
+            Ok(())
+        }
+        Err(e) => Err(seal_e2e::build_bug(e)),
+    }
+}
+
 // ── the shared cfg grammar's refusals ───────────────────────────────────────
 
 /// A runtime crate root holding a declaration under `not(feature = "x")`.
