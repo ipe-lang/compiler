@@ -185,12 +185,9 @@ fn walk<'e>(
         }
         Expr::Let { name, value, body } => {
             walk(value, scope, visit)?;
-            let binding = match value.as_ref() {
-                Expr::Str(lit) => Binding::Literal(*name, lit.as_str()),
-                other => nullary_func(other)
-                    .map_or(Binding::Shadow(*name), |id| Binding::Table(*name, id)),
-            };
-            within(scope, [binding], |scope| walk(body, scope, visit))
+            within(scope, [let_binding(*name, value)], |scope| {
+                walk(body, scope, visit)
+            })
         }
         Expr::Destructure { value, body, .. } => {
             walk(value, scope, visit)?;
@@ -254,6 +251,14 @@ fn walk<'e>(
             walk(effect, scope, visit)?;
             walk(rest, scope, visit)
         }
+    }
+}
+
+/// What a `let` binding `name = value` makes `name` stand for in its body.
+fn let_binding(name: Symbol, value: &Expr) -> Binding<'_> {
+    match value {
+        Expr::Str(lit) => Binding::Literal(name, lit.as_str()),
+        other => nullary_func(other).map_or(Binding::Shadow(name), |id| Binding::Table(name, id)),
     }
 }
 

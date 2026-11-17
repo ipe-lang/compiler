@@ -991,7 +991,7 @@ fn route_render_arms(
 // ── `Web.pageLink` ───────────────────────────────────────────────────────────
 
 /// The program's one `Web.pageLink` table and the renderer every link emits.
-pub(crate) struct PageLinkTable {
+pub struct PageLinkTable {
     /// The nullary top-level binding whose body is the table.
     id: FuncId,
     /// The table's closed page type.
@@ -1018,10 +1018,7 @@ pub(crate) struct PageLinkTable {
 ///
 /// IPE-L0165 or IPE-L0166 as above; the router's table refusals
 /// (IPE-L0123, IPE-L0157, IPE-L0158, IPE-L0159).
-pub(crate) fn plan_page_link_table(
-    ctx: &EmitCtx,
-    program: &Program,
-) -> DResult<Option<PageLinkTable>> {
+pub fn plan_page_link_table(ctx: &EmitCtx, program: &Program) -> DResult<Option<PageLinkTable>> {
     let mut link_ids: Vec<FuncId> = Vec::new();
     crate::kernel_walk::each_kernel_site(program, &mut |site| {
         match site {
@@ -1053,7 +1050,7 @@ pub(crate) fn plan_page_link_table(
         _ => return Err(route_refusal(LowerError::PageLinkTableNotAppRoutes)),
     };
     crate::kernel_walk::each_kernel_site(program, &mut |site| {
-        if routed_app_routes(ctx, site)?.is_some_and(|routes| routes != Some(id)) {
+        if app_routes_differ(ctx, site, id)? {
             return Err(route_refusal(LowerError::PageLinkTableNotAppRoutes));
         }
         Ok(())
@@ -1078,33 +1075,35 @@ pub(crate) fn plan_page_link_table(
     }))
 }
 
-/// For a routed app-entry site, `Some(Some(id))` when its `routes` is the
-/// nullary binding `id` and `Some(None)` when it is any other expression (an
-/// inline list). `None` for every other site, an app that is not routed
+/// Whether `site` is a routed app entry whose `routes` is anything but the
+/// nullary binding `table`: another binding, or any other expression (an
+/// inline list). `false` for every other site, an app that is not routed
 /// included.
-fn routed_app_routes(
+fn app_routes_differ(
     ctx: &EmitCtx,
     site: crate::kernel_walk::KernelSite<'_, '_>,
-) -> DResult<Option<Option<FuncId>>> {
+    table: FuncId,
+) -> DResult<bool> {
     let crate::kernel_walk::KernelSite::Call { kernel, args, .. } = site else {
-        return Ok(None);
+        return Ok(false);
     };
-    let cfg = match (kernel, args) {
-        (KernelFn::WebApp | KernelFn::WebEmbed | KernelFn::WebAppRouted, [cfg])
-        | (KernelFn::WebAppWith, [_, cfg]) => cfg,
-        _ => return Ok(None),
+    let ((KernelFn::WebApp | KernelFn::WebEmbed | KernelFn::WebAppRouted, [cfg])
+    | (KernelFn::WebAppWith, [_, cfg])) = (kernel, args)
+    else {
+        return Ok(false);
     };
     // A non-literal cfg is refused at lower (IPE-L0119).
     let Expr::Record { fields, .. } = cfg else {
-        return Ok(None);
+        return Ok(false);
     };
     let Some(view_e) = find_field(ctx, fields, "view")? else {
-        return Ok(None);
+        return Ok(false);
     };
     if routed_page_field(ctx, view_e).is_none() {
-        return Ok(None);
+        return Ok(false);
     }
-    Ok(find_field(ctx, fields, "routes")?.map(crate::kernel_walk::nullary_func))
+    Ok(find_field(ctx, fields, "routes")?
+        .is_some_and(|routes| crate::kernel_walk::nullary_func(routes) != Some(table)))
 }
 
 /// The cfg field named `name`, if present.
@@ -1152,7 +1151,7 @@ fn closed_route_table<'p>(
     };
     let mut free = Vec::new();
     ipe_ir::collect_generics(page_ty, &mut free);
-    let closed = items.first().is_some()
+    let closed = !items.is_empty()
         && func.type_params.is_empty()
         && func.row_params.is_empty()
         && free.is_empty()

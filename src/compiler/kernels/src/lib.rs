@@ -2194,7 +2194,7 @@ impl FieldTag {
             Self::CacheEvictions => "evictions",
             Self::WsPingInterval => "pingInterval",
             Self::EmailFrom => "from",
-            Self::EmailTo => "to",
+            Self::EmailTo | Self::PageTo => "to",
             Self::EmailCc => "cc",
             Self::EmailBcc => "bcc",
             Self::EmailSubject => "subject",
@@ -2252,7 +2252,6 @@ impl FieldTag {
             Self::ProcessStderr => "stderr",
             Self::ProcessCols => "cols",
             Self::ProcessOutput => "output",
-            Self::PageTo => "to",
             Self::PageCurrent => "current",
         }
     }
