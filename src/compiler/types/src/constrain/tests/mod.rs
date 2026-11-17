@@ -1351,6 +1351,10 @@ mod registry_phase_c_tests {
             // `Web.embed : WebConfig -> WebApp` — Ipê-new (no legacy oracle);
             // a mountable web-app handle sharing `Web.tea`'s cfg scheme.
             K::WebEmbed,
+            // `Web.pageLink : List (WebRoute page) -> List (Attribute msg) ->
+            // { to : page, current : page, label : Element msg } -> Element msg`
+            // — Ipê-new (no legacy oracle); its scheme lives in `stdlib_scheme`.
+            K::WebPageLink,
             // ── Ipe.App runtime-config front door (8, Ipê-new) ──────────────
             K::WebAppWith,
             K::AppFromEnv,
