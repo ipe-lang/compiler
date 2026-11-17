@@ -1,6 +1,8 @@
 // Control fixture for the FreeBSD root-act scan: every shape below must be
 // refused, and the comment inside the module must not count as an act.
 
+use std::fs::remove_file;
+
 #[cfg(any(target_os = "freebsd", test))]
 pub(crate) enum Primitive {
     /// `jail(8)`.
@@ -48,9 +50,34 @@ mod freebsd_jail {
         let _ = resolve_primitive(Primitive::Owner);
         let label = "chown";
         let _ = std::thread::Builder::new().spawn(|| ());
+        let _ = rustix::process::chroot(tree);
+        let _ = Path::metadata(tree);
+        let _ = std::path::Path::exists(tree);
+        via!(fs);
+        let _ = crate::elsewhere::act(tree);
+        reached_helper(tree);
+    }
+
+    macro_rules! via {
+        ($m:ident) => {
+            std::$m::remove_dir_all("/z")
+        };
     }
 
     extern "C" {
         fn mount();
     }
+}
+
+fn reached_helper(tree: &Path) {
+    let _ = std::fs::remove_dir_all(tree);
+}
+
+fn unreached_helper(tree: &Path) {
+    let _ = std::fs::remove_file(tree);
+}
+
+#[cfg(target_os = "linux")]
+fn reached_helper(tree: &Path) {
+    let _ = std::fs::rename(tree, tree);
 }

@@ -617,9 +617,10 @@ const fn win_exit_to_i32(code: u32) -> i32 {
 /// any path. Fail-closed. The scratch is removed on return so nothing leaks across
 /// the audit's per-axis tightening loop.
 ///
-/// The jail's actual deny behaviour is proven by the `freebsd-tier2` CI job inside
-/// a `vmactions/freebsd-vm` VM (no native FreeBSD GitHub runner exists); this
-/// crate builds the arm and unit-tests the pure lowering on any host.
+/// The `freebsd-check` CI step compiles this arm and its end-to-end suite
+/// (`tests/build_jail_freebsd_e2e.rs`) for FreeBSD; no CI job runs that suite,
+/// which needs root on a FreeBSD host. The pure lowering is unit-tested on any
+/// host.
 ///
 /// # Errors
 ///
@@ -2458,7 +2459,7 @@ pub(crate) struct Owner {
 
 /// An ownership change through an open handle, never by name.
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
-type ChownHeld = fn(&std::fs::File, Owner) -> std::io::Result<()>;
+type GiveHeld = fn(&std::fs::File, Owner) -> std::io::Result<()>;
 
 /// Give the object `file` holds to `owner`.
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
@@ -2466,14 +2467,14 @@ fn fchown_held(file: &std::fs::File, owner: Owner) -> std::io::Result<()> {
     std::os::unix::fs::fchown(file, Some(owner.uid), Some(owner.gid))
 }
 
-/// Give the held `bind` to `owner` through `chown`, with no restore.
+/// Give the held `bind` to `owner` through `give`, with no restore.
 ///
 /// # Errors
 ///
 /// [`RunJailDefect::Spawn`] when the ownership change fails.
 #[cfg(any(target_os = "freebsd", all(test, unix)))]
-fn give_held(bind: &HeldBind, owner: Owner, chown: ChownHeld) -> Result<(), RunJailDefect> {
-    chown(bind.dir.handle(), owner).map_err(|e| RunJailDefect::Spawn {
+fn give_held(bind: &HeldBind, owner: Owner, give: GiveHeld) -> Result<(), RunJailDefect> {
+    give(bind.dir.handle(), owner).map_err(|e| RunJailDefect::Spawn {
         detail: format!(
             "could not change the owner of the held {}: {e}",
             bind.spelling.as_path().display()
@@ -2491,7 +2492,7 @@ fn give_held(bind: &HeldBind, owner: Owner, chown: ChownHeld) -> Result<(), RunJ
 pub(crate) struct HeldOwnership<'a> {
     bind: &'a HeldBind,
     original: Owner,
-    chown: ChownHeld,
+    give: GiveHeld,
     /// Whether the original owner is still to be restored.
     pending: bool,
 }
@@ -2507,7 +2508,7 @@ impl<'a> HeldOwnership<'a> {
     pub(crate) fn acquire(
         bind: &'a HeldBind,
         owner: Owner,
-        chown: ChownHeld,
+        give: GiveHeld,
     ) -> Result<Self, RunJailDefect> {
         use std::os::unix::fs::MetadataExt as _;
         let meta = bind
@@ -2524,11 +2525,11 @@ impl<'a> HeldOwnership<'a> {
             uid: meta.uid(),
             gid: meta.gid(),
         };
-        give_held(bind, owner, chown)?;
+        give_held(bind, owner, give)?;
         Ok(Self {
             bind,
             original,
-            chown,
+            give,
             pending: true,
         })
     }
@@ -2541,7 +2542,7 @@ impl<'a> HeldOwnership<'a> {
     /// left changed, so the run is never reported clean.
     pub(crate) fn restore(mut self) -> Result<(), RunJailDefect> {
         self.pending = false;
-        give_held(self.bind, self.original, self.chown)
+        give_held(self.bind, self.original, self.give)
     }
 }
 
@@ -2551,7 +2552,7 @@ impl Drop for HeldOwnership<'_> {
         // A run that ended before `restore` (an early refusal) still restores;
         // no outcome is left to carry a failure, so it is best-effort.
         if self.pending {
-            let _ = give_held(self.bind, self.original, self.chown);
+            let _ = give_held(self.bind, self.original, self.give);
         }
     }
 }
@@ -5624,7 +5625,7 @@ mod held_tests {
         static CHOWNS: RefCell<Vec<(FileId, Owner)>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// A [`ChownHeld`] that records the object it was handed and changes nothing.
+    /// A [`GiveHeld`] that records the object it was handed and changes nothing.
     fn record_chown(file: &std::fs::File, owner: Owner) -> std::io::Result<()> {
         let id = FileId::of_file(file).map_err(ipe_fs_open::OpenRefusal::into_io)?;
         CHOWNS.with(|chowns| chowns.borrow_mut().push((id, owner)));

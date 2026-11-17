@@ -1,18 +1,24 @@
 //! The FreeBSD jail launcher makes only the root acts this inventory admits.
 //!
-//! `mod freebsd_jail` of `src/build_jail.rs` runs as root. Every program it
-//! starts, every path it creates, resolves, stats or removes, and every spawn
-//! it makes is an act in this inventory: the function it is in and what it
-//! calls. The inventory must equal [`ADMITTED`] exactly, so a new by-name act
-//! fails the scan until a reviewer admits it with a reason, and an admission
-//! whose act is gone fails as stale.
+//! The launcher's root code is `mod freebsd_jail` of `src/build_jail.rs`,
+//! every top-level item compiled for FreeBSD, and every top-level item any of
+//! those names, closed transitively: a helper the launcher calls runs as root
+//! too, so moving an act out of the module never moves it out of the scan.
+//! Every program that code starts, every path it creates, resolves, stats or
+//! removes, every `rustix` or `std::process` item it reaches, every spawn,
+//! and every reach into another module or crate is an act in this inventory:
+//! the function it is in and what it calls. The inventory must equal
+//! [`ADMITTED`] exactly, so a new act fails the scan until a reviewer admits
+//! it with a reason, and an admission whose act is gone fails as stale.
 //!
-//! Around the inventory, the module may not rename an import (the renamed
-//! name would leave the inventory), import a filesystem or process item by
-//! its bare name, reach a foreign function interface, or name an ownership
-//! change other than the held-handle `fchown` (a check over its raw text,
-//! comments and strings included). The `Primitive` table, the one source of
-//! every program the launcher runs, must hold exactly [`ADMITTED_PRIMITIVES`].
+//! Around the inventory, that code (and every top-level import of the file)
+//! may not rename an import (the renamed name would leave the inventory),
+//! import a filesystem or process item by its bare name, reach a foreign
+//! function interface, invoke a macro outside [`MACROS`] (a macro can spell
+//! any path out of pieces), or name an ownership change other than the
+//! held-handle `fchown` (a check over its raw code lines, strings included).
+//! The `Primitive` table, the one source of every program the launcher runs,
+//! must hold exactly [`ADMITTED_PRIMITIVES`].
 //!
 //! The scan reuses the lexer of the enclosing harness: comments and literals
 //! are blanked before the inventory is read. A control fixture holding each
@@ -20,8 +26,65 @@
 
 use super::{code_only, enclosing_fn, is_ident};
 
-/// The opening line of the launcher module.
+/// The opening line of the launcher module, written in this file.
 const MODULE_OPEN: &str = "\nmod freebsd_jail {";
+
+/// The name of the launcher module, the first root of the scope.
+const MODULE_NAME: &str = "freebsd_jail";
+
+/// The configuration a top-level item compiled for FreeBSD names.
+const FREEBSD_CFG: &str = "target_os = \"freebsd\"";
+
+/// Path roots that name no other module or crate: the standard library, this
+/// file, the roots read by their own rule, and the primitive types.
+const LOCAL_ROOTS: [&str; 29] = [
+    "std",
+    "core",
+    "alloc",
+    "super",
+    "self",
+    "fs",
+    "process",
+    "rustix",
+    "libc",
+    "nix",
+    "freebsd_jail",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "u128",
+    "usize",
+    "i8",
+    "i16",
+    "i32",
+    "i64",
+    "i128",
+    "isize",
+    "str",
+    "char",
+    "bool",
+    "f32",
+    "f64",
+    "clippy",
+];
+
+/// The macros the scoped code may invoke: none of them spells a path.
+const MACROS: [&str; 5] = ["format", "matches", "vec", "write", "writeln"];
+
+/// The item keywords whose next word is the item's name.
+const ITEM_KEYWORDS: [&str; 10] = [
+    "fn",
+    "struct",
+    "enum",
+    "const",
+    "static",
+    "type",
+    "trait",
+    "mod",
+    "union",
+    "macro_rules",
+];
 
 /// Path-reading calls on a `Path` receiver the inventory records.
 const PATH_QUERIES: [&str; 16] = [
@@ -53,7 +116,153 @@ const OWNERSHIP_WORDS: [&str; 2] = ["fchown_held", "fchown"];
 type Admission = (&'static str, &'static str, &'static str);
 
 /// Every root act of the launcher module, with the reason it is sound.
-const ADMITTED: [Admission; 33] = [
+const ADMITTED: [Admission; 74] = [
+    ("", "use crate::JailMounts", "the mount set type; no act"),
+    (
+        "",
+        "use crate::run_jail::JailLaunch",
+        "the launch type; its spawn is admitted where it runs",
+    ),
+    (
+        "",
+        "use crate::run_jail::{RunJailDefect, RunJailTools, SandboxProfile}",
+        "the jail profile and refusal types; no act",
+    ),
+    (
+        "require_jail_primitive",
+        "resolve_primitive(Primitive::Jail)",
+        "the jail program, from the fixed root-only primitive table",
+    ),
+    (
+        "spawn_and_decode",
+        "spawn",
+        "starts the jail launch `build_in_jail` built from resolved primitives",
+    ),
+    (
+        "spawn_and_decode",
+        "process::Stdio::inherit",
+        "the jail writes to this process stdout",
+    ),
+    (
+        "spawn_and_decode",
+        "process::Stdio::inherit",
+        "the jail writes to this process stderr",
+    ),
+    (
+        "freebsd_mount_ops",
+        "use crate::mounts::{Bind, MountStep}",
+        "the mount plan types; no act",
+    ),
+    (
+        "of",
+        "fs::Metadata",
+        "a type name; the facts read from metadata already taken",
+    ),
+    (
+        "of",
+        "use std::os::unix::fs::MetadataExt as _",
+        "the inode trait for the facts below",
+    ),
+    ("of", ".is_symlink(", "on a file type already read, no path"),
+    ("of", ".is_dir(", "on a file type already read, no path"),
+    ("of", ".is_file(", "on a file type already read, no path"),
+    (
+        "lstat_facts",
+        "fs::symlink_metadata",
+        "a read that never follows a link; the trusted-chain judges re-read every level after",
+    ),
+    (
+        "held_chain_facts",
+        ".metadata(",
+        "read on a held handle, never by name",
+    ),
+    (
+        "held_fsid",
+        "use std::os::unix::fs::MetadataExt as _",
+        "the inode trait for the held-handle read below",
+    ),
+    (
+        "held_fsid",
+        ".metadata(",
+        "read on a held handle, never by name",
+    ),
+    (
+        "spelling_fits",
+        "use std::os::unix::ffi::OsStrExt as _",
+        "the byte view of a spelling; no act",
+    ),
+    (
+        "verify_bind",
+        "use std::os::unix::ffi::OsStrExt as _",
+        "the byte view of a spelling; no act",
+    ),
+    (
+        "held_refusal",
+        "use ipe_fs_open::OpenRefusal",
+        "the held-open refusal type; no act",
+    ),
+    (
+        "walk_held",
+        "use ipe_fs_open::{EntryName, HeldDir}",
+        "the held-handle walk every chain read goes through",
+    ),
+    (
+        "hold",
+        "use std::os::unix::fs::MetadataExt as _",
+        "the inode trait for the held-handle read below",
+    ),
+    ("hold", ".metadata(", "read on a held handle, never by name"),
+    (
+        "refuse_cargo_identity",
+        "crate::covers::CargoHomeIdentity::read",
+        "reads the cargo home identity; a match refuses the bind",
+    ),
+    (
+        "",
+        "fs::File",
+        "a type name in the held-handle ownership signature",
+    ),
+    (
+        "fchown_held",
+        "fs::File",
+        "a type name; the handle is already open",
+    ),
+    (
+        "fchown_held",
+        "fs::fchown",
+        "the one ownership change, on a held handle",
+    ),
+    (
+        "acquire",
+        "use std::os::unix::fs::MetadataExt as _",
+        "the inode trait for the held-handle read below",
+    ),
+    (
+        "acquire",
+        ".metadata(",
+        "read on a held handle, never by name",
+    ),
+    ("", "use crate::JailMounts", "the mount set type; no act"),
+    (
+        "",
+        "use crate::mounts::{TreeBind, jail_binds, mount_plan}",
+        "the pure mount planners; no act",
+    ),
+    (
+        "",
+        "use crate::run_jail::{JailArgv, JailLaunch, RunJailDefect, SandboxProfile}",
+        "the launch types; no act",
+    ),
+    (
+        "",
+        "ipe_fs_open::ByteCap::from_nonzero",
+        "a const byte ceiling; no act",
+    ),
+    (
+        "read_jail_user",
+        "use ipe_fs_open::{EntryName, OpenRefusal}",
+        "the held `/etc` read of the jail user",
+    ),
     (
         "build_in_jail",
         "resolve_primitive(Primitive::Jail)",
@@ -63,6 +272,11 @@ const ADMITTED: [Admission; 33] = [
         "build_in_jail",
         "resolve_primitive(Primitive::Rctl)",
         "the rctl program, from the fixed root-only primitive table",
+    ),
+    (
+        "build_in_jail",
+        "crate::host_env::granted",
+        "the env allowlist the scrub keeps",
     ),
     (
         "build_in_jail",
@@ -86,7 +300,7 @@ const ADMITTED: [Admission; 33] = [
     ),
     (
         "mount_dir_under",
-        "fs::DirBuilderExt",
+        "use std::os::unix::fs::DirBuilderExt as _",
         "the mode trait for the exclusive create below",
     ),
     (
@@ -111,6 +325,11 @@ const ADMITTED: [Admission; 33] = [
     ),
     (
         "establish",
+        "rustix::process::geteuid",
+        "the id the trusted-chain judges admit as owner",
+    ),
+    (
+        "establish",
         "fs::canonicalize",
         "the jail root this process just created exclusively; its chain is judged root-only next",
     ),
@@ -121,7 +340,7 @@ const ADMITTED: [Admission; 33] = [
     ),
     (
         "mounted_facts",
-        "fs::MetadataExt",
+        "use std::os::unix::fs::MetadataExt as _",
         "the inode trait for the held-handle read below",
     ),
     (
@@ -131,7 +350,7 @@ const ADMITTED: [Admission; 33] = [
     ),
     (
         "mounted_facts",
-        "fs::fstatfs",
+        "rustix::fs::fstatfs",
         "read on the held handle of the mounted target, never by name",
     ),
     (
@@ -175,9 +394,19 @@ const ADMITTED: [Admission; 33] = [
         "the per-run parent of the /proc-mask source; never a recursive removal",
     ),
     (
+        "private_cache_root",
+        "crate::home::home_dir",
+        "the home the cache root is judged under; a user-owned home refuses",
+    ),
+    (
         "create_exclusive_private_dir",
-        "fs::DirBuilderExt",
+        "use std::os::unix::fs::DirBuilderExt as _",
         "the mode trait for the creates below",
+    ),
+    (
+        "create_exclusive_private_dir",
+        "rustix::process::geteuid",
+        "the id the trusted-chain judges admit as owner",
     ),
     (
         "create_exclusive_private_dir",
@@ -200,6 +429,11 @@ const ADMITTED: [Admission; 33] = [
         "an exclusive non-recursive create; the whole chain is judged again after",
     ),
     (
+        "per_run_jail_name",
+        "process::id",
+        "the per-run jail name; no act",
+    ),
+    (
         "apply",
         "Command::new(rctl_bin)",
         "the rctl primitive `build_in_jail` resolved",
@@ -213,6 +447,16 @@ const ADMITTED: [Admission; 33] = [
         "run_host_tool",
         "Command",
         "the one runner every host tool goes through",
+    ),
+    (
+        "run_host_tool",
+        "process::ExitStatus",
+        "a type name; no act",
+    ),
+    (
+        "run_host_tool",
+        "ipe_runtime_rust::system::spawn_hardened",
+        "the runtime descriptor floor: the tool inherits stdio and nothing else",
     ),
     (
         "run_host_tool",
@@ -235,6 +479,8 @@ const RENAMED_IMPORT: &str = "a renamed import";
 const BARE_IMPORT: &str = "a filesystem or process item imported by its bare name";
 const FOREIGN_CALL: &str = "a foreign function interface";
 const OWNERSHIP_BY_NAME: &str = "an ownership change other than the held-handle fchown";
+const MACRO_CALL: &str = "a macro outside the admitted list";
+const OUT_OF_FILE: &str = "the launcher module is not written in this file";
 
 /// One root act found: its line, its function, and what it calls.
 #[derive(Debug)]
@@ -396,22 +642,372 @@ fn line_of(code: &str, at: usize) -> usize {
         .saturating_add(1)
 }
 
-/// The launcher module's code and the line it opens on.
-fn launcher_module(code: &str) -> Option<(&str, usize)> {
-    let from = code.find(MODULE_OPEN)?.saturating_add(1);
-    let len = code.get(from..)?.find("\n}")?;
-    Some((
-        code.get(from..from.saturating_add(len))?,
-        line_of(code, from),
-    ))
+/// One top-level item of the file: its byte span with its attributes, where
+/// its own text opens, its name, and whether it is an import.
+#[derive(Debug)]
+struct Item {
+    start: usize,
+    body: usize,
+    end: usize,
+    name: Option<String>,
+    is_use: bool,
 }
 
-/// The root act the word at byte `at` of `module` makes, if any.
-fn act_at(module: &str, at: usize, word: &str) -> Option<String> {
-    let rest = module
+/// Whether a line of blanked code opens a top-level item or attribute.
+fn opens_item(line: &str) -> bool {
+    line.chars()
+        .next()
+        .is_some_and(|c| !c.is_whitespace() && !matches!(c, '}' | ')' | ']' | '{'))
+        && !line.starts_with("where")
+}
+
+/// The text of `after` past one balanced `<…>` group opening it.
+fn past_generics(after: &str) -> &str {
+    let trimmed = after.trim_start();
+    if !trimmed.starts_with('<') {
+        return trimmed;
+    }
+    let mut depth = 0_usize;
+    for (at, c) in trimmed.char_indices() {
+        match c {
+            '<' => depth = depth.saturating_add(1),
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return trimmed.get(at.saturating_add(1)..).unwrap_or_default();
+                }
+            }
+            _ => {}
+        }
+    }
+    trimmed
+}
+
+/// The type an `impl` header implements for.
+fn impl_type(header: &str) -> Option<String> {
+    let after = past_generics(header.trim_start().strip_prefix("impl")?);
+    let target = after.rsplit(" for ").next().unwrap_or(after);
+    let path: String = target
+        .trim_start()
+        .trim_start_matches('&')
+        .chars()
+        .take_while(|&c| is_ident(c) || c == ':')
+        .collect();
+    path.rsplit("::").next().map(str::to_owned)
+}
+
+/// The name a top-level item `header` declares.
+fn item_name(header: &str) -> Option<String> {
+    let trimmed = header.trim_start();
+    if let Some(implementation) = trimmed
+        .strip_prefix("unsafe ")
+        .or(Some(trimmed))
+        .filter(|text| text.starts_with("impl"))
+    {
+        return impl_type(implementation);
+    }
+    let names: Vec<&str> = words(header).into_iter().map(|(_, word)| word).collect();
+    names.windows(2).find_map(|pair| match pair {
+        [keyword, name] if ITEM_KEYWORDS.contains(keyword) && !ITEM_KEYWORDS.contains(name) => {
+            Some((*name).to_owned())
+        }
+        _ => None,
+    })
+}
+
+/// The top-level items of blanked `code`, each with its attributes.
+fn items(code: &str) -> Vec<Item> {
+    let mut starts = Vec::new();
+    let mut offset = 0_usize;
+    for line in code.split_inclusive('\n') {
+        if opens_item(line) {
+            starts.push(offset);
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    starts.push(code.len());
+    let mut found = Vec::new();
+    let mut attributes: Option<usize> = None;
+    for span in starts.windows(2) {
+        let [from, to] = *span else { continue };
+        let text = code.get(from..to).unwrap_or_default();
+        if text.starts_with("#[") || text.starts_with("#!") {
+            attributes = attributes.or(Some(from));
+            continue;
+        }
+        let header = text.split(['{', ';']).next().unwrap_or_default();
+        let bare = header
+            .trim_start_matches("pub(crate) ")
+            .trim_start_matches("pub(super) ")
+            .trim_start_matches("pub ");
+        found.push(Item {
+            start: attributes.take().unwrap_or(from),
+            body: from,
+            end: to,
+            name: item_name(header),
+            is_use: bare.starts_with("use "),
+        });
+    }
+    found
+}
+
+/// Whether the word at byte `at` of `code` is the name a definition declares.
+fn is_definition(code: &str, at: usize) -> bool {
+    let before = code.get(..at).unwrap_or_default();
+    ITEM_KEYWORDS.iter().any(|keyword| {
+        before
+            .strip_suffix(' ')
+            .and_then(|rest| rest.strip_suffix(keyword))
+            .is_some_and(|rest| !rest.ends_with(is_ident))
+    })
+}
+
+/// The raw attribute lines of `item`, read from `source`.
+fn attributes_of(code: &str, source: &str, item: &Item) -> String {
+    let first = line_of(code, item.start).saturating_sub(1);
+    let count = line_of(code, item.body)
+        .saturating_sub(1)
+        .saturating_sub(first);
+    source
+        .lines()
+        .skip(first)
+        .take(count)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One token of a `cfg` predicate.
+#[derive(Debug, PartialEq, Eq)]
+enum CfgToken {
+    Word(String),
+    Text(String),
+    Open,
+    Close,
+    Comma,
+    Equals,
+}
+
+/// The tokens of the `cfg` predicate `text`.
+fn cfg_tokens(text: &str) -> Vec<CfgToken> {
+    let mut tokens = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '(' => tokens.push(CfgToken::Open),
+            ')' => tokens.push(CfgToken::Close),
+            ',' => tokens.push(CfgToken::Comma),
+            '=' => tokens.push(CfgToken::Equals),
+            '"' => {
+                let value: String = chars.by_ref().take_while(|&c| c != '"').collect();
+                tokens.push(CfgToken::Text(value));
+            }
+            c if is_ident(c) => {
+                let mut word = String::from(c);
+                while let Some(next) = chars.next_if(|&next| is_ident(next)) {
+                    word.push(next);
+                }
+                tokens.push(CfgToken::Word(word));
+            }
+            _ => {}
+        }
+    }
+    tokens
+}
+
+/// Whether the configuration fact `key = value` (or the bare `key`) holds
+/// for a non-test FreeBSD x86-64 build; a fact this scan does not model holds,
+/// so an unknown gate keeps its item in scope.
+fn cfg_fact(key: &str, value: Option<&str>) -> bool {
+    match (key, value) {
+        ("target_os", Some(os)) => os == "freebsd",
+        ("target_family", Some(family)) => family == "unix",
+        ("target_arch", Some(arch)) => arch == "x86_64",
+        ("windows" | "test", None) => false,
+        _ => true,
+    }
+}
+
+/// Evaluate the predicate at the front of `tokens`, consuming it.
+fn cfg_eval(tokens: &mut std::iter::Peekable<std::vec::IntoIter<CfgToken>>) -> bool {
+    let Some(CfgToken::Word(head)) = tokens.next() else {
+        return true;
+    };
+    match tokens.peek() {
+        Some(CfgToken::Open) => {
+            tokens.next();
+            let mut values = Vec::new();
+            while !matches!(tokens.peek(), None | Some(CfgToken::Close)) {
+                values.push(cfg_eval(tokens));
+                tokens.next_if_eq(&CfgToken::Comma);
+            }
+            tokens.next();
+            match head.as_str() {
+                "any" => values.contains(&true),
+                "not" => !values.contains(&true),
+                _ => !values.contains(&false),
+            }
+        }
+        Some(CfgToken::Equals) => {
+            tokens.next();
+            match tokens.next() {
+                Some(CfgToken::Text(value)) => cfg_fact(&head, Some(&value)),
+                _ => true,
+            }
+        }
+        _ => cfg_fact(&head, None),
+    }
+}
+
+/// The `cfg` predicates of the raw attribute text `attributes`.
+fn cfg_predicates(attributes: &str) -> Vec<&str> {
+    let open = "#[cfg(";
+    attributes
+        .match_indices(open)
+        .filter_map(|(at, _)| {
+            let rest = attributes.get(at.saturating_add(open.len())..)?;
+            let mut depth = 1_usize;
+            let end = rest.char_indices().find_map(|(offset, c)| {
+                match c {
+                    '(' => depth = depth.saturating_add(1),
+                    ')' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(offset);
+                        }
+                    }
+                    _ => {}
+                }
+                None
+            })?;
+            rest.get(..end)
+        })
+        .collect()
+}
+
+/// Whether an item with the raw attribute text `attributes` compiles into a
+/// non-test FreeBSD build.
+fn compiled_for_freebsd(attributes: &str) -> bool {
+    cfg_predicates(attributes)
+        .into_iter()
+        .all(|predicate| cfg_eval(&mut cfg_tokens(predicate).into_iter().peekable()))
+}
+
+/// The items the launcher's root code spans: the launcher module, every item
+/// compiled for FreeBSD, and every item a scoped item names, transitively.
+///
+/// `None` when the launcher module is missing.
+fn root_scope<'i>(code: &str, source: &str, items: &'i [Item]) -> Option<Vec<&'i Item>> {
+    let module = items
+        .iter()
+        .position(|item| item.name.as_deref() == Some(MODULE_NAME))?;
+    let compiled: Vec<bool> = items
+        .iter()
+        .map(|item| !item.is_use && compiled_for_freebsd(&attributes_of(code, source, item)))
+        .collect();
+    let mut scoped: Vec<bool> = items
+        .iter()
+        .zip(&compiled)
+        .enumerate()
+        .map(|(index, (item, &compiled))| {
+            index == module || (compiled && attributes_of(code, source, item).contains(FREEBSD_CFG))
+        })
+        .collect();
+    loop {
+        let named: std::collections::HashSet<&str> = items
+            .iter()
+            .zip(&scoped)
+            .filter(|&(_, &inside)| inside)
+            .flat_map(|(item, _)| {
+                let text = code.get(item.start..item.end).unwrap_or_default();
+                words(text)
+                    .into_iter()
+                    .filter(move |&(at, _)| !is_definition(text, at))
+                    .map(|(_, word)| word)
+            })
+            .collect();
+        let mut grew = false;
+        for ((item, inside), &compiled) in items.iter().zip(scoped.iter_mut()).zip(&compiled) {
+            let reached = compiled
+                && item
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| named.contains(name));
+            if reached && !*inside {
+                *inside = true;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    Some(
+        items
+            .iter()
+            .zip(scoped)
+            .filter_map(|(item, inside)| inside.then_some(item))
+            .collect(),
+    )
+}
+
+/// The byte spans of the `use` statements in `code`.
+fn use_spans(code: &str) -> Vec<(usize, usize)> {
+    words(code)
+        .into_iter()
+        .filter(|&(_, word)| word == "use")
+        .map(|(at, _)| {
+            let len = code
+                .get(at..)
+                .and_then(|rest| rest.find(';'))
+                .unwrap_or_default();
+            (at, at.saturating_add(len))
+        })
+        .collect()
+}
+
+/// The first path segment of the `use` statement `statement`.
+fn use_root(statement: &str) -> &str {
+    statement
+        .trim_start_matches("use ")
+        .trim_start_matches("::")
+        .split(|c: char| !is_ident(c))
+        .next()
+        .unwrap_or_default()
+}
+
+/// Whether `statement` names a filesystem, process or foreign path segment.
+fn names_sensitive(statement: &str) -> bool {
+    statement
+        .split(|c: char| !is_ident(c))
+        .any(|segment| SENSITIVE_SEGMENTS.contains(&segment))
+}
+
+/// The identifier ending just before the `::` that closes `before`.
+fn path_owner(before: &str) -> String {
+    let head = before.trim_end_matches("::");
+    let from = head
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !is_ident(c))
+        .map_or(0, |(at, c)| at.saturating_add(c.len_utf8()));
+    head.get(from..).unwrap_or_default().to_owned()
+}
+
+/// The root act the word at byte `at` of `code` makes, if any.
+fn act_at(code: &str, at: usize, word: &str) -> Option<String> {
+    let rest = code
         .get(at.saturating_add(word.len())..)
         .unwrap_or_default();
-    let before = module.get(..at).unwrap_or_default();
+    let before = code.get(..at).unwrap_or_default();
+    let path = || format!("{word}{}", leading_path(rest));
+    if word == "use" {
+        let statement = collapse(code.get(at..)?.split(';').next()?);
+        let local = matches!(
+            use_root(&statement),
+            "std" | "core" | "alloc" | "super" | "self"
+        );
+        return (!local || names_sensitive(&statement)).then_some(statement);
+    }
     if word == "Command" {
         return Some(if rest.starts_with("::new(") {
             format!("Command::new({})", call_argument(rest, "::new".len()))
@@ -419,57 +1015,89 @@ fn act_at(module: &str, at: usize, word: &str) -> Option<String> {
             word.to_owned()
         });
     }
-    if word == "fs" && rest.starts_with("::") {
-        return Some(format!("fs{}", leading_path(rest)));
+    if word.contains("spawn") && !is_definition(code, at) {
+        return Some(word.to_owned());
+    }
+    let in_path = before.ends_with("::");
+    let under_rustix = before.ends_with("rustix::");
+    if rest.starts_with("::") {
+        let rooted = match word {
+            "rustix" => !in_path,
+            "fs" => !under_rustix,
+            "process" => !under_rustix && !rest.starts_with("::Command"),
+            _ => false,
+        };
+        if rooted {
+            return Some(path());
+        }
     }
     if word == "resolve_primitive" && rest.starts_with('(') && !before.ends_with("fn ") {
         return Some(format!("resolve_primitive({})", call_argument(rest, 0)));
     }
-    if word.contains("spawn") {
-        return Some(word.to_owned());
+    if PATH_QUERIES.contains(&word) {
+        if before.ends_with('.') && rest.starts_with('(') {
+            return Some(format!(".{word}("));
+        }
+        let owner = path_owner(before);
+        let on_a_type = !owner.starts_with(|c: char| c.is_ascii_lowercase());
+        if in_path && on_a_type {
+            return Some(format!("{owner}::{word}"));
+        }
     }
-    let queried = PATH_QUERIES.contains(&word) && before.ends_with('.') && rest.starts_with('(');
-    queried.then(|| format!(".{word}("))
+    let calls = leading_path(rest)
+        .rsplit("::")
+        .next()
+        .is_some_and(|last| last.starts_with(|c: char| c.is_ascii_lowercase()));
+    let foreign = rest.starts_with("::")
+        && rest.get(2..).is_some_and(|tail| tail.starts_with(is_ident))
+        && calls
+        && !in_path
+        && word.starts_with(|c: char| c.is_ascii_lowercase())
+        && !LOCAL_ROOTS.contains(&word);
+    foreign.then(path)
 }
 
-/// The refusal the word at byte `at` of `module` opens, if any.
-fn refusal_at(module: &str, at: usize, word: &str) -> Option<(&'static str, String)> {
-    let rest = module
+/// The refusal the word at byte `at` of `code` opens, if any.
+fn refusal_at(code: &str, at: usize, word: &str) -> Option<(&'static str, String)> {
+    let rest = code
         .get(at.saturating_add(word.len())..)
         .unwrap_or_default();
+    if rest.starts_with('!') && !rest.starts_with("!=") && !MACROS.contains(&word) {
+        return Some((MACRO_CALL, word.to_owned()));
+    }
     if word != "use" {
         let foreign =
             word == "extern" || (matches!(word, "libc" | "nix") && rest.starts_with("::"));
         return foreign.then(|| (FOREIGN_CALL, word.to_owned()));
     }
     let statement = collapse(
-        module
-            .get(at..)
+        code.get(at..)
             .and_then(|from| from.split(';').next())
             .unwrap_or_default(),
     );
     if statement.ends_with(" as _") {
         return None;
     }
-    let sensitive = statement
-        .split(|c: char| !is_ident(c))
-        .any(|segment| SENSITIVE_SEGMENTS.contains(&segment));
     if statement.contains(" as ") {
         Some((RENAMED_IMPORT, statement))
     } else {
-        sensitive.then_some((BARE_IMPORT, statement))
+        names_sensitive(&statement).then_some((BARE_IMPORT, statement))
     }
 }
 
-/// The ownership words other than `fchown` on `count` lines from `first`.
-fn ownership_words(source: &str, first: usize, count: usize) -> Vec<(usize, String)> {
+/// The ownership words other than `fchown` on lines `first..=last` of
+/// `source`; a line holding only a comment names no act.
+fn ownership_words(source: &str, first: usize, last: usize) -> Vec<(usize, String)> {
     let mut found = Vec::new();
     let lines = source
         .lines()
         .enumerate()
         .skip(first.saturating_sub(1))
-        .take(count);
+        .take(last.saturating_add(1).saturating_sub(first));
     for (index, line) in lines {
+        if line.trim_start().starts_with("//") {
+            continue;
+        }
         let lower = line.to_ascii_lowercase();
         for (at, _) in lower.match_indices("chown") {
             let start = line
@@ -525,43 +1153,59 @@ fn primitive_spellings(source: &str) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// Scan the launcher module of `source`; `None` when it is missing.
+/// Scan the launcher's root code in `source`; `None` when the launcher
+/// module is missing.
 fn scan(source: &str) -> Option<Findings> {
     let code = code_only(source);
-    let (module, first_line) = launcher_module(&code)?;
-    let line_at = |at: usize| {
-        line_of(module, at)
-            .saturating_add(first_line)
-            .saturating_sub(1)
-    };
+    let all = items(&code);
+    let scope = root_scope(&code, source, &all)?;
     let mut acts = Vec::new();
     let mut refusals = Vec::new();
-    for (at, word) in words(module) {
-        if let Some(act) = act_at(module, at, word) {
-            acts.push(Act {
-                line: line_at(at),
-                function: enclosing_fn(module, at),
-                call: act,
-            });
-        }
-        if let Some((rule, what)) = refusal_at(module, at, word) {
-            refusals.push(Refusal {
-                line: line_at(at),
-                rule,
-                what,
-            });
-        }
+    if !code.contains(MODULE_OPEN) {
+        refusals.push(Refusal {
+            line: 0,
+            rule: OUT_OF_FILE,
+            what: MODULE_NAME.to_owned(),
+        });
     }
-    let module_lines = module.matches('\n').count().saturating_add(1);
-    refusals.extend(
-        ownership_words(source, first_line, module_lines)
-            .into_iter()
-            .map(|(line, what)| Refusal {
-                line,
-                rule: OWNERSHIP_BY_NAME,
-                what,
-            }),
-    );
+    let imports = all
+        .iter()
+        .filter(|item| item.is_use && compiled_for_freebsd(&attributes_of(&code, source, item)));
+    for item in scope.iter().copied().chain(imports) {
+        let text = code.get(item.start..item.end).unwrap_or_default();
+        let statements = use_spans(text);
+        for (local, word) in words(text) {
+            let at = item.start.saturating_add(local);
+            let line = line_of(&code, at);
+            if let Some((rule, what)) = refusal_at(&code, at, word) {
+                refusals.push(Refusal { line, rule, what });
+            }
+            let inside_use = statements
+                .iter()
+                .any(|&(from, to)| from < local && local < to);
+            if inside_use {
+                continue;
+            }
+            if let Some(call) = act_at(&code, at, word) {
+                acts.push(Act {
+                    line,
+                    function: enclosing_fn(text, local),
+                    call,
+                });
+            }
+        }
+        let first = line_of(&code, item.start);
+        let last = line_of(&code, item.end.saturating_sub(1));
+        refusals.extend(
+            ownership_words(source, first, last)
+                .into_iter()
+                .map(|(line, what)| Refusal {
+                    line,
+                    rule: OWNERSHIP_BY_NAME,
+                    what,
+                }),
+        );
+    }
     refusals.sort_by_key(|refusal| refusal.line);
     Some(Findings {
         acts,
@@ -605,16 +1249,26 @@ fn the_root_act_scan_refuses_the_control_fixture() {
     assert_eq!(
         unadmitted,
         [
-            ("", "Command"),
-            ("", "fs::lchown"),
+            ("", "use std::process::Command as Run"),
+            ("", "use std::fs as files"),
+            ("", "use std::os::unix::fs::lchown"),
             ("give_tree", "Command::new(user_bin)"),
+            ("give_tree", "files::remove_dir"),
             ("give_tree", "fs::canonicalize"),
             ("give_tree", "fs::chown"),
             ("give_tree", ".symlink_metadata("),
             ("give_tree", "resolve_primitive(Primitive::Owner)"),
             ("give_tree", "spawn"),
+            ("give_tree", "rustix::process::chroot"),
+            ("give_tree", "Path::metadata"),
+            ("give_tree", "Path::exists"),
+            ("give_tree", "crate::elsewhere::act"),
+            ("give_tree", "m::remove_dir_all"),
+            ("reached_helper", "fs::remove_dir_all"),
+            ("", "use std::fs::remove_file"),
         ],
-        "each by-name act in code is found, collapsed across lines, and none in a comment"
+        "each act in the module or a FreeBSD-compiled item it reaches is found, collapsed across \
+         lines, and none in a comment, an unreached item, or an item another target compiles"
     );
     assert_eq!(
         findings.stale().len(),
@@ -629,6 +1283,7 @@ fn the_root_act_scan_refuses_the_control_fixture() {
     assert_eq!(
         refusals,
         [
+            (BARE_IMPORT, "use std::fs::remove_file"),
             (RENAMED_IMPORT, "use std::process::Command as Run"),
             (RENAMED_IMPORT, "use std::fs as files"),
             (BARE_IMPORT, "use std::os::unix::fs::lchown"),
@@ -637,6 +1292,8 @@ fn the_root_act_scan_refuses_the_control_fixture() {
             (OWNERSHIP_BY_NAME, "lchown"),
             (FOREIGN_CALL, "libc"),
             (OWNERSHIP_BY_NAME, "chown"),
+            (MACRO_CALL, "via"),
+            (MACRO_CALL, "macro_rules"),
             (FOREIGN_CALL, "extern"),
         ]
     );
@@ -647,11 +1304,25 @@ fn the_root_act_scan_refuses_the_control_fixture() {
     assert_eq!(findings.spellings.len(), 6);
     assert_eq!(
         findings.violations().len(),
-        8_usize
+        17_usize
             .saturating_add(ADMITTED.len())
-            .saturating_add(9)
+            .saturating_add(12)
             .saturating_add(2),
         "{:?}",
         findings.violations()
     );
+}
+
+/// A launcher module declared out of line is outside the scan's reach.
+#[test]
+#[allow(clippy::expect_used)] // the source is this test's own
+fn the_root_act_scan_refuses_an_out_of_line_launcher() {
+    let findings = scan("#[cfg(target_os = \"freebsd\")]\nmod freebsd_jail;\n")
+        .expect("the module is declared");
+    let refusals: Vec<&str> = findings
+        .refusals
+        .iter()
+        .map(|refusal| refusal.rule)
+        .collect();
+    assert_eq!(refusals, [OUT_OF_FILE]);
 }

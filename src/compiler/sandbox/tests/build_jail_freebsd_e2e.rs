@@ -10,7 +10,8 @@
 // The red-canary the ADR demands: the probe opens a socket while the
 // declared-scoped jail WITHHOLDS `network` → the fixture's wrapper-owned exit
 // code 10 decodes to `Denied { axis: Network }` (a differentially-probed axis).
-// The jail (established as root inside the vmactions VM) gives the withheld case a
+// The suite runs as root on a FreeBSD host; CI only compiles it (the
+// `freebsd-check` clippy step), no CI job runs it. The jail gives the withheld case a
 // fresh EMPTY `vnet` (no route → the socket is denied at the kernel) and chroots to
 // a read-only nullfs view of the host with only the scratch writable (so an
 // out-of-scratch write hits the read-only mount and is denied structurally).
@@ -480,6 +481,11 @@ fn a_jail_base_under_a_user_writable_home_refuses() {
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+        "the child filter ran exactly one test: {}",
+        String::from_utf8_lossy(&out.stdout)
     );
     assert!(!created, "root created nothing in the user-owned home");
 }

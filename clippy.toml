@@ -38,10 +38,12 @@ disallowed-methods = [
     { path = "tempfile::Builder::tempfile", reason = "creates under the shared temp root; use `ipe_sandbox::scratch::ScratchFile` or `Builder::tempfile_in`", allow-invalid = true },
     # An ownership change by name follows whatever object the name reaches when
     # the call lands, which a racer can swap. Ownership changes go through a held
-    # handle (`std::os::unix::fs::fchown`). `allow-invalid` keeps non-unix
-    # targets, which have no such path, quiet.
+    # handle (`std::os::unix::fs::fchown`, `rustix::fs::fchown`). `allow-invalid`
+    # keeps targets that have no such path quiet.
     { path = "std::os::unix::fs::chown", reason = "changes the owner of whatever the name reaches; use `fchown` on a held handle", allow-invalid = true },
     { path = "std::os::unix::fs::lchown", reason = "changes the owner of whatever the name reaches; use `fchown` on a held handle", allow-invalid = true },
+    { path = "rustix::fs::chown", reason = "changes the owner of whatever the name reaches; use `fchown` on a held handle", allow-invalid = true },
+    { path = "rustix::fs::chownat", reason = "changes the owner of whatever the name reaches; use `fchown` on a held handle", allow-invalid = true },
     # A refused OS thread must come back as an error the caller routes, never
     # a panic: every thread starts through `std::thread::Builder`.
     { path = "std::thread::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn` and route the `io::Error`" },
