@@ -421,7 +421,7 @@ fn a_tree_swapped_for_a_symlink_after_hold_is_never_chowned_by_name() {
             .spawn(move || race_tree_name(&tree, &decoy, &done))
             .expect("the racer thread starts")
     };
-    let raced: Vec<JailOutcome> = (0..32)
+    let outcomes: Vec<JailOutcome> = (0..32)
         .map(|_| build_in_jail(&inert_tools(), &profile, &mounts, &payload))
         .collect();
     done.store(true, Ordering::Relaxed);
@@ -438,7 +438,7 @@ fn a_tree_swapped_for_a_symlink_after_hold_is_never_chowned_by_name() {
     );
     assert!(
         swaps > 0,
-        "the racer swapped the tree name during {raced:?}"
+        "the racer swapped the tree name during {outcomes:?}"
     );
     assert_eq!(decoy_after, decoy_owner, "the decoy owner never moves");
     assert_eq!(

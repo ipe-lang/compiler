@@ -241,7 +241,7 @@ const OWNERSHIP_BY_NAME: &str = "an ownership change other than the held-handle 
 struct Act {
     line: usize,
     function: String,
-    act: String,
+    call: String,
 }
 
 /// One refused statement or word: its line, the rule, and the text.
@@ -269,7 +269,7 @@ impl Findings {
             .iter()
             .filter(|act| {
                 open.iter()
-                    .position(|&(f, a)| f == act.function && a == act.act)
+                    .position(|&(f, a)| f == act.function && a == act.call)
                     .map(|at| open.swap_remove(at))
                     .is_none()
             })
@@ -281,7 +281,7 @@ impl Findings {
         let mut found: Vec<(&str, &str)> = self
             .acts
             .iter()
-            .map(|act| (act.function.as_str(), act.act.as_str()))
+            .map(|act| (act.function.as_str(), act.call.as_str()))
             .collect();
         ADMITTED
             .iter()
@@ -304,7 +304,7 @@ impl Findings {
             .map(|act| {
                 format!(
                     "line {}: `{}` in `{}` is not an admitted root act",
-                    act.line, act.act, act.function
+                    act.line, act.call, act.function
                 )
             })
             .collect();
@@ -541,7 +541,7 @@ fn scan(source: &str) -> Option<Findings> {
             acts.push(Act {
                 line: line_at(at),
                 function: enclosing_fn(module, at),
-                act,
+                call: act,
             });
         }
         if let Some((rule, what)) = refusal_at(module, at, word) {
@@ -600,7 +600,7 @@ fn the_root_act_scan_refuses_the_control_fixture() {
     let unadmitted: Vec<(&str, &str)> = findings
         .unadmitted()
         .iter()
-        .map(|act| (act.function.as_str(), act.act.as_str()))
+        .map(|act| (act.function.as_str(), act.call.as_str()))
         .collect();
     assert_eq!(
         unadmitted,
