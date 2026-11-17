@@ -5297,8 +5297,11 @@ fn assert_one_page_renderer(name: &str, src: &str, mentions: usize) {
         mentions,
         "{name}: every link and the routed app render through the one renderer"
     );
+    // An inline renderer is a closure over a borrowed page; the routed app's
+    // `set_page` closure takes its page by value and is no renderer.
+    let collapsed: String = src.chars().filter(|c| !c.is_whitespace()).collect();
     assert!(
-        !src.contains("move |__page:"),
+        !collapsed.contains("move|__page:&"),
         "{name}: no inline renderer is emitted beside the table's item"
     );
 }
