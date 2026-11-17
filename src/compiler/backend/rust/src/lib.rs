@@ -1315,7 +1315,7 @@ pub(crate) struct EmitCtx<'a> {
     /// `true` when the program uses at least one `Ipe.WebView` app-entry kernel.
     /// When set, the emitted project gains the `"webview"` Cargo feature
     /// (which transitively pulls `"live"`) and the main entry is switched to
-    /// `block_on_current_thread` (tao/Cocoa requires the process main thread).
+    /// `block_on_current_thread_entry` (tao/Cocoa requires the process main thread).
     pub(crate) uses_webview: bool,
     /// The desktop window configuration for a webview-native delivery, threaded
     /// from the CLI's resolved `delivery.desktop`. `None` selects the runtime's

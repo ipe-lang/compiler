@@ -893,6 +893,8 @@ const _WASI_EFFECT_FLOOR_SEAL: () = {
     // single-thread executor (no tokio, no spawn) is the LIVE arm on WASI.
     let _ = crate::task::task_run::<E, ()>;
     let _ = crate::task::block_on::<E, i64>;
+    // The entry `fn main` calls: it builds the entry task inside the catch.
+    let _ = crate::task::block_on_entry::<E, i64, fn() -> crate::core::IpeTask<E, i64>>;
     let _ = crate::task::task_parallel::<E, i64>;
 };
 

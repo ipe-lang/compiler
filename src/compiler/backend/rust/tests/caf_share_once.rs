@@ -173,7 +173,7 @@ fn ipe_main_is_never_wrapped() -> DResult<()> {
         main_rs.contains("pub fn ipe_main()"),
         "ipe_main is emitted:\n{main_rs}"
     );
-    // `block_on(ipe_main())` needs a fresh future each call — the entry point is
+    // `block_on_entry(ipe_main)` needs a fresh future each call — the entry point is
     // never memoised.
     assert!(
         !main_rs.contains("static CELL"),

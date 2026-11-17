@@ -643,7 +643,7 @@ pub fn render_type_at(
         IrType::WebApp if ctx.target == ipe_ir::Target::WasmClient => "IpeTask<()>".to_owned(),
         // A `Web.tea` handle renders to the served `WebApp` unless the delivery
         // host is webview-native (`web desktop`): then the same DOM app is driven
-        // by `WebViewApp`, whose `run_blocking` runs the event loop on the process
+        // by `WebViewApp`, whose shape entry runs the event loop on the process
         // main thread (tao/Cocoa requirement). One shape, two host executors.
         IrType::WebApp if ctx.uses_webview => "ipe_runtime::tea::WebViewApp".to_owned(),
         IrType::WebApp => "ipe_runtime::tea::WebApp".to_owned(),

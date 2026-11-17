@@ -14,7 +14,7 @@
 //! (`ipe_backend_rust::emit_expr`) only recognised a FLAT body. A
 //! `case`-branched body where EVERY arm returns a `Task` left `ipe_main`
 //! returning `IpeResult<E, A>` while the `fn main` epilogue's
-//! `block_on(ipe_main())` requires `IpeTask<A>`. Fixed by recursing the
+//! `block_on_entry(ipe_main)` requires `IpeTask<A>`. Fixed by recursing the
 //! elision through `Match` / `If` / `Let` / `Destructure` tail positions.
 //!
 //! ## Why the emit-only assertions run in the DEFAULT gate
@@ -97,7 +97,7 @@ fn nested_str_literal_ctor_payload_does_not_emit_bare_str_pattern() {
 }
 
 /// Defect 2 pin: `ipe_main` must return `IpeTask<…>` (the shape the
-/// `block_on(ipe_main())` epilogue requires), never `IpeResult<…>` — even
+/// `block_on_entry(ipe_main)` epilogue requires), never `IpeResult<…>` — even
 /// though the body is a `case`, not a flat Task body.
 #[test]
 fn case_branched_entry_point_elides_task_run_to_ipetask() {
@@ -113,7 +113,7 @@ fn case_branched_entry_point_elides_task_run_to_ipetask() {
     assert!(
         main_rs.contains("fn ipe_main() -> IpeTask<"),
         "ipe_main must return IpeTask<…> even when its body is a `case` \
-         whose every arm returns a Task — the block_on(ipe_main()) \
+         whose every arm returns a Task — the block_on_entry(ipe_main) \
          epilogue requires a Task, not a Result. Got signature region:\n{}",
         main_rs
             .lines()

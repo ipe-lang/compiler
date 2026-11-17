@@ -1,22 +1,18 @@
-//! A runaway recursion ends as the typed `LimitExceeded` trip, never a
-//! foreign-panic record, on both emitted runtime shapes.
+//! A runaway recursion ends as the typed `LimitExceeded` trip and exit 1, never
+//! a foreign-panic record, on every emitted entry.
 //!
-//! The tokio shape runs the recursion inside the entry task, so the entry
-//! boundary converts the trip into `LimitExceeded` and the program exits 1
-//! through the error funnel. The std-only program computes its value while
-//! `fn main` builds the entry task, outside the entry catch, so this test pins
-//! only what holds there: the classifier names the trip by its type, no
-//! foreign-panic record is written, and the exit is a code, not a signal. Its
-//! exit code is deliberately left unpinned: the defect is that the emitted
-//! entry builds the task before the catch (any shape, the tokio one included,
-//! when the work is not deferred behind `Task.andThen`); the required outcome
-//! is the tokio shape's `LimitExceeded` and exit 1.
+//! The emitted `fn main` hands `ipe_main` to the entry unbuilt, so a value
+//! `main` computes eagerly while it builds its task (or its shape-app leaf) is
+//! computed inside the entry catch, the same as work deferred into the task
+//! behind `Task.andThen`. Each fixture pins that on one entry: the tokio entry
+//! with deferred and with eager work, the std-only entry, and a `Cli.tea`
+//! shape app whose `main` trips before the leaf exists.
 //!
 //! Gated on `IPE_E2E=1`; without it the test returns early.
 
 /// Runaway non-tail recursion deferred into the task behind `Task.andThen`.
 /// Every `Task` kernel is reactor-requiring, so this emits the tokio entry.
-const TOKIO_SHAPE: &str = "module Main exposing (main)
+const TOKIO_DEFERRED: &str = "module Main exposing (main)
 import Ipe.Task as Task
 import Ipe.String as String
 import Ipe.Io as Io
@@ -34,8 +30,29 @@ main =
         |> Task.andThen (\\n -> Io.println (String.fromInt (bounce n)))
 ";
 
-/// The same recursion under only reactor-free kernels: the std-only entry.
-const STD_SHAPE: &str = "module Main exposing (main)
+/// The same recursion computed while `main` builds its task, under the tokio
+/// entry: `bounce 0` is the argument of `Task.succeed`, evaluated eagerly.
+const TOKIO_EAGER: &str = "module Main exposing (main)
+import Ipe.Task as Task
+import Ipe.String as String
+import Ipe.Io as Io
+
+bounce : Int -> Int
+bounce n =
+    1 + settle n
+
+settle : Int -> Int
+settle n =
+    1 + bounce n
+
+main =
+    Task.succeed (bounce 0)
+        |> Task.andThen (\\n -> Io.println (String.fromInt n))
+";
+
+/// The same recursion under only reactor-free kernels: the std-only entry,
+/// computed while `main` builds its task.
+const STD_EAGER: &str = "module Main exposing (main)
 import Ipe.String as String
 import Ipe.Io as Io
 
@@ -49,6 +66,53 @@ settle n =
 
 main =
     Io.println (String.fromInt (bounce 0))
+";
+
+/// A `Cli.tea` shape app whose `main` computes the recursion before it builds
+/// the `CliApp` leaf: the trip fires while `ipe_main` runs, before any leaf.
+const CLI_TEA_EAGER: &str = "module Main exposing (main)
+import Ipe.Tea.Cli as Cli
+import Ipe.Ui.Cli as Ui
+import Ipe.Tea.Terminal.Cmd
+import Ipe.Tea.Cli.Sub
+
+type Msg = Line String
+
+type alias Model = { count : Int }
+
+bounce : Int -> Int
+bounce n =
+    1 + settle n
+
+settle : Int -> Int
+settle n =
+    1 + bounce n
+
+update msg model =
+    case msg of
+        Line _ ->
+            ( { model | count = model.count + 1 }, Cmd.none )
+
+view _model =
+    Ui.text \"ok\"
+
+subscriptions _model =
+    Sub.onLine onLine
+
+onLine s =
+    Line s
+
+main =
+    let
+        start =
+            bounce 0
+    in
+    Cli.tea
+        { init = \\_ -> ( { count = start }, Cmd.none )
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        }
 ";
 
 /// Build `source` as a one-module project and run it, capturing stderr.
@@ -83,42 +147,38 @@ fn assert_classified_trip(name: &str, stderr: &str) {
     );
 }
 
+/// The entry types the trip as `LimitExceeded` and ends through the error
+/// funnel with exit 1, printing nothing to stdout.
+fn assert_typed_limit_exit(name: &str, source: &str) {
+    let run = run_program(name, source);
+    assert_eq!(
+        run.exit_code,
+        Some(1),
+        "{name}: the entry must end a trip through the error funnel (exit 1)\n\
+         --- stderr ---\n{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr
+            .contains("LimitExceeded: maximum recursion depth exceeded"),
+        "{name}: the entry must type the trip as LimitExceeded\n--- stderr ---\n{}",
+        run.stderr
+    );
+    assert_classified_trip(name, &run.stderr);
+    assert_eq!(
+        run.stdout, "",
+        "{name}: no value is printed once the trip fires"
+    );
+}
+
 /// Runs in the `e2e` CI job (`IPE_E2E=1`).
 #[test]
-fn deep_recursion_is_typed_on_both_shapes() {
+fn deep_recursion_is_typed_on_every_entry() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-
-    let tokio = run_program("deep_recursion_tokio", TOKIO_SHAPE);
-    assert_eq!(
-        tokio.exit_code,
-        Some(1),
-        "the entry boundary must end a trip through the error funnel (exit 1)\n\
-         --- stderr ---\n{}",
-        tokio.stderr
-    );
-    assert!(
-        tokio
-            .stderr
-            .contains("LimitExceeded: maximum recursion depth exceeded"),
-        "the entry boundary must type the trip as LimitExceeded\n--- stderr ---\n{}",
-        tokio.stderr
-    );
-    assert_classified_trip("deep_recursion_tokio", &tokio.stderr);
-    assert_eq!(tokio.stdout, "", "no value is printed once the trip fires");
-
-    let std_only = run_program("deep_recursion_std", STD_SHAPE);
-    assert!(
-        std_only.exit_code.is_some_and(|code| code != 0),
-        "a trip must exit with a nonzero CODE, never a signal death; got {:?}\n\
-         --- stderr ---\n{}",
-        std_only.exit_code,
-        std_only.stderr
-    );
-    assert_classified_trip("deep_recursion_std", &std_only.stderr);
-    assert_eq!(
-        std_only.stdout, "",
-        "no value is printed once the trip fires"
-    );
+    assert_typed_limit_exit("deep_recursion_tokio", TOKIO_DEFERRED);
+    assert_typed_limit_exit("deep_recursion_tokio_eager", TOKIO_EAGER);
+    assert_typed_limit_exit("deep_recursion_std", STD_EAGER);
+    assert_typed_limit_exit("deep_recursion_cli_tea", CLI_TEA_EAGER);
 }
