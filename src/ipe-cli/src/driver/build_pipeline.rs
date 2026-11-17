@@ -3634,20 +3634,30 @@ mod tests {
         );
         let emitted = emitted.expect("the gate compile emits");
         let dep = emitted.path().join(RUNTIME_DEP_DIR);
-        let lib = fs::read_to_string(dep.join("src/lib.rs")).expect("the bundled runtime's lib.rs");
-        let manifest =
-            fs::read_to_string(dep.join("Cargo.toml")).expect("the bundled runtime's manifest");
-        let embedded = RuntimeSource::Embedded
+        let embedded_bundle = RuntimeSource::Embedded
             .bundled(role)
-            .expect("the embedded runtime bundles")
-            .digest();
+            .expect("the embedded runtime bundles");
+        let embedded = embedded_bundle.digest();
         let overridden = runtime
             .bundled(role)
             .expect("the override bundles")
             .digest();
+        let differing = embedded_bundle
+            .files()
+            .iter()
+            .filter(|(rel, text)| fs::read_to_string(dep.join(rel)).ok().as_ref() != Some(*text))
+            .map(|(rel, _)| rel.clone())
+            .collect::<Vec<_>>();
+        let override_lib = fs::read_to_string(dep.join("src/lib.rs")).ok();
+        let manifest =
+            fs::read_to_string(dep.join("Cargo.toml")).expect("the bundled runtime's manifest");
         let _ = fs::remove_dir_all(&root);
         assert!(
-            !lib.contains(MARKER),
+            differing.is_empty(),
+            "a gate's emit differs from the embedded bundle at {differing:?}"
+        );
+        assert!(
+            !override_lib.is_some_and(|lib| lib.contains(MARKER)),
             "the override's source reached a gate's emit"
         );
         assert!(
