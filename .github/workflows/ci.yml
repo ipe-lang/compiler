@@ -1792,14 +1792,15 @@ jobs:
 
       # Enforce (INSIDE the jail): net + fs-escape must be DENIED. Paired with the
       # control above, this is the duality that proves the denial is the jail's.
-      # `sudo -E` matches the admission-sandbox linux invocation (bwrap needs the
-      # user-namespace setup the hosted runner grants under sudo); -E forwards the
-      # ESCAPE_PATH/timeout env into the jail wrapper.
+      # `sudo` matches the admission-sandbox linux invocation (bwrap needs the
+      # user-namespace setup the hosted runner grants under sudo). The
+      # ESCAPE_PATH/timeout knobs pass as explicit `env` argv, never through
+      # `-E`: sudo-rs ignores `-E`, and the wrapper refuses an unset ESCAPE_PATH.
       - name: Admission enforce (jailed — forbidden actions must be blocked)
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
-        run: sudo -E tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
 
       # The real reconciler through the real bwrap+seccomp jail (the linux-x64
       # build_in_jail path): used-but-undeclared rejects, benign certifies.

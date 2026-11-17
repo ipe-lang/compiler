@@ -132,7 +132,7 @@ jobs:
       - name: Positive control (no jail — forbidden actions must succeed)
         env:
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
-        run: sudo -E env PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
+        run: sudo env PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
 
       - name: Run admission jail
         env:
@@ -140,7 +140,28 @@ jobs:
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
         # sudo: bwrap needs root to set up uid/gid maps on GHA runners
         # (the runner user has no /etc/subuid entry).
-        run: sudo -E tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+        # The jail's knobs pass as explicit `env` argv: a `sudo` that does not
+        # forward the caller's environment (sudo-rs ignores `-E`) would otherwise
+        # drop them, and the wrapper refuses an unset ESCAPE_PATH.
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+
+      # The jail reads its input from the launcher's descriptor, never by host
+      # path: a fixture under a directory only the runner user can traverse
+      # still runs, even where the jailed root holds no capabilities.
+      - name: Run admission jail on an input the jailed principal cannot reach by path
+        env:
+          ADMISSION_TIMEOUT_SECS: '60'
+          ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
+        run: |
+          held="$(mktemp -d "$RUNNER_TEMP/admission-held-XXXXXX")"
+          chmod 0700 "$held"
+          cp tests/fixtures/admission/untrusted-build.sh "$held/untrusted-build.sh"
+          sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh "$held/untrusted-build.sh"
+
+      # The wrapper refuses, before building any jail, an unset ESCAPE_PATH and
+      # an input that is not a readable regular file.
+      - name: Jail wrapper refusals (fail closed before the jail)
+        run: sh tools/scripts/admission/jail-linux-refusals.sh
 
   # Required `linux-x64 (seccomp socket-deny + bubblewrap)` context:
   # the tests-phase verdict over `linux-x64-jail`.
@@ -187,14 +208,35 @@ jobs:
       - name: Positive control (no jail — forbidden actions must succeed)
         env:
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
-        run: sudo -E env PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
+        run: sudo env PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
 
       - name: Run admission jail
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
         # sudo: bwrap needs root to set up uid/gid maps on GHA runners
-        run: sudo -E tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+        # The jail's knobs pass as explicit `env` argv: a `sudo` that does not
+        # forward the caller's environment (sudo-rs ignores `-E`) would otherwise
+        # drop them, and the wrapper refuses an unset ESCAPE_PATH.
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+
+      # The jail reads its input from the launcher's descriptor, never by host
+      # path: a fixture under a directory only the runner user can traverse
+      # still runs, even where the jailed root holds no capabilities.
+      - name: Run admission jail on an input the jailed principal cannot reach by path
+        env:
+          ADMISSION_TIMEOUT_SECS: '60'
+          ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
+        run: |
+          held="$(mktemp -d "$RUNNER_TEMP/admission-held-XXXXXX")"
+          chmod 0700 "$held"
+          cp tests/fixtures/admission/untrusted-build.sh "$held/untrusted-build.sh"
+          sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh "$held/untrusted-build.sh"
+
+      # The wrapper refuses, before building any jail, an unset ESCAPE_PATH and
+      # an input that is not a readable regular file.
+      - name: Jail wrapper refusals (fail closed before the jail)
+        run: sh tools/scripts/admission/jail-linux-refusals.sh
 
   # Required `linux-arm64 (seccomp socket-deny + bubblewrap)` context:
   # the tests-phase verdict over `linux-arm64-jail`.
