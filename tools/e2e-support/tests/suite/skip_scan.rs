@@ -310,6 +310,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
         "an exec-path payload host, inert unless its parent test re-executes it",
     ),
     (
+        "src/compiler/sandbox/tests/build_jail_freebsd_e2e.rs",
+        "jail_base_home_child",
+        "a payload host run under its own HOME, inert unless its parent test re-executes it",
+    ),
+    (
         "src/ipe-cli/tests/wasm_target_gate.rs",
         "hydrate_glue_type_name_matches_emitted_struct_and_compiles_for_wasm",
         "the wasm32 rustup target is not installed",
