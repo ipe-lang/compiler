@@ -467,6 +467,8 @@ mod tests {
             ("https://a.localhost/", SCHEME, NavRefusal::NotPublicHost),
             ("https://intranet/", SCHEME, NavRefusal::NotPublicHost),
             ("https://1.2.3.4.5/", SCHEME, NavRefusal::NotPublicHost),
+            ("https://0x7f.0x1/", SCHEME, NavRefusal::NotPublicHost),
+            ("https://10.0.0.0xa/", SCHEME, NavRefusal::NotPublicHost),
             (
                 "https://ipe-app.localhost/x",
                 SCHEME,

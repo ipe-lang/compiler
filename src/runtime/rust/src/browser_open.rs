@@ -148,10 +148,11 @@ fn check_authority(authority: &str, origin: BrowserOrigin) -> Result<(), Browser
 }
 
 /// Whether `host` is a lowercase name of at least two LDH labels, the last
-/// not all digits, outside the `localhost` family.
+/// not a number, outside the `localhost` family.
 ///
 /// An IP literal has no representation: a `[` is not an LDH byte, and a
-/// dotted IPv4 address ends in an all-digit label.
+/// browser reads a host whose last label is a number as IPv4 (see
+/// [`is_ipv4_number`]).
 fn is_public_host(host: &str) -> bool {
     if host.is_empty() || host.len() > MAX_HOST_LEN {
         return false;
@@ -166,10 +167,20 @@ fn is_public_host(host: &str) -> bool {
                 .bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
     });
-    let last_is_name = labels
-        .last()
-        .is_some_and(|last| !last.bytes().all(|b| b.is_ascii_digit()));
+    let last_is_name = labels.last().is_some_and(|last| !is_ipv4_number(last));
     well_formed && labels.len() >= 2 && last_is_name && labels.last() != Some(&"localhost")
+}
+
+/// Whether a browser's URL parser reads the lowercase LDH `label` as an IPv4 number.
+///
+/// A host whose last label is one is parsed as an IPv4 address: decimal and
+/// octal labels are all digits, and a hex label is `0x` followed by hex
+/// digits, none at all included (`https://0x7f.0x1/` is `127.0.0.1`).
+fn is_ipv4_number(label: &str) -> bool {
+    label.bytes().all(|b| b.is_ascii_digit())
+        || label
+            .strip_prefix("0x")
+            .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// Refuse a `port` that is not `1..=65535` written in ASCII digits alone.
@@ -718,6 +729,9 @@ mod tests {
             "https://a-b.example.co.uk/x",
             "https://xn--bcher-kva.example/",
             "https://123.example/",
+            "https://a.0xg/",
+            "https://0x7f.example/",
+            "https://a.x0/",
         ] {
             assert!(external(raw).is_ok(), "{raw}");
         }
@@ -732,6 +746,12 @@ mod tests {
             ("https://a.localhost/", BrowserUrlRefusal::Host),
             ("https://intranet/", BrowserUrlRefusal::Host),
             ("https://1.2.3.4.5/", BrowserUrlRefusal::Host),
+            ("https://0x7f.0x1/", BrowserUrlRefusal::Host),
+            ("https://127.0.0.0x1/", BrowserUrlRefusal::Host),
+            ("https://0x7f.0x0.0x0.0x1/", BrowserUrlRefusal::Host),
+            ("https://a.0x/", BrowserUrlRefusal::Host),
+            ("https://a.0xff:8443/", BrowserUrlRefusal::Host),
+            ("https://0177.0.0.01/", BrowserUrlRefusal::Host),
             ("https://Example.com/", BrowserUrlRefusal::Host),
             ("https://-a.example/", BrowserUrlRefusal::Host),
             ("https://a..example/", BrowserUrlRefusal::Host),
