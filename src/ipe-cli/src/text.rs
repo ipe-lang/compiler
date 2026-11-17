@@ -124,6 +124,7 @@ relayable!(
     crate::pack::mobile::MobileRefusal,
     crate::bundle_www::BundleError,
     crate::pack::desktop::DesktopRefusal,
+    crate::driver::ClientDesktopRefusal,
     crate::ffi::WrapperRefusal,
     crate::ffi::BuildScriptsBanner,
     ipe_watch::ScopeError,
@@ -859,8 +860,6 @@ messages! {
     delivery_client_host_has_no_dev_run(delivery, host) = "delivery-client-host-has-no-dev-run";
     /// `ipe dev watch` was handed a `client` delivery, which has no server to restart.
     delivery_watch_serves_only(delivery) = "delivery-watch-serves-only";
-    /// A `web client desktop` delivery was asked to build, and no packer builds it.
-    delivery_client_desktop_has_no_packer = "delivery-client-desktop-has-no-packer";
     /// A co-located WASI build was asked for a non-`Direct` shape.
     delivery_wasi_requires_direct_shape(shape) = "delivery-wasi-requires-direct-shape";
     /// A co-located WASI engine was asked for a non-WASI triple.
@@ -1965,6 +1964,12 @@ messages! {
     wasm_ipe_binary_unknown(detail) = "wasm-ipe-binary-unknown";
     /// The mobile shell's `web client` bundle build failed.
     mobile_wasm_build_failed(code) = "mobile-wasm-build-failed";
+    /// A `web client desktop` project accepts push or names push identifiers.
+    client_desktop_push = "client-desktop-push";
+    /// A `web client desktop` bundle id cannot key the app's storage directory.
+    client_desktop_storage_key(id, reason) = "client-desktop-storage-key";
+    /// A `web client desktop` project pins a loopback server.
+    client_desktop_local_origin(origin) = "client-desktop-local-origin";
     /// `--emit-permissions` failed.
     emit_permissions_failed(verb, detail) = "emit-permissions-failed";
     /// `ipe package validate-entry` was given more than one path.

@@ -329,7 +329,7 @@ Compile a program to a native or WebAssembly development artifact, with Debug.* 
 ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 ```
 
-**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable). With no delivery args, `dev build` builds the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent) and ignores its static or cross target; when `ships` declares several, it refuses and lists the command for each. `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
+**Arguments:** dir: a project directory (default: the current directory). shape is derived from `main` and, if written, only cross-checked. runtime/host apply to `web` only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target), and a host is desktop/ios/android. A `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable); `web client desktop` packs the wasm client into a native desktop shell that serves it from memory, with no server process. With no delivery args, `dev build` builds the one delivery declared in `ships` in package.ipe (the served default when `ships` is absent) and ignores its static or cross target; when `ships` declares several, it refuses and lists the command for each. `release build` builds every declared delivery. Delivery args select a subset or override for this invocation only and never edit package.ipe.
 
 **Output:** a native build lands the runnable binary at `out/bin/<project-name>` under the project (copied there within the build), so it is findable even when a shared `CARGO_TARGET_DIR` places cargo's own output outside the project. A `web client` build publishes the browser bundle at `out/www/`, beside the emitted crate at `out/rust/`.
 
@@ -395,7 +395,7 @@ ipe dev watch [<dir>]
 
 ### `ipe release build`
 
-Build the production artifact, optimised and with Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop` and `web client desktop|ios|android` produce a production app bundle; `web client` produces a production browser bundle.
+Build the production artifact, optimised and with Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop` and `web client desktop|ios|android` produce a production app bundle (`web client desktop` packs the wasm client into a native shell that serves it from memory, its storage keyed by the bundle id); `web client` produces a production browser bundle.
 
 ```
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]

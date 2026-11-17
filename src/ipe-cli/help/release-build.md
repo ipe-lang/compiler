@@ -1,4 +1,4 @@
-Build the production artifact, optimised and with Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop` and `web client desktop|ios|android` produce a production app bundle; `web client` produces a production browser bundle.
+Build the production artifact, optimised and with Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop` and `web client desktop|ios|android` produce a production app bundle (`web client desktop` packs the wasm client into a native shell that serves it from memory, its storage keyed by the bundle id); `web client` produces a production browser bundle.
 
 ```
 ipe release build [<dir>] [<shape>] [<runtime>] [<host>]

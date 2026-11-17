@@ -657,6 +657,8 @@ jobs:
       # GLib/GTK/WebKit pkg-config files.
       - uses: ./.github/actions/webview-link-deps
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,time-core,uuid,webview --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features webview-shell --all-targets -- -D warnings
+      - run: cargo clippy -p ipe-runtime-rust --no-default-features --features browser-open --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,encoding,json,jwt,secret,uuid --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,url,websocket_client --all-targets -- -D warnings
       - run: cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,email,encoding,http_client,random,url --all-targets -- -D warnings

@@ -88,12 +88,68 @@ fn publish_www_snapshot_with(
     Ok((published, snapshot))
 }
 
+/// Publish the bundle of `crate_dir` as `www/` under `into`, its
+/// `index.html` policy meta swapped through `swaps`, and return each published
+/// asset's bundle path.
+///
+/// The paths and the published files come from one held read, so a table
+/// built from the paths names exactly the files written.
+///
+/// # Errors
+/// As [`publish_www`]; [`CliError::ProjectRefused`] carrying
+/// [`BundleError::PolicyMismatch`] or [`BundleError::IndexTooLarge`] for a
+/// page the swap refuses, and [`BundleError::NotABundlePath`] for an asset
+/// whose name a served bundle cannot carry. Nothing is published then.
+pub fn publish_policed_www(
+    crate_dir: &OwnedDir,
+    into: &OwnedDir,
+    swaps: &[PolicySwap],
+) -> Result<(PathBuf, Vec<ipe_runtime_rust::encoding::BundlePath>), CliError> {
+    let mut paths = Vec::new();
+    let published = publish_www_read(
+        crate_dir,
+        into,
+        AssetLimits::PRODUCTION,
+        |www, asset| {
+            if !asset.is_index_html() {
+                return www.read_asset(asset);
+            }
+            let bytes = www.read_index(asset)?;
+            swapped_policy(&www.shown(asset), bytes, swaps).map(String::into_bytes)
+        },
+        |asset, _| {
+            paths.push(asset.to_bundle_path()?);
+            Ok(())
+        },
+    )?;
+    Ok((published, paths))
+}
+
 /// [`publish_www`] under the ceilings `limits`, handing `keep` each asset's
 /// path and bytes before they are staged.
+// The method path names one `HeldSpa` lifetime; the reader must hold for all.
+#[allow(clippy::redundant_closure_for_method_calls)]
 fn publish_www_with(
     crate_dir: &OwnedDir,
     into: &OwnedDir,
     limits: AssetLimits,
+    keep: impl FnMut(&AssetPath, &[u8]) -> Result<(), BundleError>,
+) -> Result<PathBuf, CliError> {
+    publish_www_read(
+        crate_dir,
+        into,
+        limits,
+        |www, asset| www.read_asset(asset),
+        keep,
+    )
+}
+
+/// [`publish_www_with`], reading each asset's published bytes through `read`.
+fn publish_www_read(
+    crate_dir: &OwnedDir,
+    into: &OwnedDir,
+    limits: AssetLimits,
+    mut read: impl FnMut(&mut HeldSpa<'_>, &AssetPath) -> Result<Vec<u8>, BundleError>,
     mut keep: impl FnMut(&AssetPath, &[u8]) -> Result<(), BundleError>,
 ) -> Result<PathBuf, CliError> {
     let refused = |e: BundleError| CliError::ProjectRefused(Message::relay(&e));
@@ -101,7 +157,7 @@ fn publish_www_with(
     let mut www = bundle.spa.hold().map_err(refused)?;
     let staged = into.stage_dir(OutputArea::Www.dir_name())?;
     for asset in &bundle.assets {
-        let bytes = www.read_asset(&asset.path).map_err(refused)?;
+        let bytes = read(&mut www, &asset.path).map_err(refused)?;
         keep(&asset.path, &bytes).map_err(refused)?;
         let rel: PathBuf = asset
             .path
@@ -132,6 +188,44 @@ pub fn sole_policy<'c, T>(
         return None;
     };
     page.matches(meta(one)).nth(1).is_none().then_some(one)
+}
+
+/// One bundle policy meta and its packed-host form, for one worker choice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicySwap {
+    /// The meta the wasm build renders for a web server.
+    served: String,
+    /// The same policy rendered for the packed host.
+    hosted: String,
+}
+
+impl PolicySwap {
+    /// The swap of the served meta `served` for the host's `hosted`.
+    #[must_use]
+    pub const fn new(served: String, hosted: String) -> Self {
+        Self { served, hosted }
+    }
+}
+
+/// `bytes`, the page at `shown`, with its one policy meta swapped.
+///
+/// The one swap every packer runs: the page must hold exactly one meta of
+/// exactly one of `swaps`, replaced by that swap's host form.
+///
+/// # Errors
+/// [`BundleError::PolicyMismatch`] when the page is not UTF-8, or does not
+/// hold exactly one meta of exactly one of `swaps`.
+pub fn swapped_policy(
+    shown: &Path,
+    bytes: Vec<u8>,
+    swaps: &[PolicySwap],
+) -> Result<String, BundleError> {
+    let mismatch = || BundleError::PolicyMismatch {
+        path: shown.to_path_buf(),
+    };
+    let page = String::from_utf8(bytes).map_err(|_| mismatch())?;
+    let swap = sole_policy(&page, swaps, |swap| swap.served.as_str()).ok_or_else(mismatch)?;
+    Ok(page.replacen(&swap.served, &swap.hosted, 1))
 }
 
 /// How deep below `www/` the asset walk descends, in directory levels.

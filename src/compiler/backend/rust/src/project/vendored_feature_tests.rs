@@ -30,7 +30,7 @@ use crate::crate_specs::tokio_base_features;
 use crate::runtime_features::{RuntimeFeature, RuntimeFeatureSet};
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_ir::Target;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 #[path = "../../tests/support/rust_lex.rs"]
@@ -1148,8 +1148,11 @@ fn auth_wrappers_follow_auth_and_db() {
 }
 
 /// The dependency names `manifest`'s cross-platform `[dependencies]` table
-/// declares, and those its `[target.…]` tables declare, read by a TOML parser.
-fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+/// declares, and those its `[target.…]` tables declare as `(cfg, name)`, read
+/// by a TOML parser.
+type DependencyTables = (BTreeSet<String>, BTreeSet<(String, String)>);
+
+fn dependency_tables(manifest: &str) -> Result<DependencyTables, String> {
     let parsed: toml::Table = manifest.parse().map_err(|e| format!("not TOML: {e}"))?;
     let keys = |deps: Option<&toml::Value>| -> BTreeSet<String> {
         deps.and_then(toml::Value::as_table)
@@ -1162,8 +1165,12 @@ fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<Strin
         .and_then(toml::Value::as_table)
         .map(|targets| {
             targets
-                .values()
-                .flat_map(|t| keys(t.get("dependencies")))
+                .iter()
+                .flat_map(|(cfg, t)| {
+                    keys(t.get("dependencies"))
+                        .into_iter()
+                        .map(|dep| (cfg.clone(), dep))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1172,8 +1179,10 @@ fn dependency_tables(manifest: &str) -> Result<(BTreeSet<String>, BTreeSet<Strin
 
 /// Every dependency an augmenter adds lands in the cross-platform
 /// `[dependencies]` table, alone and composed in emit order, so no target's
-/// build loses a crate its vendored sources name; and every composition is
-/// valid TOML (no duplicate key).
+/// build loses a crate its vendored sources name — unless the runtime manifest
+/// declares that dependency under that same `[target.…]` key, the only cfg
+/// under which the vendored sources name it; and every composition is valid
+/// TOML (no duplicate key).
 #[test]
 fn augmenter_dependencies_land_in_the_main_table() {
     let async_base = async_runtime_cargo_toml(CARGO_TOML, &tokio_base_features())
@@ -1184,13 +1193,22 @@ fn augmenter_dependencies_land_in_the_main_table() {
         "precondition: the base carries both a main and a target-only dependency \
          table: {base_tables:?}"
     );
+    let runtime_tables = dependency_tables(RUNTIME_CARGO_TOML);
+    assert!(
+        matches!(&runtime_tables, Ok((_, target)) if !target.is_empty()),
+        "precondition: the runtime manifest carries a target-only dependency: {runtime_tables:?}"
+    );
+    let runtime_target = runtime_tables.map(|(_, target)| target).unwrap_or_default();
     let mut drift = Vec::new();
     let mut check = |name: &str, mode: &str, before: &str, after: &str| match (
         dependency_tables(before),
         dependency_tables(after),
     ) {
         (Ok((main_before, target_before)), Ok((main_after, target_after))) => {
-            for dep in target_after.difference(&target_before) {
+            for dep in target_after
+                .difference(&target_before)
+                .filter(|dep| !runtime_target.contains(*dep))
+            {
                 drift.push(format!("{name} ({mode}): {dep:?} landed in a target table"));
             }
             for dep in main_before.difference(&main_after) {
@@ -1245,7 +1263,7 @@ fn dependency_splice_targets_the_main_table() {
         .map_err(|e| format!("{e:?}"))
         .and_then(dependency_tables);
     assert!(
-        matches!(&tables, Ok((main, target)) if main.contains("c") && !target.contains("c")),
+        matches!(&tables, Ok((main, target)) if main.contains("c") && !target.iter().any(|(_, dep)| dep == "c")),
         "{tables:?}"
     );
     let no_newline = super::append_dependencies("[dependencies]\na = \"1\"", "c = \"1\"", "test");
@@ -1264,6 +1282,252 @@ fn dependency_splice_targets_the_main_table() {
         assert!(
             matches!(refused, Err(Diagnostic::CompilerBug { .. })),
             "a manifest without exactly one [dependencies] header refuses: {refused:?}"
+        );
+    }
+}
+
+/// The runtime crate's manifest, whose feature edges a vendored augmenter mirrors.
+const RUNTIME_CARGO_TOML: &str = include_str!("../../../../../runtime/rust/Cargo.toml");
+
+/// One augmenter whose promoted surface must enable what the same runtime
+/// feature enables: the runtime feature, the augmenter, and each feature the
+/// vendored build reaches another way, with why.
+type MirroredSurface = (
+    &'static str,
+    fn(&str) -> DResult<String>,
+    &'static [(&'static str, &'static str)],
+);
+
+/// Every augmenter that stands for one runtime crate feature.
+const MIRRORED: &[MirroredSurface] = &[(
+    "webview",
+    webview_cargo_toml,
+    &[(
+        "encoding",
+        "the vendored manifest keeps `encoding` off; the vendored module tree \
+         declares `encoding` / `bundle_route` by append for every webview program",
+    )],
+)];
+
+/// A manifest's `[features]` table: each feature and the names it lists.
+fn feature_edges(manifest: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let table = manifest
+        .parse::<toml::Table>()
+        .map_err(|e| format!("the manifest parses: {e}"))?;
+    let features = table
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .ok_or("the manifest has a [features] table")?;
+    features
+        .iter()
+        .map(|(name, list)| {
+            let list = list
+                .as_array()
+                .ok_or_else(|| format!("feature {name:?} lists names"))?;
+            let names = list
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| format!("feature {name:?} lists only strings"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((name.clone(), names))
+        })
+        .collect()
+}
+
+/// The features `seeds` enable under `edges`, closed over the table.
+///
+/// A `dep:` entry enables no feature; `name/feature` enables `name`, and
+/// `name?/feature` enables nothing of its own.
+fn feature_closure<'a>(
+    edges: &BTreeMap<String, Vec<String>>,
+    seeds: impl IntoIterator<Item = &'a str>,
+) -> BTreeSet<String> {
+    let mut on = BTreeSet::new();
+    let mut todo: Vec<String> = seeds.into_iter().map(str::to_owned).collect();
+    while let Some(name) = todo.pop() {
+        if !on.insert(name.clone()) {
+            continue;
+        }
+        for entry in edges.get(&name).into_iter().flatten() {
+            if entry.starts_with("dep:") {
+                continue;
+            }
+            let enabled = match entry.split_once('/') {
+                Some((dep, _)) if dep.ends_with('?') => continue,
+                Some((dep, _)) => dep,
+                None => entry.as_str(),
+            };
+            todo.push(enabled.to_owned());
+        }
+    }
+    on
+}
+
+/// Every feature name a vendored source gates on.
+fn vendored_gated_features() -> BTreeSet<String> {
+    let root = runtime_src();
+    let mut gated = BTreeSet::new();
+    for rel in rust_files(&root) {
+        let rel_s = rel.to_string_lossy().replace('\\', "/");
+        if REPLACED.contains(&rel_s.as_str()) || EXCLUDED.iter().any(|(f, _)| *f == rel_s) {
+            continue;
+        }
+        let src = std::fs::read_to_string(root.join(&rel)).expect("runtime source must read");
+        gated.extend(cfg_features(&src).into_iter().map(|(_, name)| name));
+    }
+    for text in [RUNTIME_MOD_RS, RUNTIME_CONFIG_RS] {
+        gated.extend(cfg_features(text).into_iter().map(|(_, name)| name));
+    }
+    for (_, body) in mod_rs_appends() {
+        gated.extend(cfg_features(&body).into_iter().map(|(_, name)| name));
+    }
+    gated
+}
+
+/// How `vendored` (an augmented manifest grown from `base`) departs from the
+/// runtime manifest `runtime` for `feature`.
+///
+/// Reports each feature a vendored source gates on that the runtime
+/// selection enables and the augmented default leaves off (unless `exempt`
+/// names it), and each feature the augmenter switches on that the runtime
+/// selection does not.
+fn mirror_drift(
+    feature: &str,
+    runtime: &str,
+    base: &str,
+    vendored: &str,
+    exempt: &[(&str, &str)],
+    gated: &BTreeSet<String>,
+) -> Result<Vec<String>, String> {
+    let runtime_on = feature_closure(&feature_edges(runtime)?, [feature]);
+    let vendored_edges = feature_edges(vendored)?;
+    let base_default = default_features(base);
+    let vendored_default = default_features(vendored);
+    let before = feature_closure(
+        &feature_edges(base)?,
+        base_default.iter().map(String::as_str),
+    );
+    let after = feature_closure(&vendored_edges, vendored_default.iter().map(String::as_str));
+    let mut drift = Vec::new();
+    for name in runtime_on.intersection(gated) {
+        if !after.contains(name) && !exempt.iter().any(|(e, _)| e == name) {
+            drift.push(format!(
+                "{feature}: the runtime enables {name:?}, the vendored build leaves it off"
+            ));
+        }
+    }
+    for name in after.difference(&before) {
+        if !runtime_on.contains(name) {
+            drift.push(format!(
+                "{feature}: the vendored build enables {name:?}, the runtime does not"
+            ));
+        }
+    }
+    for (name, _) in exempt {
+        if after.contains(*name) || !runtime_on.contains(*name) {
+            drift.push(format!("{feature}: stale exemption {name:?}"));
+        }
+    }
+    Ok(drift)
+}
+
+/// A vendored surface enables the features its runtime crate feature enables.
+///
+/// The augmenter's promoted default, closed over the vendored `[features]`
+/// table, holds every feature a vendored source gates on that the runtime
+/// crate's own selection of that feature enables, and adds none it does not:
+/// a vendored build compiles the same gated code a crate-dependency build
+/// does.
+#[test]
+fn webview_edges_mirror_the_runtime_manifest() {
+    let gated = vendored_gated_features();
+    assert!(
+        gated.contains("webview-shell") && gated.contains("browser-open"),
+        "precondition: the vendored sources gate on the webview shell: {gated:?}"
+    );
+    let async_base = async_runtime_cargo_toml(CARGO_TOML, &tokio_base_features())
+        .expect("async base must build");
+    let mut drift = Vec::new();
+    for (feature, augment, exempt) in MIRRORED {
+        let vendored = augment(&async_base).expect("the augmenter builds on the async base");
+        drift.extend(
+            mirror_drift(
+                feature,
+                RUNTIME_CARGO_TOML,
+                &async_base,
+                &vendored,
+                exempt,
+                &gated,
+            )
+            .expect("both manifests parse"),
+        );
+    }
+    assert!(
+        drift.is_empty(),
+        "a vendored surface enables other gated features than the runtime crate \
+         feature it stands for; mirror the runtime edges in templates/Cargo.toml \
+         and its augmenter:\n{}",
+        drift.join("\n")
+    );
+}
+
+/// A vendored manifest that drops or adds an edge is drift, and the webview
+/// surgery rewrites the declaration lines, never prose quoting them.
+#[test]
+fn feature_edge_drift_is_refused() {
+    const RUNTIME: &str =
+        "[features]\na = [\"b\", \"dep:x\"]\nb = [\"c\", \"t/sub\"]\nc = []\nt = []\n";
+    const BASE: &str = "[features]\ndefault = []\na = []\nb = [\"c\"]\nc = []\nd = []\nt = []\n";
+    let gated: BTreeSet<String> = ["a", "b", "c", "d", "t"].map(str::to_owned).into();
+    let check = |vendored: &str, exempt: &[(&str, &str)]| {
+        mirror_drift("a", RUNTIME, BASE, vendored, exempt, &gated).expect("fixtures parse")
+    };
+    let mirrored =
+        "[features]\ndefault = [\"a\"]\na = [\"b\", \"t\"]\nb = [\"c\"]\nc = []\nd = []\nt = []\n";
+    assert_eq!(check(mirrored, &[]), Vec::<String>::new());
+    let dropped = mirrored.replacen("a = [\"b\", \"t\"]", "a = [\"t\"]", 1);
+    assert_eq!(check(&dropped, &[]).len(), 2, "{:?}", check(&dropped, &[]));
+    let added = mirrored.replacen("a = [\"b\", \"t\"]", "a = [\"b\", \"t\", \"d\"]", 1);
+    assert_eq!(check(&added, &[]).len(), 1, "{:?}", check(&added, &[]));
+    assert_eq!(
+        check(mirrored, &[("c", "")]).len(),
+        1,
+        "a stale exemption is drift"
+    );
+
+    let vendored = webview_cargo_toml(CARGO_TOML).expect("the webview manifest builds");
+    let lines: Vec<&str> = vendored.lines().collect();
+    assert!(
+        lines.contains(&r#"webview = ["webview-shell", "web-core"]"#),
+        "{vendored}"
+    );
+    assert!(
+        lines.contains(&r#"webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]"#),
+        "{vendored}"
+    );
+    let table = vendored
+        .split_once("\n[target.'cfg(target_os = \"linux\")'.dependencies]\n")
+        .map(|(_, table)| table);
+    assert_eq!(
+        table,
+        Some("gtk = { version = \"0.18\", optional = true }\n"),
+        "gtk is a Linux-only optional dependency, as the runtime crate declares it: {vendored}"
+    );
+    assert!(!lines.contains(&"webview = []"), "{vendored}");
+    for drifted in [
+        CARGO_TOML.replacen("\nwebview = []\n", "\n", 1),
+        CARGO_TOML.replacen("\nwebview = []\n", "\nwebview = []\nwebview = []\n", 1),
+        CARGO_TOML.replacen("\nwebview-shell = [\"browser-open\"]\n", "\n", 1),
+        format!("{CARGO_TOML}\n[target.'cfg(target_os = \"linux\")'.dependencies]\n"),
+    ] {
+        assert_ne!(drifted, CARGO_TOML, "precondition: the fixture drifts");
+        let refused = webview_cargo_toml(&drifted);
+        assert!(
+            matches!(refused, Err(Diagnostic::CompilerBug { .. })),
+            "a manifest without exactly one anchor line refuses: {refused:?}"
         );
     }
 }

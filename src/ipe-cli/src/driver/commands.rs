@@ -6282,8 +6282,11 @@ mod declared_delivery_tests {
     };
     use crate::CliError;
     use crate::cli_args::{self, DeliveryArgs};
-    use crate::delivery::{Delivery, Host, Shape, TargetTriple};
-    use crate::delivery_set::{BinaryTarget, DeclaredDeliveries, PlannedDelivery, ShipEntry};
+    use crate::delivery::{Delivery, DeliveryError, Host, Runtime, Shape, TargetTriple};
+    use crate::delivery_set::{
+        BinaryTarget, BundleHost, DeclaredDeliveries, PlannedDelivery, ReleaseRoute, ShipEntry,
+        release_route,
+    };
     use crate::verb::Verb;
     use ipe_backend_rust::static_build::StaticTriple;
 
@@ -6561,19 +6564,84 @@ mod declared_delivery_tests {
         }
     }
 
-    /// A declared `web client desktop`, which no packer builds, is refused
-    /// before anything is built, by every command that would select it.
+    /// A `web client desktop` release lands under its own slug, never the served desktop's.
     #[test]
-    fn declared_client_desktop_is_refused_before_any_build() {
-        let ships = [ShipEntry::Desktop, ShipEntry::ClientDesktop];
-        let got = declared(&ships).for_release(Verb::RELEASE_BUILD.name(), None, None);
-        assert!(matches!(got, Err(CliError::ProjectRefused(_))), "{got:?}");
+    fn client_desktop_release_lands_under_its_slug() {
+        let slugs = release_slugs(&[ShipEntry::Desktop, ShipEntry::ClientDesktop], None);
+        assert_eq!(slugs, ["web-desktop", "web-client-desktop"], "{slugs:?}");
+        assert_eq!(
+            release_slugs(&[ShipEntry::ClientDesktop], None),
+            ["web-client-desktop"]
+        );
+    }
+
+    /// `ipe dev run` of a `web client desktop` is refused as a client bundle
+    /// with no dev run: the admission names the delivery, and the run's
+    /// refusal carries that same error, so a run never falls back to the bare
+    /// browser client.
+    #[test]
+    fn dev_run_web_client_desktop_stays_refused() {
+        let ships = [ShipEntry::ClientDesktop];
+        let built = resolve_delivery(
+            &declared(&ships),
+            &DeliveryArgs::Unstated,
+            None,
+            false,
+            Verb::DEV_BUILD.name(),
+            ADMIT_ANY,
+        );
+        let Ok(delivery) = built else {
+            assert!(built.is_ok(), "{built:?}");
+            return;
+        };
+        assert_eq!(
+            (delivery.runtime(), delivery.host()),
+            (Some(Runtime::Client), Host::Desktop)
+        );
+        let refusal = DeliveryError::ClientHostHasNoDevRun { delivery };
+        assert_eq!(admit_dev_run(delivery), Err(refusal.clone()));
+        let run = super::refuse_client_host_run(delivery);
+        let expected = crate::text::msg::command_refusal(&Verb::DEV_RUN, &refusal);
+        assert!(
+            matches!(&run, Err(CliError::Usage(message)) if *message == expected),
+            "{run:?}"
+        );
+        let resolved = resolve_delivery(
+            &declared(&ships),
+            &DeliveryArgs::Unstated,
+            None,
+            false,
+            Verb::DEV_RUN.name(),
+            admit_dev_run,
+        );
+        let expected = crate::text::msg::command_refusal(&Verb::DEV_RUN.name(), &refusal);
+        assert!(
+            matches!(&resolved, Err(CliError::ProjectRefused(message)) if *message == expected),
+            "the sole declared delivery has no dev run: {resolved:?}"
+        );
+    }
+
+    /// A declared `web client desktop` routes to its own packer: the release
+    /// plans it as its own member, and the dev build admits it as a bundle.
+    #[test]
+    fn release_route_routes_web_client_desktop_to_its_packer() {
+        let ships = [ShipEntry::ClientDesktop];
         let run = declared(&ships).sole_release_member(
             Verb::RELEASE_RUN.name(),
             None,
             Verb::RELEASE_BUILD.name(),
         );
-        assert!(matches!(run, Err(CliError::ProjectRefused(_))), "{run:?}");
+        let Ok(member) = run else {
+            assert!(run.is_ok(), "{run:?}");
+            return;
+        };
+        assert!(
+            matches!(
+                release_route(member.delivery()),
+                Ok(ReleaseRoute::Bundle(BundleHost::ClientDesktop))
+            ),
+            "{member:?}"
+        );
         let dev = resolve_delivery(
             &declared(&ships),
             &DeliveryArgs::Unstated,
@@ -6582,7 +6650,13 @@ mod declared_delivery_tests {
             Verb::DEV_BUILD.name(),
             ADMIT_ANY,
         );
-        assert!(matches!(dev, Err(CliError::ProjectRefused(_))), "{dev:?}");
+        assert!(
+            matches!(
+                dev.map(release_route),
+                Ok(Ok(ReleaseRoute::Bundle(BundleHost::ClientDesktop)))
+            ),
+            "{ships:?}"
+        );
     }
 
     /// A remedy line carries the project dir after its verb, so the printed

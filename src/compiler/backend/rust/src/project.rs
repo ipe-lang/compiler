@@ -1297,8 +1297,14 @@ const RUNTIME_MOD_RS_TUI_APPEND: &str = "pub mod terminal_access;\n\
 /// [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (which fires for `uses_web || uses_webview`
 /// and pulls in the ONE real `web` module — server items inside stay
 /// `#[cfg(feature = "web")]`, so a webview build compiles only the render core).
+///
+/// The window's link policy (`webview::nav_policy`, behind `webview-shell`)
+/// hands public links to `browser_open` and keeps webview data under
+/// `app_data`, so both are declared under the runtime crate's own gates.
 const RUNTIME_MOD_RS_WEBVIEW_APPEND: &str = "#[cfg(feature = \"webview\")]\npub mod webview;\n\
-     #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n";
+     #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n\
+     #[cfg(any(feature = \"webview-shell\", feature = \"browser-open\"))]\npub mod app_data;\n\
+     #[cfg(feature = \"browser-open\")]\npub mod browser_open;\n";
 
 /// The server-free render core, declared for EVERY render host (`uses_web ||
 /// uses_webview`): the ONE real `web` module (which compiles to just its
@@ -2122,7 +2128,7 @@ fn escape_toml_basic(s: &str) -> String {
 /// — a drifted dep-model manifest template, surfaced loudly rather than emitting
 /// a manifest that names no runtime.
 fn dep_model_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
-    let mut manifest = substitute_dep_manifest_anchors(
+    let mut manifest = substitute_program_features(
         CARGO_DEP_TOML,
         ctx,
         "ipe_backend_rust::project::dep_model_cargo_toml",
@@ -2165,7 +2171,7 @@ fn dep_model_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
 /// splice keys on has drifted — each surfaced loudly rather than emitting a
 /// manifest that names no runtime or drops a referenced crate.
 fn dep_model_wasm_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
-    let mut manifest = substitute_dep_manifest_anchors(
+    let mut manifest = substitute_program_features(
         CARGO_WASM_DEP_TOML,
         ctx,
         "ipe_backend_rust::project::dep_model_wasm_cargo_toml",
@@ -2203,16 +2209,42 @@ fn dep_model_wasm_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the features
 /// placeholder is absent from `template` — a drifted manifest template,
 /// surfaced loudly rather than emitting a manifest that names no runtime.
-fn substitute_dep_manifest_anchors(
+fn substitute_program_features(
     template: &str,
     ctx: &EmitCtx,
     where_: &'static str,
 ) -> DResult<String> {
+    let features = crate::runtime_features::runtime_features(ctx);
+    substitute_dep_manifest_anchors(template, &features.as_feature_names(), where_)
+}
+
+/// Render the native dependency-model `Cargo.toml` ([`CARGO_DEP_TOML`]) with
+/// exactly `features` selected on the runtime.
+///
+/// The manifest of a crate that is not an Ipê program, such as the
+/// `client desktop` shell.
+///
+/// # Errors
+///
+/// As [`substitute_dep_manifest_anchors`].
+pub fn dep_manifest_selecting(features: &[&str], where_: &'static str) -> DResult<String> {
+    substitute_dep_manifest_anchors(CARGO_DEP_TOML, features, where_)
+}
+
+/// Substitute the `__IPE_RUNTIME_FEATURES__` anchor in `template` with
+/// `features`, quoted and comma-separated.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the anchor is absent.
+fn substitute_dep_manifest_anchors(
+    template: &str,
+    features: &[&str],
+    where_: &'static str,
+) -> DResult<String> {
     const FEATURES_ANCHOR: &str = "__IPE_RUNTIME_FEATURES__";
 
-    let features = crate::runtime_features::runtime_features(ctx);
     let feature_list = features
-        .as_feature_names()
         .iter()
         .map(|f| format!("\"{f}\""))
         .collect::<Vec<_>>()
@@ -4285,38 +4317,47 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
 
 /// Build the webview-enabled `Cargo.toml` from the given base manifest by:
 ///
-/// 1. Adding `"webview"` to the `default` feature list.
-/// 2. Wiring the `webview = []` feature declaration to actually pull `wry` and
-///    `tao` (changes it to `webview = ["dep:wry", "dep:tao"]`).
+/// 1. Adding `"web-core"` and `"webview"` to the `default` feature list.
+/// 2. Rewriting the inert `webview` and `webview-shell` declarations to the
+///    runtime crate's own edges: `webview = ["webview-shell", "web-core"]` and
+///    `webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]`.
 /// 3. Appending `wry` and `tao` as optional dependencies to the `[dependencies]` table.
+/// 4. Appending `gtk` as an optional dependency in a Linux-only table, as the
+///    runtime crate declares it (`webview::shell::WindowSystem::open` starts
+///    GTK fallibly before tao).
 ///
-/// Called AFTER `server_cargo_toml` and `web_cargo_toml` so the live feature
-/// (which the webview backend imports from) is already promoted.
+/// A vendored webview build therefore enables exactly the features a
+/// runtime-crate `webview` selection enables among those the vendored
+/// manifest declares; `webview_edges_mirror_the_runtime_manifest` holds the
+/// two tables equal.
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if any anchor string is absent — a
-/// golden-drift invariant violation (fail-loud, never a silent no-op that
-/// ships a broken manifest or links the wrong backend).
+/// Returns [`Diagnostic::CompilerBug`] if any anchor line is absent or
+/// repeated — a golden-drift invariant violation (fail-loud, never a silent
+/// no-op that ships a broken manifest or links the wrong backend).
 fn webview_cargo_toml(base: &str) -> DResult<String> {
-    // All anchor consts must precede the first `let` statement.
+    const WHERE: &str = "ipe_backend_rust::project::webview_cargo_toml";
     const DEFAULT_PREFIX: &str = "default = [";
-    // Change the empty `webview = []` feature to pull wry + tao when active.
-    // The `dep:` prefix is Cargo's "explicit dep" syntax (Cargo ≥1.60), so
-    // `webview = ["dep:wry", "dep:tao"]` activates the optional deps ONLY when
-    // the `webview` feature is in the default list — the stub path gets no
-    // heavy system deps.
-    const WEBVIEW_EMPTY: &str = "webview = []";
-    const WEBVIEW_WITH_DEPS: &str = r#"webview = ["dep:wry", "dep:tao"]"#;
-    // wry + tao are declared optional so the stub path (no `webview` feature)
-    // never downloads or links them. Versions + names from the SSOT; the
-    // `optional = true` gate stays inline.
+    const WEBVIEW_INERT: &str = "webview = []";
+    const WEBVIEW_ACTIVE: &str = r#"webview = ["webview-shell", "web-core"]"#;
+    const SHELL_INERT: &str = r#"webview-shell = ["browser-open"]"#;
+    const SHELL_ACTIVE: &str =
+        r#"webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]"#;
+    const LINUX_DEPS: &str = r#"[target.'cfg(target_os = "linux")'.dependencies]"#;
+    // wry, tao and gtk are declared optional so a manifest that leaves
+    // `webview-shell` off never downloads or links them. Versions + names from
+    // the SSOT.
+    let optional = |spec: crate_specs::CrateSpec| {
+        format!(
+            "{} = {{ version = \"{}\", optional = true }}\n",
+            spec.name, spec.version
+        )
+    };
     let webview_native_deps = format!(
-        "{} = {{ version = \"{}\", optional = true }}\n{} = {{ version = \"{}\", optional = true }}\n\n",
-        crate_specs::WRY.name,
-        crate_specs::WRY.version,
-        crate_specs::TAO.name,
-        crate_specs::TAO.version,
+        "{}{}\n",
+        optional(crate_specs::WRY),
+        optional(crate_specs::TAO)
     );
 
     // Step 1 — promote `webview` to the default feature list (generic
@@ -4324,7 +4365,7 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
     let pfx = base
         .find(DEFAULT_PREFIX)
         .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
+            where_: WHERE,
             detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
         })?;
     let search_from = pfx + DEFAULT_PREFIX.len();
@@ -4332,42 +4373,93 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
         .get(search_from..)
         .and_then(|s| s.find(']'))
         .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
+            where_: WHERE,
             detail: "default feature list has no closing ']' — golden drifted".to_owned(),
         })?;
     let close = search_from + rel;
     let mut step1 = String::with_capacity(base.len() + 64);
     step1.push_str(base.get(..close).unwrap_or(""));
-    // Promote the server-free render core (`web-core`) alongside `webview`: the
+    // The server-free render core (`web-core`) rides alongside `webview`: the
     // native backend renders through `crate::dom` + `style_inject` + `page_shell`
-    // (all `#[cfg(feature = "web-core")]` in the vendored source) over a local IPC
-    // bridge, with NO axum `server` and NO `web` surface. This is the vendored
-    // counterpart of the dep-model, where the runtime crate's own `webview`
-    // feature pulls `web-core`.
+    // over a local IPC bridge, with NO axum `server` and NO `web` surface.
     step1.push_str(r#", "web-core", "webview""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — wire the `webview` feature to its deps (`dep:wry` + `dep:tao`).
-    // Fail-loud if the empty anchor drifted — a silent no-op here would promote
-    // `webview` to defaults without pulling wry/tao, shipping a build where the
-    // real backend compiles as stub (exit-0-then-runtime-Err).
-    let step2 = step1.replacen(WEBVIEW_EMPTY, WEBVIEW_WITH_DEPS, 1);
-    if step2 == step1 {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
-            detail: format!(
-                "Cargo.toml anchor {WEBVIEW_EMPTY:?} not found — golden drifted; \
-                 the webview feature declaration must be present to wire wry + tao"
-            ),
-        });
-    }
+    // Step 2 — wire the feature edges, each anchor matched as a whole line so a
+    // comment naming it is never the one rewritten.
+    let step2 = replace_feature_line(&step1, WEBVIEW_INERT, WEBVIEW_ACTIVE, WHERE)?;
+    let step3 = replace_feature_line(&step2, SHELL_INERT, SHELL_ACTIVE, WHERE)?;
 
     // Step 3 — append wry + tao as optional deps to the `[dependencies]` table.
-    append_dependencies(
-        &step2,
-        &webview_native_deps,
-        "ipe_backend_rust::project::webview_cargo_toml",
-    )
+    let step4 = append_dependencies(&step3, &webview_native_deps, WHERE)?;
+
+    // Step 4 — gtk, Linux-only, in a table of its own at the end.
+    append_table(&step4, LINUX_DEPS, &optional(crate_specs::GTK), WHERE)
+}
+
+/// Append the table `header` holding `entries` at the end of `base`.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when `base`
+/// already declares `header`: a second declaration of one table is a TOML
+/// error the emitted build would only meet in cargo.
+fn append_table(base: &str, header: &str, entries: &str, where_: &'static str) -> DResult<String> {
+    if base.lines().any(|line| line.trim() == header) {
+        return Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!("Cargo.toml already declares {header:?} — golden drifted"),
+        });
+    }
+    let mut out = String::with_capacity(base.len() + header.len() + entries.len() + 3);
+    out.push_str(base);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(header);
+    out.push('\n');
+    out.push_str(entries);
+    Ok(out)
+}
+
+/// Replace the one line of `base` equal to `inert` with `active`.
+///
+/// Only a whole line matches, so prose that quotes the declaration is never
+/// rewritten in its place.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) unless exactly
+/// one line equals `inert`.
+fn replace_feature_line(
+    base: &str,
+    inert: &str,
+    active: &str,
+    where_: &'static str,
+) -> DResult<String> {
+    let mut out = String::with_capacity(base.len() + active.len());
+    let mut hits = 0_usize;
+    for line in base.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body == inert {
+            hits += 1;
+            out.push_str(active);
+            out.push_str(line.get(body.len()..).unwrap_or(""));
+        } else {
+            out.push_str(line);
+        }
+    }
+    if hits == 1 {
+        Ok(out)
+    } else {
+        Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!(
+                "Cargo.toml declares {inert:?} on {hits} lines, not one — golden drifted"
+            ),
+        })
+    }
 }
 
 /// Build the websocket-client-enabled `Cargo.toml` from the given base manifest

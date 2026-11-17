@@ -107,6 +107,7 @@ const SHARED_MODULES: &[&str] = &[
     "src/runtime/rust/tests/support/cfg_scan.rs",
     "src/runtime/rust/tests/support/format_width.rs",
     "src/runtime/rust/tests/support/source_tree.rs",
+    "src/runtime/rust/tests/support/test_modules.rs",
 ];
 
 /// `(file, literal)` pairs whose test-file path is invented on purpose: a

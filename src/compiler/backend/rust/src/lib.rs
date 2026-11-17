@@ -16,6 +16,8 @@
 //! with. The [`ipe_backend::Backend`] trait stays string-free.
 
 mod capabilities;
+// The fixed native shell crate a `web client desktop` bundle is built from.
+pub mod client_shell;
 mod const_fold;
 pub use const_fold::fold_program;
 pub use emit_expr::rust_str_lit;

@@ -86,6 +86,7 @@ const HOST_NAMES: &[&str] = &[
     "GITHUB_TOKEN",
     "XDG_CACHE_HOME",
     "XDG_DATA_HOME",
+    "LOCALAPPDATA",
     "HOME",
     "SystemRoot",
     "DATABASE_URL",
