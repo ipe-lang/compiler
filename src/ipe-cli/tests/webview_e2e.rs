@@ -476,17 +476,17 @@ fn private_bin(tag: &str) -> Result<std::path::PathBuf, BoxError> {
 #[cfg(unix)]
 #[test]
 fn client_desktop_without_wasm_bindgen_names_the_tool() -> Result<(), BoxError> {
-    use ipe_sandbox::host_tool::{self, HostTool};
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return Ok(());
     }
     let test_name = "client_desktop_without_wasm_bindgen";
     let bin = private_bin(test_name)?;
-    for tool in [HostTool::Cargo, HostTool::Rustc] {
-        let found = host_tool::resolve(tool);
-        let Ok(found) = found else {
-            return Err(format!("{test_name}: {} must be on PATH: {found:?}", tool.name()).into());
-        };
+    for tool in [
+        ipe_sandbox::host_tool::HostTool::Cargo,
+        ipe_sandbox::host_tool::HostTool::Rustc,
+    ] {
+        let found = ipe_sandbox::host_tool::resolve(tool)
+            .map_err(|e| format!("{test_name}: {} must be on PATH: {e:?}", tool.name()))?;
         std::os::unix::fs::symlink(found.as_path(), bin.join(tool.name()))?;
     }
     let fixture = client_desktop_fixture(test_name, "{ bundleId = \"io.acme.counter\" }")?;
