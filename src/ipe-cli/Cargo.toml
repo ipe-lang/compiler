@@ -227,6 +227,8 @@ ipe_sandbox = { path = "../compiler/sandbox", features = ["assumed-tool-path"] }
 # this crate's graph, so no new package compiles.
 proc-macro2 = "1"
 syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
+# Assembles the WAT guests the WASI preopen confinement tests run.
+wat = "1"
 
 [lints]
 workspace = true
