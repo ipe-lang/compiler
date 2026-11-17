@@ -15,20 +15,45 @@
 # SECCOMP_RET_ERRNO(EPERM) on: socket, socketpair, connect, bind, accept,
 # accept4, listen, sendto, sendmsg, sendmmsg, recvfrom, recvmsg, recvmmsg.
 #
+# Input handover: the jail never resolves a host path to read its input. The
+# fixture is opened HERE, by the unjailed launcher, and bwrap copies it from
+# that descriptor (`--ro-bind-data`) to a read-only file inside the jail's own
+# tmpfs. The jailed process may hold fewer privileges than the launcher (a host
+# LSM profile can strip every capability from bwrap's children, so even uid 0
+# inside obeys the host's directory modes), so a host path it would have to
+# traverse — a checkout under a non-world-traversable home — is unreachable by
+# construction, and the jail's outcome must not depend on it. The working
+# directory is the scratch dir for the same reason.
+#
+# Privilege: the jailed process holds no capability (`--cap-drop ALL`, bounding
+# set included). bwrap run by root otherwise keeps every capability in the
+# sandbox, and a jailed root with CAP_SYS_ADMIN/CAP_MKNOD can remount the
+# read-only root or mount a host block device. Dropping them makes the jail's
+# privilege the same on every runner image, whatever its LSM profile strips.
+# Proved by `jail-linux-caps-probe.sh` run through this wrapper.
+#
 # Fail-closed: if bwrap is absent the script exits non-zero; if the seccomp
-# filter cannot be generated the script exits non-zero.
+# filter cannot be generated the script exits non-zero; if the fixture is not a
+# readable regular file, or ESCAPE_PATH is unset, the script exits non-zero
+# before any jail is built.
 
 set -eu
 
 FIXTURE="${1:-tests/fixtures/admission/untrusted-build.sh}"
+# Forwarded into the jail so the enforce run and the unjailed control run target
+# the SAME fs-escape path (bwrap makes it read-only via --ro-bind / /).
+# Required, never defaulted: a dropped variable (a `sudo` that does not forward
+# the caller's environment) must not silently point the enforce run at another
+# path than the control run proved writable.
+if [ -z "${ESCAPE_PATH:-}" ]; then
+    echo "ERROR: ESCAPE_PATH is unset -- the enforce run must target the path the control run proved writable" >&2
+    exit 1
+fi
 # Use /var/tmp, not /tmp: bwrap mounts --tmpfs /tmp which would hide any
 # /tmp/... bind-mount.  /var/tmp survives the --tmpfs /tmp overlay.
 SCRATCH="$(mktemp -d /var/tmp/admission-scratch-XXXXXX)"
 SECCOMP_FILTER="$(mktemp /var/tmp/admission-seccomp-XXXXXX)"
 TIMEOUT_SECS="${ADMISSION_TIMEOUT_SECS:-120}"
-# Forwarded into the jail so the enforce run and the unjailed control run target
-# the SAME fs-escape path (bwrap makes it read-only via --ro-bind / /).
-ESCAPE_PATH="${ESCAPE_PATH:-/usr/jail-escape-probe}"
 # The probe contract the fixture asserts inside the jail. `enforce` (default)
 # is the isolation-proof matrix; `tier2` is the differential-confinement run
 # whose per-axis exit code names the demanded-but-withheld axis. Forwarded so a
@@ -48,7 +73,14 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-FIXTURE_ABS="$(realpath "$FIXTURE")"
+# Opened by the launcher, never by the jailed process (see "Input handover").
+if [ ! -f "$FIXTURE" ] || [ ! -r "$FIXTURE" ]; then
+    echo "ERROR: fixture '$FIXTURE' is not a readable regular file -- refusing to build the jail" >&2
+    exit 1
+fi
+exec 5< "$FIXTURE"
+# Inside the jail's own tmpfs (`--tmpfs /tmp`), never a host path.
+JAIL_FIXTURE=/tmp/admission-input/untrusted-build.sh
 
 # Generate a seccomp BPF filter that blocks socket-related syscalls.
 # The filter is a Linux seccomp_filter struct in binary form.
@@ -166,14 +198,19 @@ timeout "$TIMEOUT_SECS" \
         --ro-bind / / \
         --bind "$SCRATCH" "$SCRATCH" \
         --tmpfs /tmp \
+        --perms 0444 --ro-bind-data 5 "$JAIL_FIXTURE" \
+        --chdir "$SCRATCH" \
         --proc /proc \
         --dev /dev \
         --unshare-pid \
         --unshare-uts \
         --unshare-ipc \
         --die-with-parent \
+        --cap-drop ALL \
         --seccomp 4 \
+        --clearenv \
+        --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin \
         --setenv SCRATCH_DIR "$SCRATCH" \
         --setenv ESCAPE_PATH "$ESCAPE_PATH" \
         --setenv PROBE_MODE "$PROBE_MODE" \
-        sh "$FIXTURE_ABS"
+        sh "$JAIL_FIXTURE"

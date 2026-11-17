@@ -27,7 +27,11 @@
 //! [`ENV_SKIPS`] ratchets the tests that skip on a missing host capability
 //! (a jail primitive, a target, an outbound route) rather than a missing test
 //! artifact: each entry names its file and fn with the reason, and an entry
-//! that no longer matches a skip fails, so the list only shrinks.
+//! that no longer matches a skip fails, so the list only shrinks. An entry
+//! exempts exactly its fn's count of skip sites (early `return`s): one, or
+//! the count [`SKIP_SITES`] pins. A fn whose count differs is refused whole,
+//! so a reason ratcheted for one absent capability never silently covers a
+//! further soft exit added beside it.
 //!
 //! Outside the scan, so not refused:
 //! - a skip with no `return`: the body sits inside `if let Ok(..) = ..`, or a
@@ -73,6 +77,55 @@ const CONTROL_INCONCLUSIVE: &str = "the unjailed control run is inconclusive on 
 
 /// Why a playground test skips: its own opt-in tier or jail is absent.
 const PLAYGROUND_TIER: &str = "the playground jail tier is opt-in and needs the host jail";
+
+/// [`ENV_SKIPS`] fns with more than one skip site: `(file, fn, sites)`. Each
+/// extra site is a soft exit beside the named capability gate; the count only
+/// shrinks.
+const SKIP_SITES: &[(&str, &str, usize)] = &[
+    (PLAYGROUND_TESTS, "a_fork_bomb_is_bounded_not_unbounded", 2),
+    (
+        PLAYGROUND_TESTS,
+        "a_spawned_subprocess_cannot_escape_the_jail",
+        2,
+    ),
+    (PLAYGROUND_TESTS, "hello_world_runs_and_returns_stdout", 2),
+    (
+        PLAYGROUND_TESTS,
+        "infinite_loop_is_killed_by_the_time_limit",
+        2,
+    ),
+    (PLAYGROUND_TESTS, "network_access_is_denied", 2),
+    (PLAYGROUND_TESTS, "out_of_jail_filesystem_read_is_denied", 2),
+    (
+        "src/compiler/ffi/tests/define_trait_impl_seal.rs",
+        "the_marker_surfaces_the_type_and_the_emitted_crate_builds_and_runs",
+        2,
+    ),
+    (RUN_JAIL_TESTS, "a_jailed_clone3_is_not_implemented", 2),
+    (
+        RUN_JAIL_TESTS,
+        "a_jailed_user_namespace_clone_is_refused",
+        2,
+    ),
+    (RUN_JAIL_TESTS, "a_subprocess_granted_jail_still_spawns", 2),
+    (
+        RUN_JAIL_TESTS,
+        "a_thread_spawning_program_boots_under_the_isolated_jail",
+        2,
+    ),
+    (RUN_JAIL_TESTS, "declared_network_reaches_the_network", 2),
+    (RUN_JAIL_TESTS, "the_inspection_jail_refuses_unshare", 3),
+    (
+        "src/ipe-cli/tests/webview_e2e.rs",
+        "webview_counter_tier_b",
+        2,
+    ),
+];
+
+const PLAYGROUND_TESTS: &str =
+    "examples/wasm/language-playground/jail-runner/tests/sandbox_security.rs";
+
+const RUN_JAIL_TESTS: &str = "src/compiler/sandbox/tests/run_jail_e2e.rs";
 
 /// Tests that skip on a missing host capability: `(file, fn, why)`.
 const ENV_SKIPS: &[(&str, &str, &str)] = &[
@@ -733,6 +786,61 @@ fn path_ends(expr: &syn::Expr, tail: &[&str]) -> bool {
             .all(|(seg, want)| seg == want)
 }
 
+/// One file's findings sorted into the ones an [`ENV_SKIPS`] entry exempts and
+/// the ones refused.
+struct Verdict {
+    /// The `(file, fn)` of every entry that exempted its fn.
+    matched: BTreeSet<(String, String)>,
+    refused: Vec<Finding>,
+}
+
+/// Judge `findings` from the file at `rel` against `skips` and `sites`.
+///
+/// A fn an entry of `skips` names is exempted whole only when its count of
+/// early `return`s equals its allowance (its `sites` row, else one);
+/// otherwise every skip in it is refused, as is every finding no entry names.
+fn judge(
+    rel: &str,
+    findings: Vec<Finding>,
+    skips: &[(&str, &str, &str)],
+    sites: &[(&str, &str, usize)],
+) -> Verdict {
+    let mut returns: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for finding in &findings {
+        if finding.rule == Rule::EarlyReturn
+            && let Some(func) = finding.func.as_deref()
+        {
+            *returns.entry(func.to_owned()).or_default() += 1;
+        }
+    }
+    let allowed = |func: &str| {
+        sites
+            .iter()
+            .find(|&&(file, name, _)| file == rel && name == func)
+            .map_or(1, |&(_, _, n)| n)
+    };
+    let mut verdict = Verdict {
+        matched: BTreeSet::new(),
+        refused: Vec::new(),
+    };
+    for finding in findings {
+        let exempt = finding.rule.is_skip()
+            && finding.func.as_deref().is_some_and(|func| {
+                skips
+                    .iter()
+                    .any(|&(file, name, _)| file == rel && name == func)
+                    && returns.get(func).copied() == Some(allowed(func))
+            });
+        match (exempt, finding.func) {
+            (true, Some(func)) => {
+                verdict.matched.insert((rel.to_owned(), func));
+            }
+            (_, func) => verdict.refused.push(Finding { func, ..finding }),
+        }
+    }
+    verdict
+}
+
 /// A fixture's findings, reading it from [`FIXTURES`].
 #[allow(clippy::expect_used)] // a missing fixture fails the test: the designed outcome
 fn fixture(name: &str) -> Vec<Finding> {
@@ -831,6 +939,56 @@ fn a_return_err_and_a_closure_return_are_not_skips() {
 }
 
 #[test]
+fn an_exempted_fn_skips_at_its_pinned_site_count_only() {
+    let skips = [("inline.rs", "t", "a host capability is absent")];
+    let one = "#[test] fn t() { let Some(x) = f() else { eprintln!(\"absent\"); return; }; g(x); }";
+    let one = judge("inline.rs", scan_source("inline.rs", one), &skips, &[]);
+    assert!(one.refused.is_empty(), "{:?}", one.refused);
+    assert_eq!(one.matched.len(), 1);
+    let two = "#[test] fn t() { let Some(x) = f() else { return; }; \
+               if !g(x) { eprintln!(\"inconclusive\"); return; } h(x); }";
+    let unpinned = judge("inline.rs", scan_source("inline.rs", two), &skips, &[]);
+    assert_eq!(
+        unpinned
+            .refused
+            .iter()
+            .map(|f| f.rule)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([Rule::EarlyReturn, Rule::PrintedSkip]),
+        "a second skip in an exempted fn is refused: {:?}",
+        unpinned.refused
+    );
+    assert!(
+        unpinned.matched.is_empty(),
+        "a refused fn's entry goes stale"
+    );
+    let pinned = judge(
+        "inline.rs",
+        scan_source("inline.rs", two),
+        &skips,
+        &[("inline.rs", "t", 2)],
+    );
+    assert!(pinned.refused.is_empty(), "{:?}", pinned.refused);
+    let over = judge(
+        "inline.rs",
+        scan_source("inline.rs", two),
+        &skips,
+        &[("inline.rs", "t", 3)],
+    );
+    assert!(
+        !over.refused.is_empty(),
+        "a pin above the count is refused, so it only shrinks"
+    );
+    let other = judge(
+        "other.rs",
+        scan_source("other.rs", "#[test] fn t() { if a() { return; } b(); }"),
+        &skips,
+        &[],
+    );
+    assert_eq!(other.refused.len(), 1, "an entry names one file");
+}
+
+#[test]
 fn no_test_target_skips_silently() {
     let (root, files) = common::test_target_files();
     for pinned in [
@@ -848,17 +1006,15 @@ fn no_test_target_skips_silently() {
     for rel in &files {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         let text = std::fs::read_to_string(root.join(rel)).expect("read a test-target file");
-        for finding in scan_source(&rel_str, &text) {
-            if finding.rule.is_skip()
-                && let Some(func) = finding.func.as_deref()
-                && ENV_SKIPS
-                    .iter()
-                    .any(|&(file, name, _)| file == rel_str && name == func)
-            {
-                matched.insert((rel_str.clone(), func.to_owned()));
-                continue;
-            }
-            refused.push(format!(
+        let verdict = judge(
+            &rel_str,
+            scan_source(&rel_str, &text),
+            ENV_SKIPS,
+            SKIP_SITES,
+        );
+        matched.extend(verdict.matched);
+        refused.extend(verdict.refused.iter().map(|finding| {
+            format!(
                 "{rel_str}:{} {:?}{}",
                 finding.line,
                 finding.rule,
@@ -866,8 +1022,8 @@ fn no_test_target_skips_silently() {
                     .func
                     .as_deref()
                     .map_or_else(String::new, |f| format!(" in `{f}`"))
-            ));
-        }
+            )
+        }));
     }
     assert!(
         refused.is_empty(),
@@ -884,5 +1040,19 @@ fn no_test_target_skips_silently() {
         stale.is_empty(),
         "`ENV_SKIPS` entries that no longer skip; remove them:\n{}",
         stale.join("\n")
+    );
+    let orphan: Vec<String> = SKIP_SITES
+        .iter()
+        .filter(|&&(file, func, _)| {
+            !ENV_SKIPS
+                .iter()
+                .any(|&(f, name, _)| f == file && name == func)
+        })
+        .map(|&(file, func, n)| format!("{file} `{func}` ({n})"))
+        .collect();
+    assert!(
+        orphan.is_empty(),
+        "`SKIP_SITES` rows naming no `ENV_SKIPS` entry; remove them:\n{}",
+        orphan.join("\n")
     );
 }
