@@ -71,6 +71,21 @@ pub(crate) fn fail(msg: fmt::Arguments<'_>) -> ! {
     panic!("{msg}")
 }
 
+/// Unwrap a host capability the end-to-end tier needs, failing the calling
+/// test when it is present but unusable.
+///
+/// A capability the host offers (a jail primitive that resolved, a toolchain,
+/// the outbound route a control run needs) that then fails to work is a
+/// defect of the host the job runs on, never a reason to pass without having
+/// run: the one sanctioned skip is the first-statement tier gate.
+///
+/// # Panics
+///
+/// With `what` and the error when `probe` is `Err`.
+pub fn require_host<T, E: fmt::Debug>(what: &str, probe: Result<T, E>) -> T {
+    probe.unwrap_or_else(|e| fail(format_args!("{what}: {e:?}")))
+}
+
 /// Resolve cargo bin target `name`; the body of [`cargo_bin!`](crate::cargo_bin).
 ///
 /// Reads the run-time `CARGO_BIN_EXE_<name>` (re-exported by nextest, correct

@@ -1764,11 +1764,17 @@ jobs:
           packages: bubblewrap python3
           no-install-recommends: "true"
 
-      # Fail-closed primitive check: an absent bwrap or python3 is a hard failure,
-      # not a skip — the seccomp+bwrap jail cannot be verified without them, and an
-      # unverified platform is NEVER counted as admitted (refuse-to-certify).
+      # Fail-closed primitive check: an absent bwrap, prlimit or python3 is a hard
+      # failure, not a skip — the seccomp+bwrap jail cannot be verified without
+      # them (the suite skips only where the primitive is absent, so this step is
+      # what keeps that skip off this job), and an unverified platform is NEVER
+      # counted as admitted (refuse-to-certify).
       - name: Assert the Linux jail primitives are present (refuse-to-certify)
         run: |
+          if ! command -v prlimit >/dev/null 2>&1; then
+            echo "ERROR: prlimit absent — the Tier-2 jail cannot bound its build; refusing to certify (hard failure, never a skip-green)." >&2
+            exit 1
+          fi
           if ! command -v bwrap >/dev/null 2>&1; then
             echo "ERROR: bubblewrap (bwrap) absent on this runner — the Tier-2 jail cannot be verified; refusing to certify (this is a hard failure, never a skip-green)." >&2
             exit 1
@@ -1777,7 +1783,7 @@ jobs:
             echo "ERROR: python3 absent — the seccomp BPF filter cannot be generated, so the network-denial layer cannot be established; refusing to certify (hard failure, never a skip-green)." >&2
             exit 1
           fi
-          echo "bwrap present: $(command -v bwrap); python3 present: $(command -v python3)"
+          echo "bwrap present: $(command -v bwrap); prlimit present: $(command -v prlimit); python3 present: $(command -v python3)"
 
       - name: Make admission scripts executable
         run: chmod +x tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
@@ -1792,14 +1798,15 @@ jobs:
 
       # Enforce (INSIDE the jail): net + fs-escape must be DENIED. Paired with the
       # control above, this is the duality that proves the denial is the jail's.
-      # `sudo -E` matches the admission-sandbox linux invocation (bwrap needs the
-      # user-namespace setup the hosted runner grants under sudo); -E forwards the
-      # ESCAPE_PATH/timeout env into the jail wrapper.
+      # `sudo` matches the admission-sandbox linux invocation (bwrap needs the
+      # user-namespace setup the hosted runner grants under sudo). The
+      # ESCAPE_PATH/timeout knobs pass as explicit `env` argv, never through
+      # `-E`: sudo-rs ignores `-E`, and the wrapper refuses an unset ESCAPE_PATH.
       - name: Admission enforce (jailed — forbidden actions must be blocked)
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
-        run: sudo -E tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
 
       # The real reconciler through the real bwrap+seccomp jail (the linux-x64
       # build_in_jail path): used-but-undeclared rejects, benign certifies.
