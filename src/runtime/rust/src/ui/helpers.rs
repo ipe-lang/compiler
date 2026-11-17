@@ -2099,7 +2099,7 @@ mod white_space_helper_tests {
 }
 
 #[cfg(test)]
-#[cfg(feature = "web-core")]
+#[cfg(all(feature = "web-core", not(target_arch = "wasm32")))]
 mod page_link_tests {
     use super::{Description, Element, web_page_link};
     use crate::dom::dispatch::BrowserPath;
