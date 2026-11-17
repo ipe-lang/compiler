@@ -318,9 +318,9 @@ impl LinkableTargetDir {
     ///
     /// | Posture | Pin  | Build directory                                     |
     /// |---------|------|-----------------------------------------------------|
-    /// | Dev     | none | [`dev_cache_target`] proven private, else per-project |
+    /// | Dev     | none | `<cache>/ipe/t/dev-<k>` proven private, else per-project |
     /// | Dev     | set  | the pin                                             |
-    /// | Release | set  | `<pin>/`[`RELEASE_PIN_SUBDIR`]                      |
+    /// | Release | set  | `<pin>/release-ipe` ([`RELEASE_PIN_SUBDIR`])        |
     /// | Release | none | per-project                                         |
     ///
     /// The per-project directory is `crate_dir/target`, or, when the linker
@@ -364,7 +364,7 @@ impl LinkableTargetDir {
         Self::per_project(linker, &crate_dir, sources)
     }
 
-    /// The release build directory under the pin `self`: `<pin>/`[`RELEASE_PIN_SUBDIR`].
+    /// The release build directory under the pin `self`: `<pin>/release-ipe` ([`RELEASE_PIN_SUBDIR`]).
     ///
     /// A development build of the same pin builds in the pin itself, so a
     /// release never links a unit a development build wrote. The subdirectory
@@ -455,7 +455,7 @@ impl LinkableTargetDir {
     /// Resolve the build directory of the scratch test crate in `crate_dir` for `linker` from `sources`.
     ///
     /// A pin wins as in [`Self::resolve`]. Without one the directory is the
-    /// compiler's shared [`scratch_cache_target`]; when no cache base
+    /// compiler's shared `<cache base>/ipe/t/scratch-<k>`; when no cache base
     /// resolves, the linker cannot open it, or it is not a private directory
     /// of the effective user, it is `crate_dir/target`, a fresh private
     /// directory. The per-project user cache is never read: it is keyed by a
@@ -745,12 +745,14 @@ impl SharedDir {
 }
 
 /// The shared scratch build directory of this compiler: `<cache base>/ipe/t/scratch-<k>`.
+#[cfg(test)]
 #[must_use]
 pub fn scratch_cache_target(cache_base: &Path) -> PathBuf {
     SharedDir::Scratch.path(cache_base)
 }
 
 /// The shared development build directory of this compiler: `<cache base>/ipe/t/dev-<k>`.
+#[cfg(test)]
 #[must_use]
 pub fn dev_cache_target(cache_base: &Path) -> PathBuf {
     SharedDir::Dev.path(cache_base)

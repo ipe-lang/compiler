@@ -1629,15 +1629,17 @@ fn run_inner(
                         // The session's directory is resolved once and claimed
                         // before every build; one whose claim fails is resolved
                         // afresh on the next generation.
-                        let claimed = match session_target.take() {
-                            Some(resolved) => resolved.claim().map(|()| resolved),
-                            None => LinkableTargetDir::for_crate(
-                                &opts.cargo_path,
-                                crate::cargo_step::BuildPosture::Dev,
-                                marked.path(),
-                                opts.target_dir.as_deref(),
-                            ),
-                        };
+                        let claimed = session_target.take().map_or_else(
+                            || {
+                                LinkableTargetDir::for_crate(
+                                    &opts.cargo_path,
+                                    crate::cargo_step::BuildPosture::Dev,
+                                    marked.path(),
+                                    opts.target_dir.as_deref(),
+                                )
+                            },
+                            |resolved| resolved.claim().map(|()| resolved),
+                        );
                         match claimed {
                             Ok(resolved) => session_target = Some(resolved),
                             Err(e) => {
