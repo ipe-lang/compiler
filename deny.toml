@@ -17,14 +17,13 @@
 [graph]
 all-features = false
 no-default-features = false
-features = ["full", "ipe/wasi_run"]
+features = ["full", "wasi_run"]
 
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
 # Every entry is "ignore now, replace later": an accepted exposure, revisited
 # when its upstream fix or a replacement lands, never a permanent waiver.
 ignore = [
-    "RUSTSEC-2025-0141", # bincode unmaintained (transitive; no runtime exposure)
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" (PKCS#1 v1.5 timing
     # sidechannel). No fixed upstream release exists (the advisory's own
     # Solution field says "no fixed upgrade available"); pulled in via
