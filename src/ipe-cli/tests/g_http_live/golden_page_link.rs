@@ -143,9 +143,23 @@ fn assert_emits(
         "{name}: ipe must accept: {:?}",
         result.err()
     );
-    let emitted = crate::support::read_all_emitted_src(&out);
+    let emitted: String = crate::support::read_all_emitted_src(&out)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        emitted.matches("fn__ipe_render_page_").count(),
+        1,
+        "{name}: the one table emits one crate-level renderer",
+    );
+    let mut links = emitted.split("web_page_link(").skip(1).peekable();
+    assert!(links.peek().is_some(), "{name}: a page link is emitted");
     assert!(
-        emitted.contains("web_page_link(") && emitted.contains("__ipe_render_page("),
+        links.all(|args| {
+            args.strip_prefix("__ipe_page_attrs,crate::__ipe_render_page_")
+                .and_then(|rest| rest.split_once("),crate::__ipe_render_page_"))
+                .is_some()
+        }),
         "{name}: every page link renders its href through the table's renderer",
     );
     out

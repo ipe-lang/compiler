@@ -59,6 +59,18 @@ async function openLive(page, route = "/") {
   await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
 }
 
+/**
+ * The current history entry's index and the number of entries, through the
+ * Navigation API: unlike `history.length`, the index tells a pushed entry
+ * from a rewritten one when entries lie ahead.
+ */
+function entryPosition(page) {
+  return page.evaluate(() => ({
+    index: navigation.currentEntry.index,
+    count: navigation.entries().length,
+  }));
+}
+
 /** The text of the page heading. */
 function heading(page) {
   return page.locator("#page");
@@ -224,21 +236,33 @@ test("web client: a button's page change is one history entry, and Back restores
     await expect(page).toHaveURL(`${CLIENT}/about`);
 
     // A page-link click moves in place as one entry; so does one on a link
-    // the patch that shows the entry inserts.
+    // the patch that shows the entry inserts. Back left the entry-1 entry
+    // ahead of the about entry, so `history.length` cannot tell a push from a
+    // rewrite here: a push moves one entry on and drops every entry ahead.
     await page.evaluate(() => {
       window.__e2eSameDocument = true;
     });
-    const atLinks = await page.evaluate(() => history.length);
+    const atLinks = await entryPosition(page);
+    expect(atLinks.count).toBe(atLinks.index + 2);
     await page.locator("#link-entry").click();
     await expect(heading(page)).toHaveText("entry 2", { timeout: 10000 });
     await expect(page).toHaveURL(`${CLIENT}/entry/2`);
     await expect(page.locator("#link-entry")).toHaveAttribute("aria-current", "page");
-    expect(await page.evaluate(() => history.length)).toBe(atLinks + 1);
+    expect(await entryPosition(page)).toEqual({
+      index: atLinks.index + 1,
+      count: atLinks.index + 2,
+    });
     await page.locator("#link-about").click();
     await expect(heading(page)).toHaveText("about", { timeout: 10000 });
     await expect(page).toHaveURL(`${CLIENT}/about`);
-    expect(await page.evaluate(() => history.length)).toBe(atLinks + 2);
+    expect(await entryPosition(page)).toEqual({
+      index: atLinks.index + 2,
+      count: atLinks.index + 3,
+    });
     expect(await page.evaluate(() => window.__e2eSameDocument === true)).toBe(true);
+    await page.goBack();
+    await expect(heading(page)).toHaveText("entry 2", { timeout: 10000 });
+    await expect(page).toHaveURL(`${CLIENT}/entry/2`);
   } finally {
     await ctx.close();
   }
