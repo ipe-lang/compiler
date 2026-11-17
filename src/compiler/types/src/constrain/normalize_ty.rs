@@ -1,6 +1,6 @@
 use super::{
-    BTreeMap, Builder, DResult, Diagnostic, RowTail, STAGE, Span, Symbol, Ty, TypeError, VarNamer,
-    ty_to_doc,
+    BTreeMap, Builder, DResult, Diagnostic, FieldTag, RowTail, STAGE, Span, Symbol, Ty, TypeError,
+    VarNamer, ty_to_doc,
 };
 
 impl Builder<'_> {
@@ -175,15 +175,21 @@ impl Builder<'_> {
                         args: vec![t],
                     };
                     let mut req_fields = BTreeMap::new();
-                    req_fields.insert(self.builtins.http_f_body, string());
+                    req_fields.insert(self.builtins.field_symbol(FieldTag::HttpBody), string());
                     req_fields.insert(
-                        self.builtins.http_f_headers,
+                        self.builtins.field_symbol(FieldTag::HttpHeaders),
                         list(Ty::Tuple(vec![string(), string()])),
                     );
-                    req_fields.insert(self.builtins.http_f_method, http_method_ty());
-                    req_fields.insert(self.builtins.http_f_redirects, redirect_policy_ty());
-                    req_fields.insert(self.builtins.http_f_timeout, int());
-                    req_fields.insert(self.builtins.http_f_url, string());
+                    req_fields.insert(
+                        self.builtins.field_symbol(FieldTag::HttpMethod),
+                        http_method_ty(),
+                    );
+                    req_fields.insert(
+                        self.builtins.field_symbol(FieldTag::HttpRedirects),
+                        redirect_policy_ty(),
+                    );
+                    req_fields.insert(self.builtins.field_symbol(FieldTag::HttpTimeout), int());
+                    req_fields.insert(self.builtins.field_symbol(FieldTag::HttpUrl), string());
                     Ok(Ty::Record(req_fields, RowTail::Closed))
                 } else if module.is_empty()
                     && args.is_empty()
@@ -210,10 +216,16 @@ impl Builder<'_> {
                         args: vec![k, v],
                     };
                     let mut resp_fields = BTreeMap::new();
-                    resp_fields.insert(self.builtins.http_f_body, string());
-                    resp_fields.insert(self.builtins.server_f_content_type, string());
-                    resp_fields.insert(self.builtins.http_f_headers, dict(string(), string()));
-                    resp_fields.insert(self.builtins.http_f_status, int());
+                    resp_fields.insert(self.builtins.field_symbol(FieldTag::HttpBody), string());
+                    resp_fields.insert(
+                        self.builtins.field_symbol(FieldTag::ServerContentType),
+                        string(),
+                    );
+                    resp_fields.insert(
+                        self.builtins.field_symbol(FieldTag::HttpHeaders),
+                        dict(string(), string()),
+                    );
+                    resp_fields.insert(self.builtins.field_symbol(FieldTag::HttpStatus), int());
                     Ok(Ty::Record(resp_fields, RowTail::Closed))
                 } else if module.is_empty()
                     && args.is_empty()
@@ -232,8 +244,11 @@ impl Builder<'_> {
                     };
                     let string = || mk(self.builtins.string);
                     let mut m_fields = BTreeMap::new();
-                    m_fields.insert(self.builtins.migration_f_name, string());
-                    m_fields.insert(self.builtins.migration_f_sql, string());
+                    m_fields.insert(
+                        self.builtins.field_symbol(FieldTag::MigrationName),
+                        string(),
+                    );
+                    m_fields.insert(self.builtins.field_symbol(FieldTag::MigrationSql), string());
                     Ok(Ty::Record(m_fields, RowTail::Closed))
                 } else {
                     // Non-Task constructor: recurse into type arguments.

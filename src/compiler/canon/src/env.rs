@@ -23,8 +23,8 @@ use crate::scope::{ExprTarget, Identity, ModuleScope, Origin, Tier, ValueIdentit
 /// qualifier short-name.
 ///
 /// The key is the module's segment list; the value is the short-name under which
-/// that module's members are pooled in [`Env::kernel_members`] (see the
-/// `QUALIFIERS` table in [`Env::install_prelude_qualifiers`]).
+/// that module's members are pooled in [`Env::kernel_members`] (see
+/// [`KERNEL_QUALIFIERS`]).
 ///
 /// This is the single source of truth consulted by the canonicaliser when it
 /// registers a user's `import Ipe.… as Alias` (or the Elm last-segment default)
@@ -1193,643 +1193,265 @@ pub struct CodecAutoContext {
     pub witness_records: BTreeMap<Symbol, Vec<(Symbol, crate::ast::Type)>>,
 }
 
-/// Prelude kernel qualifier table — the `(qualifier, &[member])` surface
-/// registered by [`Env::install_prelude_qualifiers`]. Hoisted to module
-/// level so the compile-time drift gate (the `const _` block just below) can
-/// check it against the kernel registry without running the installer.
-#[rustfmt::skip]
-pub const PRELUDE_QUALIFIERS: &[(&str, &[&str])] = &[
-        // `Ipe.Error` — the real `Error ErrorKind ErrorInfo` ADT.
-        // Message constructors + nullary constructors + `toString`
-        // render + `withMessage` modifier + `isRetryable` classification +
-        // `withDetails` modifier (attaches the
-        // `ErrorDetails` union to `ErrorInfo.details : Maybe ErrorDetails`).
-        // `Ipe.CssSafety` — the Ipe.Css leaf security kernels: four
-        // `String -> Maybe String` parsers (`safeValue`/`safePropName`/
-        // `safeSelector` gate declarations/selectors at construction;
-        // `sanitizeRawBody` is the authoritative raw/keyframes-body gate over
-        // the audited `css_safety` policy) + the `String -> String`
-        // `<style>`-breakout floor. Imported (and called unqualified) by the
-        // compiled-source `Ipe.Css`.
-        (
-            "CssSafety",
-            &[
-                "safeValue",
-                "safePropName",
-                "safeSelector",
-                "sanitizeRawBody",
-                "stripStyleClose",
-            ],
-        ),
-        // `Ipe.Log` — qualified form (`import Ipe.Log as Log`).
-        // `info`/`debug`/`warn`/`error` are backed; the `*With`
-        // variants take Stringify-bounded attrs and stay fail-closed
-        // (IPE-L0108) until the Stringify obligation is added.
-        // `Log` is observability-only — line printing lives in `Ipe.Io`
-        // (`Io.println` / `Io.eprintln`).
-        // `Ipe.App` — runtime-config front door. `fromEnv` seals an env var
-        // into a `Secret` (the config-secret source: `Secret.fromString` over a
-        // value that folds to a non-empty literal is refused, IPE-L0150);
-        // `fromEnvRequired` is its fail-closed variant (a missing/empty var
-        // is a named load-time `ConfigError`, not an empty secret).
-        ("App", &["fromEnv", "fromEnvRequired"]),
-        // `Ipe.Console` — the console/telemetry `Secret`-typed token settings.
-        // Each takes a `Secret` (from `App.fromEnvRequired`), so a hard-coded
-        // token `String` does not type-check.
-        ("Console", &["adminToken", "ingestToken", "metricsToken"]),
-        // `Ipe.Host` — the host-bind setting builder plus the `HostMode`
-        // constructors it takes.
-        ("Host", &["bind", "loopback", "allInterfaces", "envDriven"]),
-        // `Ipe.Level` — the `LogLevel` constructors `Log.level` takes. A
-        // separate qualifier from `Log` because `Log.debug`/`Log.info`/… are
-        // already the logging kernels; `Level.debug`/… are the severity tags.
-        // `Ipe.Json.Encode` — JSON encoder.
-        (
-            "JsonEnc",
-            &[
-                "string", "int", "float", "bool", "null", "list", "object", "encode",
-            ],
-        ),
-        // `Ipe.Json.Decode` — JSON decoder combinators.
-        (
-            "JsonDec",
-            &[
-                "string",
-                "int",
-                "float",
-                "bool",
-                "value",
-                "decodeString",
-                "decodeValue",
-                "field",
-                "at",
-                "index",
-                "list",
-                "nullable",
-                "map",
-                "andThen",
-                "succeed",
-                "fail",
-                "oneOf",
-                "map2",
-                "map3",
-                "map4",
-            ],
-        ),
-        // `Ipe.Json.Decode.Pipeline` — pipeline-style record decoders.
-        (
-            "JsonDecP",
-            &["required", "optional", "custom", "requiredAt"],
-        ),
-        // `Ipe.Crypto` — hashes / HMAC / RSA / AEAD / key-derivation / random.
-        // String-typed surface (backward-compat) + typed-key variants (§6.11).
-        (
-            "Crypto",
-            &[
-                "sha256",
-                "sha512",
-                "sha1",
-                "md5",
-                "rsaSha256Sign",
-                "rsaSha256Verify",
-                "constantTimeEqual",
-                "aesGcmEncrypt",
-                "aesGcmDecrypt",
-                "chacha20Encrypt",
-                "chacha20Decrypt",
-                "aesKeyFromPassword",
-                "chachaKeyFromPassword",
-                "randomBytes",
-                "randomToken",
-                // Typed HMAC kernels; the AEAD/key-derivation entry points
-                // above already require/return the typed `Key`, so there is
-                // no separate bare-`String`-key spelling to register.
-                "hmacSha256WithKey",
-                "hmacSha512WithKey",
-                // Recomputes the HMAC-SHA-256 tag and compares it with a
-                // stored `Mac` in constant time.
-                "verifyHmacSha256",
-            ],
-        ),
-        // `Ipe.Secret` — opaque secret-string wrapper.
-        // `fromString` is the seal; `use` is the scoped consume (apply a
-        // function to the plaintext, return its result); `redacted` is the
-        // explicit "<redacted>" accessor. The blunt raw un-parse `reveal`
-        // relocated to the compiled-source `Ipe.Secret.Unsafe` submodule
-        // (`src/stdlib/Ipe/Secret/Unsafe.ipe`) as `unsafeReveal`, reached
-        // through the `Kernel.kernel "Secret_reveal"` alias to the SAME kernel —
-        // so it is absent here and no longer resolves off a plain
-        // `import Ipe.Secret`.
-        ("Secret", &["fromString", "use", "redacted"]),
-        // `Ipe.Jwt` — JWT encode/decode for HS256 and RS256,
-        // plus builder API: claims / hs256 / rs256 / subject / issuer /
-        // audience / expiresAt / notBefore / issuedAt / jwtId / withClaim /
-        // encode / decode.
-        (
-            "Jwt",
-            &[
-                "encodeHs256",
-                "decodeHs256",
-                "encodeRs256",
-                "decodeRs256",
-                // builder API
-                "claims",
-                "hs256",
-                "rs256",
-                "subject",
-                "issuer",
-                "audience",
-                "expiresAt",
-                "notBefore",
-                "issuedAt",
-                "jwtId",
-                "withClaim",
-                "encode",
-                "decode",
-            ],
-        ),
-        // `Ipe.System` — system effects.
-        (
-            "System",
-            &[
-                "args",
-                "getenv",
-                "getenvOr",
-                "getArg",
-                "getenvInt",
-                "getenvBool",
-                "setenv",
-                "unsetenv",
-                "cwd",
-                "getcwd",
-                "loadEnv",
-                "exit",
-            ],
-        ),
-        // `Ipe.Random` is DELIBERATELY absent: it is COMPILED-SOURCE
-        // (`ipe::stdlib::COMPILED_STD_MODULES`), so its whole surface resolves
-        // from `Ipe/Random.ipe` — the `Kernel.kernel "Random_*"` aliases and the
-        // pure Ipê wrappers — not from this kernel-qualifier catalog.
-        // `Ipe.File` is DELIBERATELY absent: it is COMPILED-SOURCE
-        // (`ipe::stdlib::COMPILED_STD_MODULES`), so its whole surface resolves
-        // from `Ipe/File.ipe` — the `Kernel.kernel "File_*"` aliases and the
-        // `ByteSize`-typed `readFileLimit` wrapper.
-        // `Ipe.Process` — subprocess execution with NO shell.
-        // `run` : `String -> List String -> Task Error String`.
-        // `runWith` : `{ command, args, cwd, env } -> Task Error { exitCode, stdout, stderr }`.
-        // `runInPty` : `{ command, args, cwd, env, cols, rows } -> Task Error { exitCode, output }`.
-        // All are server-only (`subprocess` capability), default-denied under wasm.
-        ("Process", &["run", "runWith", "runInPty"]),
-        // `Ipe.Http` — outbound HTTP client.
-        // `get` / `post` / `request` are effect kernels (Task Error
-        // HttpResponse); `parseQuery` is a pure kernel (String -> Result
-        // Error (Dict String String)); the `with*` builders + `defaultRequest` are ALSO
-        // pure kernels (HttpRequest record-update emission in the backend) —
-        // cross-module pure-Ipê stdlib calls are not resolved by ipe, so the
-        // builders cannot live as pure Ipê in Http.ipe. Every name below is
-        // registered so `Http.foo` resolves during name-resolution and lands
-        // as `Callee::Kernel` (see lower.rs ("Http", _) arms + constrain.rs
-        // kernel_ty Http entries that give each its record type).
-        (
-            "Http",
-            &[
-                "get",
-                "post",
-                "request",
-                "defaultRequest",
-                "defaultRequestFromString",
-                "withMethod",
-                "withHeader",
-                "withTimeout",
-                "withBody",
-                "withUrl",
-                "withRedirects",
-                "parseQuery",
-                "methodToString",
-                "methodFromString",
-            ],
-        ),
-        // ── TEA Cmd / Sub kernels ───────────────────────────────────────────
-        // `Cmd.publish` / `Cmd.publishNoEcho` are backed by runtime
-        // `cmd_publish` / `cmd_publish_no_echo` in live/pubsub.rs.
-        // `Sub.subscribeTopic` is backed by runtime `sub_subscribe_topic`
-        // in live/pubsub.rs; emit path uses the standard N-arg route.
-        (
-            "Cmd",
-            &[
-                "none",
-                "batch",
-                "perform",
-                "map",
-                "publish",
-                "publishNoEcho",
-            ],
-        ),
-        (
-            "Sub",
-            &[
-                "none",
-                "batch",
-                "every",
-                "map",
-                "subscribeTopic",
-                "subscribeWebSocket",
-            ],
-        ),
-        // `Ipe.PubSub` (the top-level, Task-shaped publish surface) is a
-        // COMPILED-SOURCE stdlib module (`src/stdlib/Ipe/PubSub.ipe`), so it
-        // stays OUT of this kernel-qualifier table (kernel qualifier here OR
-        // compiled-source — never both). Its `publish` / `publishNoEcho` bodies
-        // are `Kernel.kernel "PubSub_publish"` / `"PubSub_publishNoEcho"`; the
-        // alias fast-path (`detect_kernel_alias`) splits `"PubSub_publish"` →
-        // the canonical `("PubSub", "publish")` kernel (`class = Web`,
-        // Task-shaped — NOT TEA-loop machinery).
-        // ── Db kernels ──────────────────────────────────────────────────────
-        // `Ipe.Db` — the SAFE database connection + query surface. The
-        // raw-SQL and untyped-column-read escape hatches (`unsafeExecRaw`,
-        // `unsafeQuery`, `unsafeGet*`) live in the compiled-source
-        // `Ipe.Db.Unsafe` submodule (`src/stdlib/Ipe/Db/Unsafe.ipe`), reached
-        // through `Kernel.kernel "Db_*"` aliases to the SAME kernels — so they
-        // are absent here and no longer resolve off a plain `import Ipe.Db`.
-        // `SqlValue` / `SqlField` ADT constructors are handled by
-        // `install_builtin_ctors` above; they are unqualified.
-        (
-            "Db",
-            &[
-                "connect",
-                "open",
-                "close",
-                "exec",
-                "queryDecode",
-                "insertRow",
-                "getById",
-                "updateById",
-                "deleteById",
-                "findOneByField",
-                "findManyByField",
-                "findByConditions",
-                "findWhere",
-                "findWhereMasked",
-                "findJoin",
-                "findProjection",
-                "findJoinOrdered",
-                "findProjectionOrdered",
-                "deleteWhere",
-                "updateWhere",
-                // External read path — `…On` reads over a `Connection a`.
-                "findWhereOn",
-                "queryDecodeOn",
-                "getByIdOn",
-                "insertFields",
-                "updateFields",
-                "upsertFields",
-                "insertFieldsReturning",
-                "withTransaction",
-                "migrate",
-                "defaultMigration",
-                // Runtime-config front door — `Db.url : Secret -> Setting a`.
-                "url",
-            ],
-        ),
-        // `Ipe.Db.Sql` — typed, parameterized WHERE-fragment builder.
-        // A `SqlFragment` can only be built through
-        // these combinators, so a naive string-concatenated WHERE clause
-        // is a type error (`String` where `SqlFragment` is expected) at
-        // `Db.findWhere` / `Db.deleteWhere`, not a runtime injection risk.
-        (
-            "Sql",
-            &[
-                "column",
-                "maskedColumn",
-                "param",
-                "int",
-                "string",
-                "float",
-                "bool",
-                "eq",
-                "ne",
-                "gt",
-                "lt",
-                "gte",
-                "lte",
-                "and",
-                "or",
-                "not",
-                "isNull",
-                "isNotNull",
-                "inList",
-                "like",
-                "startsWith",
-                "exists",
-            ],
-        ),
-        // `Ipe.Db.Decode` — row decoder combinators.
-        // The qualifier string contains a dot ("Db.Decode") which the parser
-        // produces correctly for the 3-segment path `Db.Decode.string` — see
-        // ipe_parse::parser::ident_expr (qualifier = init.join(".")).
-        (
-            "Db.Decode",
-            &[
-                "string", "int", "float", "bool", "bytes", "money", "decimal", "nullable",
-                "map", "andThen", "succeed", "fail", "map2", "map3", "map4", "required",
-                "optional",
-            ],
-        ),
-        // Ipe.Http.Server kernels.
-        (
-            "Server",
-            &[
-                "get",
-                "post",
-                "put",
-                "delete",
-                "any",
-                "api",
-                "static",
-                "mountApp",
-                "listen",
-                "text",
-                "json",
-                "html",
-                "withStatus",
-                "withHeader",
-                "redirect",
-                "param",
-                "queryParam",
-                "header",
-                "getCookie",
-                "body",
-                "path",
-                "method",
-                "cookie",
-                "withCookie",
-                "authConfig",
-                "bearerToken",
-                "cookieToken",
-                "withRevocation",
-                "getAuthed",
-                "postAuthed",
-                "putAuthed",
-                "deleteAuthed",
-            ],
-        ),
-        // Ipe.Http.Middleware kernels.
-        (
-            "Middleware",
-            &[
-                "withCors",
-                "withLogging",
-                "withBasicAuth",
-                "withRateLimit",
-                "withCsrf",
-            ],
-        ),
-        // Ipe.Http.RateLimit kernels.
-        ("RateLimit", &["allow"]),
-        // `Ipe.Ui` is COMPILED-SOURCE (see `COMPILED_STD_MODULES`), not a
-        // kernel qualifier: the layout builders (`el`/`row`/`column`/
-        // `wrappedRow`/`grid`/`paragraph`/`textColumn`/`form`/`input`) are
-        // pure Ipê over the retained `node`/`taggedNode` primitives, and every
-        // other member is a `Kernel.kernel "Ui_*"` alias resolving to its
-        // unchanged kernel. The `Ipe.Ui.*` sub-qualifiers (Background/Border/
-        // Font/Region/Input/Lazy/Keyed) stay native below. The disjointness
-        // invariant forbids `Ui` here.
-        // ── Ipe.Ui.Background sub-module ─────────────────────────────────────
-        (
-            "Background",
-            &[
-                "color",
-                "image",
-                "hoverColor",
-                "focusColor",
-                "activeColor",
-                "disabledColor",
-                "linearGradient",
-            ],
-        ),
-        // ── Ipe.Ui.Border sub-module ─────────────────────────────────────────
-        (
-            "Border",
-            &[
-                "width",
-                "widthEach",
-                "color",
-                "rounded",
-                "solid",
-                "dashed",
-                "dotted",
-                "shadow",
-                "glow",
-                "innerShadow",
-                "hoverColor",
-                "focusColor",
-                "activeColor",
-                "hoverWidth",
-                "hoverRounded",
-            ],
-        ),
-        // ── Ipe.Ui.Font sub-module ───────────────────────────────────────────
-        (
-            "Font",
-            &[
-                "color",
-                "family",
-                "size",
-                "weight",
-                "bold",
-                "semiBold",
-                "regular",
-                "light",
-                "extraBold",
-                "black",
-                "italic",
-                "underline",
-                "lineThrough",
-                "noDecoration",
-                "letterSpacing",
-                "wordSpacing",
-                "alignLeft",
-                "alignRight",
-                "alignCenter",
-                "center",
-                "justify",
-                "sansSerif",
-                "serif",
-                "monospace",
-                "hoverColor",
-                "focusColor",
-                "activeColor",
-                "disabledColor",
-                "hoverSize",
-            ],
-        ),
-        // ── Ipe.Ui.Region sub-module ─────────────────────────────────────────
-        (
-            "Region",
-            &[
-                "mainContent",
-                "navigation",
-                "footer",
-                "aside",
-                "heading",
-                "label",
-                "announce",
-                "announceUrgently",
-            ],
-        ),
-        // ── Ipe.Ui.Input sub-module ──────────────────────────────────────────
-        (
-            "Input",
-            &[
-                "labelAbove",
-                "labelBelow",
-                "labelLeft",
-                "labelRight",
-                "labelHidden",
-                "placeholder",
-                "text",
-                "multiline",
-                "email",
-                "username",
-                "search",
-                "currentPassword",
-                "newPassword",
-                "checkbox",
-                "slider",
-                "option",
-                "radio",
-                "radioRow",
-            ],
-        ),
-        // ── Ipe.Ui.Lazy sub-module ───────────────────────────────────────────
-        ("Lazy", &["lazy", "lazy2", "lazy3", "lazy4", "lazy5"]),
-        // ── Ipe.Ui.Keyed — ipe-key for diff identity ─────────────────────────
-        ("Keyed", &["column", "row"]),
-        // `Ipe.Html` and `Ipe.Html.Attributes` are compiled-source (see exclusion
-        // table in `STDLIB_MODULE_QUALIFIERS`); `Ipe.Html.Events` is a kernel qualifier.
-        // ── Ipe.Html.Events alias ─────────────────────────────────────────────
-        (
-            "Event",
-            &[
-                "onClick",
-                "onInput",
-                "onChange",
-                "onSubmit",
-                "onFocus",
-                "onBlur",
-                "onMouseOver",
-                "onMouseOut",
-                "onKeyDown",
-                "onKeyUp",
-                "onBool",
-                "onMsg",
-            ],
-        ),
-        // ── Ipe.Web app-entry kernels ────────────────────────────────────────
-        (
-            "Web",
-            &[
-                "tea",
-                "appRouted",
-                "embed",
-                "appWith",
-                "route",
-                "csrf",
-                "sessionTtl",
-                "authMaxLifetime",
-                "authSlideWindow",
-                "withRevocation",
-                // `CsrfMode` constructors `Web.csrf` takes. No disabling
-                // variant — a setting cannot turn CSRF off.
-                "strict",
-                "inheritCsrf",
-                // `RevocationMode` constructors `Web.withRevocation` takes.
-                "revocationOff",
-                "revocationStore",
-            ],
-        ),
-        // ── Ipe.Tui / Ipe.Cli app-entry kernels ──────────────────────────────
-        // `Tui.tea` (full screen, key input) and `Cli.tea` (line stream, line
-        // input) — one terminal rendering family, two drive axes. Both
-        // carry `KernelClass::Terminal` internally.
-        ("Tui", &["tea"]),
-        ("Cli", &["tea"]),
-        // Shape-owned input subscriptions. Registered under the shape-scoped
-        // `Sub` qualifiers only (never the canonical `Sub`), so `onKey` is
-        // nameable solely through `Ipe.Tea.Tui.Sub` and `onLine` solely through
-        // `Ipe.Tea.Cli.Sub`; the rest of each qualifier's members are the
-        // canonical `Sub` set cloned in by `CMD_SUB_MODULES`.
-        ("TeaTuiSub", &["onKey"]),
-        ("TeaCliSub", &["onLine"]),
-        // `Ipe.Tea.Worker.tea` — view-less co-located worker app-entry
-        // (`{ init, update, subscriptions } -> Program Worker msg`). No render.
-        ("Worker", &["tea"]),
-        // Ipe.Auth / Ipe.Auth — authentication helpers (fail-closed: no lower
-        // arm yet → IPE-L0108 at lower time; canon registration removes N0004).
-        (
-            "Auth",
-            &[
-                "hashPassword",
-                "hashPasswordCost",
-                "verifyPassword",
-                "passwordStrength",
-                "signToken",
-                "verifyToken",
-                "register",
-                "login",
-                "setRole",
-                "subject",
-                "claim",
-                "hasRole",
-                "memberOf",
-            ],
-        ),
-        // Ipe.Auth.Revocation — per-session and per-subject revocation gate.
-        // Requires `Principal` (enforces auth-on-auth); fail-closed on store error.
-        (
-            "Revocation",
-            &["revokeUser", "revokeSession", "restoreUser", "isRevoked"],
-        ),
-        // Ipe.Http.Server.Stream — server-side streaming HTTP (fail-closed).
-        ("Stream", &["stream", "emit", "finish", "withContentType"]),
-        // Ipe.Http.Stream — client-side HTTP streaming (fail-closed).
-        ("HttpStream", &["open", "forEachChunk", "close", "chunks"]),
-        // Ipe.Decimal — DELIBERATELY absent: migrated to compiled-source
-        // `Ipe/Decimal.ipe` (COMPILED_STD_MODULES). Every member reaches its
-        // kernel via `Kernel.kernel "Decimal_*"`, so this catalog block is no
-        // longer needed here.
-        //
-        // Ipe.Http.Server.WebSocket (12 kernels).
-        (
-            "Ws",
-            &[
-                "defaultCfg",
-                "withOnConnect",
-                "withOnMessage",
-                "withOnClose",
-                "withOnError",
-                "withMaxMessageBytes",
-                "withOriginPatterns",
-                "upgrade",
-                "sendToClient",
-                "sendBinaryToClient",
-                "broadcast",
-                "closeClient",
-            ],
-        ),
-    ];
-
-/// Surface members that appear in [`PRELUDE_QUALIFIERS`] under a qualifier that
-/// backs no [`StdlibKernel`] of the *same* member name, because they are
-/// in-table aliases resolved to a different canonical kernel name at
-/// registration time (see `install_prelude_qualifiers`). They are still backed
-/// kernels — just under another name — so the drift gate exempts them.
+/// The native kernel qualifiers: each registers, under its own name, every
+/// [`StdlibKernel`] whose `decl().qualifier` it is.
 ///
-/// `("Event", "onMsg")` is the generic alias for the `Event.onClick` kernel
-/// (`onMsg foo == onClick foo`); its canonical name is rewritten to `onClick`
-/// before the `stdlib_index` lookup, so no `StdlibKernel::decl()` carries the
-/// literal `("Event", "onMsg")` pair.
-const PRELUDE_QUALIFIER_ALIASES: &[(&str, &str)] = &[("Event", "onMsg")];
+/// Members are never spelled here: [`Env::install_prelude_qualifiers`] derives
+/// them from [`StdlibKernel::ALL`], minus [`SURFACE_HIDDEN_KERNELS`]. A kernel
+/// qualifier absent from this list (`String`, `Html`, `Log`, …) is reached
+/// through a compiled-source `Kernel.kernel` alias or through `vars` instead.
+#[rustfmt::skip]
+pub const KERNEL_QUALIFIERS: &[&str] = &[
+    // `Ipe.Error` — the real `Error ErrorKind ErrorInfo` ADT.
+    // Message constructors + nullary constructors + `toString`
+    // render + `withMessage` modifier + `isRetryable` classification +
+    // `withDetails` modifier (attaches the
+    // `ErrorDetails` union to `ErrorInfo.details : Maybe ErrorDetails`).
+    // `Ipe.CssSafety` — the Ipe.Css leaf security kernels: four
+    // `String -> Maybe String` parsers (`safeValue`/`safePropName`/
+    // `safeSelector` gate declarations/selectors at construction;
+    // `sanitizeRawBody` is the authoritative raw/keyframes-body gate over
+    // the audited `css_safety` policy) + the `String -> String`
+    // `<style>`-breakout floor. Imported (and called unqualified) by the
+    // compiled-source `Ipe.Css`.
+    "CssSafety",
+    // `Ipe.Log` — qualified form (`import Ipe.Log as Log`).
+    // `info`/`debug`/`warn`/`error` are backed; the `*With`
+    // variants take Stringify-bounded attrs and stay fail-closed
+    // (IPE-L0108) until the Stringify obligation is added.
+    // `Log` is observability-only — line printing lives in `Ipe.Io`
+    // (`Io.println` / `Io.eprintln`).
+    // `Ipe.App` — runtime-config front door. `fromEnv` seals an env var
+    // into a `Secret` (the config-secret source: `Secret.fromString` over a
+    // value that folds to a non-empty literal is refused, IPE-L0150);
+    // `fromEnvRequired` is its fail-closed variant (a missing/empty var
+    // is a named load-time `ConfigError`, not an empty secret).
+    "App",
+    // `Ipe.Console` — the console/telemetry `Secret`-typed token settings.
+    // Each takes a `Secret` (from `App.fromEnvRequired`), so a hard-coded
+    // token `String` does not type-check.
+    "Console",
+    // `Ipe.Host` — the host-bind setting builder plus the `HostMode`
+    // constructors it takes.
+    "Host",
+    // `Ipe.Level` — the `LogLevel` constructors `Log.level` takes. A
+    // separate qualifier from `Log` because `Log.debug`/`Log.info`/… are
+    // already the logging kernels; `Level.debug`/… are the severity tags.
+    // `Ipe.Json.Encode` — JSON encoder.
+    "JsonEnc",
+    // `Ipe.Json.Decode` — JSON decoder combinators.
+    "JsonDec",
+    // `Ipe.Json.Decode.Pipeline` — pipeline-style record decoders.
+    "JsonDecP",
+    // `Ipe.Crypto` — hashes / HMAC / RSA / AEAD / key-derivation / random.
+    // String-typed surface (backward-compat) + typed-key variants (§6.11).
+    "Crypto",
+    // `Ipe.Secret` — opaque secret-string wrapper.
+    // `fromString` is the seal; `use` is the scoped consume (apply a
+    // function to the plaintext, return its result); `redacted` is the
+    // explicit "<redacted>" accessor. The blunt raw un-parse `reveal`
+    // relocated to the compiled-source `Ipe.Secret.Unsafe` submodule
+    // (`src/stdlib/Ipe/Secret/Unsafe.ipe`) as `unsafeReveal`, reached
+    // through the `Kernel.kernel "Secret_reveal"` alias to the SAME kernel —
+    // so it is absent here and no longer resolves off a plain
+    // `import Ipe.Secret`.
+    "Secret",
+    // `Ipe.Jwt` — JWT encode/decode for HS256 and RS256,
+    // plus builder API: claims / hs256 / rs256 / subject / issuer /
+    // audience / expiresAt / notBefore / issuedAt / jwtId / withClaim /
+    // encode / decode.
+    "Jwt",
+    // `Ipe.System` — system effects.
+    "System",
+    // `Ipe.Random` is DELIBERATELY absent: it is COMPILED-SOURCE
+    // (`ipe::stdlib::COMPILED_STD_MODULES`), so its whole surface resolves
+    // from `Ipe/Random.ipe` — the `Kernel.kernel "Random_*"` aliases and the
+    // pure Ipê wrappers — not from this kernel-qualifier catalog.
+    // `Ipe.File` is DELIBERATELY absent: it is COMPILED-SOURCE
+    // (`ipe::stdlib::COMPILED_STD_MODULES`), so its whole surface resolves
+    // from `Ipe/File.ipe` — the `Kernel.kernel "File_*"` aliases and the
+    // `ByteSize`-typed `readFileLimit` wrapper.
+    // `Ipe.Process` — subprocess execution with NO shell.
+    // `run` : `String -> List String -> Task Error String`.
+    // `runWith` : `{ command, args, cwd, env } -> Task Error { exitCode, stdout, stderr }`.
+    // `runInPty` : `{ command, args, cwd, env, cols, rows } -> Task Error { exitCode, output }`.
+    // All are server-only (`subprocess` capability), default-denied under wasm.
+    "Process",
+    // `Ipe.Http` — outbound HTTP client.
+    // `get` / `post` / `request` are effect kernels (Task Error
+    // HttpResponse); `parseQuery` is a pure kernel (String -> Result
+    // Error (Dict String String)); the `with*` builders + `defaultRequest` are ALSO
+    // pure kernels (HttpRequest record-update emission in the backend) —
+    // cross-module pure-Ipê stdlib calls are not resolved by ipe, so the
+    // builders cannot live as pure Ipê in Http.ipe. Every name below is
+    // registered so `Http.foo` resolves during name-resolution and lands
+    // as `Callee::Kernel` (see lower.rs ("Http", _) arms + constrain.rs
+    // kernel_ty Http entries that give each its record type).
+    "Http",
+    // ── TEA Cmd / Sub kernels ───────────────────────────────────────────
+    // `Cmd.publish` / `Cmd.publishNoEcho` are backed by runtime
+    // `cmd_publish` / `cmd_publish_no_echo` in live/pubsub.rs.
+    // `Sub.subscribeTopic` is backed by runtime `sub_subscribe_topic`
+    // in live/pubsub.rs; emit path uses the standard N-arg route.
+    "Cmd",
+    "Sub",
+    // `Ipe.PubSub` (the top-level, Task-shaped publish surface) is a
+    // COMPILED-SOURCE stdlib module (`src/stdlib/Ipe/PubSub.ipe`), so it
+    // stays OUT of this kernel-qualifier table (kernel qualifier here OR
+    // compiled-source — never both). Its `publish` / `publishNoEcho` bodies
+    // are `Kernel.kernel "PubSub_publish"` / `"PubSub_publishNoEcho"`; the
+    // alias fast-path (`detect_kernel_alias`) splits `"PubSub_publish"` →
+    // the canonical `("PubSub", "publish")` kernel (`class = Web`,
+    // Task-shaped — NOT TEA-loop machinery).
+    // ── Db kernels ──────────────────────────────────────────────────────
+    // `Ipe.Db` — the SAFE database connection + query surface. The
+    // raw-SQL and untyped-column-read escape hatches (`unsafeExecRaw`,
+    // `unsafeQuery`, `unsafeGet*`) live in the compiled-source
+    // `Ipe.Db.Unsafe` submodule (`src/stdlib/Ipe/Db/Unsafe.ipe`), reached
+    // through `Kernel.kernel "Db_*"` aliases to the SAME kernels — so they
+    // are absent here and no longer resolve off a plain `import Ipe.Db`.
+    // `SqlValue` / `SqlField` ADT constructors are handled by
+    // `install_builtin_ctors` above; they are unqualified.
+    "Db",
+    // `Ipe.Db.Sql` — typed, parameterized WHERE-fragment builder.
+    // A `SqlFragment` can only be built through
+    // these combinators, so a naive string-concatenated WHERE clause
+    // is a type error (`String` where `SqlFragment` is expected) at
+    // `Db.findWhere` / `Db.deleteWhere`, not a runtime injection risk.
+    "Sql",
+    // `Ipe.Db.Decode` — row decoder combinators.
+    // The qualifier string contains a dot ("Db.Decode") which the parser
+    // produces correctly for the 3-segment path `Db.Decode.string` — see
+    // ipe_parse::parser::ident_expr (qualifier = init.join(".")).
+    "Db.Decode",
+    // Ipe.Http.Server kernels.
+    "Server",
+    // Ipe.Http.Middleware kernels.
+    "Middleware",
+    // Ipe.Http.RateLimit kernels.
+    "RateLimit",
+    // `Ipe.Ui` is COMPILED-SOURCE (see `COMPILED_STD_MODULES`), not a
+    // kernel qualifier: the layout builders (`el`/`row`/`column`/
+    // `wrappedRow`/`grid`/`paragraph`/`textColumn`/`form`/`input`) are
+    // pure Ipê over the retained `node`/`taggedNode` primitives, and every
+    // other member is a `Kernel.kernel "Ui_*"` alias resolving to its
+    // unchanged kernel. The `Ipe.Ui.*` sub-qualifiers (Background/Border/
+    // Font/Region/Input/Lazy/Keyed) stay native below. The disjointness
+    // invariant forbids `Ui` here.
+    // ── Ipe.Ui.Background sub-module ─────────────────────────────────────
+    "Background",
+    // ── Ipe.Ui.Border sub-module ─────────────────────────────────────────
+    "Border",
+    // ── Ipe.Ui.Font sub-module ───────────────────────────────────────────
+    "Font",
+    // ── Ipe.Ui.Region sub-module ─────────────────────────────────────────
+    "Region",
+    // ── Ipe.Ui.Input sub-module ──────────────────────────────────────────
+    "Input",
+    // ── Ipe.Ui.Lazy sub-module ───────────────────────────────────────────
+    "Lazy",
+    // ── Ipe.Ui.Keyed — ipe-key for diff identity ─────────────────────────
+    "Keyed",
+    // `Ipe.Html` and `Ipe.Html.Attributes` are compiled-source (see exclusion
+    // table in `STDLIB_MODULE_QUALIFIERS`); `Ipe.Html.Events` is a kernel qualifier.
+    // ── Ipe.Html.Events alias ─────────────────────────────────────────────
+    "Event",
+    // ── Ipe.Web app-entry kernels ────────────────────────────────────────
+    "Web",
+    // ── Ipe.Tui / Ipe.Cli app-entry kernels ──────────────────────────────
+    // `Tui.tea` (full screen, key input) and `Cli.tea` (line stream, line
+    // input) — one terminal rendering family, two drive axes. Both
+    // carry `KernelClass::Terminal` internally.
+    "Tui",
+    "Cli",
+    // Shape-owned input subscriptions. Registered under the shape-scoped
+    // `Sub` qualifiers only (never the canonical `Sub`), so `onKey` is
+    // nameable solely through `Ipe.Tea.Tui.Sub` and `onLine` solely through
+    // `Ipe.Tea.Cli.Sub`; the rest of each qualifier's members are the
+    // canonical `Sub` set cloned in by `CMD_SUB_MODULES`.
+    "TeaTuiSub",
+    "TeaCliSub",
+    // `Ipe.Tea.Worker.tea` — view-less co-located worker app-entry
+    // (`{ init, update, subscriptions } -> Program Worker msg`). No render.
+    "Worker",
+    // Ipe.Auth / Ipe.Auth — authentication helpers (fail-closed: no lower
+    // arm yet → IPE-L0108 at lower time; canon registration removes N0004).
+    "Auth",
+    // Ipe.Auth.Revocation — per-session and per-subject revocation gate.
+    // Requires `Principal` (enforces auth-on-auth); fail-closed on store error.
+    "Revocation",
+    // Ipe.Http.Server.Stream — server-side streaming HTTP (fail-closed).
+    "Stream",
+    // Ipe.Http.Stream — client-side HTTP streaming (fail-closed).
+    "HttpStream",
+    // Ipe.Decimal — DELIBERATELY absent: migrated to compiled-source
+    // `Ipe/Decimal.ipe` (COMPILED_STD_MODULES). Every member reaches its
+    // kernel via `Kernel.kernel "Decimal_*"`, so this catalog block is no
+    // longer needed here.
+    //
+    // Ipe.Http.Server.WebSocket (12 kernels).
+    "Ws",
+];
+
+/// Kernels under a [`KERNEL_QUALIFIERS`] qualifier that its native surface
+/// does not register.
+///
+/// Each keeps its canonical `(qualifier, name)` key in `stdlib_index`, so the
+/// `Kernel.kernel` alias of the compiled-source module named on its row still
+/// resolves it; a plain import of the native module does not.
+pub const SURFACE_HIDDEN_KERNELS: &[StdlibKernel] = &[
+    // Raw SQL and untyped column reads: `Ipe.Db.Unsafe`.
+    StdlibKernel::DbExecRaw,
+    StdlibKernel::DbQuery,
+    StdlibKernel::DbGetString,
+    StdlibKernel::DbGetInt,
+    StdlibKernel::DbGetBool,
+    StdlibKernel::DbGetField,
+    // The external-connection raw write: `Ipe.Db.Unsafe`.
+    StdlibKernel::DbConnUnsafeExecRawOn,
+    // The un-validated fragment: `Ipe.Db.Unsafe.unsafeFragment`.
+    StdlibKernel::SqlUnsafeFragment,
+    // The blunt secret un-parse: `Ipe.Secret.Unsafe.unsafeReveal`. The scoped
+    // `Secret.use` stays on the native surface.
+    StdlibKernel::SecretReveal,
+    // The policy-checked secured writes: private to `Ipe.Db.Store`'s
+    // `insertAs` / `updateAs`; no module surfaces them.
+    StdlibKernel::DbInsertFieldsChecked,
+    StdlibKernel::DbUpdateWhereChecked,
+];
+
+/// Per-qualifier member aliases, as `(qualifier, alias, canonical name)`.
+///
+/// The alias resolves to the canonical kernel's home, so the lowerer's
+/// `(qualifier, canonical)` match arm fires unchanged. Installed before the
+/// `CMD_SUB_MODULES` copies, so every alias reaches each copy.
+const FUNC_ALIASES: &[(&str, &str, &str)] = &[
+    // `Event.onMsg` is the generic spelling of `Event.onClick`.
+    ("Event", "onMsg", "onClick"),
+    // `Crypto.hmacSha256`/`hmacSha512` are the typed-`Key` HMAC surface, so a
+    // bare `String` key is a type error.
+    ("Crypto", "hmacSha256", "hmacSha256WithKey"),
+    ("Crypto", "hmacSha512", "hmacSha512WithKey"),
+];
+
+/// Members re-exported under a new qualifier, as
+/// `(new qualifier, member, canonical qualifier, canonical name)`.
+///
+/// The home carries the canonical module and name, so the lowerer's match
+/// arms fire unchanged; only the resolution qualifier differs.
+const CROSS_QUALIFIER_MEMBERS: &[(&str, &str, &str, &str)] = &[
+    // `Crypto`'s typed-key surface: the `Key` constructors and the `Mac`
+    // extractor and parser, off a plain `import Ipe.Crypto`.
+    ("Crypto", "keyFromString", "Key", "fromString"),
+    ("Crypto", "keyFromBytes", "Key", "fromBytes"),
+    ("Crypto", "macToHex", "Mac", "toHex"),
+    ("Crypto", "macFromHex", "Mac", "fromHex"),
+    // `Ipe.Tea.Web.PubSub` (`TeaWebPubSub`): the TEA-side broadcast members,
+    // drawn from the `Cmd` and `Sub` kernel families.
+    ("TeaWebPubSub", "publish", "Cmd", "publish"),
+    ("TeaWebPubSub", "publishNoEcho", "Cmd", "publishNoEcho"),
+    ("TeaWebPubSub", "subscribeTopic", "Sub", "subscribeTopic"),
+];
 
 /// Number of wired kernel variants — the length of [`StdlibKernel::ALL`].
 const REGISTRY_LEN: usize = StdlibKernel::ALL.len();
@@ -1878,20 +1500,6 @@ pub const fn const_str_eq(a: &str, b: &str) -> bool {
     true
 }
 
-/// `true` iff `(qualifier, member)` is one of the sanctioned in-table aliases.
-#[allow(clippy::indexing_slicing)] // index guarded by `i < len`; see note above
-const fn is_prelude_qualifier_alias(qualifier: &str, member: &str) -> bool {
-    let mut i = 0;
-    while i < PRELUDE_QUALIFIER_ALIASES.len() {
-        let (q, m) = PRELUDE_QUALIFIER_ALIASES[i];
-        if const_str_eq(q, qualifier) && const_str_eq(m, member) {
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
-
 /// `true` iff some wired [`StdlibKernel`] declares exactly `(qualifier, member)`.
 #[allow(clippy::indexing_slicing)] // index guarded by `i < REGISTRY_LEN`; see note above
 const fn registry_backs(qualifier: &str, member: &str) -> bool {
@@ -1906,53 +1514,182 @@ const fn registry_backs(qualifier: &str, member: &str) -> bool {
     false
 }
 
-/// **Compile-time drift tripwire (fail-closed).** Every `(qualifier, member)`
-/// the canonicaliser will register from [`PRELUDE_QUALIFIERS`] must be backed by
-/// a wired [`StdlibKernel`] of the same name — or be a sanctioned in-table alias
-/// ([`PRELUDE_QUALIFIER_ALIASES`]). If the two const tables drift (a member is
-/// added here without a matching kernel, or a kernel is renamed/removed out from
-/// under a registered member) this `assert!` fails **at build time**, before any
-/// test runs — so a resolver that recognises a name the registry cannot lower
-/// (the `ipe`-accepts-then-`cargo`-fails class) can never ship.
+/// The `(qualifier, name)` identity of each [`SURFACE_HIDDEN_KERNELS`] row.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < len`; see note above
+const SURFACE_HIDDEN_DECLS: [(&str, &str); SURFACE_HIDDEN_KERNELS.len()] = {
+    let mut pairs = [("", ""); SURFACE_HIDDEN_KERNELS.len()];
+    let mut i = 0;
+    while i < SURFACE_HIDDEN_KERNELS.len() {
+        let decl = SURFACE_HIDDEN_KERNELS[i].decl();
+        pairs[i] = (decl.qualifier, decl.name);
+        i += 1;
+    }
+    pairs
+};
+
+/// `true` iff `pairs` holds `(qualifier, name)`.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < len`; see note above
+const fn pairs_contain(pairs: &[(&str, &str)], qualifier: &str, name: &str) -> bool {
+    let mut i = 0;
+    while i < pairs.len() {
+        let (q, n) = pairs[i];
+        if const_str_eq(q, qualifier) && const_str_eq(n, name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `true` iff `names` holds `name`.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < len`; see note above
+const fn names_contain(names: &[&str], name: &str) -> bool {
+    let mut i = 0;
+    while i < names.len() {
+        if const_str_eq(names[i], name) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// G1: `true` iff some registry kernel under `qualifier` is not in `hidden`.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < REGISTRY_LEN`; see note above
+const fn qualifier_backs_visible_kernel(qualifier: &str, hidden: &[(&str, &str)]) -> bool {
+    let mut i = 0;
+    while i < REGISTRY_LEN {
+        let (q, n) = REGISTRY_DECL_PAIRS[i];
+        if const_str_eq(q, qualifier) && !pairs_contain(hidden, q, n) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// G2: `true` iff every `hidden` row sits under one of `qualifiers`.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < len`; see note above
+const fn hides_are_live(hidden: &[(&str, &str)], qualifiers: &[&str]) -> bool {
+    let mut i = 0;
+    while i < hidden.len() {
+        if !names_contain(qualifiers, hidden[i].0) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// `true` iff two rows of `pairs` are equal.
+#[allow(clippy::indexing_slicing)] // indices guarded by `< len`; see note above
+const fn has_duplicate_pair(pairs: &[(&str, &str)]) -> bool {
+    let mut a = 0;
+    while a < pairs.len() {
+        let mut b = a + 1;
+        while b < pairs.len() {
+            if const_str_eq(pairs[a].0, pairs[b].0) && const_str_eq(pairs[a].1, pairs[b].1) {
+                return true;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    false
+}
+
+/// `true` iff two rows of `names` are equal.
+#[allow(clippy::indexing_slicing)] // indices guarded by `< len`; see note above
+const fn has_duplicate_name(names: &[&str]) -> bool {
+    let mut a = 0;
+    while a < names.len() {
+        let mut b = a + 1;
+        while b < names.len() {
+            if const_str_eq(names[a], names[b]) {
+                return true;
+            }
+            b += 1;
+        }
+        a += 1;
+    }
+    false
+}
+
+/// G3 and G4 for one alias or re-export: its canonical pair is a registry
+/// kernel, and its new name is not a registry member under its new qualifier.
+const fn alias_row_sound(qualifier: &str, alias: &str, canon_q: &str, canon_n: &str) -> bool {
+    registry_backs(canon_q, canon_n) && !registry_backs(qualifier, alias)
+}
+
+/// **Compile-time kernel-surface tripwire (fail-closed).** Every hand-written
+/// name around the derived member set agrees with the registry, so a drift
+/// fails the build rather than leaving a kernel unreachable or an alias
+/// unbacked:
 ///
-/// The runtime `canon_equals_registry` test in `crate::tests` still checks the
-/// dynamic wiring the interner builds (`stdlib_index` propagation, the reserved
-/// category, `.Unsafe`-relocation), which cannot be evaluated in `const` context;
-/// this gate is the const-data half the project rulebook mandates be build-time.
+/// - G1: every [`KERNEL_QUALIFIERS`] row backs a kernel that is not hidden,
+///   and no row appears twice.
+/// - G2: every [`SURFACE_HIDDEN_KERNELS`] row sits under a kernel qualifier,
+///   and no row appears twice.
+/// - G3: every [`FUNC_ALIASES`] and [`CROSS_QUALIFIER_MEMBERS`] canonical pair
+///   is a registry kernel (otherwise the alias would be a `ReservedKernel`).
+/// - G4: no alias or re-export name is a registry member under its new
+///   qualifier (otherwise its insert would overwrite the derived kernel).
+///
+/// The runtime `canon_equals_registry` test in `crate::tests` checks the
+/// interner wiring, which cannot run in `const`.
 ///
 /// The `allow(long_running_const_eval)` covers the bounded
-/// `PRELUDE_QUALIFIERS.len() × StdlibKernel::ALL.len()` cross-scan — deterministic
-/// and finite (no data-dependent iteration), just larger than the lint's default
-/// step budget for a soft infinite-loop guard.
+/// `KERNEL_QUALIFIERS.len() × StdlibKernel::ALL.len()` cross-scan.
 #[allow(long_running_const_eval)]
 #[allow(clippy::indexing_slicing)] // indices guarded by `i < len`; see note above
 const _: () = {
     let mut qi = 0;
-    while qi < PRELUDE_QUALIFIERS.len() {
-        let (qualifier, members) = PRELUDE_QUALIFIERS[qi];
-        // Internal-only qualifiers never surface a user-visible kernel member.
-        let bytes = qualifier.as_bytes();
-        let is_internal = !bytes.is_empty() && bytes[0] == b'_';
-        if !is_internal {
-            let mut mi = 0;
-            while mi < members.len() {
-                let member = members[mi];
-                // IPE-RUST-AUDIT:ACCEPTED — this `assert!` runs during const-eval of the
-                // enclosing `const _` block, so it fails the build on kernel-table drift and
-                // can never panic at runtime; it is a compile-time proof, not a runtime abort.
-                assert!(
-                    registry_backs(qualifier, member)
-                        || is_prelude_qualifier_alias(qualifier, member),
-                    "kernel-table drift: PRELUDE_QUALIFIERS lists a (qualifier, \
-                     member) pair with no matching StdlibKernel::decl() and no \
-                     sanctioned alias in PRELUDE_QUALIFIER_ALIASES. Add the kernel \
-                     variant (+ its type scheme) to the registry, or register the \
-                     alias, or remove the stale member.",
-                );
-                mi += 1;
-            }
-        }
+    while qi < KERNEL_QUALIFIERS.len() {
+        // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+        assert!(
+            qualifier_backs_visible_kernel(KERNEL_QUALIFIERS[qi], &SURFACE_HIDDEN_DECLS),
+            "kernel-surface drift (G1): a KERNEL_QUALIFIERS row backs no kernel \
+             outside SURFACE_HIDDEN_KERNELS. Fix the qualifier's spelling or drop it.",
+        );
         qi += 1;
+    }
+    // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+    assert!(
+        !has_duplicate_name(KERNEL_QUALIFIERS),
+        "kernel-surface drift (G1): a KERNEL_QUALIFIERS row appears twice.",
+    );
+    // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+    assert!(
+        hides_are_live(&SURFACE_HIDDEN_DECLS, KERNEL_QUALIFIERS),
+        "kernel-surface drift (G2): a SURFACE_HIDDEN_KERNELS row sits under no \
+         KERNEL_QUALIFIERS qualifier, so it hides nothing. Drop it.",
+    );
+    // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+    assert!(
+        !has_duplicate_pair(&SURFACE_HIDDEN_DECLS),
+        "kernel-surface drift (G2): a SURFACE_HIDDEN_KERNELS row appears twice.",
+    );
+    let mut ai = 0;
+    while ai < FUNC_ALIASES.len() {
+        let (q, alias, canonical) = FUNC_ALIASES[ai];
+        // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+        assert!(
+            alias_row_sound(q, alias, q, canonical),
+            "kernel-surface drift (G3/G4): a FUNC_ALIASES row names no registry \
+             kernel, or its alias is itself a registry member.",
+        );
+        ai += 1;
+    }
+    let mut ci = 0;
+    while ci < CROSS_QUALIFIER_MEMBERS.len() {
+        let (q, member, canon_q, canon_n) = CROSS_QUALIFIER_MEMBERS[ci];
+        // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+        assert!(
+            alias_row_sound(q, member, canon_q, canon_n),
+            "kernel-surface drift (G3/G4): a CROSS_QUALIFIER_MEMBERS row names no \
+             registry kernel, or its member is itself a registry member.",
+        );
+        ci += 1;
     }
 };
 
@@ -2531,74 +2268,13 @@ impl Env {
     /// etc. resolve without an explicit `import String`.
     #[allow(clippy::too_many_lines)] // declarative table — extracting a helper would obscure the data
     fn install_prelude_qualifiers(&mut self, interner: &mut Interner) -> DResult<()> {
-        // Compiled-source modules absent from QUALIFIERS (enforced by
+        // Compiled-source modules absent from `KERNEL_QUALIFIERS` (enforced by
         // `compiled_vs_kernel_qualifier_disjoint`; see the exclusion table in
         // `STDLIB_MODULE_QUALIFIERS` for the full list and per-module rationale):
         // String, Char, List, Math, Bitwise, Dict, Set, Bytes, Encoding,
         // Uuid, Task, Io, Debug, Time, Random, Decimal, Css, Ui, Html,
         // Html.Attributes, Path, Regex.
         // Their kernels are reached via `detect_kernel_alias`, not this table.
-        //
-        // The table itself is hoisted to the module-level `PRELUDE_QUALIFIERS`
-        // so a compile-time drift gate can check it against the kernel registry
-        // without executing this function.
-        const QUALIFIERS: &[(&str, &[&str])] = PRELUDE_QUALIFIERS;
-
-        // ── Per-qualifier function name aliases ───────────────────────────────
-        // Maps a Ipê-source alias name (e.g. `htmlRender`) to its canonical
-        // kernel function name (e.g. `render`) within a qualifier module, so
-        // `Html.htmlRender` and `Ipe.Html.htmlRender` both produce
-        // `VarKernel { module: html_sym, name: render_sym }` — which lower.rs
-        // matches under the same `("Html", "render")` arm.
-        //
-        // Declared here (before the first `for` statement) to satisfy
-        // `clippy::items_after_statements`.
-        //
-        // MUST be processed BEFORE the `CMD_SUB_MODULES` copies (installed
-        // below) so that alias entries are included in any qual-to-qual copy.
-        const FUNC_ALIASES: &[(&str, &str, &str)] = &[
-            // ("qualifier", "alias_name", "canonical_kernel_name")
-            // `Html`'s legacy pipeline-readable spellings (`htmlRender` /
-            // `htmlEscapeText` / `htmlEscapeAttr` / `htmlAttrToString`) are
-            // DELIBERATELY absent: `Ipe.Html` is now COMPILED-SOURCE
-            // (`COMPILED_STD_MODULES`), so those aliases live in `Ipe/Html.ipe`
-            // as `Kernel.kernel "Html_*"` bindings, not the kernel-qualifier prelude.
-            // `Random.range` is likewise DELIBERATELY absent: `Ipe.Random` is now
-            // COMPILED-SOURCE, so `range lo hi = int lo hi` lives in
-            // `Ipe/Random.ipe` as pure Ipê, not a kernel-qualifier alias.
-            //
-            // `Crypto.hmacSha256`/`hmacSha512` are the typed-`Key` HMAC surface,
-            // aliasing the canonical `hmacSha256WithKey`/`hmacSha512WithKey`
-            // kernels. The String-keyed originals were removed so passing a bare
-            // `String` key is a compile-time type error; the alias inherits the
-            // canonical kernel's `Key -> String -> Mac` scheme.
-            ("Crypto", "hmacSha256", "hmacSha256WithKey"),
-            ("Crypto", "hmacSha512", "hmacSha512WithKey"),
-        ];
-
-        // ── Cross-qualifier member re-exports ────────────────────────────────
-        // A member exposed under a NEW qualifier whose backing kernel lives under
-        // a DIFFERENT canonical qualifier. The `VarHome::Kernel` carries the
-        // CANONICAL module + name symbols, so the lowerer's kernel match arms
-        // (`("Cmd", "publish")`, `("Sub", "subscribeTopic")`) fire unchanged; only
-        // the resolution qualifier differs. Used to give the Web-shape-scoped
-        // `Ipe.Tea.Web.PubSub` (canonical `TeaWebPubSub`) its TEA-side broadcast
-        // members, which aggregate two canonical kernel families (`Cmd` + `Sub`).
-        const CROSS_QUALIFIER_MEMBERS: &[(&str, &str, &str, &str)] = &[
-            // (new_qualifier, member_name, canonical_qualifier, canonical_name)
-            // `Crypto`'s typed-key surface: the `Key` constructors and the `Mac`
-            // extractor and parser are canonical `Key.*` / `Mac.*` kernels,
-            // re-exported under the `Crypto` qualifier so `Crypto.keyFromBytes` /
-            // `Crypto.macToHex` / `Crypto.macFromHex` resolve off a plain
-            // `import Ipe.Crypto`.
-            ("Crypto", "keyFromString", "Key", "fromString"),
-            ("Crypto", "keyFromBytes", "Key", "fromBytes"),
-            ("Crypto", "macToHex", "Mac", "toHex"),
-            ("Crypto", "macFromHex", "Mac", "fromHex"),
-            ("TeaWebPubSub", "publish", "Cmd", "publish"),
-            ("TeaWebPubSub", "publishNoEcho", "Cmd", "publishNoEcho"),
-            ("TeaWebPubSub", "subscribeTopic", "Sub", "subscribeTopic"),
-        ];
 
         // Build stdlib_index FIRST so every `kernel_home` call below can look
         // up the backing kernel and pick `Kernel` vs `ReservedKernel`.
@@ -2620,38 +2296,29 @@ impl Env {
             }
         }
 
-        for (qual, funcs) in QUALIFIERS {
-            let qual_sym = interner.intern(qual)?;
-            let mut module = BTreeMap::new();
-            for func in *funcs {
-                let func_sym = interner.intern(func)?;
-                // Resolve the backing kernel so lower_callee can use the fast
-                // path for registered kernels.
-                //
-                // `Ipe.Html.Events` (`Event`) resolves to the DEDICATED
-                // `Html*` event kernels (`HtmlOnClick` …), which produce
-                // `Ipe.Html.Attribute msg` (`html_attr`) — the same nominal type
-                // the `Ipe.Html.Attributes` builders and every element builder's
-                // `List (html_attr msg)` slot use. (They must NOT alias to
-                // the `Ui` event kernels, which produce the `Ipe.Ui.Attribute`
-                // variant — that makes `button [ onClick Msg ]` fail to unify.) `onMsg`
-                // is the generic alias for `onClick`. All members are registered
-                // under `(Event, name)` in `stdlib_index`, so `kernel_home`
-                // yields a backed `Kernel` and `lower_callee`'s fast path returns
-                // the `Html*` kernel directly.
-                let name_sym = if *qual == "Event" {
-                    let canonical = if *func == "onMsg" { "onClick" } else { *func };
-                    interner.intern(canonical)?
-                } else {
-                    func_sym
-                };
-                module.insert(
-                    func_sym,
-                    kernel_home(&self.stdlib_index, qual_sym, name_sym),
-                );
+        // Every visible kernel under a native kernel qualifier, keyed by the
+        // `(qualifier, name)` its `stdlib_index` entry already carries. The
+        // `Event` members resolve to the dedicated `Html*` event kernels, which
+        // produce the `Ipe.Html.Attribute msg` every element builder takes.
+        let mut kernel_qualifiers = BTreeSet::new();
+        for qual in KERNEL_QUALIFIERS {
+            kernel_qualifiers.insert(interner.intern(qual)?);
+        }
+        let mut members: BTreeMap<Symbol, BTreeMap<Symbol, VarHome>> = kernel_qualifiers
+            .iter()
+            .map(|&qual| (qual, BTreeMap::new()))
+            .collect();
+        for (&(qual, name), &kernel) in &*self.stdlib_index {
+            if SURFACE_HIDDEN_KERNELS.contains(&kernel) {
+                continue;
             }
+            if let Some(module) = members.get_mut(&qual) {
+                module.insert(name, VarHome::Kernel(kernel, qual, name));
+            }
+        }
+        for (qual, module) in members {
             Rc::make_mut(&mut self.qual_vars)
-                .entry(qual_sym)
+                .entry(qual)
                 .or_default()
                 .extend(module);
         }
@@ -2711,63 +2378,90 @@ impl Env {
 
 #[cfg(test)]
 mod kernel_table_drift_gate_tests {
-    //! Guards the compile-time drift tripwire (`const _` block above, using
-    //! `registry_backs` / `is_prelude_qualifier_alias`). The `const` gate itself
-    //! cannot be exercised with a *drifted* table at test time — a real drift
-    //! fails the build, not a test — so these tests instead prove the gate's
-    //! decision logic: it rejects an unbacked pair and accepts the backed /
-    //! aliased cases, and the live table has zero unsanctioned drift.
+    //! Guards the compile-time kernel-surface tripwire (the `const _` block
+    //! above). A real drift fails the build, not a test, so these tests prove
+    //! each gate's predicate on synthetic data: it rejects the drift it names
+    //! and accepts the live tables.
 
-    use super::{PRELUDE_QUALIFIERS, is_prelude_qualifier_alias, registry_backs};
+    use super::{
+        CROSS_QUALIFIER_MEMBERS, FUNC_ALIASES, KERNEL_QUALIFIERS, SURFACE_HIDDEN_DECLS,
+        alias_row_sound, has_duplicate_name, has_duplicate_pair, hides_are_live,
+        qualifier_backs_visible_kernel, registry_backs,
+    };
     use ipe_kernels::StdlibKernel;
 
     /// A real registry pair is recognised as backed.
     #[test]
     fn registry_backs_a_real_pair() {
-        let first = StdlibKernel::ALL.first().expect("registry is non-empty");
+        let Some(first) = StdlibKernel::ALL.first() else {
+            return;
+        };
         let decl = first.decl();
         assert!(registry_backs(decl.qualifier, decl.name));
     }
 
-    /// A pair no kernel declares is NOT backed — the drift the const gate rejects.
+    /// A pair no kernel declares is not backed.
     #[test]
     fn registry_does_not_back_a_synthetic_drift_pair() {
         assert!(!registry_backs("CssSafety", "driftProbeXyz"));
-        assert!(!is_prelude_qualifier_alias("CssSafety", "driftProbeXyz"));
     }
 
-    /// The sanctioned in-table alias (`Event.onMsg`) is exempt: unbacked by its
-    /// own name, but recognised as an alias.
+    /// G1 rejects a typo'd qualifier and a qualifier whose every kernel is
+    /// hidden; it accepts every live row.
     #[test]
-    fn event_on_msg_is_a_sanctioned_alias() {
-        assert!(!registry_backs("Event", "onMsg"));
-        assert!(is_prelude_qualifier_alias("Event", "onMsg"));
-    }
-
-    /// Runtime mirror of the compile-time gate: every surfaced
-    /// `(qualifier, member)` in the live table is either registry-backed or a
-    /// sanctioned alias. If this fails, the `const _` gate above has already
-    /// failed the build — this is the readable diagnostic form.
-    #[test]
-    fn every_prelude_qualifier_member_is_backed_or_aliased() {
-        let mut offenders = Vec::new();
-        for (qualifier, members) in PRELUDE_QUALIFIERS {
-            if qualifier.starts_with('_') {
-                continue;
-            }
-            for member in *members {
-                if !registry_backs(qualifier, member)
-                    && !is_prelude_qualifier_alias(qualifier, member)
-                {
-                    offenders.push(format!("{qualifier}.{member}"));
-                }
-            }
+    fn g1_rejects_a_qualifier_with_no_visible_kernel() {
+        assert!(!qualifier_backs_visible_kernel("Wbe", &[]));
+        assert!(!qualifier_backs_visible_kernel(
+            "Wbe",
+            &SURFACE_HIDDEN_DECLS
+        ));
+        let hidden: Vec<(&str, &str)> = StdlibKernel::ALL
+            .iter()
+            .filter(|k| k.decl().qualifier == "Web")
+            .map(|k| (k.decl().qualifier, k.decl().name))
+            .collect();
+        assert!(!hidden.is_empty());
+        assert!(qualifier_backs_visible_kernel("Web", &[]));
+        assert!(!qualifier_backs_visible_kernel("Web", &hidden));
+        for qualifier in KERNEL_QUALIFIERS {
+            assert!(
+                qualifier_backs_visible_kernel(qualifier, &SURFACE_HIDDEN_DECLS),
+                "{qualifier} backs no visible kernel"
+            );
         }
-        assert!(
-            offenders.is_empty(),
-            "PRELUDE_QUALIFIERS members with no backing StdlibKernel and no \
-             sanctioned alias: {offenders:?}"
-        );
+        assert!(has_duplicate_name(&["Web", "Event", "Web"]));
+        assert!(!has_duplicate_name(KERNEL_QUALIFIERS));
+    }
+
+    /// G2 rejects a hide under no kernel qualifier and a repeated hide; it
+    /// accepts the live list.
+    #[test]
+    fn g2_rejects_a_stale_or_repeated_hide() {
+        assert!(!hides_are_live(&[("String", "fromInt")], KERNEL_QUALIFIERS));
+        assert!(hides_are_live(&SURFACE_HIDDEN_DECLS, KERNEL_QUALIFIERS));
+        assert!(has_duplicate_pair(&[("Db", "query"), ("Db", "query")]));
+        assert!(!has_duplicate_pair(&SURFACE_HIDDEN_DECLS));
+    }
+
+    /// G3 rejects an alias whose canonical pair is unbacked; G4 rejects an
+    /// alias whose own name is a registry member. Both accept the live rows.
+    #[test]
+    fn g3_g4_reject_an_unbacked_or_shadowing_alias() {
+        assert!(!alias_row_sound("Event", "onMsg", "Event", "onClik"));
+        assert!(!alias_row_sound("Event", "onClick", "Event", "onClick"));
+        for (q, alias, canonical) in FUNC_ALIASES {
+            assert!(alias_row_sound(q, alias, q, canonical), "{q}.{alias}");
+        }
+        for (q, member, canon_q, canon_n) in CROSS_QUALIFIER_MEMBERS {
+            assert!(alias_row_sound(q, member, canon_q, canon_n), "{q}.{member}");
+        }
+    }
+
+    /// `Event.onMsg` is an alias row, not a registry member.
+    #[test]
+    fn event_on_msg_is_a_func_alias() {
+        assert!(!registry_backs("Event", "onMsg"));
+        assert!(FUNC_ALIASES.contains(&("Event", "onMsg", "onClick")));
     }
 }
 

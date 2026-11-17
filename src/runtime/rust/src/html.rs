@@ -53,6 +53,34 @@ pub enum Attribute<M> {
     EventAttr(Event<M>),
     /// Sentinel for a conditionally-absent attribute; skipped during render.
     NoAttr,
+    /// A page link's target.
+    ///
+    /// Only `ui::helpers::web_page_link` builds one. The sink serializes it as
+    /// `href` (the route joined to the render's base), the `ipe-nav` marker
+    /// and, for the page on screen, `aria-current="page"`: the one producer of
+    /// each on a page link.
+    #[cfg(feature = "web-core")]
+    PageHref(PageTarget),
+}
+
+/// Whether a page link names the page on screen.
+#[cfg(feature = "web-core")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageMark {
+    /// The link names another page.
+    Away,
+    /// The link names the page on screen; it renders `aria-current="page"`.
+    Current,
+}
+
+/// A page link's route and its [`PageMark`].
+#[cfg(feature = "web-core")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageTarget {
+    /// The page's canonical path.
+    pub route: crate::web::route::RoutePath,
+    /// Whether the page is the one on screen.
+    pub mark: PageMark,
 }
 
 /// Variant names mirror the Ipê stdlib `Ipe.Html.Attributes.Event` ADT
@@ -112,6 +140,8 @@ impl<M: PartialEq> PartialEq for Attribute<M> {
             (BoolAttr(a, b), BoolAttr(c, d)) => a == c && b == d,
             (EventAttr(a), EventAttr(b)) => a == b,
             (NoAttr, NoAttr) => true,
+            #[cfg(feature = "web-core")]
+            (Self::PageHref(a), Self::PageHref(b)) => a == b,
             _ => false,
         }
     }
@@ -127,6 +157,8 @@ impl<M> std::fmt::Debug for Attribute<M> {
             Attribute::BoolAttr(k, _) => write!(f, "BoolAttr({k:?},{hidden})"),
             Attribute::EventAttr(e) => write!(f, "{e:?}"),
             Attribute::NoAttr => write!(f, "NoAttr"),
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => write!(f, "PageHref({hidden})"),
         }
     }
 }
@@ -204,17 +236,89 @@ pub fn render_html<M>(node: &Html<M>) -> String {
     render_html_in(node, &RenderCtx::Unstamped)
 }
 
-/// How a render stamps the `<style>` elements it admits.
+/// How a render stamps the `<style>` elements it admits and where its page
+/// links point.
 ///
-/// Every serialization of a session's tree passes the session's nonce, so a
-/// `<style>` written in HTML data or foreign content carries `nonce="…"`. A
-/// `<style>` under an RCDATA or RAWTEXT ancestor is text, never stamped.
+/// Every serialization of a session's tree passes the session's marks, so a
+/// `<style>` written in HTML data or foreign content carries `nonce="…"`, and
+/// a page link's `href` is its route under the session's base. A `<style>`
+/// under an RCDATA or RAWTEXT ancestor is text, never stamped.
 #[derive(Clone, Debug)]
 pub enum RenderCtx<'a> {
-    /// No stamp: emitted code, the static page render, the browser runtime.
+    /// No stamp, and page links at the root base: emitted code, the static
+    /// page render, the browser runtime.
     Unstamped,
-    /// A session's render, stamped with that session's nonce.
-    Session(&'a StyleNonce),
+    /// A session's render, under that session's marks.
+    Session(&'a SessionMarks),
+}
+
+/// What a session's every render carries: its style nonce and the mount base
+/// its page links are joined to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMarks {
+    /// The nonce every admitted `<style>` is stamped with.
+    pub nonce: StyleNonce,
+    /// The base every page link's route is joined to.
+    #[cfg(feature = "web-core")]
+    pub base: crate::encoding::EncodedBase,
+}
+
+impl SessionMarks {
+    /// Marks stamping `nonce`, with page links at the root base.
+    #[must_use]
+    pub fn new(nonce: StyleNonce) -> Self {
+        Self {
+            nonce,
+            #[cfg(feature = "web-core")]
+            base: crate::encoding::MountBase::root().encoded(),
+        }
+    }
+
+    /// These marks with page links joined to `base`.
+    #[cfg(feature = "web-core")]
+    #[must_use]
+    pub fn under(self, base: crate::encoding::EncodedBase) -> Self {
+        Self { base, ..self }
+    }
+
+    /// The bytes the marks hold past their inline size: the base's text.
+    #[must_use]
+    pub fn held_bytes(&self) -> Option<Bytes> {
+        #[cfg(feature = "web-core")]
+        let held = self.base.as_str().len();
+        #[cfg(not(feature = "web-core"))]
+        let held = 0;
+        Bytes::count(held)
+    }
+}
+
+/// The attribute a page link's route is written to.
+const PAGE_HREF_ATTR: &str = "href";
+
+/// The attribute that marks the link to the page on screen.
+const PAGE_CURRENT_ATTR: &str = "aria-current";
+
+/// The marker the client intercepts a page link by.
+///
+/// Only a [`Attribute::PageHref`] writes it: it is a reserved name, so no
+/// program-built attribute reaches a page with it.
+pub(crate) const PAGE_NAV_ATTR: &str = "ipe-nav";
+
+/// The `href` of a page link to `route` under `stamp`'s base.
+///
+/// It is [`BrowserPath::of`](crate::dom::dispatch::BrowserPath::of), the one
+/// join of a base and a route, so a link names exactly the URL its page
+/// commits.
+#[cfg(feature = "web-core")]
+fn page_href_value(route: &crate::web::route::RoutePath, stamp: &RenderCtx<'_>) -> String {
+    let joined = match stamp {
+        RenderCtx::Session(marks) => crate::dom::dispatch::BrowserPath::of(&marks.base, route),
+        RenderCtx::Unstamped => crate::dom::dispatch::BrowserPath::of(
+            &crate::encoding::MountBase::root().encoded(),
+            route,
+        ),
+    };
+    joined.as_str().to_owned()
 }
 
 /// Render an `Html` tree to an HTML string under `stamp`.
@@ -261,12 +365,12 @@ impl StampedHtml {
     }
 }
 
-/// Render `node` as a session's markup, stamped with `nonce`.
+/// Render `node` as a session's markup, under `marks`.
 #[must_use]
-pub fn render_stamped<M>(node: &Html<M>, nonce: &StyleNonce) -> StampedHtml {
+pub fn render_stamped<M>(node: &Html<M>, marks: &SessionMarks) -> StampedHtml {
     StampedHtml {
-        html: render_html_in(node, &RenderCtx::Session(nonce)),
-        nonce: nonce.clone(),
+        html: render_html_in(node, &RenderCtx::Session(marks)),
+        nonce: marks.nonce.clone(),
     }
 }
 
@@ -405,7 +509,7 @@ fn render_into_ctx<M>(
             // alphabetical order matches the byte-exact output expected by
             // golden tests.
             let child_ctx = ctx.enter(tag);
-            let mut pairs = attribute_pairs(child_ctx, tag, attrs);
+            let mut pairs = attribute_pairs(child_ctx, tag, attrs, stamp);
             let ipe_id = attrs.iter().rev().find_map(|a| match a {
                 Attribute::Attr(k, v) if k == STAMPED_ID_ATTR => Some(v.as_str()),
                 _ => None,
@@ -455,6 +559,10 @@ fn render_into_ctx<M>(
                 // itself; every other `ipe-*` name fails `SafeAttrName`.
                 let name = if *k == STAMPED_ID_ATTR {
                     STAMPED_ID_ATTR
+                } else if *k == PAGE_NAV_ATTR {
+                    // Only a `PageHref` yields this pair: `attribute_pairs`
+                    // drops every program-built reserved name first.
+                    PAGE_NAV_ATTR
                 } else {
                     let Some(safe_key) = SafeAttrName::parse(k) else {
                         continue;
@@ -471,10 +579,10 @@ fn render_into_ctx<M>(
             // reserved name, so no program-built attribute reaches this spot.
             if body == ElementBody::Style
                 && ctx.opens_style_element()
-                && let RenderCtx::Session(nonce) = stamp
+                && let RenderCtx::Session(marks) = stamp
             {
                 s.push_str(" nonce=\"");
-                nonce.write_token(s);
+                marks.nonce.write_token(s);
                 s.push('"');
             }
             // Browser-client wire markers (live/client.js): the delegated
@@ -743,11 +851,16 @@ pub(crate) fn frame_verdict<'a>(
 
 /// The `(key, value)` pairs `attrs` paints, in order: a `BoolAttr` that holds
 /// is the value `"true"`; a false one, an event and `NoAttr` carry none.
+///
+/// A `PageHref` carries none either: [`page_href_value`] is its one
+/// serializer, and a page link is an `<a>`, never a frame loader.
 fn painted_pairs<M>(attrs: &[Attribute<M>]) -> impl Iterator<Item = (&str, &str)> {
     attrs.iter().filter_map(|a| match a {
         Attribute::Attr(k, v) => Some((k.as_str(), v.as_str())),
         Attribute::BoolAttr(k, true) => Some((k.as_str(), "true")),
         Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => None,
+        #[cfg(feature = "web-core")]
+        Attribute::PageHref(_) => None,
     })
 }
 
@@ -1136,12 +1249,36 @@ pub(crate) fn attribute_pairs<'a, M>(
     child_ctx: ParseContext,
     tag: &str,
     attrs: &'a [Attribute<M>],
+    // Read only by a page link, which exists only under `web-core`.
+    #[cfg_attr(not(feature = "web-core"), allow(unused_variables))] stamp: &RenderCtx<'_>,
 ) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
     /// Pair count past which a key lookup goes through a hash index rather
     /// than a scan, so a long attribute list costs linear time.
     const SCANNED_PAIRS: usize = 16;
     let mut pairs: Vec<(Cow<'_, str>, Cow<'_, str>)> = Vec::with_capacity(attrs.len());
     let mut index: HashMap<Cow<'_, str>, usize> = HashMap::new();
+    // A page link writes its `href`, the `ipe-nav` marker and its
+    // `aria-current` first, from its first target.
+    #[cfg(feature = "web-core")]
+    let page_target = attrs.iter().find_map(|a| match a {
+        Attribute::PageHref(target) => Some(target),
+        _ => None,
+    });
+    #[cfg(feature = "web-core")]
+    if let Some(target) = page_target {
+        pairs.push((
+            Cow::Borrowed(PAGE_HREF_ATTR),
+            Cow::Owned(page_href_value(&target.route, stamp)),
+        ));
+        pairs.push((Cow::Borrowed(PAGE_NAV_ATTR), Cow::Borrowed("")));
+        if target.mark == PageMark::Current {
+            pairs.push((Cow::Borrowed(PAGE_CURRENT_ATTR), Cow::Borrowed("page")));
+        }
+    }
+    #[cfg(feature = "web-core")]
+    let page_href = page_target.is_some();
+    #[cfg(not(feature = "web-core"))]
+    let page_href = false;
     for a in attrs {
         let (k, v, joins) = match a {
             Attribute::Attr(k, v) => (k.as_str(), v.as_str(), true),
@@ -1149,8 +1286,17 @@ pub(crate) fn attribute_pairs<'a, M>(
             Attribute::BoolAttr(_, false) | Attribute::EventAttr(_) | Attribute::NoAttr => {
                 continue;
             }
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => continue,
         };
         if k != STAMPED_ID_ATTR && is_reserved_attr_name(k) {
+            continue;
+        }
+        // A page link's `href` and `aria-current` are its target's alone: no
+        // program attribute replaces either.
+        if page_href
+            && (k.eq_ignore_ascii_case(PAGE_HREF_ATTR) || k.eq_ignore_ascii_case(PAGE_CURRENT_ATTR))
+        {
             continue;
         }
         let k = stored_attr_key(child_ctx, k);
@@ -1509,6 +1655,8 @@ fn is_unstamped_reserved_attr<M>(attr: &Attribute<M>) -> bool {
         Attribute::Attr(k, _) => k != KEY_ATTR && is_reserved_attr_name(k),
         Attribute::BoolAttr(k, _) => is_reserved_attr_name(k),
         Attribute::EventAttr(_) | Attribute::NoAttr => false,
+        #[cfg(feature = "web-core")]
+        Attribute::PageHref(_) => false,
     }
 }
 
@@ -1851,6 +1999,10 @@ pub fn html_attr_to_string_<M>(attr: Attribute<M>) -> String {
         | Attribute::BoolAttr(..)
         | Attribute::EventAttr(..)
         | Attribute::NoAttr => String::new(),
+        // A page link's route serializes only at a render sink, which knows
+        // the base; it is never a program attribute.
+        #[cfg(feature = "web-core")]
+        Attribute::PageHref(_) => String::new(),
     }
 }
 
@@ -1921,6 +2073,10 @@ impl<M: RetainedBytes> Attribute<M> {
             Self::BoolAttr(key, on) => inline.plus(key)?.plus(on),
             Self::EventAttr(e) => inline.checked_add(event(e)?),
             Self::NoAttr => Some(inline),
+            #[cfg(feature = "web-core")]
+            Self::PageHref(target) => inline
+                .plus(target.route.as_str())?
+                .plus_all(target.route.decoded().segments()),
         }
     }
 }
@@ -2350,10 +2506,11 @@ mod tests {
         ]);
         for len in 0..=attrs.len() {
             let slice = attrs.get(..len).unwrap_or_default();
-            let got: Vec<(String, String)> = attribute_pairs(ParseContext::Data, "div", slice)
-                .into_iter()
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
+            let got: Vec<(String, String)> =
+                attribute_pairs(ParseContext::Data, "div", slice, &RenderCtx::Unstamped)
+                    .into_iter()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
             assert_eq!(got, scanned(slice), "{len}");
         }
     }
@@ -3508,10 +3665,11 @@ mod tests {
             Attribute::Attr("Title".into(), "t".into()),
         ];
         for ctx in [ParseContext::Data, ParseContext::Foreign] {
-            let got: Vec<(String, String)> = attribute_pairs(ctx, "div", &attrs)
-                .into_iter()
-                .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                .collect();
+            let got: Vec<(String, String)> =
+                attribute_pairs(ctx, "div", &attrs, &RenderCtx::Unstamped)
+                    .into_iter()
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
             assert_eq!(
                 got,
                 vec![
@@ -3521,6 +3679,83 @@ mod tests {
                 "{ctx:?}"
             );
         }
+    }
+
+    /// A page link's target at `path` with `mark`.
+    #[cfg(feature = "web-core")]
+    fn page_target(path: &str, mark: PageMark) -> PageTarget {
+        let routes = [crate::web::route::Route::new(path, |_| Some(()))];
+        PageTarget {
+            route: crate::web::route::render_route(&routes, 0, &[])
+                .expect("a literal route renders"),
+            mark,
+        }
+    }
+
+    /// The `(key, value)` pairs the sink writes for `attrs` on an `<a>`.
+    #[cfg(feature = "web-core")]
+    fn link_pairs(attrs: &[Attribute<()>]) -> Vec<(String, String)> {
+        attribute_pairs(ParseContext::Data, "a", attrs, &RenderCtx::Unstamped)
+            .into_iter()
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect()
+    }
+
+    /// Beside a `PageHref` the sink writes `href`, `ipe-nav` and `aria-current`
+    /// from the target alone: a program `href` or `aria-current`, in any ASCII
+    /// case, is dropped, and `aria-current` marks only the page on screen (CI
+    /// job `runtime-full-features`).
+    #[cfg(feature = "web-core")]
+    #[test]
+    fn page_link_sink_owns_href_and_aria_current() {
+        let program = || {
+            vec![
+                attr("HREF", "javascript:alert(1)"),
+                attr("Aria-Current", "step"),
+                attr("aria-current", "true"),
+                attr("class", "nav"),
+            ]
+        };
+        let mut here = vec![Attribute::PageHref(page_target("/p", PageMark::Current))];
+        here.extend(program());
+        let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+        assert_eq!(
+            link_pairs(&here),
+            vec![
+                pair("href", "/p"),
+                pair(PAGE_NAV_ATTR, ""),
+                pair("aria-current", "page"),
+                pair("class", "nav"),
+            ]
+        );
+
+        let mut away = vec![Attribute::PageHref(page_target("/p", PageMark::Away))];
+        away.extend(program());
+        assert_eq!(
+            link_pairs(&away),
+            vec![
+                pair("href", "/p"),
+                pair(PAGE_NAV_ATTR, ""),
+                pair("class", "nav")
+            ]
+        );
+
+        // Without a page link the program attributes pass as written.
+        let plain = link_pairs(&program());
+        assert!(plain.contains(&pair("aria-current", "true")), "{plain:?}");
+    }
+
+    /// `painted_pairs` serializes no `PageHref`: `page_href_value` is the one
+    /// serializer of a page link's route (CI job `runtime-full-features`).
+    #[cfg(feature = "web-core")]
+    #[test]
+    fn painted_pairs_skip_a_page_href() {
+        let attrs = vec![
+            Attribute::PageHref(page_target("/p", PageMark::Current)),
+            attr("class", "nav"),
+        ];
+        let painted: Vec<(&str, &str)> = painted_pairs(&attrs).collect();
+        assert_eq!(painted, vec![("class", "nav")]);
     }
 
     #[test]
@@ -3547,6 +3782,8 @@ mod tests {
                 | Attribute::BoolAttr(..)
                 | Attribute::EventAttr(_)
                 | Attribute::NoAttr => None,
+                #[cfg(feature = "web-core")]
+                Attribute::PageHref(_) => None,
             })
             .collect();
         assert_eq!(reserved, vec![(STAMPED_ID_ATTR, "r")]);
@@ -4384,7 +4621,10 @@ mod tests {
     fn style_stamped_only_in_data_and_foreign() {
         let nonce = StyleNonce::from_random_bytes([0x3e; 16]);
         let attr = format!(" nonce=\"{}\"", nonce.as_token());
-        let page = render_stamped(&element("div", vec![css("p{}")]), &nonce);
+        let page = render_stamped(
+            &element("div", vec![css("p{}")]),
+            &SessionMarks::new(nonce.clone()),
+        );
         assert_eq!(
             page.as_str(),
             format!("<div><style{attr}>p{{}}</style></div>")
@@ -4395,14 +4635,20 @@ mod tests {
             !shown.contains(&nonce.as_token()) && !shown.contains("nonce"),
             "{shown}"
         );
-        let svg = render_stamped(&element("svg", vec![css("p{}")]), &nonce);
+        let svg = render_stamped(
+            &element("svg", vec![css("p{}")]),
+            &SessionMarks::new(nonce.clone()),
+        );
         assert!(
             svg.as_str().contains(&format!("<style{attr}>")),
             "{}",
             svg.as_str()
         );
         for host in ["textarea", "title"] {
-            let page = render_stamped(&element(host, vec![css("p{}")]), &nonce);
+            let page = render_stamped(
+                &element(host, vec![css("p{}")]),
+                &SessionMarks::new(nonce.clone()),
+            );
             assert!(
                 !page.as_str().contains("nonce"),
                 "{host}: {}",
@@ -4422,7 +4668,10 @@ mod tests {
     fn raw_style_never_stamped() {
         let nonce = StyleNonce::from_random_bytes([0x4f; 16]);
         let raw = "<style>p{}</style>";
-        let page = render_stamped(&element("div", vec![Html::HRaw(raw.into())]), &nonce);
+        let page = render_stamped(
+            &element("div", vec![Html::HRaw(raw.into())]),
+            &SessionMarks::new(nonce.clone()),
+        );
         assert_eq!(page.as_str(), format!("<div>{raw}</div>"));
     }
 
@@ -4440,7 +4689,7 @@ mod tests {
             );
             assert!(!render_html(&forged).contains("forged"), "{name}");
             let nonce = StyleNonce::from_random_bytes([0x5a; 16]);
-            let page = render_stamped(&forged, &nonce);
+            let page = render_stamped(&forged, &SessionMarks::new(nonce.clone()));
             assert!(
                 !page.as_str().contains("forged"),
                 "{name}: {}",

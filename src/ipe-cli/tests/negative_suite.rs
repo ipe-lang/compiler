@@ -5120,6 +5120,293 @@ fn well_formed_route_paths_compile() {
     );
 }
 
+/// The page type and the `appRoutes` binding every page-link fixture names.
+const PAGE_LINK_TABLE: &str = "type Page = HomePage | AboutPage\n\
+     appRoutes : List (WebRoute Page)\n\
+     appRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]";
+
+/// The literal cfg every page-link fixture passes.
+const PAGE_LINK_CFG: &str = "{ to = AboutPage, current = model.page, label = Ui.text \"About\" }";
+
+/// A routed app over [`PAGE_LINK_TABLE`] whose `routes` field is `routes`,
+/// with `decls` appended and `view` as its view.
+fn page_link_fixture(routes: &str, decls: &str, view: &str) -> String {
+    let mut src = routed_fixture(PAGE_LINK_TABLE, routes, "HomePage", "")
+        .replace(
+            "import Ipe.Ui as Ui\n",
+            "import Ipe.Ui as Ui\nimport Ipe.List as List\n",
+        )
+        .replace("view _model = Ui.text \"hi\"", view);
+    src.push_str(decls);
+    src
+}
+
+/// The entry of a crate with no `Web.tea`: `main` renders the `View` module's
+/// page link to a string. The entry imports no `Ipe.Tea.*` shape, since a
+/// `main` that is not an app may not (IPE-N0033).
+const PAGE_LINK_NO_APP_MAIN: &str = "module Main exposing (main)\n\
+     import Ipe.Html as Html\n\
+     import Ipe.Io as Io\n\
+     import Ipe.Ui as Ui\n\
+     import View\n\
+     main = Io.println (Html.render (Ui.layout [] View.link))\n";
+
+/// Compile a crate with no `Web.tea` whose `View` module builds the page link
+/// `link` over the table `table` (a top-level declaration of `linkRoutes`).
+fn compile_page_link_without_app(name: &str, table: &str, link: &str) -> Outcome {
+    let view = format!(
+        "module View exposing (Msg(..), Page(..), link)\n\
+         import Ipe.Tea.Web as Web\n\
+         import Ipe.Ui as Ui\n\
+         type Page = HomePage | AboutPage\n\
+         type Msg = Noop\n\
+         {table}\n\
+         link : Element Msg\n\
+         link = {link}\n"
+    );
+    compile_project(
+        name,
+        &[("Main.ipe", PAGE_LINK_NO_APP_MAIN), ("View.ipe", &view)],
+    )
+}
+
+/// Assert the crate [`compile_page_link_without_app`] builds is refused with
+/// exactly `expected`.
+#[track_caller]
+fn assert_page_link_without_app_rejected(name: &str, table: &str, link: &str, expected: &str) {
+    match compile_page_link_without_app(name, table, link) {
+        Outcome::Rejected(got) => assert_eq!(
+            got, expected,
+            "{name}: expected {expected}, got {got} — a rejection for the WRONG reason"
+        ),
+        Outcome::Accepted(how) => fail_accepted(name, expected, &how),
+    }
+}
+
+/// Assert the crate [`compile_page_link_without_app`] builds compiles cleanly.
+#[track_caller]
+fn assert_page_link_without_app_compiles(name: &str, table: &str, link: &str) {
+    match compile_page_link_without_app(name, table, link) {
+        Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
+        Outcome::Accepted(how) => assert!(
+            false_marker(),
+            "{name}: expected a clean compile, got a non-pipeline failure ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "{name}: expected a clean compile, but ipe REJECTED it with {got}"
+        ),
+    }
+}
+
+/// A `Web.pageLink` table the compiler cannot read as one top-level binding is
+/// refused with IPE-L0165: an inline list, a parameter, a record field and a
+/// computed list. A table a `let` binds to the top-level name is that name,
+/// so it compiles, as do a `let`-bound cfg and a partial application.
+#[test]
+fn page_link_unreadable_table_refused() {
+    for (name, decls, view) in [
+        (
+            "page_link_inline_table",
+            "",
+            format!(
+                "view model = Web.pageLink [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ] [] {PAGE_LINK_CFG}"
+            ),
+        ),
+        (
+            "page_link_parameter_table",
+            "navLink : List (WebRoute Page) -> Model -> Element Msg\n\
+             navLink table model = Web.pageLink table [] { to = AboutPage, current = model.page, label = Ui.text \"About\" }\n",
+            "view model = navLink appRoutes model".to_owned(),
+        ),
+        (
+            "page_link_record_field_table",
+            "tables : { nav : List (WebRoute Page) }\n\
+             tables = { nav = appRoutes }\n",
+            format!("view model = Web.pageLink tables.nav [] {PAGE_LINK_CFG}"),
+        ),
+        (
+            "page_link_computed_table",
+            "",
+            format!("view model = Web.pageLink (List.reverse appRoutes) [] {PAGE_LINK_CFG}"),
+        ),
+    ] {
+        assert_rejected(
+            name,
+            &page_link_fixture("appRoutes", decls, &view),
+            "IPE-L0165",
+        );
+    }
+    for (name, view) in [
+        (
+            "page_link_let_bound_table",
+            format!(
+                "view model =\n    let\n        table = appRoutes\n    in\n    Web.pageLink table [] {PAGE_LINK_CFG}"
+            ),
+        ),
+        (
+            "page_link_let_bound_cfg",
+            format!(
+                "view model =\n    let\n        cfg = {PAGE_LINK_CFG}\n    in\n    Web.pageLink appRoutes [] cfg"
+            ),
+        ),
+        (
+            "page_link_partially_applied",
+            format!(
+                "view model = Ui.column [] (List.map (Web.pageLink appRoutes []) [ {PAGE_LINK_CFG} ])"
+            ),
+        ),
+    ] {
+        assert_compiles(name, &page_link_fixture("appRoutes", "", &view));
+    }
+}
+
+/// The emitted Rust of a build whose output lives in `out`: `src/main.rs` plus
+/// every `src/ipe_mods/*.rs` a split build writes.
+#[allow(clippy::expect_used)] // an unreadable emitted tree is the test failure
+fn emitted_source(out: &std::path::Path) -> String {
+    let src = out.join("src");
+    let mut combined =
+        std::fs::read_to_string(src.join("main.rs")).expect("the build emits src/main.rs");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(src.join("ipe_mods"))
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    files.sort();
+    for path in files {
+        combined.push('\n');
+        combined.push_str(&std::fs::read_to_string(&path).expect("an emitted module is readable"));
+    }
+    combined
+}
+
+/// Assert `src` defines exactly one page renderer and names it `mentions`
+/// times in all, its definition included.
+#[track_caller]
+fn assert_one_page_renderer(name: &str, src: &str, mentions: usize) {
+    assert_eq!(
+        src.matches("fn __ipe_render_page_").count(),
+        1,
+        "{name}: one table emits one crate-level renderer"
+    );
+    assert_eq!(
+        src.matches("__ipe_render_page_").count(),
+        mentions,
+        "{name}: every link and the routed app render through the one renderer"
+    );
+    assert!(
+        !src.contains("move |__page:"),
+        "{name}: no inline renderer is emitted beside the table's item"
+    );
+}
+
+/// Two page links over one table share one crate-level renderer, which the
+/// routed app over that table passes as its URL renderer too, in the
+/// single-file layout and the per-module split alike.
+#[test]
+fn page_links_over_one_table_share_one_renderer() {
+    let name = "page_link_shared_renderer";
+    let view = format!(
+        "view model = Ui.column [] [ Web.pageLink appRoutes [] {PAGE_LINK_CFG}, \
+         Web.pageLink appRoutes [] {{ to = HomePage, current = model.page, label = Ui.text \"Home\" }} ]"
+    );
+    assert_compiles(name, &page_link_fixture("appRoutes", "", &view));
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-out")
+        .join(name);
+    // One definition, two renders per link, and the routed app's render.
+    assert_one_page_renderer(name, &emitted_source(&out), 6);
+
+    let split = "page_link_shared_renderer_split";
+    assert_page_link_without_app_compiles(
+        split,
+        "linkRoutes : List (WebRoute Page)\n\
+         linkRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+        "Ui.column [] [ Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }, \
+         Web.pageLink linkRoutes [] { to = HomePage, current = HomePage, label = Ui.text \"Home\" } ]",
+    );
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("negsuite-proj-out")
+        .join(split);
+    // One definition and two renders per link.
+    assert_one_page_renderer(split, &emitted_source(&out), 5);
+}
+
+/// A table with no route, or over a page type that is not a closed custom
+/// type, is refused with IPE-L0165; the annotated table with every
+/// constructor routed compiles.
+#[test]
+fn page_link_open_table_refused() {
+    let link = "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }";
+    assert_page_link_without_app_rejected(
+        "page_link_empty_table",
+        "linkRoutes : List (WebRoute Page)\nlinkRoutes = []",
+        link,
+        "IPE-L0165",
+    );
+    assert_page_link_without_app_rejected(
+        "page_link_int_table",
+        "linkRoutes : List (WebRoute Int)\nlinkRoutes = [ Web.route \"/\" 1 ]",
+        "Web.pageLink linkRoutes [] { to = 1, current = 1, label = Ui.text \"One\" }",
+        "IPE-L0165",
+    );
+    assert_page_link_without_app_compiles(
+        "page_link_closed_table",
+        "linkRoutes : List (WebRoute Page)\n\
+         linkRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+        link,
+    );
+}
+
+/// A table that lacks a route for a page constructor is refused through a
+/// page link with IPE-L0159, in a crate with no `Web.tea`: the link's table
+/// passes the router's own checks.
+#[test]
+fn page_link_table_without_route_refused() {
+    assert_page_link_without_app_rejected(
+        "page_link_page_without_route",
+        "linkRoutes : List (WebRoute Page)\nlinkRoutes = [ Web.route \"/\" HomePage ]",
+        "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }",
+        "IPE-L0159",
+    );
+}
+
+/// In a routed app, a `Web.pageLink` table that is not the app's `routes`
+/// binding is refused with IPE-L0166: an inline `routes` list, and links over
+/// two different bindings. Naming one table in both places compiles.
+#[test]
+fn page_link_table_not_app_routes_refused() {
+    let link = format!("view model = Web.pageLink appRoutes [] {PAGE_LINK_CFG}");
+    assert_rejected(
+        "page_link_inline_app_routes",
+        &page_link_fixture(
+            "[ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+            "",
+            &link,
+        ),
+        "IPE-L0166",
+    );
+    assert_rejected(
+        "page_link_two_tables",
+        &page_link_fixture(
+            "appRoutes",
+            "otherRoutes : List (WebRoute Page)\n\
+             otherRoutes = [ Web.route \"/\" HomePage, Web.route \"/info\" AboutPage ]\n",
+            &format!(
+                "view model = Ui.column [] [ Web.pageLink appRoutes [] {PAGE_LINK_CFG}, Web.pageLink otherRoutes [] {PAGE_LINK_CFG} ]"
+            ),
+        ),
+        "IPE-L0166",
+    );
+    assert_compiles(
+        "page_link_app_routes",
+        &page_link_fixture("appRoutes", "", &link),
+    );
+}
+
 // ===========================================================================
 // App entries need a concrete Model / Msg — IPE-N0051. Every app entry's
 // runtime function bounds the cfg's model and message types with traits a

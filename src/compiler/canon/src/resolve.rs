@@ -1276,8 +1276,8 @@ fn thread_config_into_entry(
 
 /// The TEA app-entry kernels, keyed `(qualifier, entry name)`. A module whose
 /// `main` head-calls one of these is a TEA app; any other `main` (a plain
-/// `Task`) is a Program. Kept in lockstep with the app-entry rows of
-/// `env::QUALIFIERS` (`Web.tea`/`appRouted`, `Tui.tea`, `Cli.tea`).
+/// `Task`) is a Program. Kept in lockstep with the app-entry kernels of the
+/// `StdlibKernel` registry (`Web.tea`/`appRouted`, `Tui.tea`, `Cli.tea`).
 ///
 /// Keyed on the kernel `(module, name)` a resolved `VarKernel` carries. `Tui.tea`
 /// and `Cli.tea` are the two terminal drive-axis entries; each owns its own
