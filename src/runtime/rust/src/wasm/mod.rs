@@ -924,6 +924,7 @@ where
     install_focus_epoch(&document)?;
     attach_delegated_listeners(&body, &app)?;
     attach_widget_up_listener(&body, &app)?;
+    attach_page_link_listener(&body, &app, base.clone())?;
     attach_popstate_listener(&app, base)?;
     // The entered page's route rewrites the entry the app was loaded at.
     sync_mounted_url(&app);
@@ -964,6 +965,93 @@ where
     // The listener lives for the whole app lifetime.
     closure.forget();
     Ok(())
+}
+
+/// Install the delegated `click` listener that follows a page link in place.
+///
+/// It acts on the nearest `a[ipe-nav]` around the click target, the marker
+/// only `Web.pageLink` writes, under the served client's predicate: a left
+/// click with no modifier, on a link with no foreign `target` and no
+/// `download`, whose `href` is a same-origin path. It then pushes that path
+/// and enters it through the location read the `popstate` listener runs. The
+/// listener sits on `<body>`, so a link a patch inserts is followed too.
+fn attach_page_link_listener<Model, Msg>(
+    body: &web_sys::HtmlElement,
+    app: &Rc<App<Model, Msg>>,
+    base: crate::web::route::DecodedPath,
+) -> Result<(), MountRefusal>
+where
+    Model: Clone + 'static,
+    Msg: Clone + 'static,
+{
+    let app = Rc::clone(app);
+    let closure = Closure::<dyn Fn(web_sys::Event)>::new(move |ev: web_sys::Event| {
+        let Some(href) = page_link_href(&ev) else {
+            return;
+        };
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        let Ok(history) = window.history() else {
+            return;
+        };
+        ev.prevent_default();
+        if history
+            .push_state_with_url(&JsValue::NULL, "", Some(&href))
+            .is_err()
+        {
+            console_warn("route.history: the browser refused the page link's URL");
+            return;
+        }
+        let raw = window.location().pathname().ok();
+        navigate_to(&app, &crate::web::route::located(raw.as_deref(), &base));
+    });
+    body.add_event_listener_with_callback("click", closure.as_ref().unchecked_ref())
+        .map_err(|e| listener_refusal("click", &e))?;
+    // The delegated page-link listener lives for the whole app lifetime.
+    closure.forget();
+    Ok(())
+}
+
+/// The `href` of the page link a click follows in place, `None` when the
+/// browser keeps the click: one already handled, any button but the main one,
+/// a modifier key, no `a[ipe-nav]` around the target, a `target` other than
+/// `_self`, a `download` link, or an `href` that is not a same-origin path.
+fn page_link_href(ev: &web_sys::Event) -> Option<String> {
+    if ev.default_prevented() {
+        return None;
+    }
+    let read = |name: &str| js_sys::Reflect::get(ev, &JsValue::from_str(name)).ok();
+    if read("button")?.as_f64() != Some(0.0) {
+        return None;
+    }
+    if ["metaKey", "ctrlKey", "shiftKey", "altKey"]
+        .iter()
+        .any(|key| read(key).is_none_or(|held| held.is_truthy()))
+    {
+        return None;
+    }
+    let link = ev
+        .target()?
+        .dyn_into::<web_sys::Element>()
+        .ok()?
+        .closest("a[ipe-nav]")
+        .ok()??;
+    if link
+        .get_attribute("target")
+        .is_some_and(|target| !target.eq_ignore_ascii_case("_self"))
+        || link.has_attribute("download")
+    {
+        return None;
+    }
+    let href = link.get_attribute("href")?;
+    // A same-origin path: one leading `/`, never `//` or `/\`, which a
+    // browser reads as another host.
+    let rest = href.strip_prefix('/')?;
+    if rest.starts_with('/') || rest.starts_with('\\') {
+        return None;
+    }
+    Some(href)
 }
 
 /// Apply a client-side navigation: enter `path` via the app's router closure,

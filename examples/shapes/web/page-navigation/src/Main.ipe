@@ -9,6 +9,10 @@ module Main exposing (main)
 -- through the route table, and Back and Forward restore the page each entry
 -- names.
 --
+-- A `Web.pageLink` writes its `href` from the same route table the app's
+-- `routes` names, and marks the link to the page on screen as the current
+-- one. A click on it moves to its page in place, as one new history entry.
+--
 -- The same program runs served (`web`) and as the browser bundle
 -- (`web client`); the URL follows the page in both.
 
@@ -66,14 +70,49 @@ subscriptions model =
         Sub.none
 
 
+-- | The one route table: the app's `routes` and every page link name it.
+routes : List (WebRoute Page)
+routes =
+    [ Web.route "/" HomePage
+    , Web.route "/entry/:id" EntryPage
+    , Web.route "/about" AboutPage
+    ]
+
+
 view : Model -> Element Msg
 view model =
     Ui.column []
         [ heading model.page
+        , nav model.page
+        , entryLinks model.page
         , Ui.button [ Ui.id "open-home" ] { onPress = Just (Open HomePage), label = Ui.text "Home" }
         , Ui.button [ Ui.id "open-entry" ] { onPress = Just (Open (EntryPage 1)), label = Ui.text "Entry 1" }
         , Ui.button [ Ui.id "leave-soon" ] { onPress = Just LeaveSoon, label = Ui.text "About, soon" }
         ]
+
+
+-- | The page links on every page. The last two are the browser's to follow: one
+-- opens a new tab, the other downloads its page.
+nav : Page -> Element Msg
+nav current =
+    Ui.row []
+        [ Web.pageLink routes [ Ui.id "link-home" ] { to = HomePage, current = current, label = Ui.text "Home" }
+        , Web.pageLink routes [ Ui.id "link-entry" ] { to = EntryPage 2, current = current, label = Ui.text "Entry 2" }
+        , Web.pageLink routes [ Ui.id "link-about-tab", Ui.htmlAttribute "target" "_blank" ] { to = AboutPage, current = current, label = Ui.text "About, new tab" }
+        , Web.pageLink routes [ Ui.id "link-about-download", Ui.htmlAttribute "download" "about.html" ] { to = AboutPage, current = current, label = Ui.text "About, download" }
+        ]
+
+
+-- | A link only an entry page shows: it enters the page with the patch that
+-- shows the entry.
+entryLinks : Page -> Element Msg
+entryLinks current =
+    case current of
+        EntryPage _ ->
+            Web.pageLink routes [ Ui.id "link-about" ] { to = AboutPage, current = current, label = Ui.text "About" }
+
+        _ ->
+            Ui.none
 
 
 heading : Page -> Element Msg
@@ -95,10 +134,6 @@ main =
         , update = update
         , view = view
         , subscriptions = subscriptions
-        , routes =
-            [ Web.route "/" HomePage
-            , Web.route "/entry/:id" EntryPage
-            , Web.route "/about" AboutPage
-            ]
+        , routes = routes
         , notFound = HomePage
         }
