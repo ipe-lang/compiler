@@ -161,7 +161,7 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
      setup-python with a closed literal `with:` and no `env:`, the pinned
      Rust toolchain action with no `with:` over its pinned body and a closed
      `rust-toolchain.toml`, the pinned tool installer with an exact
-     `name@X.Y.Z` and `fallback: none`, the canonical
+     `name@X.Y.Z` of a named tool and `fallback: none`, the canonical
      pip install with no `env:`, a typed `ToolRun` of a file that exists
      under `.github/ci` in an invocation `TOOL_INVOCATIONS` lists, its words split only on bash's blanks
      `shell_lex.BLANKS`; any `timeout-minutes` a positive integer literal).
@@ -592,7 +592,11 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `no-default-features` both literally `false`, and neither `targets`
       nor `exclude` (the judged graph is all-target and unpruned).  An
       unreadable `deny.toml`, an absent `[graph]` or a non-list `features`
-      is refused.  The graph-level proof that every crate the release links
+      is refused, as is a top-level key outside `graph`, `advisories`,
+      `licenses`, `bans`, `sources` and `output` (cargo-deny reads a
+      top-level `targets`, `exclude` or `features` as graph scope) and a
+      `[graph]` key outside `all-features`, `no-default-features`,
+      `features` and `exclude-dev`.  The graph-level proof that every crate the release links
       is judged is `supply_chain_scope.py`.
   29. One advisory ignore set: the `RUSTSEC-` ids of `deny.toml
       [advisories].ignore` (each a string or a `{ id = .. }` table) equal
@@ -6002,8 +6006,12 @@ SETUP_PYTHON_WITH_KEYS = frozenset({"python-version"})
 # `name@X.Y.Z` and `fallback: none` — fetches the checksum-verified prebuilt
 # binary its manifest lists and never compiles a crate (a build script is
 # arbitrary code that could rewrite the tree).
+# The tools it may install are named: a tool's binaries land on `PATH` ahead of
+# the runner's, so an unnamed tool could shadow an interpreter or a command a
+# later step runs.
 PINNED_INSTALL_ACTION_USES = frozenset({"taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29"})
-INSTALL_TOOL_RE = re.compile(r"[a-z0-9][a-z0-9-]*@[0-9]+\.[0-9]+\.[0-9]+")
+INSTALL_TOOL_RE = re.compile(r"(?P<name>[a-z0-9][a-z0-9-]*)@[0-9]+\.[0-9]+\.[0-9]+")
+PRE_TOOL_INSTALL_NAMES = frozenset({"cargo-deny"})
 INSTALL_FALLBACK_NONE = "none"
 # A `rust-toolchain.toml` the toolchain shape trusts: one `[toolchain]` table
 # naming an exact release channel and plain component/target names. `path`
@@ -6518,14 +6526,16 @@ def parse_closed_step(st: Step, root: str) -> ClosedStep | None:
 
 
 def _install_with_closed(with_: dict) -> bool:
-    """Whether a tool installer's `with:` is exactly one `name@X.Y.Z` and
-    `fallback: none` (`PINNED_INSTALL_ACTION_USES`)."""
+    """Whether a tool installer's `with:` is exactly one `name@X.Y.Z` of a
+    `PRE_TOOL_INSTALL_NAMES` tool and `fallback: none`
+    (`PINNED_INSTALL_ACTION_USES`)."""
     tool = with_.get("tool")
+    m = INSTALL_TOOL_RE.fullmatch(tool) if isinstance(tool, str) else None
     return (
         set(with_) == {"tool", "fallback"}
         and with_.get("fallback") == INSTALL_FALLBACK_NONE
-        and isinstance(tool, str)
-        and INSTALL_TOOL_RE.fullmatch(tool) is not None
+        and m is not None
+        and m.group("name") in PRE_TOOL_INSTALL_NAMES
     )
 
 
@@ -8959,6 +8969,11 @@ def load_manifest() -> dict:
 # that would narrow the judged graph.
 DENY_GRAPH_BASE_FEATURE = "full"
 _DENY_GRAPH_NARROWING_KEYS = ("targets", "exclude")
+# The keys deny.toml may hold. cargo-deny still reads a top-level `targets`,
+# `exclude` or `features` as graph scope, and `[graph].exclude-unpublished`
+# drops roots, so every key outside these sets is refused, never read past.
+_DENY_TOP_LEVEL_KEYS = frozenset({"graph", "advisories", "licenses", "bans", "sources", "output"})
+_DENY_GRAPH_KEYS = frozenset({"all-features", "no-default-features", "features", "exclude-dev"})
 
 
 def check_deny_graph_covers_release(errors: list[str], root: str = REPO_ROOT) -> None:
@@ -8967,10 +8982,17 @@ def check_deny_graph_covers_release(errors: list[str], root: str = REPO_ROOT) ->
     if isinstance(doc, str):
         errors.append(f"check 28: deny.toml {doc}; refused")
         return
+    for key in sorted(set(doc) - _DENY_TOP_LEVEL_KEYS):
+        errors.append(
+            f"check 28: deny.toml top-level `{key}` is outside {sorted(_DENY_TOP_LEVEL_KEYS)}; cargo-deny "
+            "reads a top-level `targets`, `exclude` or `features` as the judged graph's scope; refused"
+        )
     graph = doc.get("graph")
     if not isinstance(graph, dict):
         errors.append("check 28: deny.toml has no `[graph]` table, so the scan judges the default features only; refused")
         return
+    for key in sorted(set(graph) - _DENY_GRAPH_KEYS - set(_DENY_GRAPH_NARROWING_KEYS)):
+        errors.append(f"check 28: deny.toml `[graph].{key}` is outside {sorted(_DENY_GRAPH_KEYS)}; refused")
     features = graph.get("features")
     if not isinstance(features, list) or not all(isinstance(f, str) for f in features):
         errors.append(f"check 28: deny.toml `[graph].features` must be a list of strings, not {features!r}; refused")

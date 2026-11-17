@@ -9707,6 +9707,18 @@ class TestDenyGraphCoversRelease(unittest.TestCase):
     def test_no_graph_refused(self) -> None:
         self.assertRefused("[advisories]\nignore = []\n", "no `[graph]` table")
 
+    def test_top_level_graph_scope_refused(self) -> None:
+        for key in ('exclude = ["wasmtime"]', 'targets = ["x86_64-unknown-linux-gnu"]', 'features = ["full"]'):
+            with self.subTest(key=key):
+                self.assertRefused(key + "\n" + _DG_GRAPH, f"top-level `{key.split()[0]}` is outside")
+
+    def test_graph_key_outside_the_closed_set_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH + "exclude-unpublished = true\n", "`[graph].exclude-unpublished` is outside")
+
+    def test_policy_tables_and_exclude_dev_pass(self) -> None:
+        text = _DG_GRAPH + "exclude-dev = true\n[advisories]\n[licenses]\n[bans]\n[sources]\n[output]\n"
+        self.assertEqual(self.errors(text), [])
+
     def test_non_list_features_refused(self) -> None:
         self.assertRefused(_DG_GRAPH.replace('["full", "wasi_run"]', '"full"'), "must be a list of strings")
 
@@ -9863,6 +9875,8 @@ class TestToolchainAndInstallPreToolShapes(unittest.TestCase):
             _install_step("tool: cargo-deny@0.20\nfallback: none\n"),
             _install_step("tool: cargo-deny@0.20.2,evil@1.0.0\nfallback: none\n"),
             _install_step("tool: cargo-deny@0.20.2\nfallback: none\nchecksum: false\n"),
+            _install_step("tool: coreutils@0.2.2\nfallback: none\n"),
+            _install_step("tool: uv@0.9.0\nfallback: none\n"),
             _install_step("tool: ${{ github.head_ref }}\nfallback: none\n"),
             _install_step(uses="taiki-e/install-action@v2"),
             _install_step(uses="taiki-e/install-action@" + "0" * 40),

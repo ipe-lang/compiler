@@ -2104,14 +2104,15 @@ fn check_one_dep_advisories(
 const GATE_DENY_POLICY: &str = include_str!("../../../deny.toml");
 
 /// Derive a cargo-deny config for the EMITTED project from the gate's
-/// embedded policy ([`GATE_DENY_POLICY`]), dropping its `[graph]` section.
+/// embedded policy ([`GATE_DENY_POLICY`]), keeping only its package policy
+/// tables ([`emitted_deny_policy`]).
 ///
 /// The workspace config's `[graph] features = ["full"]` names the RUNTIME crate's
 /// own feature set, which the emitted `ipe-app` does not have — passing the
 /// workspace config verbatim makes `cargo metadata` fail on the unknown feature.
 /// The advisory/license/bans/sources POLICY is exactly what the gate must apply,
-/// so this copies every section EXCEPT `[graph]` into a derived config written
-/// beside the emitted project, and returns its path.
+/// so this copies those sections, and no workspace graph scope, into a derived
+/// config written beside the emitted project, and returns its path.
 ///
 /// # Errors
 /// [`CliError::PackageAudit`] with [`Check::SupplyChain`] when the embedded
@@ -2134,17 +2135,24 @@ fn derive_deny_config(emitted_dir: &Path) -> Result<PathBuf, CliError> {
     Ok(derived)
 }
 
-/// `policy` without its `graph` table, however spelled: a `[graph]` header, a
-/// `[graph.<key>]` or `[[graph.<key>]]` sub-table, or a dotted `graph.<key>`.
+/// The cargo-deny tables a package audit applies: the emitted-project-independent
+/// policy. Every other top-level key scopes the compiler workspace's own graph
+/// (`[graph]`, and the top-level `targets`, `exclude` and `features` cargo-deny
+/// still honours) and never reaches a package audit.
+const PACKAGE_POLICY_TABLES: [&str; 4] = ["advisories", "bans", "licenses", "sources"];
+
+/// `policy` with only its [`PACKAGE_POLICY_TABLES`], kept as written.
 ///
-/// The remaining tables (`[advisories]`, `[licenses]`, `[bans]`, `[sources]`)
-/// are the emitted-project-independent policy the gate applies, kept as written.
+/// The `graph` table is dropped however spelled (a `[graph]` header, a
+/// `[graph.<key>]` or `[[graph.<key>]]` sub-table, a dotted `graph.<key>`), and
+/// so is every other top-level key, so no workspace graph scope narrows the
+/// package's judged graph.
 ///
 /// # Errors
 /// The parse error when `policy` is not TOML.
 fn emitted_deny_policy(policy: &str) -> Result<String, toml_edit::TomlError> {
     let mut doc = policy.parse::<toml_edit::DocumentMut>()?;
-    doc.remove("graph");
+    doc.retain(|key, _| PACKAGE_POLICY_TABLES.contains(&key));
     Ok(doc.to_string())
 }
 
@@ -4267,8 +4275,8 @@ mod tests {
         use std::collections::BTreeMap;
 
         use super::super::{
-            Check, GATE_DENY_POLICY, GatePosture, Rejection, derive_deny_config,
-            emitted_deny_policy,
+            Check, GATE_DENY_POLICY, GatePosture, PACKAGE_POLICY_TABLES, Rejection,
+            derive_deny_config, emitted_deny_policy,
         };
         use super::make_test_dir;
         use crate::CliError;
@@ -4390,6 +4398,27 @@ mod tests {
                     .is_some_and(|text| !text.contains("wasi_run")),
                 "a package audit's policy names no compiler-workspace feature: {emitted:?}"
             );
+        }
+
+        #[test]
+        fn the_emitted_policy_keeps_no_top_level_graph_scope() {
+            for policy in [
+                "exclude = [\"rkyv\"]\n[advisories]\nignore = []\n",
+                "targets = [\"x86_64-unknown-linux-gnu\"]\n[advisories]\nignore = []\n",
+                "features = [\"full\"]\nall-features = false\n[advisories]\nignore = []\n",
+                "[advisories]\nignore = []\n[output]\nfeature-depth = 1\n",
+            ] {
+                let emitted = emitted_deny_policy(policy).ok();
+                assert!(
+                    parsed(emitted.as_deref()).is_some_and(|doc| {
+                        doc.contains_key("advisories")
+                            && doc
+                                .iter()
+                                .all(|(key, _)| PACKAGE_POLICY_TABLES.contains(&key))
+                    }),
+                    "only the package policy tables reach a package audit: {policy:?} -> {emitted:?}"
+                );
+            }
         }
 
         #[test]
