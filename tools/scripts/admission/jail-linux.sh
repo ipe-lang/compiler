@@ -25,6 +25,13 @@
 # construction, and the jail's outcome must not depend on it. The working
 # directory is the scratch dir for the same reason.
 #
+# Privilege: the jailed process holds no capability (`--cap-drop ALL`, bounding
+# set included). bwrap run by root otherwise keeps every capability in the
+# sandbox, and a jailed root with CAP_SYS_ADMIN/CAP_MKNOD can remount the
+# read-only root or mount a host block device. Dropping them makes the jail's
+# privilege the same on every runner image, whatever its LSM profile strips.
+# Proved by `jail-linux-caps-probe.sh` run through this wrapper.
+#
 # Fail-closed: if bwrap is absent the script exits non-zero; if the seccomp
 # filter cannot be generated the script exits non-zero; if the fixture is not a
 # readable regular file, or ESCAPE_PATH is unset, the script exits non-zero
@@ -199,6 +206,7 @@ timeout "$TIMEOUT_SECS" \
         --unshare-uts \
         --unshare-ipc \
         --die-with-parent \
+        --cap-drop ALL \
         --seccomp 4 \
         --clearenv \
         --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin \

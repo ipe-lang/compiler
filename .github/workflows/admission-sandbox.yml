@@ -158,6 +158,14 @@ jobs:
           cp tests/fixtures/admission/untrusted-build.sh "$held/untrusted-build.sh"
           sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh "$held/untrusted-build.sh"
 
+      # The jailed process holds no capability and inherits no descriptor
+      # beyond stdio, whatever the runner image's LSM profile strips.
+      - name: Jailed process holds no capability and no inherited descriptor
+        env:
+          ADMISSION_TIMEOUT_SECS: '60'
+          ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tools/scripts/admission/jail-linux-caps-probe.sh
+
       # The wrapper refuses, before building any jail, an unset ESCAPE_PATH and
       # an input that is not a readable regular file.
       - name: Jail wrapper refusals (fail closed before the jail)
@@ -232,6 +240,14 @@ jobs:
           chmod 0700 "$held"
           cp tests/fixtures/admission/untrusted-build.sh "$held/untrusted-build.sh"
           sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh "$held/untrusted-build.sh"
+
+      # The jailed process holds no capability and inherits no descriptor
+      # beyond stdio, whatever the runner image's LSM profile strips.
+      - name: Jailed process holds no capability and no inherited descriptor
+        env:
+          ADMISSION_TIMEOUT_SECS: '60'
+          ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
+        run: sudo env ADMISSION_TIMEOUT_SECS="$ADMISSION_TIMEOUT_SECS" ESCAPE_PATH="$ESCAPE_PATH" tools/scripts/admission/jail-linux.sh tools/scripts/admission/jail-linux-caps-probe.sh
 
       # The wrapper refuses, before building any jail, an unset ESCAPE_PATH and
       # an input that is not a readable regular file.
