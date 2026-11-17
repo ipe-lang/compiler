@@ -1147,6 +1147,10 @@ mod tests {
                 .map(|(body, _)| body)
                 .unwrap_or_default()
         };
+        // Fragments are matched with whitespace runs collapsed, so a re-format
+        // that changes no meaning keeps every needle.
+        let flat = |text: &str| text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let has = |hay: &str, needle: &str| flat(hay).contains(&flat(needle));
         assert_eq!(
             src.matches("(app.view)(").count(),
             1,
@@ -1167,8 +1171,9 @@ mod tests {
             "a page URL is taken by `render_frame` and the mount only"
         );
         assert!(
-            src.contains(
-                "    frame: Frame<Msg>,\n    target: Option<&StampedId>,\n    push: bool,"
+            has(
+                src,
+                "frame: Frame<Msg>, target: Option<&StampedId>, push: bool,"
             ),
             "`commit_view` commits a rendered frame, never a bare tree"
         );
@@ -1192,15 +1197,17 @@ mod tests {
             "`frozen_step` reads the scrubber's held step"
         );
         assert!(
-            body_of("fn flush<").contains(
-                "if frozen_step(app).is_none() {\n        let frame = render_frame(app, model);"
+            has(
+                body_of("fn flush<"),
+                "if frozen_step(app).is_none() { let frame = render_frame(app, model);"
             ),
             "`flush` renders the live model only while no step is scrubbed"
         );
         let navigate = body_of("fn navigate_to<");
         assert!(
-            navigate.contains(
-                "match frozen_step(app) {\n        None => commit_view(app, render_frame(app, new_model), None, push),"
+            has(
+                navigate,
+                "match frozen_step(app) { None => commit_view(app, render_frame(app, new_model), None, push),"
             ),
             "a navigation commits the live page only while no step is scrubbed"
         );
@@ -1211,8 +1218,9 @@ mod tests {
         );
         let link = body_of("fn attach_page_link_listener<");
         assert!(
-            link.contains(
-                "if navigate_to(&app, &crate::web::route::located(Some(&href), &base), true) {\n            ev.prevent_default();\n        }"
+            has(
+                link,
+                "if navigate_to(&app, &crate::web::route::located(Some(&href), &base), true) { ev.prevent_default(); }"
             ),
             "a page-link click enters its href as a pushed navigation, and takes the click from the browser only when a route entered it"
         );
@@ -1221,8 +1229,9 @@ mod tests {
             "a page-link click writes no URL of its own"
         );
         assert!(
-            body_of("fn attach_popstate_listener<").contains(
-                "&crate::web::route::located(raw.as_deref(), &base),\n                false,"
+            has(
+                body_of("fn attach_popstate_listener<"),
+                "&crate::web::route::located(raw.as_deref(), &base), false,"
             ),
             "popstate rewrites the entry the browser moved to"
         );
