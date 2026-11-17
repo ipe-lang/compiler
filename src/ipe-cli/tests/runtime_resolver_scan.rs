@@ -74,16 +74,23 @@ const ADMISSION: &str = "admitted_runtime";
 /// The name the compile core's runtime is bound under, before and after admission.
 const RUNTIME_BINDING: &str = "runtime";
 
-/// The label of the admission's result rebinding the core's runtime, so no
-/// later use in the core can reach the unadmitted one.
-const ADMISSION_BOUND: &str = "let runtime = admitted_runtime(runtime)";
+/// The label of the admission's result rebinding the core's runtime as the
+/// core's first statement, so no use in the core can reach the unadmitted one.
+const ADMISSION_BOUND: &str = "let runtime = options.runtime_origin.admitted_runtime(runtime)";
+
+/// The compile core's options parameter, whose origin alone may admit its runtime.
+const OPTIONS_BINDING: &str = "options";
+
+/// The options field naming the origin that admits a runtime.
+const ORIGIN_FIELD: &str = "runtime_origin";
 
 /// The compile core: the one function whose runtime the gate admission rebinds.
 const CORE: &str = "compile_source_set_here";
 
 /// The label of any binding named [`RUNTIME_BINDING`] in [`CORE`]: its
 /// parameter and the admitted rebinding, so no later rebinding can shadow
-/// the admitted runtime with another.
+/// the admitted runtime with another. A macro body in [`CORE`] naming
+/// [`RUNTIME_BINDING`] counts too, since its expansion may bind it.
 const CORE_BINDING: &str = "a `runtime` binding in the compile core";
 
 /// The label of a zero-argument `ancestors()` walk in a runtime locator.
@@ -214,12 +221,16 @@ fn item_attrs(item: &syn::Item) -> &[Attribute] {
     }
 }
 
-/// Whether `local` is `let runtime = <origin>.admitted_runtime(runtime);`.
+/// Whether `stmt` is `let runtime = options.runtime_origin.admitted_runtime(runtime);`.
 ///
-/// Only that shape rebinds the compile core's runtime to the admitted one; a
-/// discarded call, another binding name, or another argument leaves the
-/// unadmitted runtime reachable under its own name.
-fn binds_admission(local: &syn::Local) -> bool {
+/// Only that shape rebinds the compile core's runtime to the one its own
+/// options admit; a discarded call, another binding name, a `mut` or `ref`
+/// binding, another receiver, or another argument leaves the unadmitted
+/// runtime reachable.
+fn binds_admission(stmt: &syn::Stmt) -> bool {
+    let syn::Stmt::Local(local) = stmt else {
+        return false;
+    };
     let syn::Pat::Ident(pat) = &local.pat else {
         return false;
     };
@@ -229,11 +240,22 @@ fn binds_admission(local: &syn::Local) -> bool {
     let syn::Expr::MethodCall(call) = &*init.expr else {
         return false;
     };
+    let syn::Expr::Field(origin) = &*call.receiver else {
+        return false;
+    };
+    let syn::Member::Named(field) = &origin.member else {
+        return false;
+    };
+    let of_the_options = matches!(&*origin.base, syn::Expr::Path(base) if base.path.is_ident(OPTIONS_BINDING))
+        && field == ORIGIN_FIELD;
     let takes_the_runtime = call.args.len() == 1
         && matches!(call.args.first(), Some(syn::Expr::Path(arg)) if arg.path.is_ident(RUNTIME_BINDING));
     pat.ident == RUNTIME_BINDING
         && pat.subpat.is_none()
+        && pat.mutability.is_none()
+        && pat.by_ref.is_none()
         && init.diverge.is_none()
+        && of_the_options
         && call.method == ADMISSION
         && takes_the_runtime
 }
@@ -344,6 +366,9 @@ impl Scan {
                     }
                     colons = 0;
                     let name = ident.to_string();
+                    if name == RUNTIME_BINDING && self.fns.last().is_some_and(|f| f == CORE) {
+                        self.met(CORE_BINDING.to_owned());
+                    }
                     if dot {
                         self.method(&name, 0);
                     }
@@ -409,6 +434,9 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         self.within(item.sig.ident.to_string(), |scan| {
+            if item.sig.ident == CORE && item.block.stmts.first().is_some_and(binds_admission) {
+                scan.met(ADMISSION_BOUND.to_owned());
+            }
             visit::visit_item_fn(scan, item);
         });
     }
@@ -446,13 +474,6 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         self.method(&call.method.to_string(), call.args.len());
         visit::visit_expr_method_call(self, call);
-    }
-
-    fn visit_local(&mut self, local: &'ast syn::Local) {
-        if binds_admission(local) {
-            self.met(ADMISSION_BOUND.to_owned());
-        }
-        visit::visit_local(self, local);
     }
 
     fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
@@ -688,7 +709,7 @@ fn baseline(rel: &str) -> &'static str {
              fn build_loose_file_into() { RuntimeSource::resolve(o, e, r); }\n\
              fn build_test_into() { RuntimeSource::resolve(o, None, r); }\n\
              fn build_project_into() { RuntimeSource::resolve(o, e, r); }\n\
-             fn compile_source_set_here(runtime: &RuntimeSource) { let runtime = o.runtime_origin.admitted_runtime(runtime); }\n"
+             fn compile_source_set_here(runtime: &RuntimeSource, options: &BuildOptions) { let runtime = options.runtime_origin.admitted_runtime(runtime); }\n"
         }
         HEALTH => "fn check_runtime() { runtime_check(RuntimeSource::resolve(o, None, r)); }\n",
         HARNESS => {
@@ -898,18 +919,25 @@ fn a_planted_harness_locator_in_any_member_is_refused() -> Result<(), String> {
 /// rebind the core's runtime, is refused.
 #[test]
 fn a_compile_core_without_the_bound_admission_is_refused() -> Result<(), String> {
-    let admission = "let runtime = o.runtime_origin.admitted_runtime(runtime); ";
+    let admission = "let runtime = options.runtime_origin.admitted_runtime(runtime); ";
     let baseline = baseline(PIPELINE);
     if !baseline.contains(admission) {
         return Err(format!("{PIPELINE}: the baseline lost its admission line"));
     }
     for unbound in [
         "",
-        "o.runtime_origin.admitted_runtime(runtime); ",
-        "let _ = o.runtime_origin.admitted_runtime(runtime); ",
-        "let r = o.runtime_origin.admitted_runtime(runtime); ",
-        "let runtime = o.runtime_origin.admitted_runtime(other); ",
-        "let runtime = o.runtime_origin.admitted_runtime(runtime) else { return }; ",
+        "options.runtime_origin.admitted_runtime(runtime); ",
+        "let _ = options.runtime_origin.admitted_runtime(runtime); ",
+        "let r = options.runtime_origin.admitted_runtime(runtime); ",
+        "let runtime = options.runtime_origin.admitted_runtime(other); ",
+        "let runtime = options.runtime_origin.admitted_runtime(runtime) else { return }; ",
+        "let mut runtime = options.runtime_origin.admitted_runtime(runtime); runtime = other; ",
+        "let ref runtime = options.runtime_origin.admitted_runtime(runtime); ",
+        "let runtime = RuntimeOrigin::Developer.admitted_runtime(runtime); ",
+        "let runtime = developer.runtime_origin.admitted_runtime(runtime); ",
+        "let runtime = options.other_origin.admitted_runtime(runtime); ",
+        "emit(runtime); let runtime = options.runtime_origin.admitted_runtime(runtime); ",
+        "let early = runtime; let runtime = options.runtime_origin.admitted_runtime(runtime); ",
     ] {
         let mut found = BTreeMap::new();
         found.insert(
@@ -930,6 +958,10 @@ fn a_compile_core_without_the_bound_admission_is_refused() -> Result<(), String>
         "let (runtime, _) = (other, 1); ",
         "if let Some(runtime) = other { use_it(runtime); } ",
         "let f = |runtime: &RuntimeSource| emit(runtime); ",
+        "for runtime in others { emit(runtime); } ",
+        "match other { runtime => emit(runtime) } ",
+        "let Bundle { runtime } = other; ",
+        "rebind!(runtime, other); ",
     ] {
         let mut found = BTreeMap::new();
         found.insert(
