@@ -2687,12 +2687,17 @@ fn bundle_wasm_with<T>(
     // itself raises is already fail-closed).
     let target_dir =
         crate::target_dir::LinkableTargetDir::for_crate(cargo_bin.path(), posture, out_dir, None)?;
+    // Every crate's browser module is uplifted to the same `ipe_app.wasm` of a
+    // build directory other projects may share: the directory is held from
+    // before cargo writes the module until wasm-bindgen has read it, so no
+    // other build replaces the module in between.
+    let held = target_dir.hold()?;
     let build = CargoBuild {
         cargo: &cargo_bin,
         krate: CargoCrate::Emitted(crate_dir),
         posture,
         target: CargoTarget::WasmBrowser,
-        target_dir: &target_dir,
+        target_dir: held.dir(),
         output: CargoOutput::JsonStream(Verbosity::Progress),
         what: "the emitted wasm program",
         runtime: Some(runtime_context_for_message()),
@@ -2703,14 +2708,16 @@ fn bundle_wasm_with<T>(
     // Step 2: wasm-bindgen — the .wasm cargo's own record names.
     let wasm_path = wasm_artifact_path(&messages, &artifacts, CargoTarget::WasmBrowser, out_dir)?;
 
-    bundle_wasm_pkg_with(
+    let bundled = bundle_wasm_pkg_with(
         crate_dir,
         &wasm_path,
         &WasmTools::for_posture(posture, bindgen.path()),
         crate::remote_ingest::WASM_TOOL_LIMITS,
         || home.claim(),
         publish,
-    )
+    );
+    drop(held);
+    bundled
 }
 
 /// The post-link wasm tools `bundle_wasm` runs, by program path.

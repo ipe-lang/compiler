@@ -589,6 +589,29 @@ impl LinkableTargetDir {
         }
     }
 
+    /// Hold this directory's lock until the returned guard drops.
+    ///
+    /// A build that reads back an artifact whose name is the same for every
+    /// crate (the browser module `ipe_app.wasm`) holds it from before its cargo
+    /// spawn until the read: every such build of a directory other projects
+    /// share then waits its turn, so none replaces the artifact in between.
+    ///
+    /// # Errors
+    /// The refusals of [`TargetLock`]; [`CliError::Io`] when the directory
+    /// cannot be created, or, for one ipe chose in the per-user cache, is not
+    /// private.
+    pub fn hold(&self) -> Result<HeldTargetDir<'_>, CliError> {
+        let lock = TargetLock::acquire_in(
+            &self.path,
+            DirPrep::of(self.origin),
+            crate::cargo_step::CARGO_BUILD_WALL,
+        )?;
+        Ok(HeldTargetDir {
+            dir: self,
+            _lock: lock,
+        })
+    }
+
     /// A build directory taken as resolved, for tests that hand a build its directory.
     #[cfg(test)]
     pub fn assume(path: &Path) -> Self {
@@ -609,6 +632,23 @@ impl LinkableTargetDir {
     #[must_use]
     pub const fn origin(&self) -> TargetDirOrigin {
         self.origin
+    }
+}
+
+/// A build directory whose lock this process holds, from [`LinkableTargetDir::hold`].
+#[derive(Debug)]
+pub struct HeldTargetDir<'a> {
+    /// The held directory.
+    dir: &'a LinkableTargetDir,
+    /// The held lock; dropping it releases the directory.
+    _lock: TargetLock,
+}
+
+impl HeldTargetDir<'_> {
+    /// The held directory.
+    #[must_use]
+    pub const fn dir(&self) -> &LinkableTargetDir {
+        self.dir
     }
 }
 
@@ -2330,6 +2370,54 @@ mod tests {
             assert!(
                 TargetLock::acquire(&base, wall).is_ok(),
                 "a released lock is free"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A held build directory keeps every other build out until the hold
+        /// drops: a browser build reads its `ipe_app.wasm` back from a
+        /// directory no other build can write meanwhile.
+        #[test]
+        fn a_held_build_directory_turns_every_other_build_away() {
+            let base = temp("hold");
+            let dir = LinkableTargetDir {
+                path: base.join("dev-0123456789abcdef"),
+                origin: TargetDirOrigin::Env,
+            };
+            let wall = crate::remote_ingest::LocalWall::of_secs::<1>();
+            let held = dir.hold().expect("first holder");
+            assert_eq!(held.dir().path(), dir.path());
+            let second = TargetLock::acquire(dir.path(), wall);
+            assert!(
+                matches!(second, Err(CliError::TestTargetBusy { .. })),
+                "a held build directory refuses a second build: {second:?}"
+            );
+            drop(held);
+            assert!(
+                TargetLock::acquire(dir.path(), wall).is_ok(),
+                "a released build directory is free"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// Holding a development directory re-proves it private: one widened
+        /// after its claim is refused, never built in.
+        #[cfg(unix)]
+        #[test]
+        fn holding_a_widened_development_directory_is_refused() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = temp("hold-wide");
+            let dir = LinkableTargetDir {
+                path: base.join("dev-0123456789abcdef"),
+                origin: TargetDirOrigin::DevCache,
+            };
+            drop(dir.hold().expect("a private directory is held"));
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755))
+                .expect("widen");
+            let held = dir.hold();
+            assert!(
+                matches!(held, Err(CliError::Io { .. })),
+                "a widened development directory is refused: {held:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
