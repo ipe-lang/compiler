@@ -5141,22 +5141,62 @@ fn page_link_fixture(routes: &str, decls: &str, view: &str) -> String {
     src
 }
 
-/// A crate with no `Web.tea` whose `main` renders the page link `link` builds
-/// over the table `table` (a top-level declaration of `linkRoutes`).
-fn page_link_without_app(table: &str, link: &str) -> String {
-    format!(
-        "module Main exposing (main)\n\
-         import Ipe.Html as Html\n\
-         import Ipe.Io as Io\n\
+/// The entry of a crate with no `Web.tea`: `main` renders the `View` module's
+/// page link to a string. The entry imports no `Ipe.Tea.*` shape, since a
+/// `main` that is not an app may not (IPE-N0033).
+const PAGE_LINK_NO_APP_MAIN: &str = "module Main exposing (main)\n\
+     import Ipe.Html as Html\n\
+     import Ipe.Io as Io\n\
+     import Ipe.Ui as Ui\n\
+     import View\n\
+     main = Io.println (Html.render (Ui.layout [] View.link))\n";
+
+/// Compile a crate with no `Web.tea` whose `View` module builds the page link
+/// `link` over the table `table` (a top-level declaration of `linkRoutes`).
+fn compile_page_link_without_app(name: &str, table: &str, link: &str) -> Outcome {
+    let view = format!(
+        "module View exposing (Msg(..), Page(..), link)\n\
          import Ipe.Tea.Web as Web\n\
          import Ipe.Ui as Ui\n\
          type Page = HomePage | AboutPage\n\
          type Msg = Noop\n\
          {table}\n\
          link : Element Msg\n\
-         link = {link}\n\
-         main = Io.println (Html.render (Ui.layout [] link))\n"
+         link = {link}\n"
+    );
+    compile_project(
+        name,
+        &[("Main.ipe", PAGE_LINK_NO_APP_MAIN), ("View.ipe", &view)],
     )
+}
+
+/// Assert the crate [`compile_page_link_without_app`] builds is refused with
+/// exactly `expected`.
+#[track_caller]
+fn assert_page_link_without_app_rejected(name: &str, table: &str, link: &str, expected: &str) {
+    match compile_page_link_without_app(name, table, link) {
+        Outcome::Rejected(got) => assert_eq!(
+            got, expected,
+            "{name}: expected {expected}, got {got} — a rejection for the WRONG reason"
+        ),
+        Outcome::Accepted(how) => fail_accepted(name, expected, &how),
+    }
+}
+
+/// Assert the crate [`compile_page_link_without_app`] builds compiles cleanly.
+#[track_caller]
+fn assert_page_link_without_app_compiles(name: &str, table: &str, link: &str) {
+    match compile_page_link_without_app(name, table, link) {
+        Outcome::Accepted(how) if how.starts_with("compiled successfully") => {}
+        Outcome::Accepted(how) => assert!(
+            false_marker(),
+            "{name}: expected a clean compile, got a non-pipeline failure ({how})"
+        ),
+        Outcome::Rejected(got) => assert!(
+            false_marker(),
+            "{name}: expected a clean compile, but ipe REJECTED it with {got}"
+        ),
+    }
 }
 
 /// A `Web.pageLink` table the compiler cannot read as one top-level binding is
@@ -5227,26 +5267,23 @@ fn page_link_unreadable_table_refused() {
 #[test]
 fn page_link_open_table_refused() {
     let link = "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }";
-    assert_rejected(
+    assert_page_link_without_app_rejected(
         "page_link_empty_table",
-        &page_link_without_app("linkRoutes : List (WebRoute Page)\nlinkRoutes = []", link),
+        "linkRoutes : List (WebRoute Page)\nlinkRoutes = []",
+        link,
         "IPE-L0165",
     );
-    assert_rejected(
+    assert_page_link_without_app_rejected(
         "page_link_int_table",
-        &page_link_without_app(
-            "linkRoutes : List (WebRoute Int)\nlinkRoutes = [ Web.route \"/\" 1 ]",
-            "Web.pageLink linkRoutes [] { to = 1, current = 1, label = Ui.text \"One\" }",
-        ),
+        "linkRoutes : List (WebRoute Int)\nlinkRoutes = [ Web.route \"/\" 1 ]",
+        "Web.pageLink linkRoutes [] { to = 1, current = 1, label = Ui.text \"One\" }",
         "IPE-L0165",
     );
-    assert_compiles(
+    assert_page_link_without_app_compiles(
         "page_link_closed_table",
-        &page_link_without_app(
-            "linkRoutes : List (WebRoute Page)\n\
-             linkRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
-            link,
-        ),
+        "linkRoutes : List (WebRoute Page)\n\
+         linkRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+        link,
     );
 }
 
@@ -5255,12 +5292,10 @@ fn page_link_open_table_refused() {
 /// passes the router's own checks.
 #[test]
 fn page_link_table_without_route_refused() {
-    assert_rejected(
+    assert_page_link_without_app_rejected(
         "page_link_page_without_route",
-        &page_link_without_app(
-            "linkRoutes : List (WebRoute Page)\nlinkRoutes = [ Web.route \"/\" HomePage ]",
-            "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }",
-        ),
+        "linkRoutes : List (WebRoute Page)\nlinkRoutes = [ Web.route \"/\" HomePage ]",
+        "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }",
         "IPE-L0159",
     );
 }

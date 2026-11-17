@@ -5,7 +5,8 @@
 //! * a served routed app whose `routes` and every link name one top-level
 //!   binding in another module, with a `let`-bound cfg and a partial
 //!   application `List.map (Web.pageLink Routes.routes []) cfgs`;
-//! * a crate with no `Web.tea` that renders a page link to a string;
+//! * a crate with no `Web.tea` whose `main` renders a view module's page
+//!   link to a string;
 //! * the same routed app built for the wasm client target.
 //!
 //! Each emits; under `IPE_E2E=1` the native crates also `cargo build` (THE
@@ -76,11 +77,10 @@ const ROUTED_APP: &str = "module Main exposing (main)\n\
      \x20       , notFound = HomePage\n\
      \x20       }\n";
 
-/// A crate with no `Web.tea`: `main` renders a page link to a string.
-const NO_APP: &str = "module Main exposing (main)\n\
+/// A view module with no `main` that builds a page link. Only a module with
+/// no `main` (or an app entry) may import `Ipe.Tea.Web` (IPE-N0033).
+const NO_APP_VIEW: &str = "module View exposing (Msg(..), link)\n\
      \n\
-     import Ipe.Html as Html\n\
-     import Ipe.Io as Io\n\
      import Ipe.Tea.Web as Web\n\
      import Ipe.Ui as Ui\n\
      import Routes exposing (Page(..))\n\
@@ -88,9 +88,18 @@ const NO_APP: &str = "module Main exposing (main)\n\
      type Msg = Noop\n\
      \n\
      link : Element Msg\n\
-     link = Web.pageLink Routes.routes [] { to = PostPage 3, current = HomePage, label = Ui.text \"Post\" }\n\
+     link = Web.pageLink Routes.routes [] { to = PostPage 3, current = HomePage, label = Ui.text \"Post\" }\n";
+
+/// A crate with no `Web.tea`: `main` renders the view module's page link to a
+/// string.
+const NO_APP: &str = "module Main exposing (main)\n\
      \n\
-     main = Io.println (Html.render (Ui.layout [] link))\n";
+     import Ipe.Html as Html\n\
+     import Ipe.Io as Io\n\
+     import Ipe.Ui as Ui\n\
+     import View\n\
+     \n\
+     main = Io.println (Html.render (Ui.layout [] View.link))\n";
 
 /// A fresh emit directory this test alone owns.
 fn scratch(name: &str) -> PathBuf {
@@ -99,21 +108,36 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
-/// Emit the two-module project whose `Main` is `main` into `out`.
+/// Emit the project whose `Main` is `main`, beside `Routes` and the named
+/// `modules`, into `out`.
 #[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
-fn emit(main: &str, out: &Path, options: &BuildOptions) -> Result<(), CliError> {
-    let tree = SourceTree::main(main).module("Routes", ROUTES);
+fn emit(
+    main: &str,
+    modules: &[(&str, &str)],
+    out: &Path,
+    options: &BuildOptions,
+) -> Result<(), CliError> {
+    let tree = modules.iter().fold(
+        SourceTree::main(main).module("Routes", ROUTES),
+        |tree, (name, source)| tree.module(name, source),
+    );
     let fixture = ipe::RootFixture::from_tree(&tree).expect("write and resolve the fixture");
     let runtime = e2e_support::require_runtime().into_path_buf();
     ipe::build_fixture_with_options(&fixture, out, &runtime, options).map(drop)
 }
 
-/// Assert that `main` emits under `options`, that the emitted crate renders
-/// its links through the page renderer, and return the emit directory.
+/// Assert that `main` beside `modules` emits under `options`, that the
+/// emitted crate renders its links through the page renderer, and return the
+/// emit directory.
 #[allow(clippy::expect_used)] // test helper: an unreadable emit IS the failure
-fn assert_emits(name: &str, main: &str, options: &BuildOptions) -> PathBuf {
+fn assert_emits(
+    name: &str,
+    main: &str,
+    modules: &[(&str, &str)],
+    options: &BuildOptions,
+) -> PathBuf {
     let out = scratch(name);
-    let result = emit(main, &out, options);
+    let result = emit(main, modules, &out, options);
     assert!(
         result.is_ok(),
         "{name}: ipe must accept: {:?}",
@@ -133,7 +157,7 @@ fn assert_emits(name: &str, main: &str, options: &BuildOptions) -> PathBuf {
 #[allow(clippy::expect_used)] // a missing build option set IS the failure
 fn page_link_routed_app_builds() {
     let options = BuildOptions::from_env().expect("read the build options");
-    let out = assert_emits("page_link_routed_app", ROUTED_APP, &options);
+    let out = assert_emits("page_link_routed_app", ROUTED_APP, &[], &options);
     crate::support::assert_seal_builds("page_link_routed_app", &out);
 }
 
@@ -143,7 +167,12 @@ fn page_link_routed_app_builds() {
 #[allow(clippy::expect_used)] // a missing build option set IS the failure
 fn page_link_without_app_builds() {
     let options = BuildOptions::from_env().expect("read the build options");
-    let out = assert_emits("page_link_without_app", NO_APP, &options);
+    let out = assert_emits(
+        "page_link_without_app",
+        NO_APP,
+        &[("View", NO_APP_VIEW)],
+        &options,
+    );
     crate::support::assert_seal_builds("page_link_without_app", &out);
 }
 
@@ -154,5 +183,5 @@ fn page_link_wasm_app_emits() {
         target: ipe_ir::Target::WasmClient,
         ..BuildOptions::default()
     };
-    assert_emits("page_link_wasm_app", ROUTED_APP, &options);
+    assert_emits("page_link_wasm_app", ROUTED_APP, &[], &options);
 }

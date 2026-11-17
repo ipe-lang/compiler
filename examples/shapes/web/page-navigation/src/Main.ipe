@@ -111,7 +111,10 @@ entryLinks current =
         EntryPage _ ->
             Web.pageLink routes [ Ui.id "link-about" ] { to = AboutPage, current = current, label = Ui.text "About" }
 
-        _ ->
+        HomePage ->
+            Ui.none
+
+        AboutPage ->
             Ui.none
 
 
