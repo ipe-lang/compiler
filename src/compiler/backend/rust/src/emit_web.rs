@@ -1018,7 +1018,7 @@ pub struct PageLinkTable {
 ///
 /// Emitted once per crate, so every link and the routed app over the table
 /// share one renderer.
-pub fn page_renderer_item(ctx: &EmitCtx) -> &str {
+pub fn page_renderer_item<'c>(ctx: &'c EmitCtx<'_>) -> &'c str {
     ctx.page_link_table
         .as_ref()
         .map_or("", |plan| plan.item.as_str())
