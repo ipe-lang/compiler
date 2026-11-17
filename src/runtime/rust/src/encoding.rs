@@ -1108,6 +1108,448 @@ impl ServerOrigins {
     }
 }
 
+/// The one loopback frame origin form, before its port.
+const LOOPBACK_FRAME_PREFIX: &str = "http://localhost:";
+
+/// The scheme every other `http` text opens with; only the loopback form is
+/// read past it.
+const HTTP_SCHEME: &str = "http://";
+
+/// The port an `http` origin names when it writes none.
+const DEFAULT_HTTP_PORT: u16 = 80;
+
+/// The most origins a [`FrameOriginEntries`] or [`FrameOrigins`] list holds.
+///
+/// Its own constant beside [`MAX_SERVER_ORIGINS`], so the two caps never
+/// become one by accident.
+pub const MAX_FRAME_ORIGINS: usize = 16;
+
+/// The most bytes a non-empty frame origin list adds to a served page's
+/// `Content-Security-Policy` and `Permissions-Policy` headers, in the worst
+/// case (every capability-gated directive granted).
+pub const FRAME_HEADER_BUDGET: usize = 6144;
+
+/// The `Permissions-Policy` directives a non-empty list widens to every listed
+/// origin: the delegation table's capability-gated and undisclosed rows.
+///
+/// `frames.rs` asserts at build time that this equals the table's count.
+pub const FRAME_WIDENED_DIRECTIVES: usize = 24;
+
+/// The bytes a non-empty list adds whatever its origins: `self` inside each
+/// capability-gated directive, and each undisclosed directive written as
+/// `, <feature>=(self)`.
+///
+/// `frames.rs` asserts at build time that this equals the sum over the table.
+pub const FRAME_LIST_FIXED_COST: usize = 492;
+
+/// The header bytes one listed origin adds, `len` being its written length:
+/// ` <origin>` in `frame-src` and in `object-src`, and ` "<origin>"` in every
+/// widened directive.
+#[must_use]
+pub const fn frame_origin_header_cost(len: usize) -> usize {
+    len.saturating_add(1).saturating_mul(2).saturating_add(
+        len.saturating_add(3)
+            .saturating_mul(FRAME_WIDENED_DIRECTIVES),
+    )
+}
+
+/// The header bytes a list of origins with the written lengths `lens` adds:
+/// nothing for an empty list, else [`FRAME_LIST_FIXED_COST`] plus each
+/// origin's [`frame_origin_header_cost`].
+pub fn frame_header_cost(lens: impl IntoIterator<Item = usize>) -> usize {
+    let mut lens = lens.into_iter().peekable();
+    if lens.peek().is_none() {
+        return 0;
+    }
+    lens.fold(FRAME_LIST_FIXED_COST, |cost, len| {
+        cost.saturating_add(frame_origin_header_cost(len))
+    })
+}
+
+/// Judge a list's header cost against [`FRAME_HEADER_BUDGET`].
+///
+/// # Errors
+///
+/// `OverBudget` when `cost` is past the budget.
+pub const fn check_frame_header_budget(cost: usize) -> Result<(), FrameOriginsRefusal> {
+    if cost > FRAME_HEADER_BUDGET {
+        Err(FrameOriginsRefusal::OverBudget { cost })
+    } else {
+        Ok(())
+    }
+}
+
+/// Why a text is not a frame origin.
+///
+/// No variant carries the refused text, so a refusal is shown without
+/// echoing author input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOriginRefusal {
+    /// Longer than [`MAX_ORIGIN_LEN`]; judged before any byte is scanned.
+    TooLong { len: usize },
+    /// Neither `https://` nor `http://` opens the text (`null`, `data:`,
+    /// `blob:`, `javascript:`, `file:`, `about:`, an uppercase scheme).
+    Scheme,
+    /// The `https` form, refused for the reason a server origin would be.
+    Https(ServerOriginRefusal),
+    /// An `http` host other than exactly `localhost` (`127.0.0.1`, `[::1]`,
+    /// `a.localhost`, any other name).
+    LoopbackHost,
+    /// `http://localhost` with no port.
+    LoopbackPortMissing,
+    /// A loopback port that is not `1..=65535` in digits without a leading
+    /// zero, or is the `http` default `80`.
+    LoopbackPort,
+    /// A loopback origin in a runtime built without `dev-posture`.
+    LoopbackAtRelease,
+}
+
+impl std::fmt::Display for FrameOriginRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLong { len } => write!(
+                f,
+                "a frame origin is at most {MAX_ORIGIN_LEN} bytes (this one is {len})"
+            ),
+            Self::Scheme => write!(
+                f,
+                "a frame origin starts with `https://`, or is `http://localhost:PORT` under `ipe dev`"
+            ),
+            Self::Https(refusal) => {
+                write!(f, "a frame origin has a server origin's shape: {refusal}")
+            }
+            Self::LoopbackHost => write!(
+                f,
+                "a loopback frame origin is written `http://localhost:PORT`; `127.0.0.1`, `[::1]` and `*.localhost` are not"
+            ),
+            Self::LoopbackPortMissing => write!(
+                f,
+                "a loopback frame origin names its port, as in `http://localhost:3000`"
+            ),
+            Self::LoopbackPort => write!(
+                f,
+                "a loopback frame origin port is 1..=65535 in digits, with no leading zero, and not 80"
+            ),
+            Self::LoopbackAtRelease => write!(
+                f,
+                "a loopback frame origin (`http://localhost:PORT`) is for `ipe dev` only; a release build trusts `https://` origins"
+            ),
+        }
+    }
+}
+
+/// The port of a loopback frame origin: `1..=65535`, never the `http`
+/// default `80` (that origin would be written without it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LoopbackPort(u16);
+
+impl LoopbackPort {
+    /// Parse the digits after `http://localhost:`.
+    ///
+    /// # Errors
+    ///
+    /// `LoopbackPortMissing` for no digits, `LoopbackPort` for anything else
+    /// that is not a port this type holds.
+    fn parse(port: &str) -> Result<Self, FrameOriginRefusal> {
+        if port.is_empty() {
+            return Err(FrameOriginRefusal::LoopbackPortMissing);
+        }
+        if !port.bytes().all(|b| b.is_ascii_digit()) || port.starts_with('0') {
+            return Err(FrameOriginRefusal::LoopbackPort);
+        }
+        match port.parse::<u16>() {
+            Ok(0 | DEFAULT_HTTP_PORT) | Err(_) => Err(FrameOriginRefusal::LoopbackPort),
+            Ok(port) => Ok(Self(port)),
+        }
+    }
+
+    /// The port number.
+    #[must_use]
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    /// Append `http://localhost:<port>` to `out`.
+    fn write(self, out: &mut String) {
+        out.push_str(LOOPBACK_FRAME_PREFIX);
+        out.push_str(&self.0.to_string());
+    }
+
+    /// The length of the written form.
+    fn written_len(self) -> usize {
+        LOOPBACK_FRAME_PREFIX
+            .len()
+            .saturating_add(self.0.to_string().len())
+    }
+}
+
+/// What a manifest may list as a trusted frame origin.
+///
+/// Not gated on `dev-posture`: the compiler links the runtime without it, so
+/// the manifest's type cannot depend on it. A loopback entry is refused for a
+/// release build by the build, and again by the release runtime's
+/// [`FrameOrigin::parse`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FrameOriginEntry {
+    /// An `https` origin, in a server origin's one spelling.
+    Https(ServerOrigin),
+    /// `http://localhost:PORT`, the port written.
+    Loopback(LoopbackPort),
+}
+
+impl FrameOriginEntry {
+    /// Parse `text` as an `https` origin, or as `http://localhost:PORT`.
+    ///
+    /// # Errors
+    ///
+    /// `TooLong` before any byte is scanned; `Scheme` for any other scheme;
+    /// `Https` with the server-origin refusal of an `https://` text;
+    /// `LoopbackHost`, `LoopbackPortMissing` or `LoopbackPort` for an
+    /// `http://` text.
+    pub fn parse(text: &str) -> Result<Self, FrameOriginRefusal> {
+        if text.len() > MAX_ORIGIN_LEN {
+            return Err(FrameOriginRefusal::TooLong { len: text.len() });
+        }
+        if text.starts_with(ORIGIN_SCHEME) {
+            return ServerOrigin::parse(text)
+                .map(Self::Https)
+                .map_err(FrameOriginRefusal::Https);
+        }
+        if !text.starts_with(HTTP_SCHEME) {
+            return Err(FrameOriginRefusal::Scheme);
+        }
+        if text == LOOPBACK_FRAME_PREFIX.trim_end_matches(':') {
+            return Err(FrameOriginRefusal::LoopbackPortMissing);
+        }
+        let port = text
+            .strip_prefix(LOOPBACK_FRAME_PREFIX)
+            .ok_or(FrameOriginRefusal::LoopbackHost)?;
+        LoopbackPort::parse(port).map(Self::Loopback)
+    }
+
+    /// Append the exact written origin to `out`.
+    pub fn write(&self, out: &mut String) {
+        match self {
+            Self::Https(origin) => origin.write_https(out),
+            Self::Loopback(port) => port.write(out),
+        }
+    }
+
+    /// The length of the written origin.
+    #[must_use]
+    pub fn written_len(&self) -> usize {
+        match self {
+            Self::Https(origin) => ORIGIN_SCHEME.len().saturating_add(origin.authority().len()),
+            Self::Loopback(port) => port.written_len(),
+        }
+    }
+}
+
+/// Why a list of origins is not a [`FrameOriginEntries`] or a [`FrameOrigins`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOriginsRefusal {
+    /// More than [`MAX_FRAME_ORIGINS`] distinct origins.
+    LimitExceeded,
+    /// The entry at zero-based `index` repeats an earlier one.
+    Duplicate { index: usize },
+    /// The list adds `cost` header bytes, past [`FRAME_HEADER_BUDGET`].
+    OverBudget { cost: usize },
+}
+
+impl std::fmt::Display for FrameOriginsRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LimitExceeded => write!(
+                f,
+                "a program trusts at most {MAX_FRAME_ORIGINS} frame origins"
+            ),
+            Self::Duplicate { index } => write!(
+                f,
+                "frame origin {} repeats an earlier one",
+                index.saturating_add(1)
+            ),
+            Self::OverBudget { cost } => write!(
+                f,
+                "the frame origins add {cost} bytes to the served headers; the budget is {FRAME_HEADER_BUDGET}"
+            ),
+        }
+    }
+}
+
+/// The trusted frame origins a manifest lists.
+///
+/// Sorted, distinct, at most [`MAX_FRAME_ORIGINS`] long, and within
+/// [`FRAME_HEADER_BUDGET`]. There is no `Default`: a site that means none
+/// names [`FrameOriginEntries::none`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FrameOriginEntries(Vec<FrameOriginEntry>);
+
+impl FrameOriginEntries {
+    /// No trusted frame origin.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The sorted list of `entries`, each written once.
+    ///
+    /// # Errors
+    ///
+    /// `Duplicate` at the first repeated entry, `LimitExceeded` as soon as
+    /// more than [`MAX_FRAME_ORIGINS`] are seen (nothing more is read), and
+    /// `OverBudget` for a list past [`FRAME_HEADER_BUDGET`].
+    pub fn new(
+        entries: impl IntoIterator<Item = FrameOriginEntry>,
+    ) -> Result<Self, FrameOriginsRefusal> {
+        let mut set = std::collections::BTreeSet::new();
+        for (index, entry) in entries.into_iter().enumerate() {
+            if !set.insert(entry) {
+                return Err(FrameOriginsRefusal::Duplicate { index });
+            }
+            if set.len() > MAX_FRAME_ORIGINS {
+                return Err(FrameOriginsRefusal::LimitExceeded);
+            }
+        }
+        check_frame_header_budget(frame_header_cost(
+            set.iter().map(FrameOriginEntry::written_len),
+        ))?;
+        Ok(Self(set.into_iter().collect()))
+    }
+
+    /// The entries, in sorted order.
+    pub fn entries(&self) -> impl Iterator<Item = &FrameOriginEntry> {
+        self.0.iter()
+    }
+
+    /// The number of entries.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the list is empty: no frame is trusted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// A frame origin a running runtime trusts.
+///
+/// A runtime built without `dev-posture` has no loopback variant, so a
+/// release program has no representation of a loopback trusted origin.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FrameOrigin {
+    /// An `https` origin, in a server origin's one spelling.
+    Https(ServerOrigin),
+    /// `http://localhost:PORT`, trusted only by a `dev-posture` runtime.
+    #[cfg(feature = "dev-posture")]
+    DevLoopback(LoopbackPort),
+}
+
+impl FrameOrigin {
+    /// The runtime's re-parse of a manifest's entry: [`FrameOriginEntry::parse`]'s
+    /// grammar, with the loopback form admitted only under `dev-posture`.
+    ///
+    /// # Errors
+    ///
+    /// Every refusal of [`FrameOriginEntry::parse`], and `LoopbackAtRelease`
+    /// for a loopback origin in a runtime built without `dev-posture`.
+    pub fn parse(text: &str) -> Result<Self, FrameOriginRefusal> {
+        match FrameOriginEntry::parse(text)? {
+            FrameOriginEntry::Https(origin) => Ok(Self::Https(origin)),
+            #[cfg(feature = "dev-posture")]
+            FrameOriginEntry::Loopback(port) => Ok(Self::DevLoopback(port)),
+            #[cfg(not(feature = "dev-posture"))]
+            FrameOriginEntry::Loopback(_) => Err(FrameOriginRefusal::LoopbackAtRelease),
+        }
+    }
+
+    /// Append the exact written origin to `out`: the bytes a
+    /// `Content-Security-Policy`, a `Permissions-Policy` and a client compare.
+    /// By the parse it holds no `"`, `\`, `;`, `,`, space or control byte.
+    pub fn write(&self, out: &mut String) {
+        match self {
+            Self::Https(origin) => origin.write_https(out),
+            #[cfg(feature = "dev-posture")]
+            Self::DevLoopback(port) => port.write(out),
+        }
+    }
+
+    /// The written origin.
+    #[must_use]
+    pub fn written(&self) -> String {
+        let mut out = String::new();
+        self.write(&mut out);
+        out
+    }
+
+    /// The length of the written origin.
+    #[must_use]
+    pub fn written_len(&self) -> usize {
+        match self {
+            Self::Https(origin) => ORIGIN_SCHEME.len().saturating_add(origin.authority().len()),
+            #[cfg(feature = "dev-posture")]
+            Self::DevLoopback(port) => port.written_len(),
+        }
+    }
+}
+
+/// The frame origins a running runtime trusts.
+///
+/// Sorted, distinct, at most [`MAX_FRAME_ORIGINS`] long, and within
+/// [`FRAME_HEADER_BUDGET`]. There is no `Default`: a site that means none
+/// names [`FrameOrigins::none`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FrameOrigins(Vec<FrameOrigin>);
+
+impl FrameOrigins {
+    /// No trusted frame origin.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// The sorted, de-duplicated list of `origins`.
+    ///
+    /// # Errors
+    ///
+    /// `LimitExceeded` as soon as more than [`MAX_FRAME_ORIGINS`] distinct
+    /// origins are seen (nothing more is read), and `OverBudget` for a list
+    /// past [`FRAME_HEADER_BUDGET`].
+    pub fn new(
+        origins: impl IntoIterator<Item = FrameOrigin>,
+    ) -> Result<Self, FrameOriginsRefusal> {
+        let mut set = std::collections::BTreeSet::new();
+        for origin in origins {
+            set.insert(origin);
+            if set.len() > MAX_FRAME_ORIGINS {
+                return Err(FrameOriginsRefusal::LimitExceeded);
+            }
+        }
+        check_frame_header_budget(frame_header_cost(set.iter().map(FrameOrigin::written_len)))?;
+        Ok(Self(set.into_iter().collect()))
+    }
+
+    /// The origins, in sorted order.
+    #[must_use]
+    pub const fn origins(&self) -> &[FrameOrigin] {
+        self.0.as_slice()
+    }
+
+    /// The number of origins.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the list is empty: no frame is trusted.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
 /// A bundle-relative asset path: `/`-separated segments of `[A-Za-z0-9._-]`.
 ///
 /// It has no leading `/` and no empty, `.` or `..` segment. The asset's URL is
@@ -3579,5 +4021,295 @@ mod server_origin_tests {
         let a = ServerOrigin::parse("https://a.example").expect("origin");
         let list = ServerOrigins::new([b.clone(), a.clone()]).expect("two origins");
         assert_eq!(list.origins().collect::<Vec<_>>(), vec![&a, &b]);
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod frame_origin_tests {
+    use super::*;
+
+    /// A host of exactly `len` bytes: 63-byte labels of `a` joined by dots,
+    /// then a shorter last label.
+    fn host_of(len: usize) -> String {
+        let mut host = String::new();
+        while host.len() < len {
+            if !host.is_empty() {
+                host.push('.');
+            }
+            let room = len.saturating_sub(host.len()).min(MAX_ORIGIN_LABEL_LEN);
+            host.push_str(&"a".repeat(room));
+        }
+        host
+    }
+
+    /// The text of origin `index` whose written form is `len` bytes long: one
+    /// label `o<index>` padded with `a`, so every index is distinct.
+    fn origin_text(index: usize, len: usize) -> String {
+        let mut host = format!("o{index}");
+        let host_len = len.saturating_sub(ORIGIN_SCHEME.len());
+        while host.len() < host_len {
+            host.push('a');
+        }
+        format!("{ORIGIN_SCHEME}{host}")
+    }
+
+    /// Every shape a frame origin must not take, each with its typed refusal,
+    /// for the manifest's entry and the runtime's origin alike; the two valid
+    /// neighbours parse under both.
+    #[test]
+    fn frame_origin_refuses_every_non_origin() {
+        use FrameOriginRefusal as F;
+        use ServerOriginRefusal as S;
+        let label = format!("https://{}.example", "a".repeat(MAX_ORIGIN_LABEL_LEN + 1));
+        let host = format!("https://{}", host_of(MAX_ORIGIN_HOST_LEN + 1));
+        let too_long = format!("https://{}", "a".repeat(MAX_ORIGIN_LEN));
+        let cases: Vec<(&str, FrameOriginRefusal)> = vec![
+            ("null", F::Scheme),
+            ("data:", F::Scheme),
+            ("data:text/html,x", F::Scheme),
+            ("blob:", F::Scheme),
+            ("blob:https://a.example/x", F::Scheme),
+            ("javascript:", F::Scheme),
+            ("file:", F::Scheme),
+            ("file:///etc", F::Scheme),
+            ("about:blank", F::Scheme),
+            ("HTTPS://a.example", F::Scheme),
+            ("", F::Scheme),
+            ("http://a.example", F::LoopbackHost),
+            ("http://127.0.0.1:3000", F::LoopbackHost),
+            ("https://*.a.example", F::Https(S::Wildcard)),
+            ("https://*", F::Https(S::Wildcard)),
+            ("https://u@a.example", F::Https(S::Userinfo)),
+            ("https://a.example/", F::Https(S::AfterAuthority)),
+            ("https://a.example/p", F::Https(S::AfterAuthority)),
+            ("https://a.example?q", F::Https(S::AfterAuthority)),
+            ("https://a.example#f", F::Https(S::AfterAuthority)),
+            ("https://a.example:443", F::Https(S::DefaultPort)),
+            ("https://a.example:0", F::Https(S::PortOutOfRange)),
+            ("https://a.example:08443", F::Https(S::PortLeadingZero)),
+            ("https://a.example:", F::Https(S::PortMalformed)),
+            ("https://A.example", F::Https(S::Uppercase)),
+            ("https://127.0.0.1", F::Https(S::IpLiteral)),
+            ("https://[::1]", F::Https(S::IpLiteral)),
+            ("https://\u{e9}.example", F::Https(S::Byte { byte: 0xC3 })),
+            ("https://a.example\"", F::Https(S::Byte { byte: b'"' })),
+            ("https://a.example\\", F::Https(S::Byte { byte: b'\\' })),
+            ("https://a.example;", F::Https(S::Byte { byte: b';' })),
+            ("https://a.example,", F::Https(S::Byte { byte: b',' })),
+            ("https://a .example", F::Https(S::Byte { byte: b' ' })),
+            ("https://a.example\n", F::Https(S::Byte { byte: b'\n' })),
+            (&label, F::Https(S::LabelTooLong { len: 64 })),
+            (&host, F::Https(S::HostTooLong { len: 254 })),
+            (
+                &too_long,
+                F::TooLong {
+                    len: too_long.len(),
+                },
+            ),
+        ];
+        for (text, refusal) in cases {
+            assert_eq!(FrameOriginEntry::parse(text), Err(refusal), "{text:?}");
+            assert_eq!(FrameOrigin::parse(text), Err(refusal), "{text:?}");
+        }
+        for text in ["https://a.example", "https://maps.example.org:8443"] {
+            let entry = FrameOriginEntry::parse(text);
+            let origin = FrameOrigin::parse(text);
+            assert!(matches!(entry, Ok(FrameOriginEntry::Https(_))), "{text}");
+            assert_eq!(
+                origin.as_ref().map(FrameOrigin::written),
+                Ok(text.to_owned())
+            );
+            assert_eq!(origin.map(|o| o.written_len()), Ok(text.len()));
+        }
+    }
+
+    /// The loopback form is `http://localhost:PORT` exactly: every other
+    /// spelling of a loopback origin, and every port it cannot hold, is
+    /// refused at the manifest.
+    #[test]
+    fn loopback_entry_is_localhost_with_a_port() {
+        use FrameOriginRefusal as F;
+        let cases: [(&str, FrameOriginRefusal); 12] = [
+            ("http://localhost", F::LoopbackPortMissing),
+            ("http://localhost:", F::LoopbackPortMissing),
+            ("http://127.0.0.1:3000", F::LoopbackHost),
+            ("http://[::1]:3000", F::LoopbackHost),
+            ("http://a.localhost:3000", F::LoopbackHost),
+            ("http://LOCALHOST:3000", F::LoopbackHost),
+            ("http://localhost/", F::LoopbackHost),
+            ("http://localhost:80", F::LoopbackPort),
+            ("http://localhost:0", F::LoopbackPort),
+            ("http://localhost:03000", F::LoopbackPort),
+            ("http://localhost:65536", F::LoopbackPort),
+            ("http://localhost:3000/", F::LoopbackPort),
+        ];
+        for (text, refusal) in cases {
+            assert_eq!(FrameOriginEntry::parse(text), Err(refusal), "{text:?}");
+        }
+        let entry = FrameOriginEntry::parse("http://localhost:3000");
+        assert!(matches!(entry, Ok(FrameOriginEntry::Loopback(port)) if port.get() == 3000));
+        let mut written = String::new();
+        if let Ok(entry) = &entry {
+            entry.write(&mut written);
+        }
+        assert_eq!(written, "http://localhost:3000");
+        assert_eq!(entry.map(|e| e.written_len()), Ok(written.len()));
+        assert!(FrameOriginEntry::parse("http://localhost:443").is_ok());
+        assert!(FrameOriginEntry::parse("http://localhost:65535").is_ok());
+    }
+
+    /// A `dev-posture` runtime trusts the loopback form, and refuses every
+    /// other loopback spelling.
+    #[cfg(feature = "dev-posture")]
+    #[test]
+    fn dev_posture_pin_frame_origin_loopback() {
+        let origin = FrameOrigin::parse("http://localhost:3000");
+        assert!(matches!(origin, Ok(FrameOrigin::DevLoopback(port)) if port.get() == 3000));
+        assert_eq!(
+            origin.map(|o| o.written()),
+            Ok("http://localhost:3000".to_owned())
+        );
+        for text in [
+            "http://localhost",
+            "http://127.0.0.1:3000",
+            "http://a.localhost:3000",
+            "http://[::1]:3000",
+        ] {
+            assert!(FrameOrigin::parse(text).is_err(), "{text}");
+        }
+    }
+
+    /// A runtime built without `dev-posture` refuses the loopback form the
+    /// manifest's entry still holds.
+    #[cfg(not(feature = "dev-posture"))]
+    #[test]
+    fn release_runtime_refuses_loopback_frame_origin() {
+        assert!(matches!(
+            FrameOriginEntry::parse("http://localhost:3000"),
+            Ok(FrameOriginEntry::Loopback(_))
+        ));
+        assert_eq!(
+            FrameOrigin::parse("http://localhost:3000"),
+            Err(FrameOriginRefusal::LoopbackAtRelease)
+        );
+        assert!(FrameOrigin::parse("https://a.example").is_ok());
+    }
+
+    /// The written lengths of a list whose header cost is exactly
+    /// [`FRAME_HEADER_BUDGET`]: the first origin count for which growing the
+    /// lengths one byte at a time lands on the budget.
+    pub fn lengths_at_budget() -> Vec<usize> {
+        let min = ORIGIN_SCHEME.len() + 3;
+        let max = ORIGIN_SCHEME.len() + MAX_ORIGIN_LABEL_LEN;
+        for count in 1..=MAX_FRAME_ORIGINS {
+            let mut lens = vec![min; count];
+            let mut next = 0;
+            while frame_header_cost(lens.iter().copied()) < FRAME_HEADER_BUDGET {
+                let Some(len) = lens.get_mut(next % count) else {
+                    break;
+                };
+                if *len == max {
+                    break;
+                }
+                *len += 1;
+                next += 1;
+            }
+            if frame_header_cost(lens.iter().copied()) == FRAME_HEADER_BUDGET {
+                return lens;
+            }
+        }
+        Vec::new()
+    }
+
+    /// The origin texts of a list whose header cost is exactly
+    /// [`FRAME_HEADER_BUDGET`].
+    pub fn texts_at_budget() -> Vec<String> {
+        lengths_at_budget()
+            .iter()
+            .enumerate()
+            .map(|(i, &len)| origin_text(i, len))
+            .collect()
+    }
+
+    /// Sixteen origins are a list and a seventeenth is refused; a repeat is
+    /// refused at the manifest and folded in the runtime's list; a list at
+    /// the header budget is admitted and one byte past it is refused.
+    #[test]
+    #[allow(clippy::expect_used)] // every generated origin is well-formed
+    fn frame_origins_cap_and_dedupe() {
+        let entry = |i: usize| FrameOriginEntry::parse(&origin_text(i, 12)).expect("entry");
+        let origin = |i: usize| FrameOrigin::parse(&origin_text(i, 12)).expect("origin");
+
+        let sixteen: Vec<FrameOriginEntry> = (0..MAX_FRAME_ORIGINS).map(entry).collect();
+        assert_eq!(
+            FrameOriginEntries::new(sixteen.clone()).map(|l| l.len()),
+            Ok(MAX_FRAME_ORIGINS)
+        );
+        let mut seventeen = sixteen;
+        seventeen.push(entry(MAX_FRAME_ORIGINS));
+        assert_eq!(
+            FrameOriginEntries::new(seventeen),
+            Err(FrameOriginsRefusal::LimitExceeded)
+        );
+        let origins: Vec<FrameOrigin> = (0..=MAX_FRAME_ORIGINS).map(origin).collect();
+        assert_eq!(
+            FrameOrigins::new(origins),
+            Err(FrameOriginsRefusal::LimitExceeded)
+        );
+
+        assert_eq!(
+            FrameOriginEntries::new([entry(1), entry(0), entry(1)]),
+            Err(FrameOriginsRefusal::Duplicate { index: 2 })
+        );
+        let folded = FrameOrigins::new([origin(1), origin(0), origin(1)]).expect("two origins");
+        assert_eq!(folded.origins(), &[origin(0), origin(1)]);
+
+        let texts = texts_at_budget();
+        assert!(!texts.is_empty(), "no list lands exactly on the budget");
+        let at_origins: Vec<FrameOrigin> = texts
+            .iter()
+            .map(|t| FrameOrigin::parse(t).expect("origin"))
+            .collect();
+        assert_eq!(
+            frame_header_cost(at_origins.iter().map(FrameOrigin::written_len)),
+            FRAME_HEADER_BUDGET
+        );
+        let at_entries = texts
+            .iter()
+            .map(|t| FrameOriginEntry::parse(t).expect("entry"));
+        assert!(FrameOriginEntries::new(at_entries).is_ok());
+        assert!(FrameOrigins::new(at_origins).is_ok());
+
+        let mut over = texts;
+        if let Some(first) = over.first_mut() {
+            first.push('a');
+        }
+        let cost = frame_header_cost(
+            over.iter()
+                .map(|t| FrameOrigin::parse(t).expect("origin").written_len()),
+        );
+        assert!(cost > FRAME_HEADER_BUDGET);
+        let over_entries = over
+            .iter()
+            .map(|t| FrameOriginEntry::parse(t).expect("entry"));
+        let over_origins = over.iter().map(|t| FrameOrigin::parse(t).expect("origin"));
+        assert_eq!(
+            FrameOriginEntries::new(over_entries),
+            Err(FrameOriginsRefusal::OverBudget { cost })
+        );
+        assert_eq!(
+            FrameOrigins::new(over_origins),
+            Err(FrameOriginsRefusal::OverBudget { cost })
+        );
+        assert_eq!(check_frame_header_budget(FRAME_HEADER_BUDGET), Ok(()));
+        assert_eq!(
+            check_frame_header_budget(FRAME_HEADER_BUDGET + 1),
+            Err(FrameOriginsRefusal::OverBudget {
+                cost: FRAME_HEADER_BUDGET + 1
+            })
+        );
+        assert_eq!(frame_header_cost([]), 0);
+        assert!(FrameOrigins::new([]).is_ok_and(|l| l.is_empty()));
     }
 }
