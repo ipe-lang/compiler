@@ -9,6 +9,9 @@
 //!   `ipe_runtime::web::route::Route::new(…)`.
 //! * [`KernelFn::WebRenderStatic`] — `Html.renderStatic view model` →
 //!   `ipe_runtime::web::web_render_static(…)`.
+//! * [`KernelFn::WebPageLink`] — `Web.pageLink table attrs cfg` →
+//!   `ipe_runtime::ui::helpers::web_page_link(…)` over the program's one
+//!   page renderer ([`plan_page_link_table`]).
 //!
 //! # Correctness constraints (MAKE INVALID STATES UNREPRESENTABLE)
 //!
@@ -24,7 +27,7 @@
 
 use ipe_diagnostics::{DResult, Diagnostic, LowerError, RoutePatternDefect, Span};
 use ipe_intern::rust_str_lit;
-use ipe_ir::{Callee, Expr, IrType, KernelFn};
+use ipe_ir::{Callee, Expr, FuncId, IrType, KernelFn, Program, UiCtor};
 
 use crate::EmitCtx;
 use crate::emit_expr::emit_expr_at;
@@ -166,6 +169,9 @@ pub fn emit_web_call(
 
         // ── Web.route pattern ctor ─────────────────────────────────────────
         KernelFn::WebRoute => emit_web_route(ctx, args, indent, child, generics),
+
+        // ── Web.pageLink table attrs { to, current, label } ────────────────
+        KernelFn::WebPageLink => emit_web_page_link(ctx, args, indent, child, generics).map(Some),
 
         // ── Html.renderStatic view model ────────────────────────────────────
         //
@@ -893,6 +899,38 @@ fn emit_route_render(
     page_ty: &IrType,
     page_ty_s: &str,
 ) -> DResult<String> {
+    if !matches!(page_ty, IrType::Enum { .. }) {
+        return Err(route_refusal(LowerError::RoutedPageNotCustomType));
+    }
+    let arms = route_render_arms(
+        ctx,
+        recover_route_table(ctx, routes_e)?,
+        page_ty,
+        "&__routes",
+    )?;
+    Ok(format!(
+        "{{ let __routes = {routes_s}; \
+         move |__page: &{page_ty_s}| -> ::std::result::Result<\
+         ipe_runtime::web::route::RoutePath, ipe_runtime::web::route::RenderRefusal> \
+         {{ match __page {{ {arms} }} }} }}"
+    ))
+}
+
+/// The `match` arms of a page renderer over the route table `items`, each
+/// rendering through `render_route({routes_ref}, …)`.
+///
+/// Each page constructor renders through the FIRST route that builds it (its
+/// canonical route), one `RenderArg` per payload field. The arms are
+/// exhaustive with no wildcard, so a constructor no route builds is a
+/// compile-time refusal here (IPE-L0159), never a runtime fallthrough; an
+/// ambiguous or dead route is refused before it. Every renderer, a routed
+/// app's and a page link's alike, is built here.
+fn route_render_arms(
+    ctx: &EmitCtx,
+    items: &[Expr],
+    page_ty: &IrType,
+    routes_ref: &str,
+) -> DResult<String> {
     let IrType::Enum {
         home: page_home,
         name: page_name,
@@ -901,11 +939,11 @@ fn emit_route_render(
     else {
         return Err(route_refusal(LowerError::RoutedPageNotCustomType));
     };
-    let rows = route_rows(recover_route_table(ctx, routes_e)?, page_home, *page_name)?;
+    let rows = route_rows(items, page_home, *page_name)?;
     let variants = ctx.enum_variant_payloads(page_home, *page_name);
     if variants.is_empty() {
         return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::emit_web::emit_route_render",
+            where_: "ipe_backend_rust::emit_web::route_render_arms",
             detail: "the routed page enum has no variants".into(),
         });
     }
@@ -943,16 +981,288 @@ fn emit_route_render(
             format!("{path}({})", binds.join(", "))
         };
         arms.push(format!(
-            "{pat} => ipe_runtime::web::route::render_route(&__routes, {index}, &[{}]),",
+            "{pat} => ipe_runtime::web::route::render_route({routes_ref}, {index}, &[{}]),",
             render_args.join(", ")
         ));
     }
+    Ok(arms.join(" "))
+}
+
+// ── `Web.pageLink` ───────────────────────────────────────────────────────────
+
+/// The program's one `Web.pageLink` table and the renderer every link emits.
+pub(crate) struct PageLinkTable {
+    /// The nullary top-level binding whose body is the table.
+    id: FuncId,
+    /// The table's closed page type.
+    page: IrType,
+    /// The renderer item, `fn __ipe_render_page(&Page) -> Result<RoutePath, _>`,
+    /// over the table held once in a `LazyLock`.
+    renderer: String,
+}
+
+/// Decide the program's one `Web.pageLink` table, once, before any emission.
+///
+/// Every page-link site names its table through the binder-aware
+/// [`crate::kernel_walk::KernelSite::table_arg`]: a reference, direct or
+/// `let`-captured, to a nullary top-level binding whose body is a literal list
+/// of `Web.route` calls. Anything else, the kernel used as a value included,
+/// is IPE-L0165. Every link names the same binding, and every routed app's
+/// `routes` is that binding, or IPE-L0166 refuses. The binding's own type must
+/// be `List (WebRoute Page)` over one closed custom type, else IPE-L0165. The
+/// renderer then comes from the router's own table checks
+/// ([`route_render_arms`]), so a table no router could serve never yields a
+/// link. `None` when the program holds no page link.
+///
+/// # Errors
+///
+/// IPE-L0165 or IPE-L0166 as above; the router's table refusals
+/// (IPE-L0123, IPE-L0157, IPE-L0158, IPE-L0159).
+pub(crate) fn plan_page_link_table(
+    ctx: &EmitCtx,
+    program: &Program,
+) -> DResult<Option<PageLinkTable>> {
+    let mut link_ids: Vec<FuncId> = Vec::new();
+    crate::kernel_walk::each_kernel_site(program, &mut |site| {
+        match site {
+            crate::kernel_walk::KernelSite::Value(KernelFn::WebPageLink) => {
+                return Err(route_refusal(LowerError::PageLinkTableOpaque));
+            }
+            crate::kernel_walk::KernelSite::Call {
+                kernel: KernelFn::WebPageLink,
+                ..
+            }
+            | crate::kernel_walk::KernelSite::Applied {
+                kernel: KernelFn::WebPageLink,
+                ..
+            } => match site.table_arg(0) {
+                Some(id) if ctx.route_tables.contains_key(&id) => {
+                    if !link_ids.contains(&id) {
+                        link_ids.push(id);
+                    }
+                }
+                _ => return Err(route_refusal(LowerError::PageLinkTableOpaque)),
+            },
+            _ => {}
+        }
+        Ok(())
+    })?;
+    let id = match link_ids.as_slice() {
+        [] => return Ok(None),
+        [id] => *id,
+        _ => return Err(route_refusal(LowerError::PageLinkTableNotAppRoutes)),
+    };
+    crate::kernel_walk::each_kernel_site(program, &mut |site| {
+        if routed_app_routes(ctx, site)?.is_some_and(|routes| routes != Some(id)) {
+            return Err(route_refusal(LowerError::PageLinkTableNotAppRoutes));
+        }
+        Ok(())
+    })?;
+    let (items, page_ty) = closed_route_table(ctx, program, id)?;
+    let page_ty_s = render_type(ctx, page_ty, GenericScope::new(&[]))?;
+    let arms = route_render_arms(ctx, items, page_ty, "__routes")?;
+    let table = crate::emit_expr::callee_name(ctx, &Callee::Func(id))?;
+    let route_s = format!("ipe_runtime::web::route::Route<{page_ty_s}>");
+    let renderer = format!(
+        "fn __ipe_render_page(__page: &{page_ty_s}) -> ::std::result::Result<\
+         ipe_runtime::web::route::RoutePath, ipe_runtime::web::route::RenderRefusal> {{ \
+         static __ROUTES: ::std::sync::LazyLock<::std::vec::Vec<{route_s}>> = \
+         ::std::sync::LazyLock::new(|| {table}()); \
+         let __routes: &[{route_s}] = &__ROUTES; \
+         match __page {{ {arms} }} }}"
+    );
+    Ok(Some(PageLinkTable {
+        id,
+        page: page_ty.clone(),
+        renderer,
+    }))
+}
+
+/// For a routed app-entry site, `Some(Some(id))` when its `routes` is the
+/// nullary binding `id` and `Some(None)` when it is any other expression (an
+/// inline list). `None` for every other site, an app that is not routed
+/// included.
+fn routed_app_routes(
+    ctx: &EmitCtx,
+    site: crate::kernel_walk::KernelSite<'_, '_>,
+) -> DResult<Option<Option<FuncId>>> {
+    let crate::kernel_walk::KernelSite::Call { kernel, args, .. } = site else {
+        return Ok(None);
+    };
+    let cfg = match (kernel, args) {
+        (KernelFn::WebApp | KernelFn::WebEmbed | KernelFn::WebAppRouted, [cfg])
+        | (KernelFn::WebAppWith, [_, cfg]) => cfg,
+        _ => return Ok(None),
+    };
+    // A non-literal cfg is refused at lower (IPE-L0119).
+    let Expr::Record { fields, .. } = cfg else {
+        return Ok(None);
+    };
+    let Some(view_e) = find_field(ctx, fields, "view")? else {
+        return Ok(None);
+    };
+    if routed_page_field(ctx, view_e).is_none() {
+        return Ok(None);
+    }
+    Ok(find_field(ctx, fields, "routes")?.map(crate::kernel_walk::nullary_func))
+}
+
+/// The cfg field named `name`, if present.
+fn find_field<'f>(
+    ctx: &EmitCtx,
+    fields: &'f [(ipe_intern::Symbol, Expr)],
+    name: &str,
+) -> DResult<Option<&'f Expr>> {
+    for (sym, expr) in fields {
+        if ctx.resolve_ident(*sym)? == name {
+            return Ok(Some(expr));
+        }
+    }
+    Ok(None)
+}
+
+/// The route items of table binding `id` and its page type, which must be one
+/// closed custom type: the binding is not generic, its lowered type is
+/// `List (WebRoute Page)` with `Page` a custom type free of type variables,
+/// and it lists at least one route. Otherwise IPE-L0165.
+fn closed_route_table<'p>(
+    ctx: &'p EmitCtx,
+    program: &'p Program,
+    id: FuncId,
+) -> DResult<(&'p [Expr], &'p IrType)> {
+    let open = || route_refusal(LowerError::PageLinkTableOpenPage);
+    let items = ctx
+        .route_tables
+        .get(&id)
+        .ok_or_else(|| route_refusal(LowerError::PageLinkTableOpaque))?;
+    let func = program
+        .modules
+        .iter()
+        .flat_map(|module| &module.funcs)
+        .find(|func| func.id == id)
+        .ok_or_else(|| Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::emit_web::closed_route_table",
+            detail: format!("route table {} names no function", id.as_raw()),
+        })?;
+    let IrType::List(elem) = &func.ret else {
+        return Err(open());
+    };
+    let IrType::WebRoute(page_ty) = elem.as_ref() else {
+        return Err(open());
+    };
+    let mut free = Vec::new();
+    ipe_ir::collect_generics(page_ty, &mut free);
+    let closed = items.first().is_some()
+        && func.type_params.is_empty()
+        && func.row_params.is_empty()
+        && free.is_empty()
+        && matches!(page_ty.as_ref(), IrType::Enum { .. });
+    if closed {
+        Ok((items, page_ty))
+    } else {
+        Err(open())
+    }
+}
+
+/// Emit `Web.pageLink table attrs cfg`.
+///
+/// The table is not evaluated here: [`plan_page_link_table`] resolved every
+/// link to the program's one table, whose renderer item this call carries.
+/// `to` and `current` render through it; the runtime keeps `href` and
+/// `aria-current` for the rendered target alone. A literal cfg binds its
+/// fields in source order; any other cfg (a residual closure's parameter, a
+/// `let`-bound record) is bound once and read through IR field access.
+fn emit_web_page_link(
+    ctx: &EmitCtx,
+    args: &[Expr],
+    indent: usize,
+    child: u16,
+    generics: GenericScope,
+) -> DResult<String> {
+    let bug = |detail: &str| Diagnostic::CompilerBug {
+        where_: "ipe_backend_rust::emit_web::emit_web_page_link",
+        detail: detail.into(),
+    };
+    let [table_e, attrs_e, cfg_e] = args else {
+        return Err(bug("Web.pageLink requires 3 arguments"));
+    };
+    let Some(plan) = ctx.page_link_table.as_ref() else {
+        return Err(bug("a page link reached emission with no planned table"));
+    };
+    match table_e {
+        Expr::Var(_) | Expr::CloneVar(_) => {}
+        other if crate::kernel_walk::nullary_func(other) == Some(plan.id) => {}
+        _ => return Err(bug("a page link's table is not the planned table")),
+    }
+    let attrs_s = emit_expr_at(ctx, attrs_e, indent, child, generics)?;
+    let renderer = &plan.renderer;
+    let call = |to: &str, current: &str, label: &str| {
+        format!(
+            "ipe_runtime::ui::helpers::web_page_link(__ipe_page_attrs, \
+             __ipe_render_page(&{to}), __ipe_render_page(&{current}), {label})"
+        )
+    };
+    if let Expr::Record { fields, .. } = cfg_e {
+        if fields.len() != 3 {
+            return Err(bug(
+                "a page link cfg literal does not hold exactly three fields",
+            ));
+        }
+        let mut binds = Vec::with_capacity(fields.len());
+        for (sym, expr) in fields {
+            let name = match ctx.resolve_ident(*sym)? {
+                "to" => "__ipe_page_to",
+                "current" => "__ipe_page_current",
+                "label" => "__ipe_page_label",
+                _ => return Err(bug("a page link cfg field is not to, current or label")),
+            };
+            let value = emit_expr_at(ctx, expr, indent, child, generics)?;
+            binds.push(format!("let {name} = {value};"));
+        }
+        let binds = binds.join(" ");
+        let call = call("__ipe_page_to", "__ipe_page_current", "__ipe_page_label");
+        return Ok(format!(
+            "{{ let __ipe_page_attrs = {attrs_s}; {binds} {renderer} {call} }}"
+        ));
+    }
+    // The cfg is bound to a local named by the `to` field symbol, which the
+    // type checker interned for this kernel's scheme; the block holds no other
+    // read of that name.
+    let to = ctx
+        .interner
+        .lookup("to")
+        .ok_or_else(|| bug("the `to` field symbol is not interned"))?;
+    let current = ctx
+        .interner
+        .lookup("current")
+        .ok_or_else(|| bug("the `current` field symbol is not interned"))?;
+    let label = ctx
+        .interner
+        .lookup("label")
+        .ok_or_else(|| bug("the `label` field symbol is not interned"))?;
+    let cfg_s = emit_expr_at(ctx, cfg_e, indent, child, generics)?;
+    let local = ctx.emit_local_ident(to)?;
+    let read = |field, field_ty: IrType| {
+        let access = Expr::Access {
+            record: Box::new(Expr::Var(to)),
+            field,
+            field_ty,
+        };
+        emit_expr_at(ctx, &access, indent, child, GenericScope::new(&[]))
+    };
+    // The field type steers only the clone-or-copy choice of the read; an
+    // `Element` label is neither `Copy` nor an effect carrier whatever its
+    // message type, so `Unit` stands for it.
+    let label_ty = IrType::Ui {
+        ctor: UiCtor::Element,
+        msg: Box::new(IrType::Unit),
+    };
+    let to_s = read(to, plan.page.clone())?;
+    let current_s = read(current, plan.page.clone())?;
+    let label_s = read(label, label_ty)?;
+    let call = call(&to_s, &current_s, &label_s);
     Ok(format!(
-        "{{ let __routes = {routes_s}; \
-         move |__page: &{page_ty_s}| -> ::std::result::Result<\
-         ipe_runtime::web::route::RoutePath, ipe_runtime::web::route::RenderRefusal> \
-         {{ match __page {{ {} }} }} }}",
-        arms.join(" ")
+        "{{ let __ipe_page_attrs = {attrs_s}; let {local} = {cfg_s}; {renderer} {call} }}"
     ))
 }
 

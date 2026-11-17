@@ -127,6 +127,8 @@ field_symbols! {
     (ProcessCols, process_f_cols),
     (ProcessRows, process_f_rows),
     (ProcessOutput, process_f_output),
+    (PageTo, web_f_page_to),
+    (PageCurrent, web_f_page_current),
 }
 
 /// Interned symbols of every built-in type, constructor, and field name.

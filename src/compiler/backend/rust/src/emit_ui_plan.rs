@@ -1164,6 +1164,7 @@ pub const fn appearance_literal_args(k: KernelFn) -> &'static [(usize, LitKind)]
         | KernelFn::WebAppRouted
         | KernelFn::WebEmbed
         | KernelFn::WebRoute
+        | KernelFn::WebPageLink
         | KernelFn::WebRenderStatic
         | KernelFn::TerminalAppScreen
         | KernelFn::WebAppWith
@@ -2041,6 +2042,7 @@ pub const fn ui_call_shape(k: KernelFn) -> Option<UiEmitPlan> {
         | KernelFn::WebEmbed
         | KernelFn::WebAppWith
         | KernelFn::WebRoute
+        | KernelFn::WebPageLink
         | KernelFn::WebRenderStatic => delegate(UiDelegate::Web),
         KernelFn::TerminalAppScreen => delegate(UiDelegate::Tui),
         KernelFn::TerminalAppLines => delegate(UiDelegate::Console),

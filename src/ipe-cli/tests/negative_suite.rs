@@ -5120,6 +5120,184 @@ fn well_formed_route_paths_compile() {
     );
 }
 
+/// The page type and the `appRoutes` binding every page-link fixture names.
+const PAGE_LINK_TABLE: &str = "type Page = HomePage | AboutPage\n\
+     appRoutes : List (WebRoute Page)\n\
+     appRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]";
+
+/// The literal cfg every page-link fixture passes.
+const PAGE_LINK_CFG: &str = "{ to = AboutPage, current = model.page, label = Ui.text \"About\" }";
+
+/// A routed app over [`PAGE_LINK_TABLE`] whose `routes` field is `routes`,
+/// with `decls` appended and `view` as its view.
+fn page_link_fixture(routes: &str, decls: &str, view: &str) -> String {
+    let mut src = routed_fixture(PAGE_LINK_TABLE, routes, "HomePage", "")
+        .replace(
+            "import Ipe.Ui as Ui\n",
+            "import Ipe.Ui as Ui\nimport Ipe.List as List\n",
+        )
+        .replace("view _model = Ui.text \"hi\"", view);
+    src.push_str(decls);
+    src
+}
+
+/// A crate with no `Web.tea` whose `main` renders the page link `link` builds
+/// over the table `table` (a top-level declaration of `linkRoutes`).
+fn page_link_without_app(table: &str, link: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\
+         import Ipe.Html as Html\n\
+         import Ipe.Io as Io\n\
+         import Ipe.Tea.Web as Web\n\
+         import Ipe.Ui as Ui\n\
+         type Page = HomePage | AboutPage\n\
+         type Msg = Noop\n\
+         {table}\n\
+         link : Element Msg\n\
+         link = {link}\n\
+         main = Io.println (Html.render (Ui.layout [] link))\n"
+    )
+}
+
+/// A `Web.pageLink` table the compiler cannot read as one top-level binding is
+/// refused with IPE-L0165: an inline list, a parameter, a record field and a
+/// computed list. A table a `let` binds to the top-level name is that name,
+/// so it compiles, as do a `let`-bound cfg and a partial application.
+#[test]
+fn page_link_unreadable_table_refused() {
+    for (name, decls, view) in [
+        (
+            "page_link_inline_table",
+            "",
+            format!(
+                "view model = Web.pageLink [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ] [] {PAGE_LINK_CFG}"
+            ),
+        ),
+        (
+            "page_link_parameter_table",
+            "navLink : List (WebRoute Page) -> Model -> Element Msg\n\
+             navLink table model = Web.pageLink table [] { to = AboutPage, current = model.page, label = Ui.text \"About\" }\n",
+            "view model = navLink appRoutes model".to_owned(),
+        ),
+        (
+            "page_link_record_field_table",
+            "tables : { nav : List (WebRoute Page) }\n\
+             tables = { nav = appRoutes }\n",
+            format!("view model = Web.pageLink tables.nav [] {PAGE_LINK_CFG}"),
+        ),
+        (
+            "page_link_computed_table",
+            "",
+            format!("view model = Web.pageLink (List.reverse appRoutes) [] {PAGE_LINK_CFG}"),
+        ),
+    ] {
+        assert_rejected(
+            name,
+            &page_link_fixture("appRoutes", decls, &view),
+            "IPE-L0165",
+        );
+    }
+    for (name, view) in [
+        (
+            "page_link_let_bound_table",
+            format!(
+                "view model =\n    let\n        table = appRoutes\n    in\n    Web.pageLink table [] {PAGE_LINK_CFG}"
+            ),
+        ),
+        (
+            "page_link_let_bound_cfg",
+            format!(
+                "view model =\n    let\n        cfg = {PAGE_LINK_CFG}\n    in\n    Web.pageLink appRoutes [] cfg"
+            ),
+        ),
+        (
+            "page_link_partially_applied",
+            format!(
+                "view model = Ui.column [] (List.map (Web.pageLink appRoutes []) [ {PAGE_LINK_CFG} ])"
+            ),
+        ),
+    ] {
+        assert_compiles(name, &page_link_fixture("appRoutes", "", &view));
+    }
+}
+
+/// A table with no route, or over a page type that is not a closed custom
+/// type, is refused with IPE-L0165; the annotated table with every
+/// constructor routed compiles.
+#[test]
+fn page_link_open_table_refused() {
+    let link = "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }";
+    assert_rejected(
+        "page_link_empty_table",
+        &page_link_without_app("linkRoutes : List (WebRoute Page)\nlinkRoutes = []", link),
+        "IPE-L0165",
+    );
+    assert_rejected(
+        "page_link_int_table",
+        &page_link_without_app(
+            "linkRoutes : List (WebRoute Int)\nlinkRoutes = [ Web.route \"/\" 1 ]",
+            "Web.pageLink linkRoutes [] { to = 1, current = 1, label = Ui.text \"One\" }",
+        ),
+        "IPE-L0165",
+    );
+    assert_compiles(
+        "page_link_closed_table",
+        &page_link_without_app(
+            "linkRoutes : List (WebRoute Page)\n\
+             linkRoutes = [ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+            link,
+        ),
+    );
+}
+
+/// A table that lacks a route for a page constructor is refused through a
+/// page link with IPE-L0159, in a crate with no `Web.tea`: the link's table
+/// passes the router's own checks.
+#[test]
+fn page_link_table_without_route_refused() {
+    assert_rejected(
+        "page_link_page_without_route",
+        &page_link_without_app(
+            "linkRoutes : List (WebRoute Page)\nlinkRoutes = [ Web.route \"/\" HomePage ]",
+            "Web.pageLink linkRoutes [] { to = AboutPage, current = HomePage, label = Ui.text \"About\" }",
+        ),
+        "IPE-L0159",
+    );
+}
+
+/// In a routed app, a `Web.pageLink` table that is not the app's `routes`
+/// binding is refused with IPE-L0166: an inline `routes` list, and links over
+/// two different bindings. Naming one table in both places compiles.
+#[test]
+fn page_link_table_not_app_routes_refused() {
+    let link = format!("view model = Web.pageLink appRoutes [] {PAGE_LINK_CFG}");
+    assert_rejected(
+        "page_link_inline_app_routes",
+        &page_link_fixture(
+            "[ Web.route \"/\" HomePage, Web.route \"/about\" AboutPage ]",
+            "",
+            &link,
+        ),
+        "IPE-L0166",
+    );
+    assert_rejected(
+        "page_link_two_tables",
+        &page_link_fixture(
+            "appRoutes",
+            "otherRoutes : List (WebRoute Page)\n\
+             otherRoutes = [ Web.route \"/\" HomePage, Web.route \"/info\" AboutPage ]\n",
+            &format!(
+                "view model = Ui.column [] [ Web.pageLink appRoutes [] {PAGE_LINK_CFG}, Web.pageLink otherRoutes [] {PAGE_LINK_CFG} ]"
+            ),
+        ),
+        "IPE-L0166",
+    );
+    assert_compiles(
+        "page_link_app_routes",
+        &page_link_fixture("appRoutes", "", &link),
+    );
+}
+
 // ===========================================================================
 // App entries need a concrete Model / Msg — IPE-N0051. Every app entry's
 // runtime function bounds the cfg's model and message types with traits a

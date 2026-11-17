@@ -9,13 +9,15 @@
 
 use ipe_diagnostics::DResult;
 use ipe_intern::Symbol;
-use ipe_ir::{Callee, Expr, KernelFn, Program};
+use ipe_ir::{Callee, Expr, FuncId, KernelFn, Program};
 
 /// One binder in scope at a kernel site.
 #[derive(Clone, Copy)]
 pub enum Binding<'e> {
     /// A `let` binding the symbol to a string literal.
     Literal(Symbol, &'e str),
+    /// A `let` binding the symbol to a nullary call of a top-level function.
+    Table(Symbol, FuncId),
     /// A binder naming the symbol with a value the walk does not know.
     Shadow(Symbol),
     /// A pattern scope. Its binders are not listed, so no outer literal is
@@ -65,13 +67,56 @@ impl<'e> KernelSite<'e, '_> {
             Expr::Var(name) | Expr::CloneVar(name) => {
                 scope.iter().rev().find_map(|binding| match *binding {
                     Binding::Literal(bound, lit) if bound == *name => Some(Some(lit)),
-                    Binding::Shadow(bound) if bound == *name => Some(None),
+                    Binding::Shadow(bound) | Binding::Table(bound, _) if bound == *name => {
+                        Some(None)
+                    }
                     Binding::Opaque => Some(None),
-                    Binding::Literal(..) | Binding::Shadow(_) => None,
+                    Binding::Literal(..) | Binding::Shadow(_) | Binding::Table(..) => None,
                 })?
             }
             _ => None,
         }
+    }
+
+    /// The top-level function argument `index` calls with no arguments, if
+    /// any.
+    ///
+    /// That is a nullary call written at the site, or a variable an enclosing
+    /// `let` binds to one. Partial application lowers a supplied table to the
+    /// second shape (`let __ipe_cap_0 = table()` around the residual closure).
+    /// A parameter, a pattern binder or any other binder of the name hides an
+    /// outer binding, so it reads as no table.
+    #[must_use]
+    pub fn table_arg(&self, index: usize) -> Option<FuncId> {
+        let (Self::Call { args, scope, .. } | Self::Applied { args, scope, .. }) = self else {
+            return None;
+        };
+        match args.get(index)? {
+            Expr::Var(name) | Expr::CloneVar(name) => {
+                scope.iter().rev().find_map(|binding| match *binding {
+                    Binding::Table(bound, id) if bound == *name => Some(Some(id)),
+                    Binding::Literal(bound, _) | Binding::Shadow(bound) if bound == *name => {
+                        Some(None)
+                    }
+                    Binding::Opaque => Some(None),
+                    Binding::Literal(..) | Binding::Shadow(_) | Binding::Table(..) => None,
+                })?
+            }
+            other => nullary_func(other),
+        }
+    }
+}
+
+/// The function `expr` calls when it is a call of a top-level function with no
+/// arguments.
+pub const fn nullary_func(expr: &Expr) -> Option<FuncId> {
+    match expr {
+        Expr::Call {
+            callee: Callee::Func(id),
+            args,
+            ..
+        } if args.is_empty() => Some(*id),
+        _ => None,
     }
 }
 
@@ -142,7 +187,8 @@ fn walk<'e>(
             walk(value, scope, visit)?;
             let binding = match value.as_ref() {
                 Expr::Str(lit) => Binding::Literal(*name, lit.as_str()),
-                _ => Binding::Shadow(*name),
+                other => nullary_func(other)
+                    .map_or(Binding::Shadow(*name), |id| Binding::Table(*name, id)),
             };
             within(scope, [binding], |scope| walk(body, scope, visit))
         }
