@@ -13,6 +13,8 @@
 //! blanked first, so only code is matched. A control fixture holding each
 //! refused form proves the scan turns red on it.
 
+mod freebsd_root_acts_scan;
+
 /// The tokens of a path-based filesystem query.
 ///
 /// A renamed import (`fs as`, `rustix as`) is refused too: the paths it
