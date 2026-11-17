@@ -19,8 +19,8 @@ pub mod target;
 pub mod warnings;
 
 pub use bin::{
-    ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_manifest_dir, require_runtime,
-    require_runtime_crate,
+    ProvenBin, ProvenRuntime, ResolveError, Tier, e2e_tier, require_host, require_manifest_dir,
+    require_runtime, require_runtime_crate,
 };
 pub use target::{SharedBuild, child_shared_target_from_env};
 
