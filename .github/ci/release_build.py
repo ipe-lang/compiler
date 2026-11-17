@@ -13,8 +13,12 @@ from __future__ import annotations
 
 # The feature release binaries ship: `ipe dev run --target wasi` needs it, and
 # its refusal text promises it "in release packaging". A comma-separated list
-# in cargo's `--features` grammar.
-RELEASE_FEATURE = "ipe/wasi_run"
+# in cargo's `--features` grammar, each a bare feature name: cargo enables it on
+# every selected package that declares it. A `<pkg>/<feature>` spelling is
+# never used — `ipe`'s self dev-dependency is keyed `ipe`, so cargo would read
+# `ipe/<feature>` as that dev edge's feature and leave the shipped binary
+# without it (verify-manifest check 30).
+RELEASE_FEATURE = "wasi_run"
 
 # The packages a release build compiles, in the order the cargo lines name them.
 RELEASE_PACKAGES = ("ipe", "ipe-ffi-inspector")

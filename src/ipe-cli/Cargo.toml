@@ -209,7 +209,9 @@ cap-primitives = "3.4.6"
 win32job = "2"
 
 [dev-dependencies]
-# Turns on `test-fixtures` for this package's own test targets.
+# Turns on `test-fixtures` for this package's own test targets. Its key `ipe`
+# makes a `--features ipe/<f>` spelling name this dev edge's feature, so the
+# release build spells its feature bare (`.github/ci/release_build.py`).
 ipe = { path = ".", features = ["test-fixtures"] }
 ipe-test-temp = { path = "../../tools/test-temp" }
 # The nesting shapes at the parser's ceiling, shared with the in-browser test.

@@ -54,9 +54,10 @@ env:
 
 jobs:
   # RustSec advisories + license compliance + dependency-source pinning +
-  # duplicate-version report against the `--features full` graph (matches
-  # ci.yml's `runtime-full-features` job — the actual shipped feature surface,
-  # not the narrow default-feature slice `cargo test` alone would see).
+  # duplicate-version report against the graph `deny.toml [graph]` names:
+  # `full` (ci.yml's `runtime-full-features` job) plus the release build's
+  # features (`.github/ci/release_build.py`) — the shipped feature surface, not
+  # the narrow default-feature slice `cargo test` alone would see.
   # Deliberately NOT `--all-features`: `webview` (wry/tao/GTK3) is excluded
   # from `full` by design (runtime/Cargo.toml) and would inject a large, noisy,
   # platform-gated dependency surface that no CI job or generated project
@@ -72,4 +73,8 @@ jobs:
       - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
         with:
           tool: cargo-deny@0.20.2
+          fallback: none
+      # Every registry crate the release build links is in the graph judged
+      # below (`.github/ci/release_build.py` names that build once).
+      - run: python3 .github/ci/supply_chain_scope.py
       - run: cargo deny check advisories bans licenses sources

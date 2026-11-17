@@ -42,7 +42,7 @@ import release_build  # noqa: E402  # the release feature set and packages
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # The release-only crate whose absence from `R` means the release graph lost
-# its release feature (the embedded wasm engine `ipe/wasi_run` pulls in).
+# its release feature (the embedded wasm engine `wasi_run` pulls in).
 SENTINEL_CRATE = "wasmtime"
 
 # Each child's ceilings: the wall-clock seconds it may run and the bytes it

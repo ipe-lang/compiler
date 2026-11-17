@@ -38,7 +38,7 @@ DENY_TOML = """\
 [graph]
 all-features = false
 no-default-features = false
-features = ["full", "ipe/wasi_run"]
+features = ["full", "wasi_run"]
 
 [advisories]
 ignore = ["RUSTSEC-2025-0141"]
@@ -185,6 +185,16 @@ class RefusesTheReleaseGraph(ScopeCase):
         self.assertEqual(tree[tree.index("--features") + 1], "sentinel-pkg/sentinel-feature")
         self.assertEqual([tree[i + 1] for i, a in enumerate(tree) if a == "-p"], ["pkg-a", "pkg-b"])
 
+    def test_the_tree_reads_only_normal_and_build_edges_on_every_target(self) -> None:
+        # A dev edge (a self dev-dependency keyed by the package's own name)
+        # can carry the release feature while the shipped binary lacks it, so
+        # the sentinel must be found on the edges a release build links.
+        tree = scs.tree_argv()
+        self.assertEqual(tree[tree.index("-e") + 1], "normal,build")
+        self.assertEqual(tree.count("-e") + tree.count("--edges"), 1)
+        self.assertEqual(tree[tree.index("--target") + 1], "all")
+        self.assertNotIn("--all-features", tree)
+
 
 class RefusesTheJudgedGraph(ScopeCase):
     def test_a_release_crate_never_banned_is_refused_by_name(self) -> None:
@@ -225,7 +235,7 @@ class RefusesTheJudgedGraph(ScopeCase):
 
 class TheTemporaryConfig(ScopeCase):
     def test_graph_is_byte_identical_and_a_narrow_graph_is_passed_through(self) -> None:
-        narrow = DENY_TOML.replace('features = ["full", "ipe/wasi_run"]', 'features = ["full"]')
+        narrow = DENY_TOML.replace('features = ["full", "wasi_run"]', 'features = ["full"]')
         self.write_deny(narrow)
         runner = FakeRunner()
         scs.prove_scope(runner, self.root)
@@ -233,7 +243,7 @@ class TheTemporaryConfig(ScopeCase):
         graph = narrow[narrow.index("[graph]") : narrow.index("[advisories]")]
         self.assertIn(graph, runner.config)
         self.assertIn('features = ["full"]\n', runner.config)
-        self.assertNotIn("ipe/wasi_run", runner.config)
+        self.assertNotIn('"wasi_run"', runner.config)
 
     def test_bans_are_replaced_and_every_other_table_kept(self) -> None:
         runner = FakeRunner()
