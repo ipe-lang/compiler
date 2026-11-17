@@ -631,6 +631,10 @@ const OUTSIDE_SECRET: &[u8] = b"outside-the-preopen";
 #[cfg(all(unix, feature = "wasi_run"))]
 const REFUSED_AT_OPEN: i32 = 20;
 
+/// The guest's exit code when the bytes it read reached `leak`.
+#[cfg(all(unix, feature = "wasi_run"))]
+const LEAK_WRITTEN: i32 = 12;
+
 /// What a confinement guest asks of the preopen, through one path.
 #[cfg(all(unix, feature = "wasi_run"))]
 #[derive(Clone, Copy)]
@@ -743,7 +747,9 @@ impl ConfinementFixture {
     ///
     /// `sandbox/up -> ../outside` and `sandbox/f -> ../outside/secret` are
     /// proven to resolve on the host first, so a refusal the guest sees is the
-    /// preopen's, never a broken fixture's.
+    /// preopen's, never a broken fixture's. `sandbox/inside/secret` and
+    /// `sandbox/g` hold the same bytes inside the preopen, for the controls
+    /// that prove the guest reads and leaks when the preopen allows it.
     #[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
     fn new(name: &str) -> Self {
         let root = ipe_test_temp::temp_root().join(format!(
@@ -758,6 +764,10 @@ impl ConfinementFixture {
         std::fs::create_dir_all(&sandbox).expect("create the working tree");
         std::fs::create_dir_all(&outside).expect("create the outside directory");
         std::fs::write(outside.join("secret"), OUTSIDE_SECRET).expect("write the secret");
+        std::fs::create_dir_all(sandbox.join("inside")).expect("create the inside directory");
+        std::fs::write(sandbox.join("inside").join("secret"), OUTSIDE_SECRET)
+            .expect("write the inside secret");
+        std::fs::write(sandbox.join("g"), OUTSIDE_SECRET).expect("write the inside file");
         std::os::unix::fs::symlink("../outside", sandbox.join("up")).expect("link up");
         std::os::unix::fs::symlink("../outside/secret", sandbox.join("f")).expect("link f");
         assert_eq!(
@@ -868,4 +878,50 @@ fn preopen_confinement_control_plain_link() {
         "the outside secret reached the working tree"
     );
     assert_refused_at_open(&result);
+}
+
+/// An in-tree directory opened with a trailing slash is read and leaked.
+///
+/// The positive control: the same guest the refusals run reaches its last
+/// stage when the preopen allows the path, so a refusal at the first call is
+/// the preopen's, never a guest that cannot open anything.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_inside_dir_is_read() {
+    let fixture = ConfinementFixture::new("inside_dir");
+    let result = fixture.run(GuestAct::OpenDirThenSecret { path: "inside/" });
+    assert!(
+        matches!(result, Err(CliError::WasiRunExited { code: LEAK_WRITTEN })),
+        "the guest must open, read and write in-tree (exit {LEAK_WRITTEN}); got {result:?}",
+    );
+    assert!(fixture.leaked(), "the in-tree secret must reach `leak`");
+}
+
+/// An in-tree file opened by name is read and leaked: the file guest's control.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_inside_file_is_read() {
+    let fixture = ConfinementFixture::new("inside_file");
+    let result = fixture.run(GuestAct::OpenFile { path: "g" });
+    assert!(
+        matches!(result, Err(CliError::WasiRunExited { code: LEAK_WRITTEN })),
+        "the guest must open, read and write in-tree (exit {LEAK_WRITTEN}); got {result:?}",
+    );
+    assert!(fixture.leaked(), "the in-tree secret must reach `leak`");
+}
+
+/// An in-tree directory renamed with a trailing slash moves: the rename control.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_inside_rename() {
+    let fixture = ConfinementFixture::new("inside_rename");
+    let result = fixture.run(GuestAct::Rename { path: "inside/" });
+    assert!(
+        matches!(result, Err(CliError::WasiRunExited { code: 13 })),
+        "the guest must rename in-tree (exit 13); got {result:?}",
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.sandbox.join("moved")).is_ok_and(|m| m.is_dir()),
+        "the in-tree directory must move to `moved`",
+    );
 }
