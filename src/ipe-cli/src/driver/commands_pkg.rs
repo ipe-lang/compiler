@@ -704,7 +704,7 @@ impl<'a> BundleAssembler<'a> {
         let bin_name = emitted_bin_filename(crate_dir.path())?;
         let binary = artifacts.join(&bin_name);
         if !binary.is_file() {
-            return Err(CliError::Usage(text::msg::app_binary_missing(
+            return Err(CliError::ProjectRefused(text::msg::app_binary_missing(
                 &binary.display(),
             )));
         }
@@ -1087,16 +1087,16 @@ pub const MOBILE_BUNDLE_DELIVERY: delivery::Delivery = delivery::Delivery::web_c
 /// carries through so a `release web client <os>` shell hosts the production SPA.
 ///
 /// # Errors
-/// [`CliError::Usage`] when this binary's path cannot be resolved or the
-/// wasm build exits non-zero; [`CliError::Io`] when the build cannot be spawned
-/// or waited on.
+/// [`CliError::ProjectRefused`] when this binary's path cannot be resolved or
+/// the wasm build exits non-zero (the child already rendered its own refusal);
+/// [`CliError::Io`] when the build cannot be spawned or waited on.
 pub fn build_wasm_for_mobile(
     manifest_path: &Path,
     output_root: &Path,
     profile: BundleProfile,
 ) -> Result<(), CliError> {
     let exe = std::env::current_exe()
-        .map_err(|e| CliError::Usage(text::msg::wasm_ipe_binary_unknown(&e)))?;
+        .map_err(|e| CliError::ProjectRefused(text::msg::wasm_ipe_binary_unknown(&e)))?;
     let project_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
     let mut build = std::process::Command::new(&exe);
     build
@@ -1113,9 +1113,9 @@ pub fn build_wasm_for_mobile(
             }
         })?;
     if !status.success() {
-        return Err(CliError::Usage(text::msg::mobile_wasm_build_failed(
-            &status.code().unwrap_or(1),
-        )));
+        return Err(CliError::ProjectRefused(
+            text::msg::mobile_wasm_build_failed(&status.code().unwrap_or(1)),
+        ));
     }
     Ok(())
 }

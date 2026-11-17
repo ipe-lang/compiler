@@ -417,6 +417,13 @@ const HOST_ONLY_RUSTFLAGS: &str = "-C link-arg=-Wl,-O1";
 /// ambient `RUSTFLAGS` are [`HOST_ONLY_RUSTFLAGS`]: the shell links for the
 /// host under them, and the wasm client build must not see them.
 fn dev_build_client_desktop(project: &std::path::Path) -> Result<std::process::Output, BoxError> {
+    Ok(dev_build_client_desktop_command(project)?.output()?)
+}
+
+/// The command [`dev_build_client_desktop`] runs, before it is spawned.
+fn dev_build_client_desktop_command(
+    project: &std::path::Path,
+) -> Result<std::process::Command, BoxError> {
     let isolated =
         e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
     let Ok(isolated) = isolated else {
@@ -424,13 +431,14 @@ fn dev_build_client_desktop(project: &std::path::Path) -> Result<std::process::O
     };
     let target = e2e_support::target::BuildTarget::Isolated(isolated);
     let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
-    Ok(e2e_support::target::ipe_command(&ipe_bin, &target)
+    let mut command = e2e_support::target::ipe_command(&ipe_bin, &target);
+    command
         .args(["dev", "build"])
         .arg(project)
         .args(["web", "client", "desktop"])
         .env("RUSTFLAGS", HOST_ONLY_RUSTFLAGS)
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .output()?)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS");
+    Ok(command)
 }
 
 /// A bundle id the bundle grammar admits but no OS can name a directory by is
@@ -447,6 +455,55 @@ fn client_desktop_refuses_a_dos_device_bundle_id() -> Result<(), BoxError> {
     assert!(
         !fixture.path().join("out").join("client-shell").exists(),
         "no shell crate is written for a refused bundle id"
+    );
+    Ok(())
+}
+
+/// A fresh, empty directory to hold a test's own `PATH` entries.
+#[cfg(unix)]
+fn private_bin(tag: &str) -> Result<std::path::PathBuf, BoxError> {
+    let dir = ipe_test_temp::temp_root()
+        .join(format!("ipe_webview_e2e_{tag}_bin_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// A host without the `wasm-bindgen` CLI is refused by name before any wasm
+/// build: the message names the tool and its pinned version, and neither the
+/// nested `web client` build nor the shell build reads the tool as a source
+/// path or prints a usage page. The `PATH` holds `cargo` and `rustc` alone.
+#[cfg(unix)]
+#[test]
+fn client_desktop_without_wasm_bindgen_names_the_tool() -> Result<(), BoxError> {
+    use ipe_sandbox::host_tool::{self, HostTool};
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return Ok(());
+    }
+    let test_name = "client_desktop_without_wasm_bindgen";
+    let bin = private_bin(test_name)?;
+    for tool in [HostTool::Cargo, HostTool::Rustc] {
+        let found = host_tool::resolve(tool);
+        let Ok(found) = found else {
+            return Err(format!("{test_name}: {} must be on PATH: {found:?}", tool.name()).into());
+        };
+        std::os::unix::fs::symlink(found.as_path(), bin.join(tool.name()))?;
+    }
+    let fixture = client_desktop_fixture(test_name, "{ bundleId = \"io.acme.counter\" }")?;
+    let out = dev_build_client_desktop_command(fixture.path())?
+        .env("PATH", &bin)
+        .output();
+    let _ = std::fs::remove_dir_all(&bin);
+    let out = out?;
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("wasm-bindgen was not found"), "{stderr}");
+    assert!(stderr.contains("so it needs wasm-bindgen-cli "), "{stderr}");
+    assert!(!stderr.contains("source file"), "{stderr}");
+    assert!(!stderr.contains("Usage:"), "{stderr}");
+    assert!(
+        !stderr.contains("compiled the emitted wasm program"),
+        "the tool is checked before the wasm build: {stderr}"
     );
     Ok(())
 }
