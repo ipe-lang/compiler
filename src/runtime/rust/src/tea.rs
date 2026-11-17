@@ -2176,8 +2176,8 @@ mod worker_appearance_na_tests {
         let handle: WorkerApp = WorkerApp(Box::pin(async { ok_res(()) }));
         // The sole driver. If an appearance-apply method were added it would be
         // a second consumer; there is none.
-        let _run: fn(fn() -> WorkerApp) -> crate::IpeResult<crate::error::IpeError, ()> =
-            <WorkerApp as ShapeApp>::run_blocking_entry::<fn() -> WorkerApp>;
+        type WorkerDriver = fn(fn() -> WorkerApp) -> crate::IpeResult<crate::error::IpeError, ()>;
+        let _run: WorkerDriver = <WorkerApp as ShapeApp>::run_blocking_entry::<fn() -> WorkerApp>;
         let _ = handle;
     }
 }
