@@ -1,8 +1,10 @@
 # cargo-audit configuration — the documented, justified advisory ignore-list
-# (mirror of deny.toml [advisories].ignore; keep the two in sync).
+# (the same id set as deny.toml [advisories].ignore; verify-manifest.py check
+# 29 refuses a difference either way).
 
 [advisories]
 ignore = [
+    "RUSTSEC-2025-0141", # bincode unmaintained (transitive; no runtime exposure)
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" (PKCS#1 v1.5 timing
     # sidechannel). No fixed upstream release exists (the advisory's own
     # Solution field says "no fixed upgrade available"); pulled in via

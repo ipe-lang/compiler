@@ -4351,6 +4351,21 @@ mod tests {
             );
         }
 
+        #[test]
+        fn the_emitted_policy_names_no_workspace_feature() {
+            let emitted = emitted_deny_policy(GATE_DENY_POLICY);
+            let leaked: Vec<&str> = emitted
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.starts_with('#'))
+                .filter(|line| line.starts_with("[graph") || line.contains("ipe/"))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "a package audit's policy carries no compiler-workspace graph or feature: {leaked:?}"
+            );
+        }
+
         /// Names whose qualified mention in production code is an ambient read:
         /// the process environment, the working directory, a runtime tree or
         /// emit model found from either, the sandbox facts.

@@ -210,6 +210,8 @@ jobs:
         run: python3 .github/ci/test_ipe_fmt_check.py -v
       - name: Prove the static cache-prune refusals (unit tests)
         run: python3 .github/ci/test_cache_prune.py -v
+      - name: Prove the release supply-chain scope refusals (unit tests)
+        run: python3 .github/ci/test_supply_chain_scope.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 

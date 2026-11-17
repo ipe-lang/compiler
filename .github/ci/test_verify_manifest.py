@@ -7051,6 +7051,14 @@ class TestReleaseTargetParity(unittest.TestCase):
         release = _RT_RELEASE.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
         self.assertRefused("release.yml job 'build' step 3.run is", ci, release)
 
+    def test_the_pinned_feature_and_packages_are_release_build_s(self) -> None:
+        # Check 23 reads the one copy check 28 and the scope proof read too.
+        import release_build
+
+        self.assertIs(verify_manifest.RELEASE_FEATURE, release_build.RELEASE_FEATURE)
+        self.assertEqual(verify_manifest._RELEASE_PACKAGES, "-p ipe -p ipe-ffi-inspector")
+        self.assertEqual(release_build.package_args(), "-p ipe -p ipe-ffi-inspector")
+
     def test_ci_must_check_not_build(self) -> None:
         ci = self.swap(_RT_CI, "cargo check --release --locked --features", "cargo build --release --locked --features")
         self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci)
@@ -9632,6 +9640,136 @@ class TestRuntimeClippyAllTargets(unittest.TestCase):
         entries = manifest.get("checks") if isinstance(manifest, dict) else None
         check_runtime_clippy_all_targets(wfs, entries, errors)
         self.assertEqual(errors, [])
+
+
+_DG_GRAPH = """\
+[graph]
+all-features = false
+no-default-features = false
+features = ["full", "ipe/wasi_run"]
+"""
+
+
+class TestDenyGraphCoversRelease(unittest.TestCase):
+    """Check 28: `deny.toml [graph]` names `full` and every release feature,
+    explicitly, all-target and unpruned."""
+
+    def errors(self, deny: str | None) -> list[str]:
+        with tempfile.TemporaryDirectory() as repo:
+            if deny is not None:
+                _write(os.path.join(repo, "deny.toml"), deny)
+            errors: list[str] = []
+            verify_manifest.check_deny_graph_covers_release(errors, root=os.path.join(repo, ".github"))
+            return errors
+
+    def assertRefused(self, deny: str | None, needle: str) -> None:
+        errors = self.errors(deny)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_valid_passes(self) -> None:
+        self.assertEqual(self.errors(_DG_GRAPH), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_deny_graph_covers_release(errors)
+        self.assertEqual(errors, [])
+
+    def test_missing_release_feature_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace(', "ipe/wasi_run"', ""), "lacks 'ipe/wasi_run'")
+
+    def test_missing_full_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace('"full", ', ""), "lacks 'full'")
+
+    def test_every_release_feature_is_required(self) -> None:
+        with mock.patch.object(verify_manifest.release_build, "RELEASE_FEATURE", "ipe/wasi_run,ipe/extra"):
+            self.assertRefused(_DG_GRAPH, "lacks 'ipe/extra'")
+
+    def test_all_features_true_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace("all-features = false", "all-features = true"), "`[graph].all-features`")
+
+    def test_all_features_absent_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace("all-features = false\n", ""), "`[graph].all-features`")
+
+    def test_no_default_features_true_refused(self) -> None:
+        self.assertRefused(
+            _DG_GRAPH.replace("no-default-features = false", "no-default-features = true"),
+            "`[graph].no-default-features`",
+        )
+
+    def test_targets_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH + 'targets = ["x86_64-unknown-linux-gnu"]\n', "`[graph].targets` narrows")
+
+    def test_exclude_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH + 'exclude = ["wasmtime"]\n', "`[graph].exclude` narrows")
+
+    def test_no_graph_refused(self) -> None:
+        self.assertRefused("[advisories]\nignore = []\n", "no `[graph]` table")
+
+    def test_non_list_features_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace('["full", "ipe/wasi_run"]', '"full"'), "must be a list of strings")
+
+    def test_missing_or_unreadable_deny_toml_refused(self) -> None:
+        self.assertRefused(None, "deny.toml is missing")
+        self.assertRefused("[graph\n", "deny.toml is unreadable")
+
+
+class TestAuditIgnoresEqual(unittest.TestCase):
+    """Check 29: deny.toml and .cargo/audit.toml ignore one RUSTSEC id set."""
+
+    def errors(self, deny: str, audit: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as repo:
+            _write(os.path.join(repo, "deny.toml"), deny)
+            _write(os.path.join(repo, ".cargo", "audit.toml"), audit)
+            errors: list[str] = []
+            verify_manifest.check_audit_ignores_equal(errors, root=os.path.join(repo, ".github"))
+            return errors
+
+    @staticmethod
+    def ignores(*entries: str) -> str:
+        return "[advisories]\nignore = [\n" + "".join(f"    {e},\n" for e in entries) + "]\n"
+
+    def assertRefused(self, deny: str, audit: str, needle: str) -> None:
+        errors = self.errors(deny, audit)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_equal_sets_pass(self) -> None:
+        a, b = '"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0543"'
+        self.assertEqual(self.errors(self.ignores(a, b), self.ignores(b, a)), [])
+
+    def test_table_form_counts_as_its_id(self) -> None:
+        deny = self.ignores('{ id = "RUSTSEC-2023-0071", reason = "no fix" }')
+        self.assertEqual(self.errors(deny, self.ignores('"RUSTSEC-2023-0071"')), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_audit_ignores_equal(errors)
+        self.assertEqual(errors, [])
+
+    def test_id_only_in_deny_refused(self) -> None:
+        deny = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2025-0141"')
+        self.assertRefused(deny, self.ignores('"RUSTSEC-2023-0071"'), "deny.toml ignores ['RUSTSEC-2025-0141']")
+
+    def test_id_only_in_audit_refused(self) -> None:
+        audit = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0459"')
+        self.assertRefused(
+            self.ignores('"RUSTSEC-2023-0071"'), audit, ".cargo/audit.toml ignores ['RUSTSEC-2026-0459']"
+        )
+
+    def test_unparseable_entry_refused_never_skipped(self) -> None:
+        for entry in ('"GHSA-xxxx-yyyy-zzzz"', '"RUSTSEC-23-71"', "{ reason = \"no id\" }", "7"):
+            with self.subTest(entry=entry):
+                self.assertRefused(
+                    self.ignores(entry), self.ignores(), "is not a RUSTSEC id"
+                )
+                self.assertRefused(
+                    self.ignores(), self.ignores(entry), "is not a RUSTSEC id"
+                )
+
+    def test_non_list_ignore_refused(self) -> None:
+        self.assertRefused('[advisories]\nignore = "RUSTSEC-2023-0071"\n', self.ignores(), "must be a list")
+
+    def test_unreadable_side_refused(self) -> None:
+        self.assertRefused("[advisories\n", self.ignores(), "deny.toml is unreadable")
 
 
 if __name__ == "__main__":

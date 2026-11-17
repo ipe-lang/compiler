@@ -583,6 +583,19 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       position (a comment line included).  A file it cannot read is
       refused.  LIMIT: an apt reached through a variable, a script or a
       third-party action is not read.
+  28. The dependency scan covers the release feature set: `deny.toml
+      [graph]` names `full` and every feature of `release_build.
+      RELEASE_FEATURE` in `features`, with `all-features` and
+      `no-default-features` both literally `false`, and neither `targets`
+      nor `exclude` (the judged graph is all-target and unpruned).  An
+      unreadable `deny.toml`, an absent `[graph]` or a non-list `features`
+      is refused.  The graph-level proof that every crate the release links
+      is judged is `supply_chain_scope.py`.
+  29. One advisory ignore set: the `RUSTSEC-` ids of `deny.toml
+      [advisories].ignore` (each a string or a `{ id = .. }` table) equal
+      those of `.cargo/audit.toml [advisories].ignore`, compared both ways
+      and each side's extra ids named.  An entry of either list that is not
+      a `RUSTSEC-YYYY-NNNN` id is refused, never skipped.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -636,6 +649,7 @@ import check_required_set  # noqa: E402  # owns the admin-read environment's nam
 import claims_table  # noqa: E402  # the one reader of test-claims.yml, check 20
 import action_metadata  # noqa: E402  # proven declared inputs of every pinned action, check 24
 import rerun_policy  # noqa: E402  # the job-name leg rule the merge-group test watchers apply
+import release_build  # noqa: E402  # the release feature set and packages, checks 23 and 28
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -6043,6 +6057,7 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_check_required_set.py": _SELF_TEST,
     "test_ipe_fmt_check.py": _SELF_TEST,
     "test_cache_prune.py": _SELF_TEST,
+    "test_supply_chain_scope.py": _SELF_TEST,
     "rerun_policy.py": {("--lint",): _V, ("--decide",): _O, ("--proven-test-red",): _O},
     "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
     "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},
@@ -7881,14 +7896,13 @@ RELEASE_TARGET_ACTION = "./.github/actions/release-target-toolchain"
 # The one action every CI apt package install runs (check 27).
 APT_INSTALL_ACTION = "./.github/actions/apt-install"
 _RELEASE_EXPECTED = re.compile(r'expected="([^"]*)"')
-# The feature release binaries ship: `ipe dev run --target wasi` needs it, and
-# its refusal text promises it "in release packaging".
-RELEASE_FEATURE = "ipe/wasi_run"
-# The cargo command's argv, the one copy every pinned cargo line is built
-# from; only the verb (`check` in ci.yml, `build` in release.yml) and the
-# native jobs' `--target` differ.
+# The release feature and packages live in `release_build` (check 28 and
+# `supply_chain_scope.py` read the same names). The cargo command's argv is
+# the one copy every pinned cargo line is built from; only the verb (`check`
+# in ci.yml, `build` in release.yml) and the native jobs' `--target` differ.
+RELEASE_FEATURE = release_build.RELEASE_FEATURE
 _RELEASE_CARGO_FLAGS = f"--release --locked --features {RELEASE_FEATURE}"
-_RELEASE_PACKAGES = "-p ipe -p ipe-ffi-inspector"
+_RELEASE_PACKAGES = release_build.package_args()
 # The job that parses the release tag, and the one `ref` a release build
 # checks out: the tag it parsed. ci.yml checks the tree under test instead.
 RELEASE_TAG_JOB = "resolve-tag"
@@ -8842,6 +8856,94 @@ def load_manifest() -> dict:
     return doc
 
 
+# Check 28: the `deny.toml [graph]` feature every graph must carry besides the
+# release features (the runtime's shipped surface), and the `[graph]` keys
+# that would narrow the judged graph.
+DENY_GRAPH_BASE_FEATURE = "full"
+_DENY_GRAPH_NARROWING_KEYS = ("targets", "exclude")
+
+
+def check_deny_graph_covers_release(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 28 (see the module docstring)."""
+    doc = _load_toml(os.path.join(os.path.dirname(root), "deny.toml"))
+    if isinstance(doc, str):
+        errors.append(f"check 28: deny.toml {doc}; refused")
+        return
+    graph = doc.get("graph")
+    if not isinstance(graph, dict):
+        errors.append("check 28: deny.toml has no `[graph]` table, so the scan judges the default features only; refused")
+        return
+    features = graph.get("features")
+    if not isinstance(features, list) or not all(isinstance(f, str) for f in features):
+        errors.append(f"check 28: deny.toml `[graph].features` must be a list of strings, not {features!r}; refused")
+        return
+    for want in (DENY_GRAPH_BASE_FEATURE, *release_build.release_features()):
+        if want not in features:
+            errors.append(
+                f"check 28: deny.toml `[graph].features` lacks {want!r}, so crates the release build links "
+                f"(`--features {release_build.RELEASE_FEATURE}`) are never judged; refused"
+            )
+    for key in ("all-features", "no-default-features"):
+        if graph.get(key) is not False:
+            errors.append(
+                f"check 28: deny.toml `[graph].{key}` must be `false`, not {graph.get(key)!r} — the feature "
+                "list is the scanned set, stated explicitly; refused"
+            )
+    for key in _DENY_GRAPH_NARROWING_KEYS:
+        if key in graph:
+            errors.append(f"check 28: deny.toml `[graph].{key}` narrows the judged graph; refused")
+
+
+# Check 29: the one advisory id grammar both ignore lists hold.
+_RUSTSEC_ID_RE = re.compile(r"RUSTSEC-[0-9]{4}-[0-9]{4}")
+
+
+def _advisory_ignores(doc: dict[str, object], name: str, errors: list[str]) -> set[str] | None:
+    """The `RUSTSEC-` ids of `doc`'s `[advisories].ignore`, or None (with each
+    refusal appended) when an entry is not one."""
+    adv = doc.get("advisories")
+    ignore = adv.get("ignore", []) if isinstance(adv, dict) else None
+    if not isinstance(ignore, list):
+        errors.append(f"check 29: {name} `[advisories].ignore` must be a list, not {ignore!r}; refused")
+        return None
+    ids: set[str] = set()
+    ok = True
+    for entry in ignore:
+        rid = entry.get("id") if isinstance(entry, dict) else entry
+        if not isinstance(rid, str) or not _RUSTSEC_ID_RE.fullmatch(rid):
+            errors.append(f"check 29: {name} `[advisories].ignore` entry {entry!r} is not a RUSTSEC id; refused")
+            ok = False
+            continue
+        ids.add(rid)
+    return ids if ok else None
+
+
+def check_audit_ignores_equal(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 29 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    sides: list[set[str]] = []
+    for name in ("deny.toml", ".cargo/audit.toml"):
+        doc = _load_toml(os.path.join(repo, name))
+        if isinstance(doc, str):
+            errors.append(f"check 29: {name} {doc}; refused")
+            return
+        ids = _advisory_ignores(doc, name, errors)
+        if ids is None:
+            return
+        sides.append(ids)
+    deny, audit = sides
+    if deny - audit:
+        errors.append(
+            f"check 29: deny.toml ignores {sorted(deny - audit)} that .cargo/audit.toml does not; "
+            "the two ignore lists must be one set; refused"
+        )
+    if audit - deny:
+        errors.append(
+            f"check 29: .cargo/audit.toml ignores {sorted(audit - deny)} that deny.toml does not; "
+            "the two ignore lists must be one set; refused"
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.parse_args()
@@ -9009,6 +9111,12 @@ def main() -> int:
 
     # ---- 27. every apt package install runs the one apt action ----
     check_apt_one_path(workflows, errors)
+
+    # ---- 28. the dependency scan's graph covers the release feature set ----
+    check_deny_graph_covers_release(errors)
+
+    # ---- 29. deny.toml and .cargo/audit.toml ignore one advisory set ----
+    check_audit_ignores_equal(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:
