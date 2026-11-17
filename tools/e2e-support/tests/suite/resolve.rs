@@ -130,11 +130,13 @@ fn a_runtime_tree_without_its_crate_manifest_is_not_taken() {
 }
 
 /// A checkout root holding the runtime crate (manifest and module tree), outside every checkout.
+#[allow(clippy::expect_used)] // unwritable test scratch is an environment failure, not a case under test
 fn outside_checkout(tag: &str) -> (PathBuf, PathBuf) {
     let root = outside_scratch(tag);
     let tree = root.join("src/runtime/rust/src");
-    std::fs::create_dir_all(&tree).unwrap();
-    std::fs::write(root.join("src/runtime/rust/Cargo.toml"), b"").unwrap();
+    std::fs::create_dir_all(&tree).expect("create the runtime tree");
+    std::fs::write(root.join("src/runtime/rust/Cargo.toml"), b"")
+        .expect("write the runtime manifest");
     (root, tree)
 }
 
