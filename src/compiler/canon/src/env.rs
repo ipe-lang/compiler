@@ -1656,6 +1656,13 @@ const fn alias_row_sound(qualifier: &str, alias: &str, canon_q: &str, canon_n: &
     registry_backs(canon_q, canon_n) && !registry_backs(qualifier, alias)
 }
 
+/// G6 for one alias or re-export: its canonical kernel is neither in `hidden`
+/// nor an `unsafe*` escape hatch under any qualifier, so no alias row
+/// re-exposes a kernel the derived member set withholds.
+const fn alias_target_visible(hidden: &[(&str, &str)], canon_q: &str, canon_n: &str) -> bool {
+    !pairs_contain(hidden, canon_q, canon_n) && !names_an_escape_hatch(canon_n)
+}
+
 /// **Compile-time kernel-surface tripwire (fail-closed).** Every hand-written
 /// name around the derived member set agrees with the registry, so a drift
 /// fails the build rather than leaving a kernel unreachable or an alias
@@ -1672,6 +1679,9 @@ const fn alias_row_sound(qualifier: &str, alias: &str, canon_q: &str, canon_n: &
 /// - G5: every kernel under a [`KERNEL_QUALIFIERS`] qualifier whose name
 ///   begins with `unsafe` is in [`SURFACE_HIDDEN_KERNELS`], so the derived
 ///   member set never exposes an escape hatch on a plain import.
+/// - G6: no [`FUNC_ALIASES`] or [`CROSS_QUALIFIER_MEMBERS`] row names a
+///   hidden kernel or an `unsafe*` kernel under any qualifier, so an alias
+///   never re-exposes what G5 and [`SURFACE_HIDDEN_KERNELS`] withhold.
 ///
 /// The runtime `canon_equals_registry` test in `crate::tests` checks the
 /// interner wiring, which cannot run in `const`.
@@ -1723,6 +1733,12 @@ const _: () = {
             "kernel-surface drift (G3/G4): a FUNC_ALIASES row names no registry \
              kernel, or its alias is itself a registry member.",
         );
+        // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+        assert!(
+            alias_target_visible(&SURFACE_HIDDEN_DECLS, q, canonical),
+            "kernel-surface drift (G6): a FUNC_ALIASES row names a hidden or \
+             `unsafe*` kernel, so a plain import would expose it.",
+        );
         ai += 1;
     }
     let mut ci = 0;
@@ -1733,6 +1749,12 @@ const _: () = {
             alias_row_sound(q, member, canon_q, canon_n),
             "kernel-surface drift (G3/G4): a CROSS_QUALIFIER_MEMBERS row names no \
              registry kernel, or its member is itself a registry member.",
+        );
+        // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+        assert!(
+            alias_target_visible(&SURFACE_HIDDEN_DECLS, canon_q, canon_n),
+            "kernel-surface drift (G6): a CROSS_QUALIFIER_MEMBERS row names a \
+             hidden or `unsafe*` kernel, so a plain import would expose it.",
         );
         ci += 1;
     }
@@ -2430,8 +2452,9 @@ mod kernel_table_drift_gate_tests {
 
     use super::{
         CROSS_QUALIFIER_MEMBERS, FUNC_ALIASES, KERNEL_QUALIFIERS, SURFACE_HIDDEN_DECLS,
-        alias_row_sound, escape_hatches_hidden, has_duplicate_name, has_duplicate_pair,
-        hides_are_live, names_an_escape_hatch, qualifier_backs_visible_kernel, registry_backs,
+        alias_row_sound, alias_target_visible, escape_hatches_hidden, has_duplicate_name,
+        has_duplicate_pair, hides_are_live, names_an_escape_hatch, qualifier_backs_visible_kernel,
+        registry_backs,
     };
     use ipe_kernels::StdlibKernel;
 
@@ -2532,6 +2555,36 @@ mod kernel_table_drift_gate_tests {
         }
         for (q, member, canon_q, canon_n) in CROSS_QUALIFIER_MEMBERS {
             assert!(alias_row_sound(q, member, canon_q, canon_n), "{q}.{member}");
+        }
+    }
+
+    /// G6 rejects an alias or re-export whose canonical kernel is hidden or an
+    /// `unsafe*` hatch under any qualifier; it accepts the live rows.
+    #[test]
+    fn g6_rejects_an_alias_to_a_withheld_kernel() {
+        assert!(!alias_target_visible(
+            &SURFACE_HIDDEN_DECLS,
+            "Secret",
+            "reveal"
+        ));
+        assert!(!alias_target_visible(
+            &SURFACE_HIDDEN_DECLS,
+            "Db",
+            "insertFieldsChecked"
+        ));
+        assert!(!alias_target_visible(&[], "Html", "unsafeScript"));
+        assert!(alias_target_visible(&[], "Secret", "reveal"));
+        for (q, _, canonical) in FUNC_ALIASES {
+            assert!(
+                alias_target_visible(&SURFACE_HIDDEN_DECLS, q, canonical),
+                "{q}.{canonical}"
+            );
+        }
+        for (_, _, canon_q, canon_n) in CROSS_QUALIFIER_MEMBERS {
+            assert!(
+                alias_target_visible(&SURFACE_HIDDEN_DECLS, canon_q, canon_n),
+                "{canon_q}.{canon_n}"
+            );
         }
     }
 
