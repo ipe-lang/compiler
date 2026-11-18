@@ -183,9 +183,12 @@ def tree_argv() -> list[str]:
     """The `cargo tree` listing the release build's normal and build dependencies.
 
     The features and packages are read from `release_build` at call time, so
-    the listing is the release command's graph, never a restated copy.
+    the listing is the release command's graph, never a restated copy. Colour
+    is off on the command line, so an ambient `CARGO_TERM_COLOR` cannot put
+    escape codes into the lines `parse_tree` reads.
     """
-    argv = ["cargo", "tree", "--locked", "-e", "normal,build", "--target", "all"]
+    argv = ["cargo", "tree", "--color", "never", "--locked", "-e", "normal,build"]
+    argv += ["--target", "all"]
     argv += ["--prefix", "none", "--format", "{p}", "--features", release_build.RELEASE_FEATURE]
     for pkg in release_build.RELEASE_PACKAGES:
         argv += ["-p", pkg]
@@ -197,6 +200,8 @@ def deny_argv(manifest: str, config: str) -> list[str]:
     return [
         "cargo",
         "deny",
+        "--color",
+        "never",
         "--manifest-path",
         manifest,
         "--config",

@@ -195,6 +195,17 @@ class RefusesTheReleaseGraph(ScopeCase):
         self.assertEqual(tree[tree.index("--target") + 1], "all")
         self.assertNotIn("--all-features", tree)
 
+    def test_every_parsed_invocation_turns_colour_off_itself(self) -> None:
+        # CI exports CARGO_TERM_COLOR=always; the argv must override it, or
+        # escape codes reach the strict line parsers.
+        for argv in (scs.tree_argv(), scs.deny_argv("/r/Cargo.toml", "/t/deny.toml")):
+            self.assertEqual(argv[argv.index("--color") + 1], "never", argv)
+
+    def test_a_coloured_tree_line_is_refused_not_misread(self) -> None:
+        with self.assertRaises(scs.ScopeError) as cm:
+            scs.parse_tree("windows-sys v0.61.2 \x1b[33m\x1b[2m(*)\x1b[39m\x1b[22m\n")
+        self.assertIs(cm.exception.kind, K.TREE_LINE)
+
 
 class RefusesTheJudgedGraph(ScopeCase):
     def test_a_release_crate_never_banned_is_refused_by_name(self) -> None:
