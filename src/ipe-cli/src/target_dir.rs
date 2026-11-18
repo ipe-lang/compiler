@@ -1261,12 +1261,43 @@ enum RootRefusal {
 struct PruneReport {
     /// The directory whose siblings were judged.
     root: PathBuf,
-    /// Why the root was not walked, when it was not.
-    refused: Option<RootRefusal>,
-    /// How many siblings were left in place by a fault; at most the listing cap.
-    skipped: u32,
-    /// The first of those faults.
-    first_skip: Option<SiblingFault>,
+    /// Whether the root was walked, and what the walk left in place.
+    outcome: PruneOutcome,
+}
+
+/// Whether a prune walked its root: a refused root judged no sibling, so it
+/// has no skips to carry.
+#[derive(Debug)]
+enum PruneOutcome {
+    /// Every listed sibling was judged; `None` when no fault left one in place.
+    Walked(Option<Skips>),
+    /// The root was not walked: nothing was judged.
+    Refused(RootRefusal),
+}
+
+/// The siblings a walk left in place by a fault: at least one, at most the
+/// listing cap.
+#[derive(Debug)]
+struct Skips {
+    /// How many; saturating, though the listing cap bounds it first.
+    count: std::num::NonZeroU32,
+    /// The first of them.
+    first: SiblingFault,
+}
+
+impl Skips {
+    /// Count `fault` as one more sibling left in place in `skips`.
+    fn record(skips: &mut Option<Self>, fault: SiblingFault) {
+        match skips {
+            Some(seen) => seen.count = seen.count.saturating_add(1),
+            None => {
+                *skips = Some(Self {
+                    count: std::num::NonZeroU32::MIN,
+                    first: fault,
+                });
+            }
+        }
+    }
 }
 
 /// Whether some prune of this process already reported what it left in place.
@@ -1278,41 +1309,31 @@ fn first_report(latch: &std::sync::atomic::AtomicBool) -> bool {
 }
 
 impl PruneReport {
-    /// A report of `root` that judged nothing yet.
-    const fn of(root: PathBuf) -> Self {
-        Self {
-            root,
-            refused: None,
-            skipped: 0,
-            first_skip: None,
+    /// The one message this report shows; `None` for a clean walk.
+    fn message(&self) -> Option<crate::text::Message> {
+        let root = self.root.display();
+        match &self.outcome {
+            PruneOutcome::Walked(None) => None,
+            PruneOutcome::Walked(Some(skips)) => Some(crate::text::build_dir_prune_skipped(
+                &skips.count,
+                &skips.first.path.display(),
+                &skips.first.kind,
+            )),
+            PruneOutcome::Refused(RootRefusal::Crowded(cap)) => {
+                Some(crate::text::build_dir_prune_crowded(&root, &cap.get()))
+            }
+            PruneOutcome::Refused(RootRefusal::Unlisted(kind)) => {
+                Some(crate::text::build_dir_prune_unlisted(&root, kind))
+            }
         }
-    }
-
-    /// Count `fault` as one sibling left in place.
-    fn record(&mut self, fault: SiblingFault) {
-        self.skipped = self.skipped.saturating_add(1);
-        self.first_skip.get_or_insert(fault);
-    }
-
-    /// Whether every sibling judged was pruned or kept without a fault.
-    const fn is_clean(&self) -> bool {
-        self.refused.is_none() && self.skipped == 0
     }
 
     /// Say on stderr what the prune left in place, once per process; a clean prune says nothing.
     fn report(self) {
-        if self.is_clean() || !first_report(&PRUNE_REPORTED) {
+        let Some(message) = self.message() else {
             return;
-        }
-        let root = self.root.display();
-        let refusal = self.refused.map(|refused| match refused {
-            RootRefusal::Crowded(cap) => crate::text::build_dir_prune_crowded(&root, &cap.get()),
-            RootRefusal::Unlisted(kind) => crate::text::build_dir_prune_unlisted(&root, &kind),
-        });
-        let skip = self.first_skip.as_ref().map(|fault| {
-            crate::text::build_dir_prune_skipped(&self.skipped, &fault.path.display(), &fault.kind)
-        });
-        for message in [refusal, skip].into_iter().flatten() {
+        };
+        if first_report(&PRUNE_REPORTED) {
             crate::screen::chatter(
                 crate::screen::Stream::Stderr,
                 crate::screen::Tone::UserError,
@@ -1356,19 +1377,21 @@ fn prune_siblings_with(
         std::time::Duration,
     ) -> Result<Pruned, SiblingFault>,
 ) -> PruneReport {
-    let mut report = PruneReport::of(root.to_path_buf());
+    let report = |outcome| PruneReport {
+        root: root.to_path_buf(),
+        outcome,
+    };
     let entries = match ipe_fs_open::HeldDir::open_root(root).and_then(|dir| dir.entries(cap)) {
         Ok(entries) => entries,
-        Err(ipe_fs_open::OpenRefusal::Absent) => return report,
+        Err(ipe_fs_open::OpenRefusal::Absent) => return report(PruneOutcome::Walked(None)),
         Err(ipe_fs_open::OpenRefusal::TooManyEntries(over)) => {
-            report.refused = Some(RootRefusal::Crowded(over));
-            return report;
+            return report(PruneOutcome::Refused(RootRefusal::Crowded(over)));
         }
         Err(refusal) => {
-            report.refused = Some(RootRefusal::Unlisted(refusal.kind()));
-            return report;
+            return report(PruneOutcome::Refused(RootRefusal::Unlisted(refusal.kind())));
         }
     };
+    let mut skips = None;
     let now = std::time::SystemTime::now();
     for (name, kind) in entries {
         let is_own_kind = name
@@ -1383,7 +1406,7 @@ fn prune_siblings_with(
             Ok(meta) => Access::of(&meta),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => {
-                report.record(SiblingFault::io(&sibling, &e));
+                Skips::record(&mut skips, SiblingFault::io(&sibling, &e));
                 continue;
             }
         };
@@ -1392,10 +1415,10 @@ fn prune_siblings_with(
         }
         match prune(&sibling, now, retention) {
             Ok(Pruned::Removed | Pruned::Kept) => {}
-            Err(fault) => report.record(fault),
+            Err(fault) => Skips::record(&mut skips, fault),
         }
     }
-    report
+    report(PruneOutcome::Walked(skips))
 }
 
 /// The last use a prune judged a scratch build directory by.
@@ -2477,7 +2500,10 @@ mod tests {
             holder.try_lock().expect("held elsewhere");
 
             let report = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
-            assert!(report.is_clean(), "{report:?}");
+            assert!(
+                matches!(report.outcome, PruneOutcome::Walked(None)),
+                "{report:?}"
+            );
 
             assert!(!old.exists(), "an old unheld sibling is removed");
             assert!(own.exists(), "the run's own dir is kept");
@@ -2508,13 +2534,12 @@ mod tests {
             let report = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700))
                 .expect("unseal");
-            assert_eq!(report.skipped, 1, "{report:?}");
-            assert_eq!(report.refused, None, "{report:?}");
             assert!(
-                report
-                    .first_skip
-                    .as_ref()
-                    .is_some_and(|fault| fault.path.starts_with(&sealed)),
+                matches!(
+                    &report.outcome,
+                    PruneOutcome::Walked(Some(skips))
+                        if skips.count.get() == 1 && skips.first.path.starts_with(&sealed)
+                ),
                 "{report:?}"
             );
             assert!(sealed.exists(), "an unreadable sibling is left in place");
@@ -2554,10 +2579,13 @@ mod tests {
                     }
                 },
             );
-            assert_eq!(report.skipped, 1, "{report:?}");
-            assert_eq!(
-                report.first_skip.as_ref().map(|fault| fault.path.clone()),
-                Some(faulted.clone())
+            assert!(
+                matches!(
+                    &report.outcome,
+                    PruneOutcome::Walked(Some(skips))
+                        if skips.count.get() == 1 && skips.first.path == faulted
+                ),
+                "{report:?}"
             );
             assert!(!old.exists(), "a fault never stops the other siblings");
             assert!(faulted.exists(), "the faulted sibling is left in place");
@@ -2589,13 +2617,14 @@ mod tests {
                     prune_if_stale(dir, now, retention)
                 },
             );
-            assert_eq!(
-                report.refused,
-                Some(RootRefusal::Crowded(cap)),
+            assert!(
+                matches!(
+                    report.outcome,
+                    PruneOutcome::Refused(RootRefusal::Crowded(over)) if over == cap
+                ),
                 "{report:?}"
             );
             assert_eq!(calls, 0, "no sibling is judged past the cap");
-            assert_eq!(report.skipped, 0);
             assert!(old.exists(), "nothing is removed past the cap");
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2611,7 +2640,10 @@ mod tests {
             let linked = root.join("scratch-linked");
             std::os::unix::fs::symlink(&elsewhere, &linked).expect("planted link");
             let report = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
-            assert!(report.is_clean(), "{report:?}");
+            assert!(
+                matches!(report.outcome, PruneOutcome::Walked(None)),
+                "{report:?}"
+            );
             assert!(
                 elsewhere.join("debug").join("unit.rlib").is_file(),
                 "nothing is removed through the link"
@@ -2622,6 +2654,52 @@ mod tests {
                 "the link is left"
             );
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_prune_report_shows_one_sanitised_message_per_outcome() {
+            let root = PathBuf::from("/cache/ipe/t");
+            let report = |outcome| PruneReport {
+                root: root.clone(),
+                outcome,
+            };
+            assert_eq!(report(PruneOutcome::Walked(None)).message(), None);
+            let mut skips = None;
+            for name in ["dev-\u{1b}[31mred", "dev-second"] {
+                Skips::record(
+                    &mut skips,
+                    SiblingFault {
+                        path: root.join(name),
+                        kind: std::io::ErrorKind::PermissionDenied,
+                    },
+                );
+            }
+            let skipped = report(PruneOutcome::Walked(skips))
+                .message()
+                .expect("a skip is shown");
+            assert!(skipped.contains("2 in all"), "{skipped}");
+            assert!(skipped.contains("dev-"), "{skipped}");
+            assert!(
+                !skipped.contains("dev-second"),
+                "only the first skip is named: {skipped}"
+            );
+            assert!(
+                !skipped.contains('\u{1b}'),
+                "a listed name is sanitised: {skipped:?}"
+            );
+            let crowded = report(PruneOutcome::Refused(RootRefusal::Crowded(sibling_cap())))
+                .message()
+                .expect("a crowded root is shown");
+            assert!(
+                crowded.contains(&SCRATCH_SIBLING_CAP.to_string()),
+                "{crowded}"
+            );
+            let unlisted = report(PruneOutcome::Refused(RootRefusal::Unlisted(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+            .message()
+            .expect("an unlisted root is shown");
+            assert!(unlisted.contains("/cache/ipe/t"), "{unlisted}");
         }
 
         #[test]
