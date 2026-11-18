@@ -58,12 +58,16 @@ MAIN = "main"
 MAX_AGE_H = 48
 # Runs fetched per listing; the newest matching run across all listings is judged.
 LISTING_PAGE = 20
-# Jobs fetched per page of an attempt's job listing, and the most pages read; a
-# run with more jobs than the bound covers is refused, never judged on a prefix.
-# The page is GitHub's default size: a rerun attempt's listing is rendered with
-# its carried-forward jobs, and large pages of it fail at the gateway.
-JOBS_PAGE = 30
-MAX_JOB_PAGES = 34
+# Page sizes of an attempt's job listing, largest first, and the most jobs read;
+# a run with more jobs than the bound is refused, never judged on a prefix. A
+# rerun attempt's listing is rendered with its carried-forward jobs, and the
+# gateway can fail every try at one page size while serving a smaller one, so a
+# read that fails transiently restarts whole at the next size (pages of two
+# sizes never mix). The first size is GitHub's default.
+JOBS_PAGES: tuple[int, ...] = (30, 10)
+MAX_JOBS = 1020
+if list(JOBS_PAGES) != sorted(set(JOBS_PAGES), reverse=True) or any(MAX_JOBS % size for size in JOBS_PAGES):
+    raise SystemExit("nightly_green.py: JOBS_PAGES must strictly descend and each size must divide MAX_JOBS")
 # Fields a run is judged on; two equally fresh copies of one run must agree on them.
 _JUDGED_FIELDS = ("event", "path", "status", "conclusion", "head_branch", "head_sha", "created_at")
 GH_TIMEOUT_S = 60
@@ -96,6 +100,10 @@ _QUEUE_REF = re.compile(r"refs/heads/gh-readonly-queue/main/pr-([1-9][0-9]{0,9})
 
 class NightlyError(Exception):
     """A listing, run, or event shape that proves nothing."""
+
+
+class GhTransient(NightlyError):
+    """A `gh api` read that failed transiently on every try."""
 
 
 class GhFailure(Enum):
@@ -464,7 +472,7 @@ def _gh_json(path: str) -> object:
             raise NightlyError(f"`gh api {path}` {last}")
         if tried < len(GH_BACKOFF_S):
             _pause(GH_BACKOFF_S[tried])
-    raise NightlyError(f"`gh api {path}` failed transiently {GH_TRIES} times; last {last}")
+    raise GhTransient(f"`gh api {path}` failed transiently {GH_TRIES} times; last {last}")
 
 
 def _listing_paths(repo: str, producer: Producer, event: str, scope: str) -> tuple[str, ...]:
@@ -482,8 +490,8 @@ def _listing_paths(repo: str, producer: Producer, event: str, scope: str) -> tup
     )
 
 
-def _jobs_path(repo: str, rid: int, attempt: int, page: int) -> str:
-    return f"repos/{repo}/actions/runs/{rid}/attempts/{attempt}/jobs?per_page={JOBS_PAGE}&page={page}"
+def _jobs_path(repo: str, rid: int, attempt: int, size: int, page: int) -> str:
+    return f"repos/{repo}/actions/runs/{rid}/attempts/{attempt}/jobs?per_page={size}&page={page}"
 
 
 def _reread(repo: str, run: dict) -> dict:
@@ -501,16 +509,28 @@ def _reread(repo: str, run: dict) -> dict:
 
 
 def _jobs(repo: str, run: dict) -> list[dict]:
-    """Read the jobs of the judged copy `run`'s own attempt, page by page, at most `MAX_JOB_PAGES` pages.
+    """Read the jobs of the judged copy `run`'s own attempt at the first page size the gateway serves.
 
     The attempt is the one the judged run document names, never "the latest at
-    read time": a rerun started mid-read cannot substitute its jobs.
+    read time": a rerun started mid-read cannot substitute its jobs. Only a
+    transient failure moves to the next size; a refusal, or a transient failure
+    at the last size, stays red.
     """
     rid, attempt = _run_id(run), _attempt(run)
+    for size in JOBS_PAGES[:-1]:
+        try:
+            return _jobs_sized(repo, rid, attempt, size)
+        except GhTransient:
+            continue
+    return _jobs_sized(repo, rid, attempt, JOBS_PAGES[-1])
+
+
+def _jobs_sized(repo: str, rid: int, attempt: int, size: int) -> list[dict]:
+    """Read attempt `attempt` of run `rid`'s job listing in pages of `size`, at most `MAX_JOBS` jobs."""
     pages: list[object] = []
     collected = 0
-    for number in range(1, MAX_JOB_PAGES + 1):
-        page = _gh_json(_jobs_path(repo, rid, attempt, number))
+    for number in range(1, MAX_JOBS // size + 1):
+        page = _gh_json(_jobs_path(repo, rid, attempt, size, number))
         pages.append(page)
         jobs = page.get("jobs") if isinstance(page, dict) else None
         count = page.get("total_count") if isinstance(page, dict) else None
