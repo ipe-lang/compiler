@@ -907,6 +907,45 @@ class JobListingTest(unittest.TestCase):
         self.assertEqual(list(ng.JOBS_PAGES), sorted(set(ng.JOBS_PAGES), reverse=True))
         self.assertGreater(len(ng.JOBS_PAGES), 1)
         self.assertTrue(all(ng.MAX_JOBS % size == 0 for size in ng.JOBS_PAGES))
+        self.assertTrue(0 < ng.JOBS_PAGES[-1] and ng.JOBS_PAGES[0] <= 100)
+
+    def test_job_listing_restarts_whole_after_a_midread_transient(self) -> None:
+        # Page 1 at the first size is served, page 2 fails transiently: the next
+        # size starts again at page 1 and judges only its own pages.
+        api = FakeApi(_listing(_run()))
+        names = sorted(SANDBOX.gates)
+        first, second = ng.JOBS_PAGES[0], ng.JOBS_PAGES[1]
+        partial = _jobs_page(SANDBOX_ID, (names[0], "success"), total=len(names))
+        whole = _jobs_page(SANDBOX_ID, *((n, "success") for n in names))
+
+        def gateway(path: str) -> object:
+            if f"/runs/{SANDBOX_ID}/attempts/1/jobs?per_page={first}&" in path:
+                api.calls.append(path)
+                if path.endswith("&page=1"):
+                    return partial
+                raise ng.GhTransient(path)
+            if f"/runs/{SANDBOX_ID}/attempts/1/jobs?per_page={second}&" in path:
+                api.calls.append(path)
+                return whole if path.endswith("&page=1") else {"total_count": len(names), "jobs": []}
+            return api(path)
+
+        with _patched(_gh_json=gateway):
+            self.assertEqual(ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW), [])
+        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, first, 2), api.calls)
+        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, second, 1), api.calls)
+
+    def test_run_over_job_bound_refused_at_every_size(self) -> None:
+        for i, size in enumerate(ng.JOBS_PAGES):
+            with self.subTest(size=size):
+                pages = [
+                    _jobs_page(SANDBOX_ID, *((f"j{p}-{k}", "success") for k in range(size)), total=ng.MAX_JOBS + 1)
+                    for p in range(ng.MAX_JOBS // size + 1)
+                ]
+                api = FakeApi(_listing(_run()), jobs={SANDBOX_ID: pages})
+                with _patched(_gh_json=self._gateway_failing(api, ng.JOBS_PAGES[:i])):
+                    with self.assertRaises(ng.NightlyError):
+                        ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW)
+                self.assertEqual(sum(f"per_page={size}&" in c for c in api.calls), ng.MAX_JOBS // size)
 
     def test_every_page_read(self) -> None:
         names = sorted(SANDBOX.gates)

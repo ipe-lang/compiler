@@ -66,8 +66,13 @@ LISTING_PAGE = 20
 # sizes never mix). The first size is GitHub's default.
 JOBS_PAGES: tuple[int, ...] = (30, 10)
 MAX_JOBS = 1020
-if list(JOBS_PAGES) != sorted(set(JOBS_PAGES), reverse=True) or any(MAX_JOBS % size for size in JOBS_PAGES):
-    raise SystemExit("nightly_green.py: JOBS_PAGES must strictly descend and each size must divide MAX_JOBS")
+if (
+    not JOBS_PAGES
+    or not 0 < JOBS_PAGES[-1] <= JOBS_PAGES[0] <= 100
+    or list(JOBS_PAGES) != sorted(set(JOBS_PAGES), reverse=True)
+    or any(MAX_JOBS % size for size in JOBS_PAGES)
+):
+    raise SystemExit("nightly_green.py: JOBS_PAGES must be non-empty, strictly descend within 1..100, and each size must divide MAX_JOBS")
 # Fields a run is judged on; two equally fresh copies of one run must agree on them.
 _JUDGED_FIELDS = ("event", "path", "status", "conclusion", "head_branch", "head_sha", "created_at")
 GH_TIMEOUT_S = 60
