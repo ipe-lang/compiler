@@ -55,6 +55,9 @@ runs:
         packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev
         archives: ${{ runner.temp }}/apt-archives
         no-install-recommends: "true"
+    # An archive's filename ends in the architecture apt fetched it for (an
+    # architecture variant such as `amd64v3`), not dpkg's `${Architecture}`
+    # (`amd64`), so an archive is kept by its package and version alone.
     - name: Prune and check the webview link dep archives
       id: apt-archives
       shell: bash
@@ -68,7 +71,11 @@ runs:
           echo "::error::webview-link-deps: the archives directory is missing or not a directory" >&2
           exit 1
         fi
-        installed="$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}_${Version}_${Architecture}.deb\n')"
+        if [[ ! -r "$ARCHIVES_DIR" || ! -x "$ARCHIVES_DIR" ]]; then
+          echo "::error::webview-link-deps: the archives directory is not listable by the runner user, so it cannot be cached" >&2
+          exit 1
+        fi
+        installed="$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}_${Version}\n')"
         declare -A keep=()
         while IFS=$'\t' read -r status name; do
           if [[ "${status:1:1}" == "i" && -n "$name" ]]; then
@@ -95,7 +102,11 @@ runs:
             echo "::error::webview-link-deps: ${shown} is not readable by the runner user, so it cannot be cached" >&2
             exit 1
           fi
-          if [[ -z "${keep[$base]+set}" ]]; then
+          stem=""
+          if [[ "$base" =~ ^([a-z0-9][a-z0-9.+-]*_[A-Za-z0-9.+~%-]+)_[a-z0-9]+\.deb$ ]]; then
+            stem="${BASH_REMATCH[1]}"
+          fi
+          if [[ -z "$stem" || -z "${keep[$stem]+set}" ]]; then
             rm -f -- "$deb"
             pruned=$((pruned + 1))
             continue
