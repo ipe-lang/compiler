@@ -68,6 +68,7 @@ checks:
       tier: quick
       run:
         - cargo clippy --all-targets {packages} -- -D warnings
+        - cargo clippy --locked --target x86_64-unknown-freebsd -p ipe_sandbox --all-targets -- -D warnings
   - context: runtime-feature-combos
     disposition: gate
     producer: ci.yml

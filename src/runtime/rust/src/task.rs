@@ -438,6 +438,57 @@ where
     block_on_std(future)
 }
 
+/// The entry task `entry` builds, built on its first poll.
+///
+/// `fn main` hands the entry over unbuilt, so the work `ipe_main` does while it
+/// builds its task (a value computed eagerly, a shape-app leaf constructed) runs
+/// inside the poll, under the catch of whichever entry drives that poll, never on
+/// the bare main thread before any catch exists.
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-client")))]
+fn deferred_entry<E, A, F>(entry: F) -> IpeTask<E, A>
+where
+    E: Send + 'static,
+    A: Send + 'static,
+    F: FnOnce() -> IpeTask<E, A> + Send + 'static,
+{
+    Box::pin(async move { entry().await })
+}
+
+/// The process entry: build the task `entry` returns and drive it, both inside
+/// [`block_on`]'s catch.
+///
+/// `fn main` calls this with `ipe_main` itself, never `ipe_main()`, so a runtime
+/// trip raised while the task is built ends as its typed error and exit 1, the
+/// same as one raised while the task runs.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub fn block_on_entry<E, A, F>(entry: F) -> IpeResult<E, A>
+where
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+    F: FnOnce() -> IpeTask<E, A> + Send + 'static,
+{
+    block_on(deferred_entry(entry))
+}
+
+/// The process entry: build the task `entry` returns and drive it, both inside
+/// [`block_on`]'s catch.
+///
+/// `fn main` calls this with `ipe_main` itself, never `ipe_main()`, so a runtime
+/// trip raised while the task is built ends as its typed error and exit 1, the
+/// same as one raised while the task runs.
+#[cfg(all(
+    not(all(target_arch = "wasm32", feature = "wasm-client")),
+    any(not(feature = "tokio"), target_arch = "wasm32")
+))]
+pub fn block_on_entry<E, A, F>(entry: F) -> IpeResult<E, A>
+where
+    E: crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+    F: FnOnce() -> IpeTask<E, A> + Send + 'static,
+{
+    block_on(deferred_entry(entry))
+}
+
 /// The std-only entry: poll `future` on this thread inside the entry catch.
 ///
 /// The body of the std-only [`block_on`]. It is also compiled in every native
@@ -545,6 +596,21 @@ where
         Err(e) => return IpeResult::Err(runtime_init_refused(&e)),
     };
     drive_entry_caught(move || rt.block_on(future))
+}
+
+/// The main-thread process entry: build the task `entry` returns and drive it,
+/// both inside [`block_on_current_thread`]'s catch.
+///
+/// The webview leaf's entry: the leaf is built on the main thread inside the
+/// catch, so a trip raised while `ipe_main` builds it is typed, never a raw panic.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub fn block_on_current_thread_entry<E, A, F>(entry: F) -> IpeResult<E, A>
+where
+    E: crate::FromUnavailable + crate::FromIpeError + Send + 'static,
+    A: Send + 'static,
+    F: FnOnce() -> IpeTask<E, A> + Send + 'static,
+{
+    block_on_current_thread(deferred_entry(entry))
 }
 
 pub fn task_succeed<E: Send + 'static, A: Send + 'static>(a: A) -> IpeTask<E, A> {
@@ -1959,6 +2025,59 @@ mod entry_unwind_tests {
     #[test]
     fn block_on_current_thread_types_a_trip() {
         assert_recursion_limit(block_on_current_thread(tripping_task()));
+    }
+
+    /// An entry that trips while it builds its task, before any task exists.
+    fn trips_while_built() -> IpeTask<IpeError, i64> {
+        trip(RuntimeTrip::RecursionLimit)
+    }
+
+    /// An entry that unwinds with a foreign payload while it builds its task.
+    fn panics_while_built() -> IpeTask<IpeError, i64> {
+        std::panic::resume_unwind(Box::new("sk_live_SECRET".to_string()))
+    }
+
+    /// An entry whose build and task both succeed.
+    fn builds_and_succeeds() -> IpeTask<IpeError, i64> {
+        Box::pin(async { IpeResult::Ok(3) })
+    }
+
+    #[test]
+    fn block_on_entry_types_a_trip_raised_while_the_task_is_built() {
+        assert_recursion_limit(block_on_entry(trips_while_built));
+        assert_redacted_unexpected(block_on_entry(panics_while_built));
+        assert!(matches!(
+            block_on_entry(builds_and_succeeds),
+            IpeResult::Ok(3)
+        ));
+    }
+
+    #[test]
+    fn std_entry_types_a_trip_raised_while_the_task_is_built() {
+        assert_recursion_limit(block_on_std(deferred_entry(trips_while_built)));
+        assert_redacted_unexpected(block_on_std(deferred_entry(panics_while_built)));
+        assert!(matches!(
+            block_on_std(deferred_entry(builds_and_succeeds)),
+            IpeResult::Ok(3)
+        ));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn current_thread_entry_types_a_trip_raised_while_the_task_is_built() {
+        assert_recursion_limit(block_on_current_thread_entry(trips_while_built));
+        assert_redacted_unexpected(block_on_current_thread_entry(panics_while_built));
+        assert!(matches!(
+            block_on_current_thread_entry(builds_and_succeeds),
+            IpeResult::Ok(3)
+        ));
+    }
+
+    /// Building the entry task never runs the entry: only the poll does.
+    #[test]
+    fn a_deferred_entry_is_not_built_until_polled() {
+        let deferred = deferred_entry(trips_while_built);
+        drop(deferred);
     }
 
     #[cfg(feature = "tokio")]

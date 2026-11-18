@@ -1520,7 +1520,7 @@ Task.fail (Error.unexpected \"intentional\")
 // -----------------------------------------------------------------------
 
 /// `main` returning a `Task` directly must emit `fn ipe_main() -> IpeTask<`
-/// (the shape the `block_on(ipe_main())` epilogue requires), never
+/// (the shape the `block_on_entry(ipe_main)` epilogue requires), never
 /// `IpeResult<…>`. The internal `TaskRun` kernel is the auto-run mechanism
 /// at the entry boundary; the surface `Task.run` binding is gone.
 #[test]

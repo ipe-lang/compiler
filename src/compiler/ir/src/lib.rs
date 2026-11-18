@@ -14,6 +14,7 @@
 mod alpha;
 pub mod borrow;
 mod carrier;
+mod entry;
 mod enum_facts;
 mod enum_params;
 pub mod free_vars;
@@ -30,6 +31,7 @@ mod show_policy;
 pub use alpha::alpha_equivalent_fields;
 pub use borrow::{Param, ParamPass};
 pub use carrier::wants_arc_ctor;
+pub use entry::EntryRun;
 pub use enum_facts::{
     EnumFacts, EnumTraits, FfiUnion, RuntimeBridgedEnum, STORE_ROW_PHANTOM_UNIONS,
     classify_unregistered_enum, enum_derivable_fixpoint, enum_trait_fixpoint,

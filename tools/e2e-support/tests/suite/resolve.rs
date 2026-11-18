@@ -4,7 +4,10 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::process::Command;
 
-use e2e_support::bin::{ResolveError, Source, in_repo_runtime_src, parse_tier, resolve_bin};
+use e2e_support::bin::{
+    RUNTIME_LOOKUP_CEILING, ResolveError, RuntimeLookupError, Source, in_repo_runtime_src,
+    parse_tier, resolve_bin,
+};
 use e2e_support::{Tier, require_runtime};
 
 #[allow(clippy::expect_used)] // unwritable test scratch is an environment failure, not a case under test
@@ -119,10 +122,102 @@ fn a_runtime_tree_without_its_crate_manifest_is_not_taken() {
     let root = outside_scratch("no-manifest");
     std::fs::create_dir_all(root.join("src/runtime/rust/src")).unwrap();
     let got = in_repo_runtime_src(&root);
-    assert!(
-        matches!(got, Err(ResolveError::Missing { .. })),
-        "a tree whose crate holds no Cargo.toml is not the runtime: {got:?}"
+    assert_eq!(
+        got,
+        Err(RuntimeLookupError::Missing { anchor: root }),
+        "a tree whose crate holds no Cargo.toml is not the runtime"
     );
+}
+
+/// A checkout root holding the runtime crate (manifest and module tree), outside every checkout.
+#[allow(clippy::expect_used)] // unwritable test scratch is an environment failure, not a case under test
+fn outside_checkout(tag: &str) -> (PathBuf, PathBuf) {
+    let root = outside_scratch(tag);
+    let tree = root.join("src/runtime/rust/src");
+    std::fs::create_dir_all(&tree).expect("create the runtime tree");
+    std::fs::write(root.join("src/runtime/rust/Cargo.toml"), b"")
+        .expect("write the runtime manifest");
+    (root, tree)
+}
+
+#[test]
+fn the_in_repo_tree_is_found_from_a_descendant() {
+    let (root, tree) = outside_checkout("walk");
+    let deep = root.join("a/b");
+    std::fs::create_dir_all(&deep).unwrap();
+    let got = in_repo_runtime_src(&deep).unwrap();
+    assert_eq!(got.path(), tree.as_path());
+    assert_eq!(got.crate_root(), root.join("src/runtime/rust").as_path());
+}
+
+/// The lookup visits the anchor and its next ancestors up to the ceiling:
+/// a tree the last visited directory holds is found, one a directory
+/// further up holds is not.
+#[test]
+fn the_lookup_stops_at_the_ceiling() {
+    let (root, tree) = outside_checkout("ceiling");
+    let below = |levels: usize| {
+        let dir = (0..levels).fold(root.clone(), |dir, _| dir.join("d"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    };
+    let last_visited = below(RUNTIME_LOOKUP_CEILING - 1);
+    let past_ceiling = below(RUNTIME_LOOKUP_CEILING);
+    assert_eq!(
+        in_repo_runtime_src(&last_visited).map(e2e_support::ProvenRuntime::into_path_buf),
+        Ok(tree)
+    );
+    assert_eq!(
+        in_repo_runtime_src(&past_ceiling),
+        Err(RuntimeLookupError::Missing {
+            anchor: past_ceiling
+        })
+    );
+}
+
+/// A symlinked `src/runtime/rust` is refused on the spot, never followed to
+/// the crate it names nor passed over for a real tree further up.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_runtime_crate_is_refused() {
+    let (outer, _) = outside_checkout("linked-crate");
+    let (elsewhere, _) = outside_checkout("linked-crate-target");
+    let inner = outer.join("inner");
+    std::fs::create_dir_all(inner.join("src/runtime")).unwrap();
+    let link = inner.join("src/runtime/rust");
+    std::os::unix::fs::symlink(elsewhere.join("src/runtime/rust"), &link).unwrap();
+    assert_eq!(
+        in_repo_runtime_src(&inner),
+        Err(RuntimeLookupError::Linked { path: link })
+    );
+}
+
+/// A link at any component of the tree (an intermediate directory, the
+/// manifest, the module tree) is refused, never followed.
+#[cfg(unix)]
+#[test]
+fn a_link_at_any_tree_component_is_refused() {
+    let (target, _) = outside_checkout("linked-part-target");
+    for part in [
+        "src",
+        "src/runtime",
+        "src/runtime/rust/Cargo.toml",
+        "src/runtime/rust/src",
+    ] {
+        let (root, _) = outside_checkout(&format!("linked-part-{}", part.replace('/', "-")));
+        let link = root.join(part);
+        if std::fs::symlink_metadata(&link).unwrap().is_dir() {
+            std::fs::remove_dir_all(&link).unwrap();
+        } else {
+            std::fs::remove_file(&link).unwrap();
+        }
+        std::os::unix::fs::symlink(target.join(part), &link).unwrap();
+        assert_eq!(
+            in_repo_runtime_src(&root),
+            Err(RuntimeLookupError::Linked { path: link }),
+            "{part}"
+        );
+    }
 }
 
 #[test]
@@ -188,9 +283,10 @@ fn outside_scratch(tag: &str) -> PathBuf {
 fn a_walk_with_no_runtime_tree_fails() {
     let root = outside_scratch("no-runtime");
     let got = in_repo_runtime_src(&root);
-    assert!(
-        matches!(got, Err(ResolveError::Missing { .. })),
-        "a walk above a scratch dir must find no runtime tree: {got:?}"
+    assert_eq!(
+        got,
+        Err(RuntimeLookupError::Missing { anchor: root }),
+        "a walk above a scratch dir must find no runtime tree"
     );
 }
 

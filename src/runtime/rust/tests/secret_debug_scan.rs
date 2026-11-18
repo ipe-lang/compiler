@@ -351,18 +351,6 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "emit_program",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "emit_spine",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "insert_app_serde_dependency",
         count: 1,
         why: DIAGNOSTIC,
@@ -412,6 +400,12 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "substitute_dep_manifest_anchors",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "switch_shape_app_entry",
         count: 1,
         why: DIAGNOSTIC,
     },

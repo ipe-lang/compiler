@@ -6,8 +6,8 @@ name: Build & test
 # runs in exactly one phase, keyed on a `changes` output, and is further scoped
 # by the fail-closed path classifier (`code`, `emit`, `sanitize`, `wasm`,
 # `editors`; .github/ci/change_class.py):
-#   • CHEAP (`cheap`: pull request, merge queue, dispatch) — fmt, clippy,
-#     quick-check, panic-scan, the lock/artifact/ruleset guards, windows-check,
+#   • CHEAP (`cheap`: pull request, merge queue, dispatch) — fmt, clippy (with
+#     the FreeBSD sandbox freebsd-check), quick-check, panic-scan, the lock/artifact/ruleset guards, windows-check,
 #     diagnostic-tone, build-tools, the docs-drift gates, the example gates, the
 #     first-party check-floor + shapes build gate, wasm-floor, editors-configure.
 #     A pull request runs only this phase.
@@ -248,6 +248,7 @@ jobs:
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           components: clippy
+          targets: x86_64-unknown-freebsd
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -255,6 +256,11 @@ jobs:
         run: cargo fetch
       - name: Run clippy
         run: cargo clippy --offline --all-targets --workspace -- -D warnings
+      # freebsd-check: the FreeBSD jail launcher compiles only for FreeBSD, so
+      # the host clippy above never sees it. Checking the sandbox crate for the
+      # FreeBSD target on every change keeps it compiling and lint-clean.
+      - name: freebsd-check (sandbox clippy for x86_64-unknown-freebsd)
+        run: cargo clippy --offline --locked --target x86_64-unknown-freebsd -p ipe_sandbox --all-targets -- -D warnings
 
   # Token-level scan for authored abrupt-failure constructs in the compiler and
   # runtime's own Rust — the second, independent gate behind clippy (see

@@ -1210,7 +1210,8 @@ mod tests {
 
         // A new directory may inherit a setgid or BSD parent's group; pin it to
         // the invoker's effective group, the one group write is admitted under.
-        rustix::fs::chown(&dir, None, Some(rustix::process::getegid())).expect("chgrp token dir");
+        let held = std::fs::File::open(&dir).expect("hold token dir");
+        rustix::fs::fchown(&held, None, Some(rustix::process::getegid())).expect("chgrp token dir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o770))
             .expect("chmod token dir");
         assert!(
