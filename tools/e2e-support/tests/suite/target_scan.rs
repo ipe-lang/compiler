@@ -77,7 +77,7 @@ const BUILD_VERBS: &[&str] = &["build", "run", "release", "test", "watch", "dev"
 /// test fails if the named fn no longer exists or no longer trips the rule.
 const ALLOWLIST: &[(&str, &str, &str)] = &[(
     "src/ipe-cli/tests/target_dir_windows_gnu.rs",
-    "build",
+    "build_in",
     "exercises ipe's own CARGO_TARGET_DIR resolution from outside (unset, a \
      non-ASCII pin, an unlinkable sysroot/pin) — routing through `ipe_command` \
      would fix the exact value this test varies, defeating it",

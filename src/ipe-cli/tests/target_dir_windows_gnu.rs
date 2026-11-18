@@ -5,9 +5,12 @@
 //! `x86_64-pc-windows-gnu` host (an ASCII-only linker family) and a stub
 //! `cargo` that logs every call with the `CARGO_TARGET_DIR` it was handed. An
 //! unlinkable pin or sysroot is refused with IPE-E0002 before any build; a
-//! non-ASCII project with no pin builds in the per-user cache; and a link
-//! failure naming an input the linker could not open is IPE-E0003, an
-//! environment fault, never the IPE-I0001 compiler-bug frame.
+//! development build with no pin builds in the compiler's development
+//! directory of the per-user cache, or, when that directory is not private, in
+//! the project's own per-user cache directory; a release build under a pin
+//! builds in the pin's `release-ipe`; and a link failure naming an input the
+//! linker could not open is IPE-E0003, an environment fault, never the
+//! IPE-I0001 compiler-bug frame.
 
 #[cfg(test)]
 #[cfg(unix)]
@@ -106,31 +109,57 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
 
         /// Run `ipe dev build` on the project with `extra` environment.
         fn build(&self, extra: &[(&str, &Path)]) -> (bool, String) {
-            let runtime_dir = e2e_support::require_runtime().into_path_buf();
+            self.build_in(&self.project, Verb::Dev, extra)
+        }
+
+        /// Write a second project, `dir` under the case root, beside the first.
+        fn another_project(&self, dir: &str) -> PathBuf {
+            let project = self.root.join(dir);
+            fs::create_dir_all(project.join("src")).expect("make src dir");
+            fs::copy(
+                self.project.join("package.ipe"),
+                project.join("package.ipe"),
+            )
+            .expect("copy package.ipe");
+            fs::write(project.join("src").join("Main.ipe"), SRC).expect("write source");
+            project
+        }
+
+        /// Run `ipe <verb> build` on `project` with `extra` environment.
+        fn build_in(&self, project: &Path, verb: Verb, extra: &[(&str, &Path)]) -> (bool, String) {
             let mut cmd = std::process::Command::new(e2e_support::cargo_bin!("ipe"));
-            cmd.args(["dev", "build"])
-                .arg(&self.project)
+            cmd.args([verb.word(), "build"])
+                .arg(project)
                 .arg("--out")
-                .arg(self.project.join("out"))
-                .env(
-                    "PATH",
-                    std::env::join_paths([
-                        self.bin.as_path(),
-                        Path::new("/usr/bin"),
-                        Path::new("/bin"),
-                    ])
-                    .expect("join PATH"),
-                )
-                .env("IPE_RUNTIME_DIR", &runtime_dir)
-                .env("IPE_HOME", &self.home)
-                .env("XDG_CACHE_HOME", &self.cache)
-                .env("HOME", &self.root)
-                .env("NO_COLOR", "1");
+                .arg(project.join("out"));
+            // A release builds only against the runtime the compiler embeds.
+            match verb {
+                Verb::Dev => {
+                    cmd.env(
+                        "IPE_RUNTIME_DIR",
+                        e2e_support::require_runtime().into_path_buf(),
+                    );
+                }
+                Verb::Release => {}
+            }
+            cmd.env(
+                "PATH",
+                std::env::join_paths([
+                    self.bin.as_path(),
+                    Path::new("/usr/bin"),
+                    Path::new("/bin"),
+                ])
+                .expect("join PATH"),
+            )
+            .env("IPE_HOME", &self.home)
+            .env("XDG_CACHE_HOME", &self.cache)
+            .env("HOME", &self.root)
+            .env("NO_COLOR", "1");
             e2e_support::target::clear_target_dir_env(&mut cmd);
             for (key, value) in extra {
                 cmd.env(key, value);
             }
-            let out = cmd.output().expect("spawn ipe dev build");
+            let out = cmd.output().expect("spawn ipe");
             (
                 out.status.success(),
                 String::from_utf8_lossy(&out.stderr).into_owned(),
@@ -154,6 +183,30 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
                 .map(str::to_owned)
                 .collect()
         }
+    }
+
+    /// The build verb a case runs.
+    #[derive(Clone, Copy)]
+    enum Verb {
+        /// `ipe dev build`.
+        Dev,
+        /// `ipe release build`.
+        Release,
+    }
+
+    impl Verb {
+        /// The verb's command word.
+        const fn word(self) -> &'static str {
+            match self {
+                Self::Dev => "dev",
+                Self::Release => "release",
+            }
+        }
+    }
+
+    /// Whether `key` is a 16-digit hex digest.
+    fn is_key(key: &str) -> bool {
+        key.len() == 16 && key.chars().all(|c| c.is_ascii_hexdigit())
     }
 
     impl Drop for Case {
@@ -193,25 +246,81 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
         );
     }
 
-    /// A non-ASCII project with no pin builds in the per-user cache, keyed the
-    /// same on every build.
+    /// A development build with no pin builds in the compiler's development
+    /// directory, `<cache>/ipe/t/dev-<key>`: one ASCII directory keyed by the
+    /// compiler, never by the project, so a non-ASCII project builds there
+    /// every time and a second project builds in the same directory.
     #[test]
-    fn a_non_ascii_project_builds_in_the_per_user_cache() {
-        let case = Case::new("relocate", "proj\u{e9}to");
+    fn a_development_build_shares_the_compilers_development_directory() {
+        let case = Case::new("devdir", "proj\u{e9}to");
+        case.gnu_rustc("/opt/rust/toolchain");
+        case.cargo("unopenable.txt");
+        let other = case.another_project("outro\u{e9}");
+        let _ = case.build(&[]);
+        let _ = case.build(&[]);
+        let _ = case.build_in(&other, Verb::Dev, &[]);
+        let dirs = case.build_dirs();
+        assert_eq!(dirs.len(), 3, "three builds ran: {:?}", case.calls());
+        let shared_root = case.cache.join("ipe").join("t");
+        for dir in &dirs {
+            let dir = Path::new(dir);
+            assert_eq!(
+                dir.parent(),
+                Some(shared_root.as_path()),
+                "{} is in {}",
+                dir.display(),
+                shared_root.display()
+            );
+            assert!(
+                dir.to_string_lossy().is_ascii(),
+                "{} is ASCII",
+                dir.display()
+            );
+            let name = dir
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            assert!(
+                name.strip_prefix("dev-").is_some_and(is_key),
+                "{name} is the compiler's development directory"
+            );
+        }
+        assert!(
+            dirs.windows(2).all(|pair| pair.first() == pair.last()),
+            "every build of every project shares one directory: {dirs:?}"
+        );
+    }
+
+    /// A development directory another user could write is never built in: a
+    /// non-ASCII project falls back to its own per-user cache directory,
+    /// keyed by the project the same on every build.
+    #[test]
+    #[allow(clippy::panic)] // a case whose first build did not run fails the test
+    fn a_widened_development_directory_falls_back_to_the_project_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let case = Case::new("widened", "proj\u{e9}to");
         case.gnu_rustc("/opt/rust/toolchain");
         case.cargo("unopenable.txt");
         let _ = case.build(&[]);
+        let first = case.build_dirs();
+        let [planted] = first.as_slice() else {
+            panic!("one build ran: {:?}", case.calls());
+        };
+        fs::set_permissions(planted, fs::Permissions::from_mode(0o777)).expect("widen");
+        let _ = case.build(&[]);
         let _ = case.build(&[]);
         let dirs = case.build_dirs();
-        assert_eq!(dirs.len(), 2, "two builds ran: {:?}", case.calls());
-        let relocated_root = case.cache.join("ipe").join("t");
-        for dir in &dirs {
+        let fallen = dirs.get(1..).unwrap_or_default();
+        assert_eq!(fallen.len(), 2, "two more builds ran: {:?}", case.calls());
+        let shared_root = case.cache.join("ipe").join("t");
+        for dir in fallen {
+            assert_ne!(dir, planted, "the widened directory is never built in");
             let dir = Path::new(dir);
-            assert!(
-                dir.starts_with(&relocated_root),
-                "{} is under {}",
-                dir.display(),
-                relocated_root.display()
+            assert_eq!(
+                dir.parent(),
+                Some(shared_root.as_path()),
+                "{}",
+                dir.display()
             );
             assert!(
                 dir.to_string_lossy().is_ascii(),
@@ -222,15 +331,34 @@ error: could not compile `app` (bin \"app\") due to 1 previous error
                 .file_name()
                 .and_then(|key| key.to_str())
                 .unwrap_or_default();
-            assert!(
-                key.len() == 16 && key.chars().all(|c| c.is_ascii_hexdigit()),
-                "{key} is a 16-digit project key"
-            );
+            assert!(is_key(key), "{key} is a 16-digit project key");
         }
         assert_eq!(
-            dirs.first(),
-            dirs.get(1),
-            "the cache key is the same every build"
+            fallen.first(),
+            fallen.last(),
+            "the project key is the same every build"
+        );
+    }
+
+    /// Under a `CARGO_TARGET_DIR` pin a development build builds in the pin and
+    /// a release build in the pin's `release-ipe`, so a release never
+    /// rebuilds over the development artifacts.
+    #[test]
+    fn a_pinned_release_builds_in_the_pins_release_directory() {
+        let case = Case::new("release-pin", "app");
+        case.gnu_rustc("/opt/rust/toolchain");
+        case.cargo("unopenable.txt");
+        let pin = case.root.join("pin");
+        let _ = case.build(&[("CARGO_TARGET_DIR", &pin)]);
+        let (_, stderr) =
+            case.build_in(&case.project, Verb::Release, &[("CARGO_TARGET_DIR", &pin)]);
+        let dirs = case.build_dirs();
+        let release = pin.join("release-ipe");
+        assert_eq!(
+            dirs,
+            [pin.display().to_string(), release.display().to_string()],
+            "the development build in the pin, the release in its release-ipe: {:?}\n{stderr}",
+            case.calls()
         );
     }
 
