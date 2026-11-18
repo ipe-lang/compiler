@@ -5891,8 +5891,10 @@ class TestAptOnePath(unittest.TestCase):
 class TestAptInstallScript(unittest.TestCase):
     """The apt action's own `run` text, executed with `sudo` stubbed (an apt
     or dpkg command exits `rc`, the mirror edit succeeds): it refuses every
-    input it cannot pass to apt as written, and fails when both attempts
-    fail."""
+    input it cannot pass to apt as written, repoints each failed attempt to
+    the next mirror, and fails when every attempt fails."""
+
+    _OPTS = "-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
 
     def run_script(self, packages: str, archives: str = "", recommends: str = "false", rc: int = 0, lc_all: str = "en_US.UTF-8") -> tuple[int, list[str]]:
         """Exit status and recorded `sudo` argv lines; `{tmp}` in `archives`
@@ -5915,6 +5917,7 @@ class TestAptInstallScript(unittest.TestCase):
                 "APT_NO_RECOMMENDS": recommends,
             }
             done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
+            self.stdout, self.stderr = done.stdout, done.stderr
             calls = open(log, encoding="utf-8").read().splitlines() if os.path.exists(log) else []
         return done.returncode, calls
 
@@ -5926,8 +5929,8 @@ class TestAptInstallScript(unittest.TestCase):
             calls,
             [
                 "timeout 360 dpkg --configure -a",
-                "timeout 360 apt-get -o Acquire::Retries=3 update",
-                f"timeout 360 apt-get -o Acquire::Retries=3 -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
+                f"timeout 360 apt-get {self._OPTS} update",
+                f"timeout 360 apt-get {self._OPTS} -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
             ],
         )
 
@@ -5954,10 +5957,58 @@ class TestAptInstallScript(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertEqual(calls, [])
 
-    def test_both_attempts_failing_fails(self) -> None:
+    def test_every_attempt_failing_fails(self) -> None:
         code, calls = self.run_script("bubblewrap", rc=1)
         self.assertNotEqual(code, 0)
-        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], ["timeout 360 dpkg --configure -a"] * 2)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], ["timeout 360 dpkg --configure -a"] * 3)
+
+    def test_each_failed_attempt_repoints_to_the_next_mirror(self) -> None:
+        code, _calls = self.run_script("bubblewrap", rc=1)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(
+            [line for line in self.stdout.splitlines() if "repoints" in line],
+            [
+                "apt attempt 2 repoints the Ubuntu sources to archive.ubuntu.com",
+                "apt attempt 3 repoints the Ubuntu sources to mirrors.edge.kernel.org",
+            ],
+        )
+        self.assertIn("every mirror failed", self.stderr)
+
+    def test_first_success_stops(self) -> None:
+        code, calls = self.run_script("bubblewrap")
+        self.assertEqual(code, 0)
+        self.assertNotIn("repoints", self.stdout)
+        self.assertEqual(len(calls), 3)
+
+    def test_mirror_edit_rewrites_every_ubuntu_archive_host(self) -> None:
+        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+        script = doc["runs"]["steps"][0]["run"]
+        edit = next(line.strip() for line in script.splitlines() if "sed -i -E" in line)
+        expr = edit.split('"')[1]
+        sources = (
+            "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+            "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
+            "URIs: http://security.ubuntu.com/ubuntu/\n"
+            "URIs: https://archive.ubuntu.com/ubuntu/\n"
+            "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"
+        )
+        for mirror in ("archive.ubuntu.com", "mirrors.edge.kernel.org"):
+            with self.subTest(mirror=mirror):
+                done = subprocess.run(
+                    ["bash", "-c", f'printf "{sources}" | sed -E "{expr}"'],
+                    env={"PATH": os.environ.get("PATH", ""), "mirror": mirror},
+                    capture_output=True, text=True, timeout=30, check=True,
+                )
+                self.assertEqual(
+                    done.stdout.splitlines(),
+                    [
+                        f"http://{mirror}/ubuntu/\tpriority:1",
+                        f"URIs: http://{mirror}/ubuntu/",
+                        f"URIs: http://{mirror}/ubuntu/",
+                        f"URIs: https://{mirror}/ubuntu/",
+                        "URIs: http://ports.ubuntu.com/ubuntu-ports/",
+                    ],
+                )
 
 
 _DU_WF = """\
@@ -7066,10 +7117,12 @@ class TestReleaseTargetParity(unittest.TestCase):
         toolchain = self.swap(_RT_TOOLCHAIN, "packages: musl-tools", "packages: musl-tools\n        no-install-recommends: \"true\"")
         self.assertRefused("release-target-toolchain' step 3.with has keys", toolchain=toolchain)
         for old, new in (
-            ("sudo timeout 360 dpkg --configure -a \\\n", ""),
-            ("timeout 360 apt-get -o Acquire::Retries=3 update", "apt-get update"),
-            ("for attempt in 1 2; do", "for attempt in 1; do"),
-            ("archive.ubuntu.com|g'", "mirror.invalid|g'"),
+            ("if capped dpkg --configure -a \\\n            && ", "if "),
+            ('capped apt-get "${apt_opts[@]}" update', "apt-get update"),
+            ("for attempt in 1 2 3; do", "for attempt in 1; do"),
+            ('mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)', 'mirrors=("" mirror.invalid mirrors.edge.kernel.org)'),
+            ("deadline=$((SECONDS + 900))", "deadline=$((SECONDS + 9000))"),
+            ("          left=360\n", "          left=3600\n"),
         ):
             with self.subTest(apt=new):
                 self.assertRefused(self._APT_PINNED, apt=self.swap(_RT_APT, old, new))
