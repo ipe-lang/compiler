@@ -111,12 +111,15 @@ class FakeRunner:
         self.deny_flags = deny_flags
         self.calls: list[list[str]] = []
         self.config: str | None = None
+        self.fetch_rc: int | None = 0
 
     def __call__(self, argv: Sequence[str], cwd: str) -> scs.RunResult:
         argv = list(argv)
         self.calls.append(argv)
         if argv[1] == "tree":
             return scs.RunResult(0, self.tree.encode(), b"")
+        if argv[1] == "fetch":
+            return scs.RunResult(self.fetch_rc, b"", b"")
         with open(argv[argv.index("--config") + 1], encoding="utf-8") as f:
             self.config = f.read()
         return scs.RunResult(self.deny_rc, b"", self.deny, **self.deny_flags)
@@ -200,6 +203,21 @@ class RefusesTheReleaseGraph(ScopeCase):
         # escape codes reach the strict line parsers.
         for argv in (scs.tree_argv(), scs.deny_argv("/r/Cargo.toml", "/t/deny.toml")):
             self.assertEqual(argv[argv.index("--color") + 1], "never", argv)
+
+    def test_the_offline_deny_runs_only_after_a_locked_fetch(self) -> None:
+        runner = FakeRunner()
+        scs.prove_scope(runner, self.root)
+        verbs = [argv[1] for argv in runner.calls]
+        self.assertEqual(verbs, ["tree", "fetch", "deny"])
+        self.assertIn("--locked", runner.calls[1])
+        self.assertIn("--offline", runner.calls[2])
+
+    def test_a_failed_fetch_is_refused_before_deny_runs(self) -> None:
+        runner = FakeRunner()
+        runner.fetch_rc = 101
+        with self.assertRaises(scs.ScopeError):
+            scs.prove_scope(runner, self.root)
+        self.assertNotIn("deny", [argv[1] for argv in runner.calls])
 
     def test_a_coloured_tree_line_is_refused_not_misread(self) -> None:
         with self.assertRaises(scs.ScopeError) as cm:

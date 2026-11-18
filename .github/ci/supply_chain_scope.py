@@ -195,6 +195,15 @@ def tree_argv() -> list[str]:
     return argv
 
 
+def fetch_argv() -> list[str]:
+    """The locked download of the workspace graph's sources.
+
+    `cargo deny` runs `--offline`, so it reads crate manifests from the local
+    cache alone; this fetch fills that cache first, on every runner.
+    """
+    return ["cargo", "fetch", "--color", "never", "--locked"]
+
+
 def deny_argv(manifest: str, config: str) -> list[str]:
     """The `cargo deny` bans check of `manifest` under `config` (cargo-deny 0.20 layout)."""
     return [
@@ -334,6 +343,7 @@ def prove_scope(runner: Runner, root: str = REPO_ROOT) -> set[Crate]:
         config_path = os.path.join(tmp, "deny.toml")
         with open(config_path, "w", encoding="utf-8") as f:
             f.write(config)
+        _checked(runner(fetch_argv(), root), "cargo fetch", (0,))
         argv = deny_argv(os.path.join(root, "Cargo.toml"), config_path)
         result = _checked(runner(argv, tmp), "cargo deny check bans", (DENY_EXIT_BANS_FAILED,))
     banned = banned_crates(result.stderr)
