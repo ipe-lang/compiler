@@ -1,6 +1,135 @@
 use super::{
-    BTreeSet, BuiltinTag, CtorKey, CtorScheme, DResult, Diagnostic, Interner, Symbol, Ty, TyBounds,
+    BTreeSet, BuiltinTag, CtorKey, CtorScheme, DResult, Diagnostic, FieldTag, Interner, Symbol, Ty,
+    TyBounds,
 };
+
+/// Generates [`FieldSymbols`] from one `(FieldTag, field)` row per tag.
+///
+/// A row's interned text and its `get` arm come from the same row, so a tag
+/// can never pair with another tag's text; a tag with no row fails the
+/// exhaustive `get` match and a duplicate row is a duplicate field.
+macro_rules! field_symbols {
+    ($(($tag:ident, $field:ident)),+ $(,)?) => {
+        /// Interned record field names the type checker keys on, one per [`FieldTag`].
+        ///
+        /// Each name is spelled once, in [`FieldTag::text`]; rows are listed in
+        /// intern order, which fixes the `Symbol` order of record keys.
+        pub struct FieldSymbols {
+            $(
+                #[doc = concat!("The [`FieldTag::", stringify!($tag), "`] field name.")]
+                pub $field: Symbol,
+            )+
+        }
+
+        impl FieldSymbols {
+            /// Interns every row's [`FieldTag::text`].
+            ///
+            /// # Errors
+            /// Propagates the interner-capacity diagnostic.
+            pub fn new(interner: &mut Interner) -> DResult<Self> {
+                Ok(Self {
+                    $($field: interner.intern(FieldTag::$tag.text())?,)+
+                })
+            }
+
+            /// The interned field name of `tag`.
+            #[must_use]
+            pub const fn get(&self, tag: FieldTag) -> Symbol {
+                match tag {
+                    $(FieldTag::$tag => self.$field,)+
+                }
+            }
+        }
+    };
+}
+
+field_symbols! {
+    (HttpBody, http_f_body),
+    (HttpHeaders, http_f_headers),
+    (HttpStatus, http_f_status),
+    (ServerContentType, server_f_content_type),
+    (MigrationName, migration_f_name),
+    (MigrationSql, migration_f_sql),
+    (HttpMethod, http_f_method),
+    (HttpUrl, http_f_url),
+    (HttpTimeout, http_f_timeout),
+    (HttpRedirects, http_f_redirects),
+    (LayoutWrapperAttrs, lw_wrapper_attrs),
+    (LayoutRootAttrs, lw_root_attrs),
+    (AppInit, live_f_init),
+    (AppUpdate, live_f_update),
+    (AppView, live_f_view),
+    (AppSubscriptions, live_f_subscriptions),
+    (AppRoutes, live_f_routes),
+    (AppNotFound, live_f_not_found),
+    (TerminalKeyKind, tui_f_key_kind),
+    (TerminalKeyValue, tui_f_key_value),
+    (ButtonOnPress, btn_f_on_press),
+    (Label, btn_f_label),
+    (InputOnChange, input_f_on_change),
+    (InputText, input_f_text),
+    (InputPlaceholder, input_f_placeholder),
+    (InputChecked, input_f_checked),
+    (InputIcon, input_f_icon),
+    (InputSpellcheck, input_f_spellcheck),
+    (InputValue, input_f_value),
+    (InputMin, input_f_min),
+    (InputMax, input_f_max),
+    (InputStep, input_f_step),
+    (InputOptions, input_f_options),
+    (InputSelected, input_f_selected),
+    (CsvHeader, csv_f_header),
+    (CsvRows, csv_f_rows),
+    (CacheMaxEntries, cache_f_max_entries),
+    (CacheTtlMs, cache_f_ttl_ms),
+    (CacheMaxBytes, cache_f_max_bytes),
+    (CacheHits, cache_f_hits),
+    (CacheMisses, cache_f_misses),
+    (CacheEvictions, cache_f_evictions),
+    (WsUrl, ws_f_url),
+    (WsHeaders, ws_f_headers),
+    (WsTimeout, ws_f_timeout),
+    (WsPingInterval, ws_f_ping_interval),
+    (EmailFrom, email_f_from),
+    (EmailTo, email_f_to),
+    (EmailCc, email_f_cc),
+    (EmailBcc, email_f_bcc),
+    (EmailSubject, email_f_subject),
+    (EmailTextBody, email_f_text_body),
+    (EmailHtmlBody, email_f_html_body),
+    (EmailAttachments, email_f_attachments),
+    (EmailReplyTo, email_f_reply_to),
+    (EmailFilename, email_f_filename),
+    (EmailMimeType, email_f_mime_type),
+    (EmailContent, email_f_content),
+    (RetryBaseMs, retry_f_base_ms),
+    (RetryMaxAttempts, retry_f_max_attempts),
+    (RetryShouldRetry, retry_f_should_retry),
+    (RetryStrategy, retry_f_strategy),
+    (EdgeTop, edge_f_top),
+    (EdgeRight, edge_f_right),
+    (EdgeBottom, edge_f_bottom),
+    (EdgeLeft, edge_f_left),
+    (ShadowOffsetX, shadow_f_offset_x),
+    (ShadowOffsetY, shadow_f_offset_y),
+    (ShadowBlur, shadow_f_blur),
+    (ShadowSpread, shadow_f_spread),
+    (ShadowColor, shadow_f_color),
+    (ImageSrc, img_f_src),
+    (ImageDescription, img_f_description),
+    (ProcessCommand, process_f_command),
+    (ProcessArgs, process_f_args),
+    (ProcessCwd, process_f_cwd),
+    (ProcessEnv, process_f_env),
+    (ProcessExitCode, process_f_exit_code),
+    (ProcessStdout, process_f_stdout),
+    (ProcessStderr, process_f_stderr),
+    (ProcessCols, process_f_cols),
+    (ProcessRows, process_f_rows),
+    (ProcessOutput, process_f_output),
+    (PageTo, web_f_page_to),
+    (PageCurrent, web_f_page_current),
+}
 
 /// Interned symbols of every built-in type, constructor, and field name.
 pub struct Builtins {
@@ -82,28 +211,11 @@ pub struct Builtins {
     /// each use site instantiates them fresh through one shared map.
     pub tv_a: Symbol,
     pub tv_e: Symbol,
-    // ── Http field-name symbols ──────────────────────────────────────────────
-    // Pre-interned because `kernel_ty` takes `&self` (the interner is immutable
-    // at that point); these symbols give `Ty::Record` the correct BTreeMap keys
-    // for `HttpResponse` and `HttpRequest` so the emit prepass registers both
-    // record shapes.
-    /// `"body"` — shared by `HttpResponse` and `HttpRequest`.
-    pub http_f_body: Symbol,
-    /// `"headers"` — shared by `HttpResponse` (`Dict String String`) and
-    /// `HttpRequest` (`List (String, String)`).
-    pub http_f_headers: Symbol,
-    /// `"status"` — `HttpResponse` only.
-    pub http_f_status: Symbol,
-    /// `"method"` — `HttpRequest` only.
-    pub http_f_method: Symbol,
+    /// Interned record field names, one per [`FieldTag`].
+    pub fields: FieldSymbols,
+    // ── Http type symbols ────────────────────────────────────────────────────
     /// `"HttpMethod"` — the `Ipe.Http.HttpMethod` ADT type constructor.
     pub http_method: Symbol,
-    /// `"url"` — `HttpRequest` only.
-    pub http_f_url: Symbol,
-    /// `"timeout"` — `HttpRequest` only.
-    pub http_f_timeout: Symbol,
-    /// `"redirects"` — `HttpRequest` only.
-    pub http_f_redirects: Symbol,
     /// `"RedirectPolicy"` — the `Ipe.Http.RedirectPolicy` ADT type constructor.
     pub redirect_policy: Symbol,
     /// `"Duration"` — the `Ipe.Duration.Duration` opaque ADT type constructor.
@@ -115,12 +227,6 @@ pub struct Builtins {
     pub no_redirects: Symbol,
     /// `"FollowRedirects"` — `Int -> RedirectPolicy` constructor.
     pub follow_redirects: Symbol,
-    /// `"contentType"` — `Ipe.Http.Server.Response` record field (camelCase).
-    pub server_f_content_type: Symbol,
-    /// `"name"` — `Ipe.Db.Migration` record field.
-    pub migration_f_name: Symbol,
-    /// `"sql"` — `Ipe.Db.Migration` record field.
-    pub migration_f_sql: Symbol,
     // ── Db type symbols ──────────────────────────────────────────────────────
     /// `"Db"` — the opaque database connection pool type constructor.
     pub db: Symbol,
@@ -291,13 +397,6 @@ pub struct Builtins {
     /// `Ty::Var(u32::MAX)` exit-0 hole) rather than leaning on the lowerer's
     /// free-`Ty::Var` → `Json` fallback.
     pub json_value: Symbol,
-    /// `"wrapperAttrs"` — field name in the `Ui.layoutWith` config record.
-    /// Pre-interned because `kernel_ty` builds a `Ty::Record` for the first
-    /// argument of `Ui.layoutWith : { wrapperAttrs, rootAttrs } -> ...` and
-    /// needs the key as a `Symbol`.
-    pub lw_wrapper_attrs: Symbol,
-    /// `"rootAttrs"` — the second field in the `Ui.layoutWith` config record.
-    pub lw_root_attrs: Symbol,
     // ── Ipe.Web / Ipe.Web opaque type constructor symbols ───────────────────
     /// `"WebReq"` — opaque request threaded through `Web.tea`'s `init`.
     pub web_req: Symbol,
@@ -306,39 +405,7 @@ pub struct Builtins {
     pub session_handle: Symbol,
     /// `"WebRoute"` — opaque route descriptor returned by `Web.route`.
     pub live_route_con: Symbol,
-    // ── Web cfg record field name symbols ───────────────────────────────────────
-    /// `"init"` — the init field of the `Web.tea` config record.
-    pub live_f_init: Symbol,
-    /// `"update"` — the update field of the `Web.tea` config record.
-    pub live_f_update: Symbol,
-    /// `"view"` — the view field of the `Web.tea` config record.
-    pub live_f_view: Symbol,
-    /// `"subscriptions"` — the subscriptions field of the `Web.tea` config record.
-    pub live_f_subscriptions: Symbol,
-    /// `"routes"` — the routes field of the `Web.appRouted` config record.
-    /// Reserved for a future split scheme between `app` and `appRouted`.
-    #[allow(dead_code)]
-    pub live_f_routes: Symbol,
-    /// `"notFound"` — the notFound field of the `Web.appRouted` config record.
-    /// Reserved for a future split scheme between `app` and `appRouted`.
-    #[allow(dead_code)]
-    pub live_f_not_found: Symbol,
-    // ── Tui.Sub.onKey `KeyEvent` record field name symbols ────────────────────
-    /// `"kind"` — a field of the pinned `Tui.Sub.onKey` `KeyEvent` record.
-    ///
-    /// The backend bridges the record handler onto the runtime's flat
-    /// `Fn(String, String) -> Msg` key handler.
-    pub tui_f_key_kind: Symbol,
-    /// `"value"` — a field of the pinned `Tui.Sub.onKey` `KeyEvent` record.
-    pub tui_f_key_value: Symbol,
-    // ── Ui.button cfg record field name symbols ───────────────────────────────
-    /// `"onPress"` — the onPress field of the `Ui.button` config record.
-    /// Typed as `Maybe msg`.
-    pub btn_f_on_press: Symbol,
-    /// `"label"` — the label field of the `Ui.button` config record.
-    /// Typed as `Element msg`.
-    pub btn_f_label: Symbol,
-    // ── Ipe.Ui.Input type constructor + cfg field symbols ─────────────
+    // ── Ipe.Ui.Input type constructor symbols ─────────────────────────
     /// `"Label"` — the `Label msg` type constructor from `Ipe.Ui.Input`.
     /// Lowered to `IrType::Ui { ctor: UiCtor::Label, msg }`.
     pub input_label_con: Symbol,
@@ -348,30 +415,6 @@ pub struct Builtins {
     /// `"RadioOption"` — the `RadioOption msg` type constructor from `Ipe.Ui.Input`.
     /// Lowered to `IrType::Ui { ctor: UiCtor::RadioOption, msg }`.
     pub input_radio_option_con: Symbol,
-    /// `"onChange"` — the onChange field of Input text/multiline/password cfg records.
-    pub input_f_on_change: Symbol,
-    /// `"text"` — the text field of text/multiline/email/username/search/password cfg records.
-    pub input_f_text: Symbol,
-    /// `"placeholder"` — the placeholder field of text-variant cfg records.
-    pub input_f_placeholder: Symbol,
-    /// `"checked"` — the checked field of the checkbox cfg record.
-    pub input_f_checked: Symbol,
-    /// `"icon"` — the icon field of the checkbox cfg record.
-    pub input_f_icon: Symbol,
-    /// `"spellcheck"` — the spellcheck field of the multiline cfg record.
-    pub input_f_spellcheck: Symbol,
-    /// `"value"` — the value field of the slider cfg record (current value as String).
-    pub input_f_value: Symbol,
-    /// `"min"` — the min field of the slider cfg record.
-    pub input_f_min: Symbol,
-    /// `"max"` — the max field of the slider cfg record.
-    pub input_f_max: Symbol,
-    /// `"step"` — the step field of the slider cfg record.
-    pub input_f_step: Symbol,
-    /// `"options"` — the options field of the radio/radioRow cfg record.
-    pub input_f_options: Symbol,
-    /// `"selected"` — the selected field of the radio/radioRow cfg record.
-    pub input_f_selected: Symbol,
     // ── Ipe.Http.Stream opaque StreamId type constructor ─────────────────
     /// `"StreamId"` — the opaque stream identifier type constructor from
     /// `Ipe.Http.Stream`. Backed by `ipe_runtime::http_stream::IpeStreamId`.
@@ -387,61 +430,6 @@ pub struct Builtins {
     pub eq: Symbol,
     /// `"GT"` — the GT constructor of the Order ADT (greater-than).
     pub gt: Symbol,
-    // ── Task.RetryPolicy field name symbols (retry surface) ───────────────────
-    /// `"maxAttempts"` — maximum number of attempts in `RetryPolicy e`.
-    pub retry_f_max_attempts: Symbol,
-    /// `"baseMs"` — base delay in milliseconds in `RetryPolicy e`.
-    pub retry_f_base_ms: Symbol,
-    /// `"shouldRetry"` — predicate field `e -> Bool` in `RetryPolicy e`.
-    pub retry_f_should_retry: Symbol,
-    /// `"strategy"` — the `BackoffStrategy` ADT field in `RetryPolicy e`.
-    pub retry_f_strategy: Symbol,
-    // ── Border/padding edge field name symbols (Border.widthEach) ────────────
-    /// `"top"` — top edge field of `Border.widthEach { top, right, bottom, left }`.
-    pub edge_f_top: Symbol,
-    /// `"right"` — right edge field.
-    pub edge_f_right: Symbol,
-    /// `"bottom"` — bottom edge field.
-    pub edge_f_bottom: Symbol,
-    /// `"left"` — left edge field.
-    pub edge_f_left: Symbol,
-    // ── Border.shadow record field name symbols ──────────────────────────────
-    /// `"offsetX"` — horizontal offset field of `Border.shadow { offsetX, … }`.
-    pub shadow_f_offset_x: Symbol,
-    /// `"offsetY"` — vertical offset field.
-    pub shadow_f_offset_y: Symbol,
-    /// `"blur"` — blur radius field.
-    pub shadow_f_blur: Symbol,
-    /// `"spread"` — spread field.
-    pub shadow_f_spread: Symbol,
-    /// `"color"` — shadow colour field.
-    pub shadow_f_color: Symbol,
-    // ── Ui.image record field name symbols ──────────────────────────────
-    /// `"src"` — image source URL field of `Ui.image _ { src, description }`.
-    pub img_f_src: Symbol,
-    /// `"description"` — alt-text field of `Ui.image _ { src, description }`.
-    pub img_f_description: Symbol,
-    // ── Process.runWith input / output record field name symbols ──────────
-    /// `"command"` — `Process.runWith` input: executable name or path.
-    pub process_f_command: Symbol,
-    /// `"args"` — `Process.runWith` input: argument vector.
-    pub process_f_args: Symbol,
-    /// `"cwd"` — `Process.runWith` input: optional per-child working directory.
-    pub process_f_cwd: Symbol,
-    /// `"env"` — `Process.runWith` input: per-child env overrides.
-    pub process_f_env: Symbol,
-    /// `"exitCode"` — `Process.runWith` output: exit status code.
-    pub process_f_exit_code: Symbol,
-    /// `"stdout"` — `Process.runWith` output: captured standard output.
-    pub process_f_stdout: Symbol,
-    /// `"stderr"` — `Process.runWith` output: captured standard error.
-    pub process_f_stderr: Symbol,
-    /// `"cols"` — `Process.runInPty` input: pty window width in columns.
-    pub process_f_cols: Symbol,
-    /// `"rows"` — `Process.runInPty` input: pty window height in rows.
-    pub process_f_rows: Symbol,
-    /// `"output"` — `Process.runInPty` output: combined pty-master stream.
-    pub process_f_output: Symbol,
     // ── JWT builder opaque type constructor symbols (D-00) ────────────────────
     /// `"Claims"` — opaque JWT claims builder object.  Backed at runtime by
     /// `serde_json::Value` (a JSON object accumulator).  Used as the input /
@@ -459,56 +447,11 @@ pub struct Builtins {
     /// `rust_decimal::Decimal`).  Zero type arguments.  Lowered to
     /// `IrType::Decimal` by `ir_type_from_ty` / `ir_type_from_canon`.
     pub decimal: Symbol,
-    // ── Ipe.Csv record field symbols ─────────────────────────────────────
-    /// `"header"` — `Ipe.Csv.Csv.header : List String`.
-    pub csv_f_header: Symbol,
-    /// `"rows"` — `Ipe.Csv.Csv.rows : List (List String)`.
-    pub csv_f_rows: Symbol,
-    // ── Ipe.Cache record field symbols ───────────────────────────────────
-    /// `"maxEntries"` — `Ipe.Cache.CacheCfg.maxEntries : Int`.
-    pub cache_f_max_entries: Symbol,
-    /// `"ttlMs"` — `Ipe.Cache.CacheCfg.ttlMs : Int`.
-    pub cache_f_ttl_ms: Symbol,
-    /// `"maxBytes"` — `Ipe.Cache.CacheCfg.maxBytes : Int`.
-    pub cache_f_max_bytes: Symbol,
-    /// `"hits"` — `Ipe.Cache.stats` return field `hits : Int`.
-    pub cache_f_hits: Symbol,
-    /// `"misses"` — `Ipe.Cache.stats` return field `misses : Int`.
-    pub cache_f_misses: Symbol,
-    /// `"evictions"` — `Ipe.Cache.stats` return field `evictions : Int`.
-    pub cache_f_evictions: Symbol,
-    // ── Ipe.WebSocket.WebSocketCfg record field symbols ─────────────
-    /// `"url"` — `Ipe.WebSocket.WebSocketCfg.url : String`.
-    pub ws_f_url: Symbol,
-    /// `"headers"` — `WebSocketCfg.headers : List (String, String)`.
-    pub ws_f_headers: Symbol,
-    /// `"timeout"` — `WebSocketCfg.timeout : Int`.
-    pub ws_f_timeout: Symbol,
-    /// `"pingInterval"` — `WebSocketCfg.pingInterval : Int`.
-    pub ws_f_ping_interval: Symbol,
-    // ── Ipe.Email type + record field symbols ────────────────────────────
+    // ── Ipe.Email type symbols ───────────────────────────────────────────
     /// `"EmailProvider"` — the opaque `Ipe.Email.EmailProvider` ADT constructor
     /// (`Resend`/`Ses`/`SendGrid`/`Smtp`).  Backed by
     /// `ipe_runtime::email::EmailProvider`; lowered to `IrType::EmailProvider`.
     pub email_provider: Symbol,
-    /// `EmailMessage` record field names (`ipe_runtime::email::EmailMessage`).
-    pub email_f_from: Symbol,
-    pub email_f_to: Symbol,
-    pub email_f_cc: Symbol,
-    pub email_f_bcc: Symbol,
-    pub email_f_subject: Symbol,
-    pub email_f_text_body: Symbol,
-    pub email_f_html_body: Symbol,
-    pub email_f_attachments: Symbol,
-    pub email_f_reply_to: Symbol,
-    /// `Attachment` record field names (`ipe_runtime::email::EmailAttachment`)
-    /// — the `attachments` element shape carried inside `EmailMessage`.
-    pub email_f_filename: Symbol,
-    pub email_f_mime_type: Symbol,
-    pub email_f_content: Symbol,
-    // `SesConfig` / `SmtpConfig` record shapes are folded by the lowerer via
-    // field-name string constants (`ipe_lower`), not through a kernel scheme, so
-    // no interned field symbols for them are needed here.
     // ── Ipe.Crypto typed-key newtypes ──────────────────────────────────────
     /// `"Key"` — opaque role-typed crypto key (`ipe_runtime::crypto::Key`).
     /// The ONLY constructor is `Key.fromString`/`Key.fromBytes`; no implicit
@@ -851,18 +794,9 @@ impl Builtins {
             errorinfo: interner.intern("ErrorInfo")?,
             tv_a: interner.intern("a")?,
             tv_e: interner.intern("e")?,
-            // Http field names (camelCase, as they appear in Ipê source).
-            http_f_body: interner.intern("body")?,
-            http_f_headers: interner.intern("headers")?,
-            http_f_status: interner.intern("status")?,
-            server_f_content_type: interner.intern("contentType")?,
-            migration_f_name: interner.intern("name")?,
-            migration_f_sql: interner.intern("sql")?,
-            http_f_method: interner.intern("method")?,
+            fields: FieldSymbols::new(interner)?,
+            // Http type symbols.
             http_method: interner.intern("HttpMethod")?,
-            http_f_url: interner.intern("url")?,
-            http_f_timeout: interner.intern("timeout")?,
-            http_f_redirects: interner.intern("redirects")?,
             redirect_policy: interner.intern("RedirectPolicy")?,
             duration: interner.intern("Duration")?,
             no_redirects: interner.intern("NoRedirects")?,
@@ -924,109 +858,23 @@ impl Builtins {
             description: interner.intern("Description")?,
             pseudo_class: interner.intern("PseudoClass")?,
             json_value: interner.intern("Value")?,
-            lw_wrapper_attrs: interner.intern("wrapperAttrs")?,
-            lw_root_attrs: interner.intern("rootAttrs")?,
-            // Ipe.Web / Ipe.Web opaque types + cfg field names.
+            // Ipe.Web opaque types.
             web_req: interner.intern("WebReq")?,
             session_handle: interner.intern("SessionHandle")?,
             live_route_con: interner.intern("WebRoute")?,
-            live_f_init: interner.intern("init")?,
-            live_f_update: interner.intern("update")?,
-            live_f_view: interner.intern("view")?,
-            live_f_subscriptions: interner.intern("subscriptions")?,
-            live_f_routes: interner.intern("routes")?,
-            live_f_not_found: interner.intern("notFound")?,
-            // Tui.Sub.onKey `KeyEvent` field names.
-            tui_f_key_kind: interner.intern("kind")?,
-            tui_f_key_value: interner.intern("value")?,
-            // Ui.button cfg field names.
-            btn_f_on_press: interner.intern("onPress")?,
-            btn_f_label: interner.intern("label")?,
-            // Ipe.Ui.Input type constructors + cfg field names.
+            // Ipe.Ui.Input type constructors.
             input_label_con: interner.intern("Label")?,
             input_placeholder_con: interner.intern("Placeholder")?,
             input_radio_option_con: interner.intern("RadioOption")?,
-            input_f_on_change: interner.intern("onChange")?,
-            input_f_text: interner.intern("text")?,
-            input_f_placeholder: interner.intern("placeholder")?,
-            input_f_checked: interner.intern("checked")?,
-            input_f_icon: interner.intern("icon")?,
-            input_f_spellcheck: interner.intern("spellcheck")?,
-            // Ipe.Ui.Input.slider cfg fields.
-            input_f_value: interner.intern("value")?,
-            input_f_min: interner.intern("min")?,
-            input_f_max: interner.intern("max")?,
-            input_f_step: interner.intern("step")?,
-            // Ipe.Ui.Input.radio / radioRow cfg fields.
-            input_f_options: interner.intern("options")?,
-            input_f_selected: interner.intern("selected")?,
             // Ipe.Http.Stream: StreamId opaque handle type.
             stream_id: interner.intern("StreamId")?,
-            csv_f_header: interner.intern("header")?,
-            csv_f_rows: interner.intern("rows")?,
-            // ── Ipe.Cache record field symbols ──────────────────────────
-            cache_f_max_entries: interner.intern("maxEntries")?,
-            cache_f_ttl_ms: interner.intern("ttlMs")?,
-            cache_f_max_bytes: interner.intern("maxBytes")?,
-            cache_f_hits: interner.intern("hits")?,
-            cache_f_misses: interner.intern("misses")?,
-            cache_f_evictions: interner.intern("evictions")?,
-            // ── Ipe.WebSocket.WebSocketCfg record field symbols ────
-            ws_f_url: interner.intern("url")?,
-            ws_f_headers: interner.intern("headers")?,
-            ws_f_timeout: interner.intern("timeout")?,
-            ws_f_ping_interval: interner.intern("pingInterval")?,
-            // ── Ipe.Email type + record field symbols ───────────────────
+            // ── Ipe.Email type symbols ───────────────────
             email_provider: interner.intern("EmailProvider")?,
-            email_f_from: interner.intern("from")?,
-            email_f_to: interner.intern("to")?,
-            email_f_cc: interner.intern("cc")?,
-            email_f_bcc: interner.intern("bcc")?,
-            email_f_subject: interner.intern("subject")?,
-            email_f_text_body: interner.intern("textBody")?,
-            email_f_html_body: interner.intern("htmlBody")?,
-            email_f_attachments: interner.intern("attachments")?,
-            email_f_reply_to: interner.intern("replyTo")?,
-            email_f_filename: interner.intern("filename")?,
-            email_f_mime_type: interner.intern("mimeType")?,
-            email_f_content: interner.intern("content")?,
             // ── Order ADT ─────────────────────────────────────────────
             order: interner.intern("Order")?,
             lt: interner.intern("LT")?,
             eq: interner.intern("EQ")?,
             gt: interner.intern("GT")?,
-            // ── Task.RetryPolicy field names (retry surface) ─────────────────────
-            // Interned in BTreeMap / alphabetical order so the TyShape record
-            // field slice order matches the symbol-key sort order.
-            retry_f_base_ms: interner.intern("baseMs")?,
-            retry_f_max_attempts: interner.intern("maxAttempts")?,
-            retry_f_should_retry: interner.intern("shouldRetry")?,
-            retry_f_strategy: interner.intern("strategy")?,
-            // ── Border/padding edge field names (Border.widthEach) ───────────────
-            edge_f_top: interner.intern("top")?,
-            edge_f_right: interner.intern("right")?,
-            edge_f_bottom: interner.intern("bottom")?,
-            edge_f_left: interner.intern("left")?,
-            // ── Border.shadow record field names ─────────────────────────────────
-            shadow_f_offset_x: interner.intern("offsetX")?,
-            shadow_f_offset_y: interner.intern("offsetY")?,
-            shadow_f_blur: interner.intern("blur")?,
-            shadow_f_spread: interner.intern("spread")?,
-            shadow_f_color: interner.intern("color")?,
-            // ── Ui.image record field names ────────────────────────────────
-            img_f_src: interner.intern("src")?,
-            img_f_description: interner.intern("description")?,
-            // ── Process.runWith input / output record field names ─────────
-            process_f_command: interner.intern("command")?,
-            process_f_args: interner.intern("args")?,
-            process_f_cwd: interner.intern("cwd")?,
-            process_f_env: interner.intern("env")?,
-            process_f_exit_code: interner.intern("exitCode")?,
-            process_f_stdout: interner.intern("stdout")?,
-            process_f_stderr: interner.intern("stderr")?,
-            process_f_cols: interner.intern("cols")?,
-            process_f_rows: interner.intern("rows")?,
-            process_f_output: interner.intern("output")?,
             // ── JWT builder opaque type constructor symbols (D-00) ──────────────
             jwt_claims: interner.intern("Claims")?,
             jwt_algorithm: interner.intern("Algorithm")?,

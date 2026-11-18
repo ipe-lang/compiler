@@ -2785,14 +2785,12 @@ mod tests {
     /// Forward direction (registry → canon): for every
     /// [`ipe_kernels::StdlibKernel`] variant in `ALL`, if the variant's
     /// declared qualifier IS present in `Env.kernel_members`, then the variant's
-    /// declared name must ALSO be present in that qualifier's member map.  A
-    /// failure here means `QUALIFIERS` in `env.rs` diverged from
-    /// `StdlibKernel::ALL + decl()` — the anti-drift invariant is broken.
+    /// declared name must ALSO be present in that qualifier's member map,
+    /// unless the variant is in [`crate::env::SURFACE_HIDDEN_KERNELS`], in
+    /// which case it must be ABSENT. A failure here means the derivation in
+    /// `install_prelude_qualifiers` diverged from `StdlibKernel::ALL + decl()`.
     ///
-    /// The forward check is intentionally one-directional: names present in
-    /// `QUALIFIERS` but absent from the registry (e.g. `Basics.*` helper
-    /// aliases) are NOT an error.  Qualifiers absent from the pool entirely
-    /// (e.g. `"Log"`, `"PubSub"`) are skipped automatically.
+    /// Qualifiers absent from the pool entirely (e.g. `"Log"`) are skipped.
     ///
     /// Reverse direction (canon → registry, "G1"): every
     /// `VarHome::Kernel(sk, ..)` entry is checked for exact kernel propagation
@@ -2803,7 +2801,7 @@ mod tests {
     /// allowlist so it cannot drift.
     ///
     /// **Scope note (this crate has no dependency on `ipe_types`):** this
-    /// test proves `QUALIFIERS` (env.rs) stays consistent with
+    /// test proves `KERNEL_QUALIFIERS` (env.rs) stays consistent with
     /// `StdlibKernel::ALL` — it does NOT re-verify the type-scheme table's
     /// own fail-closed behaviour. That guarantee (`ipe`'s exit-0-then-
     /// cargo-fail class `PRINCIPLES.md` calls out: a kernel the resolver
@@ -2825,43 +2823,6 @@ mod tests {
         let env = Env::initial(vec![], &mut interner)
             .expect("Env::initial must not fail in the tripwire test");
 
-        // Kernels whose CANONICAL (qualifier, member) key is retained for
-        // `Kernel.kernel` alias resolution (via `stdlib_index`) but whose SURFACE
-        // relocated OUT of the native qualifier into a compiled-source
-        // `Ipe.<M>.Unsafe` escape-hatch submodule. The canonical qualifier stays
-        // (so `Kernel.kernel "Db_unsafeExecRaw"` still splits to `("Db", …)` and
-        // resolves the same kernel), but the member is intentionally ABSENT from
-        // `kernel_members[qualifier]` so it no longer resolves off a plain import of
-        // the native module. Verified positively by the `Ipe.Db.Unsafe`
-        // disclosure + resolution tests; this set exempts them from the
-        // surface-parity tripwire below.
-        let relocated_to_unsafe: std::collections::BTreeSet<(&str, &str)> = [
-            ("Db", "unsafeExecRaw"),
-            ("Db", "unsafeQuery"),
-            ("Db", "unsafeGetString"),
-            ("Db", "unsafeGetInt"),
-            ("Db", "unsafeGetBool"),
-            ("Db", "unsafeGetField"),
-            // The external-connection raw write hatch: canonical `("Db", …)` key
-            // for the `Kernel.kernel` alias, surfaced only through `Ipe.Db.Unsafe`.
-            ("Db", "unsafeExecRawOn"),
-            // The un-validated anti-`Sql.column`: canonical `("Sql", …)` key for
-            // the alias, surfaced only through `Ipe.Db.Unsafe.unsafeFragment`.
-            ("Sql", "unsafeFragment"),
-            // The blunt secret un-parse: canonical `("Secret", "reveal")` key
-            // retained for the `Kernel.kernel "Secret_reveal"` alias, surfaced only
-            // through `Ipe.Secret.Unsafe.unsafeReveal`. The scoped `Secret.use`
-            // stays on the native `Secret` surface (capability-neutral).
-            ("Secret", "reveal"),
-            // The policy-checked secured writes: canonical `("Db", …)` keys for
-            // the `Kernel.kernel` aliases `Ipe.Db.Store` keeps private to
-            // `insertAs` / `updateAs`; no module surfaces them.
-            ("Db", "insertFieldsChecked"),
-            ("Db", "updateWhereChecked"),
-        ]
-        .into_iter()
-        .collect();
-
         for sk in StdlibKernel::ALL {
             let decl = sk.decl();
 
@@ -2870,12 +2831,7 @@ mod tests {
                 continue;
             }
 
-            // Skip members relocated to a compiled-source `.Unsafe` submodule:
-            // their canonical key stays for alias resolution but the surface
-            // deliberately left the native qualifier (see the set above).
-            if relocated_to_unsafe.contains(&(decl.qualifier, decl.name)) {
-                continue;
-            }
+            let hidden = crate::env::SURFACE_HIDDEN_KERNELS.contains(sk);
 
             // Intern qualifier + name.  If they were already interned by
             // install_prelude_qualifiers we get the same symbol; if not, the
@@ -2894,23 +2850,24 @@ mod tests {
                 continue;
             };
 
-            // The qualifier IS registered — so the name must also be present.
-            assert!(
+            // The qualifier IS registered — so a visible name must be present
+            // and a hidden one absent.
+            assert_eq!(
                 members.contains_key(&name_sym),
-                "StdlibKernel::{sk:?} declares ({:?}, {:?}) but {:?} is missing \
-                 from env.kernel_members[{:?}]; update QUALIFIERS in env.rs to match \
-                 StdlibKernel::decl()",
+                !hidden,
+                "StdlibKernel::{sk:?} declares ({:?}, {:?}); env.kernel_members[{:?}] \
+                 must hold it exactly when it is not in SURFACE_HIDDEN_KERNELS",
                 decl.qualifier,
-                decl.name,
                 decl.name,
                 decl.qualifier,
             );
 
-            // Also verify the stdlib_index was populated for this entry.
+            // The stdlib_index keeps every entry, hidden or not, for the
+            // `Kernel.kernel` alias path.
             assert!(
                 env.stdlib_index.contains_key(&(qual_sym, name_sym)),
-                "StdlibKernel::{sk:?} is in kernel_members but missing from stdlib_index; \
-                 the Phase-A registry-population loop in install_prelude_qualifiers \
+                "StdlibKernel::{sk:?} is missing from stdlib_index; the \
+                 registry-population loop in install_prelude_qualifiers \
                  must have skipped it",
             );
         }
@@ -5325,7 +5282,7 @@ mod tests {
 
     /// `import Ipe.Ui.Lazy as Lazy` followed by a bare `Lazy.lazy` call must
     /// resolve without a name error.  If the qualifier "Lazy" were
-    /// absent from `STDLIB_MODULE_QUALIFIERS` / `QUALIFIERS`, any reference
+    /// absent from `STDLIB_MODULE_QUALIFIERS` / `KERNEL_QUALIFIERS`, any reference
     /// to `Lazy.lazy` would fire `NameError::ValueNotFound`.
     #[test]
     fn lazy_module_lazy_resolves_without_name_error() {

@@ -30094,7 +30094,10 @@ impl<'a> Lowerer<'a> {
                 // web::style_inject::build_mq (see ui_media_query_).
                 | KernelFn::UiMediaQuery
                 // `Terminal.Color.rgb : Int -> Int -> Int -> Color`
-                | KernelFn::TermColorRgb,
+                | KernelFn::TermColorRgb
+                // `Web.pageLink : List (WebRoute page) -> List (Attribute msg)
+                //     -> { to : page, current : page, label : Element msg } -> Element msg`
+                | KernelFn::WebPageLink,
             ) => Ok(3),
             // Arity 4: `Ui.rgba r g b a`, `Ui.animate name shorthand kf respect`.
             Callee::Kernel(
@@ -32403,6 +32406,7 @@ impl<'a> Lowerer<'a> {
                     ("Web", "embed") => Ok(Callee::Kernel(KernelFn::WebEmbed)),
                     ("Web", "appRouted") => Ok(Callee::Kernel(KernelFn::WebAppRouted)),
                     ("Web", "route") => Ok(Callee::Kernel(KernelFn::WebRoute)),
+                    ("Web", "pageLink") => Ok(Callee::Kernel(KernelFn::WebPageLink)),
                     // `Ipe.Html.renderStatic` — shape-neutral static-render bridge.
                     ("Html", "renderStatic") => Ok(Callee::Kernel(KernelFn::WebRenderStatic)),
                     // ── Ipe.Tui / Ipe.Cli app-entry kernels ───────────────
