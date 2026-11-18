@@ -4,10 +4,12 @@ description: >-
   27 refuses any other). Each of three attempts first completes an install an
   earlier cap interrupted mid-unpack, then updates and installs with apt's own
   download retries; every command is capped at six minutes and at what is left
-  of one fifteen-minute budget for the whole install. The first attempt uses
-  the runner's own Ubuntu mirror; each failed attempt repoints every Ubuntu
-  archive and security source to the next independent mirror
-  (archive.ubuntu.com, then mirrors.edge.kernel.org) before the next. Archives
+  of one fifteen-minute budget for the whole install, and is killed thirty
+  seconds after its cap if it ignores the stop. The first attempt uses the
+  runner's own Ubuntu mirror; each failed attempt repoints every Ubuntu archive
+  and security source to the next independent mirror (archive.ubuntu.com, then
+  mirrors.edge.kernel.org) before the next, names each source file it
+  repointed, and warns when it found none to repoint. Archives
   an attempt finished downloading stay in the archive directory, so a later
   attempt fetches only what is still missing. When every attempt fails the
   step fails, and so does a spent budget.
@@ -73,16 +75,22 @@ runs:
         fi
         apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
         mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)
+        source_host='://([A-Za-z0-9.-]*\.)?(archive|security)\.ubuntu\.com/'
         deadline=$((SECONDS + 900))
         for attempt in 1 2 3; do
           mirror="${mirrors[attempt - 1]}"
           if [[ -n "$mirror" ]]; then
-            echo "apt attempt $attempt repoints the Ubuntu sources to $mirror"
+            repointed=0
             for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-              if [[ -f "$list" ]]; then
-                sudo sed -i -E "s#://([A-Za-z0-9.-]*\.)?(archive|security)\.ubuntu\.com/#://${mirror}/#g" "$list"
+              if [[ -f "$list" ]] && grep -qE "$source_host" "$list"; then
+                sudo sed -i -E "s#${source_host}#://${mirror}/#g" "$list"
+                echo "apt attempt $attempt repoints $list to $mirror"
+                repointed=$((repointed + 1))
               fi
             done
+            if ((repointed == 0)); then
+              echo "::warning::apt-install: attempt $attempt found no Ubuntu archive or security source to repoint, so it retries the same mirrors"
+            fi
           fi
           failed=""
           for stage in configure update install; do
@@ -95,9 +103,9 @@ runs:
               left=360
             fi
             case "$stage" in
-              configure) sudo timeout "$left" dpkg --configure -a || failed="$stage" ;;
-              update) sudo timeout "$left" apt-get "${apt_opts[@]}" update || failed="$stage" ;;
-              install) sudo timeout "$left" apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}" || failed="$stage" ;;
+              configure) sudo timeout -k 30 "$left" dpkg --configure -a || failed="$stage" ;;
+              update) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" update || failed="$stage" ;;
+              install) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}" || failed="$stage" ;;
             esac
             if [[ -n "$failed" ]]; then
               break

@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -5890,27 +5891,70 @@ class TestAptOnePath(unittest.TestCase):
 
 class TestAptInstallScript(unittest.TestCase):
     """The apt action's own `run` text, executed with `sudo` stubbed (an apt
-    or dpkg command exits `rc`, the mirror edit succeeds): it refuses every
-    input it cannot pass to apt as written, repoints each failed attempt to
-    the next mirror, and fails when every attempt fails."""
+    or dpkg command exits `rc`; the mirror edit runs for real on source files
+    under a scratch `/etc/apt`): it refuses every input it cannot pass to apt
+    as written, repoints each failed attempt to the next mirror and names each
+    file it repointed, warns when an attempt has nothing to repoint, kills a
+    command that ignores its cap's stop, and fails when every attempt fails."""
 
     _OPTS = "-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+    _CAP = "timeout -k 30 360"
+    # A runner's mirror list and deb822 sources, as the Ubuntu runner images
+    # ship them (the mirror host varies with the provider).
+    _SOURCES = {
+        "apt-mirrors.txt": "http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\n",
+        "sources.list.d/ubuntu.sources": "Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\n",
+    }
 
-    def run_script(self, packages: str, archives: str = "", recommends: str = "false", rc: int = 0, lc_all: str = "en_US.UTF-8") -> tuple[int, list[str]]:
+    def run_script(
+        self,
+        packages: str,
+        archives: str = "",
+        recommends: str = "false",
+        rc: int = 0,
+        lc_all: str = "en_US.UTF-8",
+        sources: dict[str, str] | None = None,
+        hang: bool = False,
+        script: str | None = None,
+    ) -> tuple[int, list[str]]:
         """Exit status and recorded `sudo` argv lines; `{tmp}` in `archives`
-        is a writable scratch directory."""
-        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
-        script = doc["runs"]["steps"][0]["run"]
+        is a writable scratch directory. `/etc/apt/` in the script reads a
+        scratch directory holding `sources`, so the host's own apt sources are
+        never read or edited. `hang` runs each capped command, its durations
+        cut to one second, as a process that ignores the stop signal."""
+        if script is None:
+            doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+            script = doc["runs"]["steps"][0]["run"]
         with tempfile.TemporaryDirectory() as tmp:
+            etc = os.path.join(tmp, "etc", "apt")
+            os.makedirs(os.path.join(etc, "sources.list.d"))
+            for name, text in (sources or {}).items():
+                with open(os.path.join(etc, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            self.etc = etc
+            script = script.replace("/etc/apt/", etc + "/")
             log = os.path.join(tmp, "sudo.log")
             stub = os.path.join(tmp, "sudo")
             with open(stub, "w", encoding="utf-8") as f:
-                f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SUDO_LOG"\n[ "$1" = timeout ] || exit 0\nexit "$SUDO_RC"\n')
+                f.write(
+                    "#!/bin/bash\n"
+                    'printf \'%s\\n\' "$*" >> "$SUDO_LOG"\n'
+                    'if [ "$1" = sed ]; then exec "$@"; fi\n'
+                    '[ "$1" = timeout ] || exit 0\n'
+                    'if [ -n "$SUDO_HANG" ]; then\n'
+                    "  shift\n"
+                    "  pre=()\n"
+                    '  while [[ "$1" == -* ]]; do pre+=("$1" 1); shift 2; done\n'
+                    "  exec timeout \"${pre[@]}\" 1 bash -c 'trap \"\" TERM; sleep 20'\n"
+                    "fi\n"
+                    'exit "$SUDO_RC"\n'
+                )
             os.chmod(stub, 0o755)
             env = {
                 "PATH": tmp + os.pathsep + os.environ.get("PATH", ""),
                 "SUDO_LOG": log,
                 "SUDO_RC": str(rc),
+                "SUDO_HANG": "1" if hang else "",
                 "LC_ALL": lc_all,
                 "APT_PACKAGES": packages,
                 "APT_ARCHIVES": archives.replace("{tmp}", tmp),
@@ -5918,6 +5962,10 @@ class TestAptInstallScript(unittest.TestCase):
             }
             done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
             self.stdout, self.stderr = done.stdout, done.stderr
+            self.edited = {}
+            for name in (sources or {}):
+                with open(os.path.join(etc, name), encoding="utf-8") as f:
+                    self.edited[name] = f.read()
             calls = open(log, encoding="utf-8").read().splitlines() if os.path.exists(log) else []
         return done.returncode, calls
 
@@ -5928,9 +5976,9 @@ class TestAptInstallScript(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "timeout 360 dpkg --configure -a",
-                f"timeout 360 apt-get {self._OPTS} update",
-                f"timeout 360 apt-get {self._OPTS} -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
+                f"{self._CAP} dpkg --configure -a",
+                f"{self._CAP} apt-get {self._OPTS} update",
+                f"{self._CAP} apt-get {self._OPTS} -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
             ],
         )
 
@@ -5960,19 +6008,59 @@ class TestAptInstallScript(unittest.TestCase):
     def test_every_attempt_failing_fails(self) -> None:
         code, calls = self.run_script("bubblewrap", rc=1)
         self.assertNotEqual(code, 0)
-        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], ["timeout 360 dpkg --configure -a"] * 3)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], [f"{self._CAP} dpkg --configure -a"] * 3)
 
     def test_each_failed_attempt_repoints_to_the_next_mirror(self) -> None:
-        code, _calls = self.run_script("bubblewrap", rc=1)
+        code, _calls = self.run_script("bubblewrap", rc=1, sources=self._SOURCES)
         self.assertNotEqual(code, 0)
+        mirrors = f"{self.etc}/apt-mirrors.txt"
+        deb822 = f"{self.etc}/sources.list.d/ubuntu.sources"
         self.assertEqual(
             [line for line in self.stdout.splitlines() if "repoints" in line],
             [
-                "apt attempt 2 repoints the Ubuntu sources to archive.ubuntu.com",
-                "apt attempt 3 repoints the Ubuntu sources to mirrors.edge.kernel.org",
+                f"apt attempt 2 repoints {mirrors} to archive.ubuntu.com",
+                f"apt attempt 2 repoints {deb822} to archive.ubuntu.com",
+                f"apt attempt 3 repoints {mirrors} to mirrors.edge.kernel.org",
+                f"apt attempt 3 repoints {deb822} to mirrors.edge.kernel.org",
             ],
         )
+        self.assertEqual(
+            self.edited,
+            {
+                "apt-mirrors.txt": "http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n",
+                "sources.list.d/ubuntu.sources": "Types: deb\nURIs: http://mirrors.edge.kernel.org/ubuntu/\nSuites: noble-security\n",
+            },
+        )
+        self.assertNotIn("::warning::", self.stdout)
         self.assertIn("every mirror failed", self.stderr)
+
+    def test_attempt_with_nothing_to_repoint_warns(self) -> None:
+        # An arm64 runner's sources name ports.ubuntu.com, which no fallback
+        # mirror serves: the attempt says so instead of claiming a repoint.
+        ports = {"sources.list.d/ubuntu.sources": "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"}
+        for sources in (None, ports):
+            with self.subTest(sources=sources):
+                code, _calls = self.run_script("bubblewrap", rc=1, sources=sources)
+                self.assertNotEqual(code, 0)
+                self.assertNotIn("repoints", self.stdout)
+                self.assertEqual(
+                    [line for line in self.stdout.splitlines() if line.startswith("::warning::")],
+                    [
+                        f"::warning::apt-install: attempt {n} found no Ubuntu archive or security source to repoint, so it retries the same mirrors"
+                        for n in (2, 3)
+                    ],
+                )
+                self.assertEqual(self.edited, sources or {})
+
+    def test_command_ignoring_its_stop_is_killed(self) -> None:
+        # Each capped command ignores SIGTERM for 20 s; the kill grace ends it
+        # within a second of its (shortened) cap, so all three attempts finish
+        # well inside the subprocess timeout.
+        start = time.monotonic()
+        code, calls = self.run_script("bubblewrap", hang=True)
+        self.assertNotEqual(code, 0)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], [f"{self._CAP} dpkg --configure -a"] * 3)
 
     def test_first_success_stops(self) -> None:
         code, calls = self.run_script("bubblewrap")
@@ -5985,6 +6073,8 @@ class TestAptInstallScript(unittest.TestCase):
         script = doc["runs"]["steps"][0]["run"]
         edit = next(line.strip() for line in script.splitlines() if "sed -i -E" in line)
         expr = edit.split('"')[1]
+        host = next(line.strip() for line in script.splitlines() if line.strip().startswith("source_host="))
+        source_host = host.split("'")[1]
         sources = (
             "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
             "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
@@ -5996,7 +6086,7 @@ class TestAptInstallScript(unittest.TestCase):
             with self.subTest(mirror=mirror):
                 done = subprocess.run(
                     ["bash", "-c", f'printf "{sources}" | sed -E "{expr}"'],
-                    env={"PATH": os.environ.get("PATH", ""), "mirror": mirror},
+                    env={"PATH": os.environ.get("PATH", ""), "mirror": mirror, "source_host": source_host},
                     capture_output=True, text=True, timeout=30, check=True,
                 )
                 self.assertEqual(
@@ -7176,8 +7266,10 @@ class TestReleaseTargetParity(unittest.TestCase):
         toolchain = self.swap(_RT_TOOLCHAIN, "packages: musl-tools", "packages: musl-tools\n        no-install-recommends: \"true\"")
         self.assertRefused("release-target-toolchain' step 3.with has keys", toolchain=toolchain)
         for old, new in (
-            ("configure) sudo timeout \"$left\" dpkg --configure -a", "configure) true"),
-            ('update) sudo timeout "$left" apt-get "${apt_opts[@]}" update', 'update) sudo apt-get "${apt_opts[@]}" update'),
+            ("configure) sudo timeout -k 30 \"$left\" dpkg --configure -a", "configure) true"),
+            ('update) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" update', 'update) sudo apt-get "${apt_opts[@]}" update'),
+            ('install) sudo timeout -k 30 "$left" apt-get', 'install) sudo timeout "$left" apt-get'),
+            ("            if ((repointed == 0)); then\n", "            if false; then\n"),
             ("for stage in configure update install; do", "for stage in update install; do"),
             ('    exit 1\n            fi\n            if ((left > 360))', '    break\n            fi\n            if ((left > 360))'),
             ("for attempt in 1 2 3; do", "for attempt in 1; do"),
