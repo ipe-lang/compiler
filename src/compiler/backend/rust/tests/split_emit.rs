@@ -318,3 +318,94 @@ fn emit_spine_of_a_program_naming_only_a_db_type_has_no_projection() -> DResult<
     backend.emit(&program)?;
     Ok(())
 }
+
+/// The emitted `src/main.rs` of a program whose `main` returns `ret`, laid out
+/// over two homes (`split`, the spine) or one (single file); `entry` names
+/// `main` as the module's entry.
+fn entry_main_rs(ret: &IrType, split: bool, entry: bool) -> DResult<String> {
+    let mut interner = Interner::new();
+    let (mut program, lib_home, main_home) = build_two_module(&mut interner)?;
+    for module in &mut program.modules {
+        if entry {
+            module.entry = Some(FuncId::from_raw(1));
+        }
+        for func in &mut module.funcs {
+            if func.id == FuncId::from_raw(1) {
+                func.ret = ret.clone();
+            }
+            if !split && func.home == lib_home {
+                func.home = main_home.clone();
+            }
+        }
+        if !split {
+            for TypeDef::Enum(e) in &mut module.types {
+                e.home = main_home.clone();
+            }
+        }
+    }
+    let project = RustBackend::new(&interner).emit(&program)?;
+    Ok(project
+        .files
+        .iter()
+        .find(|(path, _)| path.as_str() == "src/main.rs")
+        .map(|(_, text)| text.clone())
+        .unwrap_or_default())
+}
+
+const RUN_BLOCKING_ENTRY: &str = "match run_blocking_entry(ipe_main) {";
+const BLOCK_ON_ENTRY: &str = "match block_on_entry(ipe_main) {";
+
+/// Every shape-app leaf `main` returns runs through `run_blocking_entry` in
+/// both layouts: the spine and the single file read the one `EntryRun`
+/// classification the lowerer admits by, so no leaf the lowerer accepts can
+/// reach `block_on_entry`, which `cargo` refuses for a non-future.
+#[test]
+fn every_shape_leaf_entry_runs_blocking_in_both_layouts() -> DResult<()> {
+    for leaf in [
+        IrType::WebApp,
+        IrType::TuiApp,
+        IrType::CliApp,
+        IrType::WorkerApp,
+    ] {
+        for split in [true, false] {
+            let main_rs = entry_main_rs(&leaf, split, true)?;
+            assert!(
+                main_rs.contains(RUN_BLOCKING_ENTRY) && !main_rs.contains(BLOCK_ON_ENTRY),
+                "{leaf:?} (split: {split}) must run through `run_blocking_entry`:\n{main_rs}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A task `main` keeps `block_on_entry` in both layouts.
+#[test]
+fn a_task_entry_blocks_on_in_both_layouts() -> DResult<()> {
+    for split in [true, false] {
+        let main_rs = entry_main_rs(&IrType::Task(Box::new(IrType::Unit)), split, true)?;
+        assert!(
+            main_rs.contains(BLOCK_ON_ENTRY) && !main_rs.contains(RUN_BLOCKING_ENTRY),
+            "a task entry (split: {split}) must run through `block_on_entry`:\n{main_rs}"
+        );
+    }
+    Ok(())
+}
+
+/// The single-file emit refuses an `ipe_main` signature that renders a shape app
+/// the IR names no entry for: the IR run form and the emitted signature are two
+/// independent witnesses, and their disagreement is a `CompilerBug`, never an
+/// entry line `cargo` refuses.
+#[test]
+fn a_shape_signature_without_an_ir_entry_is_a_compiler_bug() {
+    let got = entry_main_rs(&IrType::WorkerApp, false, false);
+    assert!(
+        matches!(
+            got,
+            Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
+                ..
+            })
+        ),
+        "an IR/signature disagreement must be refused: {got:?}"
+    );
+}

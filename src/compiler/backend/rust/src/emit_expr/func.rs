@@ -694,7 +694,7 @@ pub fn elide_task_run_tail(expr: &Expr) -> Option<Expr> {
 /// When `ipe_main` was NOT elided (its body is not — or not uniformly in
 /// every tail position — a `Task.run` call), the function currently returns
 /// its declared value type directly, but the entry-point epilogue calls
-/// `block_on(ipe_main())`, which requires `ipe_main` to return `IpeTask<A>`
+/// `block_on_entry(ipe_main)`, which requires `ipe_main` to return `IpeTask<A>`
 /// (an unevaluated future), never a resolved value.
 ///
 /// Two declared-return shapes reach here, and BOTH wrap the body rather than
@@ -916,7 +916,7 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     //   func.body = Call(TaskRun | TaskPerform, [inner_task])
     //   func.ret  = IrType::Result(IrType::Error, A)
     //
-    // The Rust epilogue calls `block_on(ipe_main())`, which requires `ipe_main`
+    // The Rust epilogue calls `block_on_entry(ipe_main)`, which requires `ipe_main`
     // to return `IpeTask<A>` (an unevaluated future), NOT `IpeResult<E, A>`.
     // Elide the outer `task_run(...)` wrapper: use the inner task expression as
     // the body and convert the return type from `Result(Error, A)` to `Task(A)`.
@@ -927,7 +927,7 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     // cfg |> Task.run; _ -> Tui.tea cfg |> Task.run`. Every arm still
     // tail-calls
     // `Task.run`, so the SAME elision must apply — otherwise `ipe_main` keeps
-    // its `IpeResult<E, A>` return type and `block_on(ipe_main())` mismatches
+    // its `IpeResult<E, A>` return type and `block_on_entry(ipe_main)` mismatches
     // exactly as the flat case would (a real SEAL violation found on
     // `examples/24-tui-kitchen-sink`, BACKLOG "24-tui-kitchen-sink").
     // `elide_task_run_tail` recurses through every tail-position control-flow
@@ -948,7 +948,7 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     };
 
     // ── ipe_main synchronous-body wrap ────────────────────────────────────────
-    // When ipe_main was NOT elided, `block_on(ipe_main())` still needs
+    // When ipe_main was NOT elided, `block_on_entry(ipe_main)` still needs
     // `IpeTask<A>`. See `ipe_main_wrap_decision`'s doc comment for the full
     // rationale (the CLI `task_run()`-calls idiom AND Finding B's mixed-arm
     // sibling gap).
@@ -1014,7 +1014,7 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     // capture nothing type-parametric, so the wrapper applies only to a
     // monomorphic CAF whose return type is a plain shareable data type
     // ([`is_share_once_safe`]). `ipe_main` is excluded — the epilogue's
-    // `block_on(ipe_main())` needs a fresh future each call. Every other binding
+    // `block_on_entry(ipe_main)` needs a fresh future each call. Every other binding
     // keeps the direct inline emission.
     let is_caf = func.params.is_empty()
         && func.type_params.is_empty()

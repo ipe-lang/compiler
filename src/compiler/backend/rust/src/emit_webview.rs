@@ -15,10 +15,10 @@
 //! [`crate::EmitCtx::webview_window`] — never a source `main` field. When the
 //! delivery carries no explicit desktop block, a built-in fallback window is used.
 //!
-//! `run_blocking()` on the `WebViewApp` internally calls `block_on_current_thread`,
+//! The `WebViewApp` shape entry calls `block_on_current_thread_entry`,
 //! satisfying tao/Cocoa's requirement that the event loop runs on the process main
 //! thread (hard `NSApplication` requirement on macOS). The `fn main` epilogue
-//! switch to `run_blocking` is performed in `project.rs` (`emit_program` /
+//! switch to `run_blocking_entry` is performed in `project.rs` (`emit_program` /
 //! `emit_spine`) keyed on the emitted `ipe_main` return type.
 
 /// The built-in desktop window used when a webview-native delivery carries no
