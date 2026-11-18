@@ -943,7 +943,7 @@ mod tests {
 mod register_tests {
     use super::*;
     use crate::encoding::MAX_FRAME_ORIGINS;
-    use crate::encoding::frame_origin_tests::texts_at_budget;
+    use crate::encoding::frame_origin_tests::{shortest_origin_text, texts_at_budget};
 
     /// A bad origin refuses and sets nothing; an unknown grant suffix is
     /// dropped; a second registration widens neither origins nor grants.
@@ -1001,15 +1001,18 @@ mod register_tests {
     /// admitted, and a repeated origin folded.
     #[test]
     fn frame_register_holds_cap_and_budget() {
-        let texts: Vec<String> = (0..=MAX_FRAME_ORIGINS)
-            .map(|i| format!("https://o{i}.example"))
-            .collect();
+        let texts: Vec<String> = (0..=MAX_FRAME_ORIGINS).map(shortest_origin_text).collect();
         let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         assert_eq!(
             policy_of(&refs, &[]),
             Err(FrameRegisterRefusal::List(
                 FrameOriginsRefusal::LimitExceeded
             ))
+        );
+        let full = refs.get(..MAX_FRAME_ORIGINS).unwrap_or_default();
+        assert_eq!(
+            policy_of(full, &[]).map(|p| p.origins().len()),
+            Ok(MAX_FRAME_ORIGINS)
         );
 
         let at = texts_at_budget();

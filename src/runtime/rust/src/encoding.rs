@@ -1153,6 +1153,26 @@ pub const fn frame_origin_header_cost(len: usize) -> usize {
     )
 }
 
+/// The shortest written frame origin any parse admits: `https://` and a
+/// one-byte host (`https://a`). The loopback form is longer.
+pub const MIN_FRAME_ORIGIN_LEN: usize = ORIGIN_SCHEME.len() + 1;
+
+/// The header bytes `count` origins of written length `len` add: the
+/// `const` form of [`frame_header_cost`] for a uniform list.
+#[must_use]
+pub const fn uniform_frame_header_cost(count: usize, len: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    FRAME_LIST_FIXED_COST.saturating_add(count.saturating_mul(frame_origin_header_cost(len)))
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD when either list cap stops being reachable on its own: one origin past the count cap must still fit the header budget (so `LimitExceeded` is what a too-long list of short origins meets, and a full list is admissible), and a full list of the longest origins must exceed it (so `OverBudget` is reachable within the count cap) [ledger #boundary]
+const _: () = assert!(
+    uniform_frame_header_cost(MAX_FRAME_ORIGINS + 1, MIN_FRAME_ORIGIN_LEN) <= FRAME_HEADER_BUDGET
+        && uniform_frame_header_cost(MAX_FRAME_ORIGINS, MAX_ORIGIN_LEN) > FRAME_HEADER_BUDGET
+);
+
 /// The header bytes a list of origins with the written lengths `lens` adds:
 /// nothing for an empty list, else [`FRAME_LIST_FIXED_COST`] plus each
 /// origin's [`frame_origin_header_cost`].
@@ -4232,7 +4252,34 @@ pub(crate) mod frame_origin_tests {
             .collect()
     }
 
-    /// Sixteen origins are a list and a seventeenth is refused; a repeat is
+    /// The text of the shortest origin `index` names: `https://` and one
+    /// distinct lowercase letter, [`MIN_FRAME_ORIGIN_LEN`] bytes.
+    pub fn shortest_origin_text(index: usize) -> String {
+        let host = "abcdefghijklmnopqrstuvwxyz"
+            .get(index..=index)
+            .unwrap_or("z");
+        format!("{ORIGIN_SCHEME}{host}")
+    }
+
+    /// [`MIN_FRAME_ORIGIN_LEN`] is the parser's: a one-byte host parses at
+    /// that length, and the bare scheme and every loopback form refuse or run
+    /// longer.
+    #[test]
+    fn min_frame_origin_len_is_the_parsers() {
+        let shortest = FrameOrigin::parse(&shortest_origin_text(0));
+        assert_eq!(shortest.map(|o| o.written_len()), Ok(MIN_FRAME_ORIGIN_LEN));
+        assert_eq!(
+            FrameOrigin::parse(ORIGIN_SCHEME),
+            Err(FrameOriginRefusal::Https(ServerOriginRefusal::EmptyHost))
+        );
+        assert!(
+            FrameOriginEntry::parse("http://localhost:1")
+                .is_ok_and(|e| e.written_len() > MIN_FRAME_ORIGIN_LEN)
+        );
+    }
+
+    /// Sixteen of the shortest origins are a list and a seventeenth is
+    /// refused by the count cap though it fits the header budget; a repeat is
     /// refused at the manifest and folded in the runtime's list; a list at
     /// the header budget is admitted and one byte past it is refused.
     #[test]
@@ -4240,23 +4287,42 @@ pub(crate) mod frame_origin_tests {
     fn frame_origins_cap_and_dedupe() {
         let entry = |i: usize| FrameOriginEntry::parse(&origin_text(i, 12)).expect("entry");
         let origin = |i: usize| FrameOrigin::parse(&origin_text(i, 12)).expect("origin");
+        let short_entry =
+            |i: usize| FrameOriginEntry::parse(&shortest_origin_text(i)).expect("entry");
+        let short_origin = |i: usize| FrameOrigin::parse(&shortest_origin_text(i)).expect("origin");
 
-        let sixteen: Vec<FrameOriginEntry> = (0..MAX_FRAME_ORIGINS).map(entry).collect();
+        let sixteen: Vec<FrameOriginEntry> = (0..MAX_FRAME_ORIGINS).map(short_entry).collect();
         assert_eq!(
             FrameOriginEntries::new(sixteen.clone()).map(|l| l.len()),
             Ok(MAX_FRAME_ORIGINS)
         );
+        let full: Vec<FrameOrigin> = (0..MAX_FRAME_ORIGINS).map(short_origin).collect();
+        assert_eq!(
+            FrameOrigins::new(full).map(|l| l.len()),
+            Ok(MAX_FRAME_ORIGINS)
+        );
+
         let mut seventeen = sixteen;
-        seventeen.push(entry(MAX_FRAME_ORIGINS));
+        seventeen.push(short_entry(MAX_FRAME_ORIGINS));
+        assert!(
+            frame_header_cost(seventeen.iter().map(FrameOriginEntry::written_len))
+                <= FRAME_HEADER_BUDGET,
+            "the seventeenth must meet the count cap, not the budget"
+        );
         assert_eq!(
             FrameOriginEntries::new(seventeen),
             Err(FrameOriginsRefusal::LimitExceeded)
         );
-        let origins: Vec<FrameOrigin> = (0..=MAX_FRAME_ORIGINS).map(origin).collect();
+        let origins: Vec<FrameOrigin> = (0..=MAX_FRAME_ORIGINS).map(short_origin).collect();
         assert_eq!(
             FrameOrigins::new(origins),
             Err(FrameOriginsRefusal::LimitExceeded)
         );
+        assert_eq!(
+            uniform_frame_header_cost(MAX_FRAME_ORIGINS + 1, MIN_FRAME_ORIGIN_LEN),
+            frame_header_cost([MIN_FRAME_ORIGIN_LEN; MAX_FRAME_ORIGINS + 1])
+        );
+        assert_eq!(uniform_frame_header_cost(0, MIN_FRAME_ORIGIN_LEN), 0);
 
         assert_eq!(
             FrameOriginEntries::new([entry(1), entry(0), entry(1)]),
