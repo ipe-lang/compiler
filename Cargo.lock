@@ -3318,9 +3318,6 @@ dependencies = [
 [[package]]
 name = "ipe_env"
 version = "0.7.4"
-dependencies = [
- "ipe-test-temp",
-]
 
 [[package]]
 name = "ipe_ffi"
