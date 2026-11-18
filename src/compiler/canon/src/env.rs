@@ -1581,6 +1581,41 @@ const fn hides_are_live(hidden: &[(&str, &str)], qualifiers: &[&str]) -> bool {
     true
 }
 
+/// `true` iff `name` begins with the `unsafe` escape-hatch prefix.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < PREFIX.len() <= name.len()`
+const fn names_an_escape_hatch(name: &str) -> bool {
+    const PREFIX: &[u8] = b"unsafe";
+    let bytes = name.as_bytes();
+    if bytes.len() < PREFIX.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < PREFIX.len() {
+        if bytes[i] != PREFIX[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// G5: `true` iff every registry kernel under one of `qualifiers` whose name
+/// begins with `unsafe` is in `hidden`, so an escape hatch never reaches a
+/// plain import of a native module.
+#[allow(clippy::indexing_slicing)] // index guarded by `i < REGISTRY_LEN`; see note above
+const fn escape_hatches_hidden(hidden: &[(&str, &str)], qualifiers: &[&str]) -> bool {
+    let mut i = 0;
+    while i < REGISTRY_LEN {
+        let (q, n) = REGISTRY_DECL_PAIRS[i];
+        if names_contain(qualifiers, q) && names_an_escape_hatch(n) && !pairs_contain(hidden, q, n)
+        {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// `true` iff two rows of `pairs` are equal.
 #[allow(clippy::indexing_slicing)] // indices guarded by `< len`; see note above
 const fn has_duplicate_pair(pairs: &[(&str, &str)]) -> bool {
@@ -1634,6 +1669,9 @@ const fn alias_row_sound(qualifier: &str, alias: &str, canon_q: &str, canon_n: &
 ///   is a registry kernel (otherwise the alias would be a `ReservedKernel`).
 /// - G4: no alias or re-export name is a registry member under its new
 ///   qualifier (otherwise its insert would overwrite the derived kernel).
+/// - G5: every kernel under a [`KERNEL_QUALIFIERS`] qualifier whose name
+///   begins with `unsafe` is in [`SURFACE_HIDDEN_KERNELS`], so the derived
+///   member set never exposes an escape hatch on a plain import.
 ///
 /// The runtime `canon_equals_registry` test in `crate::tests` checks the
 /// interner wiring, which cannot run in `const`.
@@ -1668,6 +1706,13 @@ const _: () = {
     assert!(
         !has_duplicate_pair(&SURFACE_HIDDEN_DECLS),
         "kernel-surface drift (G2): a SURFACE_HIDDEN_KERNELS row appears twice.",
+    );
+    // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+    assert!(
+        escape_hatches_hidden(&SURFACE_HIDDEN_DECLS, KERNEL_QUALIFIERS),
+        "kernel-surface drift (G5): an `unsafe*` kernel under a KERNEL_QUALIFIERS \
+         qualifier is missing from SURFACE_HIDDEN_KERNELS, so a plain import \
+         would expose it. Add it to SURFACE_HIDDEN_KERNELS.",
     );
     let mut ai = 0;
     while ai < FUNC_ALIASES.len() {
@@ -2385,8 +2430,8 @@ mod kernel_table_drift_gate_tests {
 
     use super::{
         CROSS_QUALIFIER_MEMBERS, FUNC_ALIASES, KERNEL_QUALIFIERS, SURFACE_HIDDEN_DECLS,
-        alias_row_sound, has_duplicate_name, has_duplicate_pair, hides_are_live,
-        qualifier_backs_visible_kernel, registry_backs,
+        alias_row_sound, escape_hatches_hidden, has_duplicate_name, has_duplicate_pair,
+        hides_are_live, names_an_escape_hatch, qualifier_backs_visible_kernel, registry_backs,
     };
     use ipe_kernels::StdlibKernel;
 
@@ -2441,6 +2486,39 @@ mod kernel_table_drift_gate_tests {
         assert!(hides_are_live(&SURFACE_HIDDEN_DECLS, KERNEL_QUALIFIERS));
         assert!(has_duplicate_pair(&[("Db", "query"), ("Db", "query")]));
         assert!(!has_duplicate_pair(&SURFACE_HIDDEN_DECLS));
+    }
+
+    /// G5 rejects a surface that hides no `unsafe*` kernel under a kernel
+    /// qualifier, and one missing any single live hatch; it accepts the live
+    /// list.
+    #[test]
+    fn g5_rejects_an_unhidden_escape_hatch() {
+        assert!(names_an_escape_hatch("unsafeExecRaw"));
+        assert!(!names_an_escape_hatch("unsaf"));
+        assert!(!names_an_escape_hatch("reveal"));
+        assert!(!escape_hatches_hidden(&[], KERNEL_QUALIFIERS));
+        let hatches: Vec<(&str, &str)> = SURFACE_HIDDEN_DECLS
+            .iter()
+            .copied()
+            .filter(|(_, n)| names_an_escape_hatch(n))
+            .collect();
+        assert!(!hatches.is_empty());
+        for dropped in &hatches {
+            let fewer: Vec<(&str, &str)> = SURFACE_HIDDEN_DECLS
+                .iter()
+                .copied()
+                .filter(|pair| pair != dropped)
+                .collect();
+            assert!(
+                !escape_hatches_hidden(&fewer, KERNEL_QUALIFIERS),
+                "{dropped:?}"
+            );
+        }
+        assert!(escape_hatches_hidden(
+            &SURFACE_HIDDEN_DECLS,
+            KERNEL_QUALIFIERS
+        ));
+        assert!(escape_hatches_hidden(&[], &[]));
     }
 
     /// G3 rejects an alias whose canonical pair is unbacked; G4 rejects an
