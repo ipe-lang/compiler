@@ -429,6 +429,10 @@ impl UiTemplateAttr {
             }
             // Checkedness follows the model per render; it has no static wire form.
             Attribute::AttrChecked(_) => return None,
+            // A page link's route renders under the session's base at the sink;
+            // it has no static wire form.
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => return None,
         })
     }
 

@@ -1095,6 +1095,15 @@ fn lower_prose(msg: &LowerError) -> String {
             "This attribute name belongs to the Ipê runtime, so it would never reach the page."
                 .to_string()
         }
+        LowerError::PageLinkTableOpaque => {
+            "I can't read the route table this `Web.pageLink` names.".to_string()
+        }
+        LowerError::PageLinkTableOpenPage => {
+            "The route table this `Web.pageLink` names has no single page type.".to_string()
+        }
+        LowerError::PageLinkTableNotAppRoutes => {
+            "This `Web.pageLink` names another route table than the app's `routes`.".to_string()
+        }
         LowerError::CalleeBoundUnmet { callee, demand, .. } => format!(
             "`{callee}` {} the value it is given, and this value cannot be {}.",
             demand.phrase(),
@@ -2574,6 +2583,16 @@ fn lower_label(msg: &LowerError) -> String {
         }
         LowerError::ReservedAttributeName { call, name } => {
             format!("`{call}` names the attribute `{name}`, which the runtime reserves")
+        }
+        LowerError::PageLinkTableOpaque => {
+            "the route table of `Web.pageLink` is not a top-level list of `Web.route` calls"
+                .to_string()
+        }
+        LowerError::PageLinkTableOpenPage => {
+            "the route table of `Web.pageLink` does not build one custom page type".to_string()
+        }
+        LowerError::PageLinkTableNotAppRoutes => {
+            "a `Web.pageLink` table is not the routed app's `routes` binding".to_string()
         }
         LowerError::CalleeBoundUnmet {
             callee,
