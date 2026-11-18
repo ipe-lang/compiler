@@ -1904,8 +1904,8 @@ mod real_jail {
             "--offline",
         ])
         .current_dir(&crate_dir)
-        .env("CARGO_TARGET_DIR", target)
         .stdin(std::process::Stdio::null());
+        e2e_support::target::set_target_dir_env(&mut cmd, target);
         let meta = super::run_child(cmd).expect("run cargo metadata");
         assert!(
             meta.status.success(),
@@ -1973,13 +1973,13 @@ mod real_jail {
             .arg("--out")
             .arg(&out)
             .current_dir(&project)
-            .env("CARGO_TARGET_DIR", &target)
             .env(
                 "IPE_RUNTIME_DIR",
                 e2e_support::require_runtime().into_path_buf(),
             )
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::null());
+        e2e_support::target::set_target_dir_env(&mut cmd, &target);
         let ran = super::run_child(cmd).expect("run ipe dev run");
         assert!(
             ran.status.success(),
