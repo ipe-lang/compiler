@@ -1679,9 +1679,10 @@ const fn alias_target_visible(hidden: &[(&str, &str)], canon_q: &str, canon_n: &
 /// - G5: every kernel under a [`KERNEL_QUALIFIERS`] qualifier whose name
 ///   begins with `unsafe` is in [`SURFACE_HIDDEN_KERNELS`], so the derived
 ///   member set never exposes an escape hatch on a plain import.
-/// - G6: no [`FUNC_ALIASES`] or [`CROSS_QUALIFIER_MEMBERS`] row names a
-///   hidden kernel or an `unsafe*` kernel under any qualifier, so an alias
-///   never re-exposes what G5 and [`SURFACE_HIDDEN_KERNELS`] withhold.
+/// - G6: no [`FUNC_ALIASES`], [`CROSS_QUALIFIER_MEMBERS`] or
+///   [`PRELUDE_VALUES`] row names a hidden kernel or an `unsafe*` kernel under
+///   any qualifier, so no table installed past the hide filter re-exposes what
+///   G5 and [`SURFACE_HIDDEN_KERNELS`] withhold.
 ///
 /// The runtime `canon_equals_registry` test in `crate::tests` checks the
 /// interner wiring, which cannot run in `const`.
@@ -1757,6 +1758,17 @@ const _: () = {
              hidden or `unsafe*` kernel, so a plain import would expose it.",
         );
         ci += 1;
+    }
+    let mut pi = 0;
+    while pi < PRELUDE_VALUE_DECLS.len() {
+        let (q, n) = PRELUDE_VALUE_DECLS[pi];
+        // IPE-RUST-AUDIT:ACCEPTED — const-eval only: fails the build, never panics at runtime.
+        assert!(
+            alias_target_visible(&SURFACE_HIDDEN_DECLS, q, n),
+            "kernel-surface drift (G6): a PRELUDE_VALUES row names a hidden or \
+             `unsafe*` kernel, so every module would see it unqualified.",
+        );
+        pi += 1;
     }
 };
 
@@ -2451,10 +2463,10 @@ mod kernel_table_drift_gate_tests {
     //! and accepts the live tables.
 
     use super::{
-        CROSS_QUALIFIER_MEMBERS, FUNC_ALIASES, KERNEL_QUALIFIERS, SURFACE_HIDDEN_DECLS,
-        alias_row_sound, alias_target_visible, escape_hatches_hidden, has_duplicate_name,
-        has_duplicate_pair, hides_are_live, names_an_escape_hatch, qualifier_backs_visible_kernel,
-        registry_backs,
+        CROSS_QUALIFIER_MEMBERS, FUNC_ALIASES, KERNEL_QUALIFIERS, PRELUDE_VALUE_DECLS,
+        SURFACE_HIDDEN_DECLS, alias_row_sound, alias_target_visible, escape_hatches_hidden,
+        has_duplicate_name, has_duplicate_pair, hides_are_live, names_an_escape_hatch,
+        qualifier_backs_visible_kernel, registry_backs,
     };
     use ipe_kernels::StdlibKernel;
 
@@ -2585,6 +2597,9 @@ mod kernel_table_drift_gate_tests {
                 alias_target_visible(&SURFACE_HIDDEN_DECLS, canon_q, canon_n),
                 "{canon_q}.{canon_n}"
             );
+        }
+        for (q, n) in PRELUDE_VALUE_DECLS {
+            assert!(alias_target_visible(&SURFACE_HIDDEN_DECLS, q, n), "{q}.{n}");
         }
     }
 
