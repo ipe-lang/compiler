@@ -10,7 +10,7 @@ description: >-
   (archive.ubuntu.com, then mirrors.edge.kernel.org) before the next. Archives
   an attempt finished downloading stay in the archive directory, so a later
   attempt fetches only what is still missing. When every attempt fails the
-  step fails.
+  step fails, and so does a spent budget.
 inputs:
   packages:
     description: Space-separated Debian package names on one line (lower-case ASCII letters, digits and `.+:-`, never a leading `-`).
@@ -74,17 +74,6 @@ runs:
         apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
         mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)
         deadline=$((SECONDS + 900))
-        capped() {
-          local left=$((deadline - SECONDS))
-          if ((left <= 0)); then
-            echo "apt-install: the 15 minute install budget is spent" >&2
-            return 1
-          fi
-          if ((left > 360)); then
-            left=360
-          fi
-          sudo timeout "$left" "$@"
-        }
         for attempt in 1 2 3; do
           mirror="${mirrors[attempt - 1]}"
           if [[ -n "$mirror" ]]; then
@@ -95,12 +84,29 @@ runs:
               fi
             done
           fi
-          if capped dpkg --configure -a \
-            && capped apt-get "${apt_opts[@]}" update \
-            && capped apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}"; then
+          failed=""
+          for stage in configure update install; do
+            left=$((deadline - SECONDS))
+            if ((left <= 0)); then
+              echo "::error::apt-install: the 15 minute install budget is spent" >&2
+              exit 1
+            fi
+            if ((left > 360)); then
+              left=360
+            fi
+            case "$stage" in
+              configure) sudo timeout "$left" dpkg --configure -a || failed="$stage" ;;
+              update) sudo timeout "$left" apt-get "${apt_opts[@]}" update || failed="$stage" ;;
+              install) sudo timeout "$left" apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}" || failed="$stage" ;;
+            esac
+            if [[ -n "$failed" ]]; then
+              break
+            fi
+          done
+          if [[ -z "$failed" ]]; then
             exit 0
           fi
-          echo "apt attempt $attempt failed or did not finish within its cap"
+          echo "apt attempt $attempt failed at $failed or did not finish within its cap"
         done
         echo "::error::apt-install: every mirror failed within the install budget" >&2
         exit 1

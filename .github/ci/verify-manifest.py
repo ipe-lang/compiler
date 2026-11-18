@@ -448,11 +448,15 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `runtime-feature-combos`), with a refusal for a stale entry.  LIMIT: a
       `--workspace --exclude` run is not counted; `cfg(all(feature=a,
       not(feature=b)))` combinations are not enumerated.
-  23. Release-target parity: ci.yml's `release-targets-run` and
-      `release-targets-freebsd` check exactly what release.yml's `build` and
-      `build-freebsd` build, and each of the four jobs is an allowlist, not
-      a scan.  The `(os, target)` pairs of the two matrices are equal (a
-      target missing from either side, or on another `os`, is refused); each
+  23. Release-target parity: ci.yml's merge-queue `release-targets-run`
+      and release-targets.yml's nightly and dispatched
+      `release-targets-native` and `release-targets-freebsd` check exactly
+      what release.yml's `build` and `build-freebsd` build, and each of the
+      five jobs is an allowlist, not a scan.  The `(os, target)` pairs of
+      the two checking matrices, together, equal release.yml's (a target
+      missing from every side, checked by both, or on another `os`, is
+      refused), and release-targets.yml holds no leg on an `ubuntu-` runner,
+      so every Linux target stays in the merge queue; each
       matrix leg holds exactly its keys (`os`, `target`, plus release.yml's
       `artifact` and `ext`), every value a literal string of the runner-label
       and target-triple grammar (`ext` empty or `.exe`).  A native job's
@@ -463,12 +467,13 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       matrix.target }}`; and a `shell: bash` step whose `env` is exactly
       `TARGET: ${{ matrix.target }}` and whose `run` is exactly the one
       cargo line, `cargo <verb> --release --locked --features ipe/wasi_run
-      --target "$TARGET" -p ipe -p ipe-ffi-inspector` (`check` in ci.yml,
-      `build` in release.yml).  A FreeBSD job's first two steps are exactly
-      its checkout and the FreeBSD VM step (`prepare: pkg install -y
-      rust`), whose `run` is exactly the cargo line without
-      `--target` in ci.yml and opens with it in release.yml.  ci.yml's jobs
-      run nothing else.  Each pinned step is compared key for key both ways,
+      --target "$TARGET" -p ipe -p ipe-ffi-inspector` (`check` in the
+      checking workflows, `build` in release.yml).  A FreeBSD job's first
+      two steps are exactly its checkout and the FreeBSD VM step (`prepare:
+      pkg install -y rust`), whose `run` is exactly the cargo line without
+      `--target` in release-targets.yml and opens with it in release.yml.
+      The checking jobs run nothing else.  Each pinned step is compared key
+      for key both ways,
       typed (`1` is not `true`, nor `'1'`), a `name` that is a literal string
       the one key set aside; the shared loader refuses a plain scalar YAML
       1.1 and 1.2 read differently (`yes`, `0x2`, `010`).  Every local
@@ -2219,7 +2224,6 @@ INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("ci.yml", "e2e"): "E2E shard ${{ matrix.shard }}/14 (THE SEAL — build+run emitted Rust)",
     ("ci.yml", "linux-arm64-tier2"): "audit_native fail-closed refuse-to-certify on aarch64",
     ("ci.yml", "linux-x64-tier2"): "audit_native E2E through the real Linux jail",
-    ("ci.yml", "release-targets-freebsd"): "Check in FreeBSD VM",
     ("ci.yml", "release-targets-run"): "Check ipe + ipe-ffi-inspector",
     ("ci.yml", "seal-modset-vendored"): "Run seal_modset under the vendored emit model",
     ("ci.yml", "seal-slice-cover"): "Prove the e2e shards partition the archived test set",
@@ -7873,7 +7877,14 @@ RELEASE_NATIVE_JOB = "build"
 RELEASE_FREEBSD_JOB = "build-freebsd"
 RELEASE_PUBLISH_JOB = "release"
 CI_RELEASE_NATIVE_JOB = "release-targets-run"
-CI_RELEASE_FREEBSD_JOB = "release-targets-freebsd"
+# The workflow that checks, nightly and on dispatch, the release targets the
+# merge queue does not, and its two jobs.
+MANUAL_RELEASE_WORKFLOW = "release-targets.yml"
+MANUAL_RELEASE_NATIVE_JOB = "release-targets-native"
+MANUAL_RELEASE_FREEBSD_JOB = "release-targets-freebsd"
+# The runner-label prefix of a Linux release leg: every one stays in ci.yml's
+# merge-queue job, never in `MANUAL_RELEASE_WORKFLOW`.
+_LINUX_RUNNER_PREFIX = "ubuntu-"
 _TOOLCHAIN_ACTION = "./.github/actions/rust-toolchain-pinned"
 # The one step both native jobs run between their checkout and their cargo
 # command: the toolchain, the dependency cache and the musl tools.
@@ -7995,17 +8006,6 @@ _APT_INSTALL_RUN = (
     'apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)',
     'mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)',
     'deadline=$((SECONDS + 900))',
-    'capped() {',
-    '  local left=$((deadline - SECONDS))',
-    '  if ((left <= 0)); then',
-    '    echo "apt-install: the 15 minute install budget is spent" >&2',
-    '    return 1',
-    '  fi',
-    '  if ((left > 360)); then',
-    '    left=360',
-    '  fi',
-    '  sudo timeout "$left" "$@"',
-    '}',
     'for attempt in 1 2 3; do',
     '  mirror="${mirrors[attempt - 1]}"',
     '  if [[ -n "$mirror" ]]; then',
@@ -8016,12 +8016,29 @@ _APT_INSTALL_RUN = (
     '      fi',
     '    done',
     '  fi',
-    '  if capped dpkg --configure -a \\',
-    '    && capped apt-get "${apt_opts[@]}" update \\',
-    '    && capped apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}"; then',
+    '  failed=""',
+    '  for stage in configure update install; do',
+    '    left=$((deadline - SECONDS))',
+    '    if ((left <= 0)); then',
+    '      echo "::error::apt-install: the 15 minute install budget is spent" >&2',
+    '      exit 1',
+    '    fi',
+    '    if ((left > 360)); then',
+    '      left=360',
+    '    fi',
+    '    case "$stage" in',
+    '      configure) sudo timeout "$left" dpkg --configure -a || failed="$stage" ;;',
+    '      update) sudo timeout "$left" apt-get "${apt_opts[@]}" update || failed="$stage" ;;',
+    '      install) sudo timeout "$left" apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}" || failed="$stage" ;;',
+    '    esac',
+    '    if [[ -n "$failed" ]]; then',
+    '      break',
+    '    fi',
+    '  done',
+    '  if [[ -z "$failed" ]]; then',
     '    exit 0',
     '  fi',
-    '  echo "apt attempt $attempt failed or did not finish within its cap"',
+    '  echo "apt attempt $attempt failed at $failed or did not finish within its cap"',
     'done',
     'echo "::error::apt-install: every mirror failed within the install budget" >&2',
     'exit 1',
@@ -8123,10 +8140,10 @@ def _same_value(a: object, b: object) -> bool:
     return a == b
 
 
-def _compare(what: str, ci_value: object, release_value: object, errors: list[str]) -> None:
+def _compare(what: str, ci_value: object, release_value: object, errors: list[str], checker: str = "ci.yml") -> None:
     if not _same_value(ci_value, release_value):
         errors.append(
-            f"check 23: ci.yml's {what} is {ci_value!r} but release.yml's is {release_value!r}; "
+            f"check 23: {checker}'s {what} is {ci_value!r} but release.yml's is {release_value!r}; "
             "they must be equal"
         )
 
@@ -8139,6 +8156,7 @@ class _Side(enum.Enum):
     """The workflow a value of a release-target pair comes from."""
 
     CI = "ci.yml"
+    MANUAL = MANUAL_RELEASE_WORKFLOW
     RELEASE = RELEASE_WORKFLOW
 
 
@@ -8264,7 +8282,7 @@ def _check_tag_need(job: dict, where: str, errors: list[str]) -> None:
 
 
 def _native_pins(side: _Side) -> tuple[dict, dict, dict]:
-    verb = "check" if side is _Side.CI else "build"
+    verb = "build" if side is _Side.RELEASE else "check"
     return (
         _checkout_pin(side),
         {"uses": RELEASE_TARGET_ACTION, "with": {"target": _MATRIX_TARGET}},
@@ -8292,7 +8310,7 @@ def _check_native_job(side: _Side, job: dict, where: str, errors: list[str]) -> 
     for n, (pin, why) in enumerate(zip(pins, whys), start=1):
         step = steps[n - 1] if len(steps) >= n else None
         _pinned_step(step, pin, f"{where} step {n}", why, errors)
-    if side is _Side.CI and len(steps) != len(pins):
+    if side is not _Side.RELEASE and len(steps) != len(pins):
         errors.append(
             f"check 23: {where} has {len(steps)} steps; it runs exactly the checkout, the shared step and the "
             "cargo line, and nothing after them; refused"
@@ -8312,7 +8330,7 @@ def _check_freebsd_job(side: _Side, job: dict, where: str, errors: list[str]) ->
     first = steps[0] if steps else None
     _pinned_step(first, _checkout_pin(side), f"{where} step 1", "a release-target job's first step is its one checkout, of the tag on release.yml's side", errors)
     vm = steps[1] if len(steps) >= 2 else None
-    line = _release_cargo_line("check" if side is _Side.CI else "build", native=False)
+    line = _release_cargo_line("build" if side is _Side.RELEASE else "check", native=False)
     run: object = _Lines((line,))
     if side is _Side.RELEASE and isinstance(vm, dict) and isinstance(vm.get("with"), dict):
         text = vm["with"].get("run")
@@ -8326,7 +8344,7 @@ def _check_freebsd_job(side: _Side, job: dict, where: str, errors: list[str]) ->
         f"`{line}` (and only that on ci.yml's side)",
         errors,
     )
-    if side is _Side.CI and len(steps) != 2:
+    if side is not _Side.RELEASE and len(steps) != 2:
         errors.append(
             f"check 23: {where} has {len(steps)} steps; it runs exactly the checkout and the VM step, and "
             "nothing after them; refused"
@@ -8577,7 +8595,8 @@ def check_release_target_parity(wfs: WorkflowSet, errors: list[str]) -> None:
     by_file = {wf.fname: wf for wf in wfs.workflows}
     jobs: dict[str, dict[str, dict]] = {}
     for fname, wanted in (
-        ("ci.yml", (CI_RELEASE_NATIVE_JOB, CI_RELEASE_FREEBSD_JOB)),
+        ("ci.yml", (CI_RELEASE_NATIVE_JOB,)),
+        (MANUAL_RELEASE_WORKFLOW, (MANUAL_RELEASE_NATIVE_JOB, MANUAL_RELEASE_FREEBSD_JOB)),
         (RELEASE_WORKFLOW, (RELEASE_NATIVE_JOB, RELEASE_FREEBSD_JOB, RELEASE_PUBLISH_JOB)),
     ):
         wf = by_file.get(fname)
@@ -8590,17 +8609,22 @@ def check_release_target_parity(wfs: WorkflowSet, errors: list[str]) -> None:
                 errors.append(f"check 23: {fname} has no job {job_id!r}, which the release-target parity needs")
                 return
         jobs[fname] = {job_id: have[job_id] for job_id in wanted}
-    ci, rel = jobs["ci.yml"], jobs[RELEASE_WORKFLOW]
+    ci, manual, rel = jobs["ci.yml"], jobs[MANUAL_RELEASE_WORKFLOW], jobs[RELEASE_WORKFLOW]
     for side in _Side:
         _check_workflow_scope(side, by_file[side.value].doc, errors)
     _check_local_action_pins(repo, errors)
 
     ci_native, rel_native = ci[CI_RELEASE_NATIVE_JOB], rel[RELEASE_NATIVE_JOB]
-    ci_bsd, rel_bsd = ci[CI_RELEASE_FREEBSD_JOB], rel[RELEASE_FREEBSD_JOB]
+    manual_native = manual[MANUAL_RELEASE_NATIVE_JOB]
+    manual_bsd, rel_bsd = manual[MANUAL_RELEASE_FREEBSD_JOB], rel[RELEASE_FREEBSD_JOB]
+    natives = (
+        (_Side.CI, ci_native, CI_RELEASE_NATIVE_JOB),
+        (_Side.MANUAL, manual_native, MANUAL_RELEASE_NATIVE_JOB),
+        (_Side.RELEASE, rel_native, RELEASE_NATIVE_JOB),
+    )
     for side, job, name, native in (
-        (_Side.CI, ci_native, CI_RELEASE_NATIVE_JOB, True),
-        (_Side.CI, ci_bsd, CI_RELEASE_FREEBSD_JOB, False),
-        (_Side.RELEASE, rel_native, RELEASE_NATIVE_JOB, True),
+        *((side, job, name, True) for side, job, name in natives),
+        (_Side.MANUAL, manual_bsd, MANUAL_RELEASE_FREEBSD_JOB, False),
         (_Side.RELEASE, rel_bsd, RELEASE_FREEBSD_JOB, False),
     ):
         where = f"{side.value} job {name!r}"
@@ -8615,42 +8639,63 @@ def check_release_target_parity(wfs: WorkflowSet, errors: list[str]) -> None:
             _check_tag_need(job, where, errors)
         _check_checkouts(job, where, repo, errors)
         _check_shells(job, where, repo, errors)
-    for side, job, name in ((_Side.CI, ci_native, CI_RELEASE_NATIVE_JOB), (_Side.RELEASE, rel_native, RELEASE_NATIVE_JOB)):
+    for side, job, name in natives:
         _check_native_job(side, job, f"{side.value} job {name!r}", errors)
     _check_tail(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", 4, None, repo, errors)
-    _compare("checkout action", (_steps_of(ci_native) or [{}])[0].get("uses"), (_steps_of(rel_native) or [{}])[0].get("uses"), errors)
+    rel_checkout = (_steps_of(rel_native) or [{}])[0].get("uses")
+    for side, job, _name in natives[:2]:
+        _compare("checkout action", (_steps_of(job) or [{}])[0].get("uses"), rel_checkout, errors, side.value)
 
     vm_uses = {}
-    for side, job, name in ((_Side.CI, ci_bsd, CI_RELEASE_FREEBSD_JOB), (_Side.RELEASE, rel_bsd, RELEASE_FREEBSD_JOB)):
+    for side, job, name in ((_Side.MANUAL, manual_bsd, MANUAL_RELEASE_FREEBSD_JOB), (_Side.RELEASE, rel_bsd, RELEASE_FREEBSD_JOB)):
         vm_uses[side] = _check_freebsd_job(side, job, f"{side.value} job {name!r}", errors)
-    if vm_uses[_Side.CI] is not None and vm_uses[_Side.RELEASE] is not None:
-        _compare("FreeBSD VM action", vm_uses[_Side.CI], vm_uses[_Side.RELEASE], errors)
+    if vm_uses[_Side.MANUAL] is not None and vm_uses[_Side.RELEASE] is not None:
+        _compare("FreeBSD VM action", vm_uses[_Side.MANUAL], vm_uses[_Side.RELEASE], errors, MANUAL_RELEASE_WORKFLOW)
     rel_vm_run = next(iter(s.get("with", {}).get("run") for s in _steps_of(rel_bsd)[1:2] if isinstance(s.get("with"), dict)), None)
     vm_tail = "\n".join(_run_lines(rel_vm_run)[1:]) if isinstance(rel_vm_run, str) else None
     _check_tail(rel_bsd, f"{RELEASE_WORKFLOW} job {RELEASE_FREEBSD_JOB!r}", 3, vm_tail, repo, errors)
     _compare(
         "checkout action (FreeBSD)",
-        (_steps_of(ci_bsd) or [{}])[0].get("uses"),
+        (_steps_of(manual_bsd) or [{}])[0].get("uses"),
         (_steps_of(rel_bsd) or [{}])[0].get("uses"),
         errors,
+        MANUAL_RELEASE_WORKFLOW,
     )
 
     ci_legs = _matrix_legs(ci_native, f"ci.yml job {CI_RELEASE_NATIVE_JOB!r}", _CI_LEG_KEYS, errors)
+    manual_legs = _matrix_legs(
+        manual_native, f"{MANUAL_RELEASE_WORKFLOW} job {MANUAL_RELEASE_NATIVE_JOB!r}", _CI_LEG_KEYS, errors
+    )
     rel_legs = _matrix_legs(rel_native, f"{RELEASE_WORKFLOW} job {RELEASE_NATIVE_JOB!r}", _RELEASE_LEG_KEYS, errors)
-    if ci_legs is None or rel_legs is None:
+    if ci_legs is None or manual_legs is None or rel_legs is None:
         return
-    for target, leg in sorted(rel_legs.items()):
-        if target not in ci_legs:
+    for target, leg in sorted(manual_legs.items()):
+        if leg["os"].startswith(_LINUX_RUNNER_PREFIX):
             errors.append(
-                f"check 23: {RELEASE_WORKFLOW} builds {target!r} but ci.yml's {CI_RELEASE_NATIVE_JOB} never checks it"
+                f"check 23: {MANUAL_RELEASE_WORKFLOW} checks {target!r} on {leg['os']!r}, a Linux runner; every "
+                f"Linux release target is checked in the merge queue by ci.yml's {CI_RELEASE_NATIVE_JOB}; refused"
             )
-        elif ci_legs[target]["os"] != leg["os"]:
+    for target in sorted(set(ci_legs).intersection(manual_legs)):
+        errors.append(
+            f"check 23: {target!r} is checked by both ci.yml's {CI_RELEASE_NATIVE_JOB} and "
+            f"{MANUAL_RELEASE_WORKFLOW}'s {MANUAL_RELEASE_NATIVE_JOB}; each target has exactly one check; refused"
+        )
+    checked = {**manual_legs, **ci_legs}
+    for target, leg in sorted(rel_legs.items()):
+        if target not in checked:
             errors.append(
-                f"check 23: target {target!r} runs on {ci_legs[target]['os']!r} in ci.yml but "
+                f"check 23: {RELEASE_WORKFLOW} builds {target!r} but neither ci.yml's {CI_RELEASE_NATIVE_JOB} nor "
+                f"{MANUAL_RELEASE_WORKFLOW}'s {MANUAL_RELEASE_NATIVE_JOB} checks it"
+            )
+        elif checked[target]["os"] != leg["os"]:
+            checker = "ci.yml" if target in ci_legs else MANUAL_RELEASE_WORKFLOW
+            errors.append(
+                f"check 23: target {target!r} runs on {checked[target]['os']!r} in {checker} but "
                 f"{leg['os']!r} in {RELEASE_WORKFLOW}; they must be equal"
             )
-    for target in sorted(set(ci_legs) - set(rel_legs)):
-        errors.append(f"check 23: ci.yml checks {target!r}, which {RELEASE_WORKFLOW} does not build")
+    for fname, legs in (("ci.yml", ci_legs), (MANUAL_RELEASE_WORKFLOW, manual_legs)):
+        for target in sorted(set(legs) - set(rel_legs)):
+            errors.append(f"check 23: {fname} checks {target!r}, which {RELEASE_WORKFLOW} does not build")
 
     published = {leg.get("artifact") for leg in rel_legs.values()}
     for step in _steps_of(rel_bsd):
