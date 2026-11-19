@@ -3118,7 +3118,7 @@ fn assemble_project_text(
             &mut files,
             &ctx.mount_base,
             &ctx.server_origins,
-            &FrameOriginEntries::none(),
+            &ctx.frame_origins,
             worker,
         )?;
 

@@ -1702,6 +1702,7 @@ mod tests {
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
             server_origins: ipe_backend_rust::ServerOrigins::none(),
+            frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -1910,6 +1911,7 @@ mod tests {
             wasm_public_env: _,
             mount_base: _,
             server_origins: _,
+            frame_origins: _,
             wasm_hydrate_mode: _,
             runtime_dep: _,
             debugger: _,
@@ -1937,6 +1939,10 @@ mod tests {
             flip("server_origins", |s| {
                 s.server_origins =
                     ipe_backend_rust::ServerOrigins::new([server]).expect("one origin is a list");
+            }),
+            flip("frame_origins", |s| {
+                s.frame_origins =
+                    frame_list(&["https://player.example"]).expect("one origin is a frame list");
             }),
             flip("wasm_hydrate_mode", |s| s.wasm_hydrate_mode = true),
             flip("runtime_dep", |s| {
@@ -2107,6 +2113,47 @@ mod tests {
         assert_eq!(
             api,
             key(&["https://api.example"]),
+            "an equal list reuses the entry"
+        );
+    }
+
+    /// The frame origins `texts` name, or `None` when one is not a frame
+    /// origin or the list is not a frame list.
+    fn frame_list(texts: &[&str]) -> Option<ipe_backend_rust::FrameOriginEntries> {
+        let entries = texts
+            .iter()
+            .map(|text| ipe_backend_rust::FrameOriginEntry::parse(text).ok())
+            .collect::<Option<Vec<_>>>()?;
+        ipe_backend_rust::FrameOriginEntries::new(entries).ok()
+    }
+
+    /// R35: the frame origins are part of the key: a bundle trusting a
+    /// framer and one trusting none never share an entry, nor do two
+    /// different lists, while the same list twice yields the same key.
+    #[test]
+    fn cache_key_flips_with_frame_origins() {
+        let (sources, injected) = sample_sources();
+        let key = |frames: &[&str]| {
+            let frames = frame_list(frames)?;
+            Some(compute_project_key(
+                &sources,
+                &injected,
+                &entry(),
+                &ipe_backend_rust::EmitSettings {
+                    frame_origins: frames,
+                    ..key_settings()
+                },
+            ))
+        };
+        let none = key(&[]);
+        let player = key(&["https://player.example"]);
+        let dev = key(&["http://localhost:3000"]);
+        assert!(none.is_some() && player.is_some() && dev.is_some());
+        assert_ne!(none, player, "the frame origins are part of the key");
+        assert_ne!(player, dev, "each list keys its own entry");
+        assert_eq!(
+            player,
+            key(&["https://player.example"]),
             "an equal list reuses the entry"
         );
     }

@@ -1243,6 +1243,11 @@ fn run_inner(
                     opts.hot_appearance,
                     opts.runtime_emit,
                 );
+                // A development rebuild never refuses a frame origin; the
+                // notice is shown once, by the first build of the session.
+                if let Ok(reach) = crate::driver::frame_step(&settings) {
+                    crate::driver::show_frame_reach(reach);
+                }
                 // Borrow each module's text from the snapshot:
                 // `sync_source_root` clones only at the real mutation points
                 // (a new input, or an actually-changed set), so the database

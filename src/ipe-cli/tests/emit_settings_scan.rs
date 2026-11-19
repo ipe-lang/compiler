@@ -212,6 +212,14 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "of",
         1,
     ),
+    // The emit settings carry the manifest's frame list to the shell meta and
+    // the emitted registration.
+    (
+        "field delivery.frame_origins",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "manifest_emit_settings",
+        1,
+    ),
     (
         "field delivery.frame_origins",
         "src/ipe-cli/src/driver/commands_pkg.rs",
@@ -1165,7 +1173,7 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
              fn build_from_sources() { go(HostIntent::Served); }\n\
              fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
              let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; \
-             let v = m.delivery.servers.clone(); }\n\
+             let v = m.delivery.servers.clone(); let f = m.delivery.frame_origins.clone(); }\n\
              fn emit_settings() { match s { Loose => loose_emit_settings(o, r), \
              Manifest { .. } => manifest_emit_settings(m, p, o, h, r) } }\n\
              fn loose_emit_settings() { EmitSettings { db_driver: d }; }\n\

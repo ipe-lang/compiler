@@ -85,6 +85,7 @@ fn compile_with_helper(main: &str, extras: &[(Vec<String>, String)]) -> Result<(
             wasm_public_env: Vec::new(),
             mount_base: ipe_backend_rust::MountBase::root(),
             server_origins: ipe_backend_rust::ServerOrigins::none(),
+            frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,

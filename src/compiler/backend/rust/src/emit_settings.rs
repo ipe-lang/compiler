@@ -11,6 +11,7 @@ use crate::{
     BuildIntent, CargoPackageName, CrateIdentity, DbDriver, FfiEmit, MountBase, RuntimeDep,
     ServedInstall, ServerOrigins, WebViewWindow,
 };
+use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
 
 /// The emitted crate's `[package] name`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -84,6 +85,8 @@ pub struct EmitSettings {
     pub mount_base: MountBase,
     /// The `delivery.servers` origins the browser bundle may reach.
     pub server_origins: ServerOrigins,
+    /// The `delivery.frameOrigins` a page of the program trusts to frame.
+    pub frame_origins: FrameOriginEntries,
     /// `true` when the wasm bundle emits the hydrate export.
     pub wasm_hydrate_mode: bool,
     /// The dependency-model selector; `None` emits the vendored project.
@@ -112,6 +115,7 @@ impl EmitSettings {
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
             server_origins: ServerOrigins::none(),
+            frame_origins: FrameOriginEntries::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -135,6 +139,7 @@ impl EmitSettings {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -182,6 +187,16 @@ impl EmitSettings {
             push_framed(&mut payload, origin.authority().as_bytes());
         }
         emit_field(sink, FieldTag::ServerOrigins, &payload);
+
+        let mut payload = Vec::new();
+        push_len(&mut payload, frame_origins.len());
+        let mut written = String::new();
+        for entry in frame_origins.entries() {
+            written.clear();
+            entry.write(&mut written);
+            push_framed(&mut payload, written.as_bytes());
+        }
+        emit_field(sink, FieldTag::FrameOrigins, &payload);
 
         emit_field(
             sink,
@@ -231,6 +246,51 @@ impl EmitSettings {
     }
 }
 
+/// A release build listing a loopback frame origin, which only `ipe dev`
+/// trusts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoopbackAtRelease {
+    /// The refused loopback entry.
+    pub entry: FrameOriginEntry,
+}
+
+impl std::fmt::Display for LoopbackAtRelease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut written = String::with_capacity(self.entry.written_len());
+        self.entry.write(&mut written);
+        write!(
+            f,
+            "`delivery.frameOrigins` lists `{written}`, a loopback origin that is for `ipe dev` \
+             only; a release build trusts `https://` origins"
+        )
+    }
+}
+
+/// The frame origins a build of `intent` may emit.
+///
+/// A development build emits every entry; a release build only `https://`
+/// entries.
+///
+/// # Errors
+///
+/// [`LoopbackAtRelease`] naming the first loopback entry of a release build.
+pub fn frame_origins_for_intent(
+    entries: &FrameOriginEntries,
+    intent: BuildIntent,
+) -> Result<&FrameOriginEntries, LoopbackAtRelease> {
+    match intent {
+        BuildIntent::Development => Ok(entries),
+        BuildIntent::Release => entries
+            .entries()
+            .find(|entry| matches!(entry, FrameOriginEntry::Loopback(_)))
+            .map_or(Ok(entries), |entry| {
+                Err(LoopbackAtRelease {
+                    entry: entry.clone(),
+                })
+            }),
+    }
+}
+
 /// The [`FieldTag::Host`] payload of `host`.
 fn host_payload(host: &EmitHost) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -276,6 +336,7 @@ enum FieldTag {
     Host = 11,
     Intent = 12,
     ServerOrigins = 13,
+    FrameOrigins = 14,
 }
 
 /// Write one field record: tag, payload length, payload.
@@ -379,6 +440,68 @@ mod tests {
             runtime_dep_payload(&linked(base)),
             Some(expected),
             "the dependency record is the presence byte and the framed digest alone",
+        );
+    }
+
+    /// The entries of `texts`, each a well-formed frame origin.
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn frames(texts: &[&str]) -> FrameOriginEntries {
+        FrameOriginEntries::new(
+            texts
+                .iter()
+                .map(|text| FrameOriginEntry::parse(text).expect("a frame origin")),
+        )
+        .expect("a frame list")
+    }
+
+    /// R28: a release build refuses a loopback frame origin and names it; a
+    /// development build admits it; a release build admits `https://` entries.
+    #[test]
+    fn release_refuses_a_loopback_frame_origin() {
+        let loopback = frames(&["https://player.example", "http://localhost:3000"]);
+        let refused = frame_origins_for_intent(&loopback, BuildIntent::Release);
+        assert!(
+            matches!(&refused, Err(LoopbackAtRelease { entry }) if matches!(entry, FrameOriginEntry::Loopback(_))),
+            "{refused:?}"
+        );
+        let Err(refusal) = refused else { return };
+        let text = refusal.to_string();
+        assert!(text.contains("`http://localhost:3000`"), "{text}");
+        assert!(text.contains("`ipe dev` only"), "{text}");
+        assert_eq!(
+            frame_origins_for_intent(&loopback, BuildIntent::Development),
+            Ok(&loopback)
+        );
+        let https = frames(&["https://player.example"]);
+        assert_eq!(
+            frame_origins_for_intent(&https, BuildIntent::Release),
+            Ok(&https)
+        );
+        let none = FrameOriginEntries::none();
+        assert_eq!(
+            frame_origins_for_intent(&none, BuildIntent::Release),
+            Ok(&none)
+        );
+    }
+
+    /// The listed frame origins split the key, and an empty list keeps a
+    /// record of its own.
+    #[test]
+    fn the_frame_origins_split_the_key() {
+        let with = |entries| EmitSettings {
+            frame_origins: entries,
+            ..EmitSettings::unconfigured()
+        };
+        let none = records(&EmitSettings::unconfigured());
+        let one = records(&with(frames(&["https://a.example"])));
+        assert_ne!(none, one);
+        assert_ne!(one, records(&with(frames(&["https://b.example"]))));
+        assert_eq!(one, records(&with(frames(&["https://a.example"]))));
+        assert!(
+            none.chunks(3)
+                .any(|record| record.first().map(Vec::as_slice)
+                    == Some(&[FieldTag::FrameOrigins as u8])),
+            "the empty list writes its record"
         );
     }
 

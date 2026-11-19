@@ -480,6 +480,7 @@ mod tests {
                 wasm_public_env: Vec::new(),
                 mount_base: ipe_backend_rust::MountBase::root(),
                 server_origins: ipe_backend_rust::ServerOrigins::none(),
+                frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
                 wasm_hydrate_mode: false,
                 runtime_dep: None,
                 debugger: false,
@@ -513,6 +514,7 @@ mod tests {
                     .ok()
                     .and_then(|origin| ipe_backend_rust::ServerOrigins::new([origin]).ok())
                     .unwrap_or_else(ipe_backend_rust::ServerOrigins::none),
+                frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
                 wasm_hydrate_mode: true,
                 runtime_dep: Some(ipe_backend_rust::RuntimeDep {
                     content: ipe_backend_rust::RuntimeContentId::from_digest_bytes([3; 16]),
