@@ -343,6 +343,10 @@ pub enum NetworkRefusal {
     /// [`NetworkAuthority`]: a host, user or port holding text a program
     /// handed it (`ssh`, a proxy command) could read as more than a name.
     Authority,
+    /// An `https://` or `ssh://` URL `git` would split at another place than
+    /// its first `/`: a path holding `[` or `]`, or an `ssh://` URL holding a
+    /// `%` escape `git` decodes first.
+    Path,
 }
 
 impl NetworkRefusal {
@@ -356,6 +360,7 @@ impl NetworkRefusal {
             Self::Plaintext => crate::text::msg::index_source_url_plaintext(pkg, shown),
             Self::Invalid => crate::text::msg::index_source_url_invalid(pkg, shown),
             Self::Authority => crate::text::msg::index_source_url_authority(pkg, shown),
+            Self::Path => crate::text::msg::index_source_url_path(pkg, shown),
         }
     }
 }
@@ -446,9 +451,7 @@ impl SourceUrl {
         if !raw.chars().all(is_url_char) {
             return Err(NetworkRefusal::Invalid);
         }
-        if !NetworkAuthority::admits(raw) {
-            return Err(NetworkRefusal::Authority);
-        }
+        NetworkAuthority::judge(raw)?;
         Ok(Some(Self {
             recorded: raw.to_owned(),
             transport,
@@ -503,13 +506,14 @@ fn sink_check(arg: &str) -> Result<(), SourceRefusal> {
     if arg.starts_with('-') || arg.contains("::") {
         return Err(SourceRefusal::Network(NetworkRefusal::Invalid));
     }
-    if !NetworkAuthority::admits(arg) {
-        return Err(SourceRefusal::Network(NetworkRefusal::Authority));
+    if !arg.chars().all(is_url_char) {
+        return Err(SourceRefusal::Network(NetworkRefusal::Invalid));
     }
-    Ok(())
+    NetworkAuthority::judge(arg).map_err(SourceRefusal::Network)
 }
 
-/// The authority grammar of a network source URL: `[user@]host[:port]`.
+/// The grammar of a network source URL past its scheme:
+/// `[user@]host[:port]/path`.
 ///
 /// `git` hands an `ssh://` URL's `user@host` to `ssh` as one argument, and
 /// `ssh` substitutes it into a configured `ProxyCommand` or `Match exec`
@@ -519,22 +523,42 @@ fn sink_check(arg: &str) -> Result<(), SourceRefusal> {
 ///   bracketed IPv6 literal of hex digits, `:` and `.`;
 /// - port: 1 to 65535 in decimal digits.
 ///
-/// The authority ends at the first `/`, which must follow it.
+/// The authority ends at the first `/`, which must follow it. `git` must split
+/// the URL at that same `/`, so the path holds no `[` or `]` (`git` takes an
+/// `@[...]` anywhere in an `ssh://` URL as the bracketed host) and an
+/// `ssh://` URL holds no `%` (`git` percent-decodes it before splitting).
 struct NetworkAuthority;
 
 impl NetworkAuthority {
-    /// Whether the `https://` or `ssh://` URL `url` has a plain authority
-    /// followed by a path; any other text is not admitted.
-    fn admits(url: &str) -> bool {
-        let Some(rest) = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("ssh://"))
-        else {
-            return false;
+    /// Judge the `https://` or `ssh://` URL `url`: a plain authority followed
+    /// by a path `git` splits at the same `/`.
+    ///
+    /// # Errors
+    /// [`NetworkRefusal::Path`] when the path holds `[` or `]` or an `ssh://`
+    /// URL holds `%`; [`NetworkRefusal::Authority`] for any other text that is
+    /// not a plain authority followed by `/`.
+    fn judge(url: &str) -> Result<(), NetworkRefusal> {
+        let (rest, decoded) = match url.strip_prefix("ssh://") {
+            Some(rest) => (rest, true),
+            None => (
+                url.strip_prefix("https://")
+                    .ok_or(NetworkRefusal::Authority)?,
+                false,
+            ),
         };
-        let Some((authority, _path)) = rest.split_once('/') else {
-            return false;
-        };
+        let (authority, path) = rest.split_once('/').ok_or(NetworkRefusal::Authority)?;
+        if !Self::admits(authority) {
+            return Err(NetworkRefusal::Authority);
+        }
+        if path.contains(['[', ']']) || (decoded && url.contains('%')) {
+            return Err(NetworkRefusal::Path);
+        }
+        Ok(())
+    }
+
+    /// Whether `authority` (the text between the scheme and the first `/`) is
+    /// a plain `[user@]host[:port]`.
+    fn admits(authority: &str) -> bool {
         let (user, host_port) = match authority.split_once('@') {
             Some((user, host_port)) => (Some(user), host_port),
             None => (None, authority),
@@ -2693,6 +2717,101 @@ mod tests {
             assert!(SourceUrl::parse_in(admitted).is_ok(), "{admitted:?}");
             assert_eq!(sink_check(admitted), Ok(()), "{admitted:?}");
         }
+    }
+
+    /// `git` reads an `@[...]` anywhere in an `ssh://` URL as the bracketed
+    /// host and percent-decodes an `ssh://` URL before splitting it, so a path
+    /// that could move the host `git` hands `ssh` is refused at parse and sink.
+    #[test]
+    fn a_network_source_path_cannot_move_the_host_git_reads() {
+        use super::{NetworkRefusal, SourceRefusal, sink_check};
+        for raw in [
+            "ssh://h/x@[$(id)]/r",
+            "ssh://git@h/x@[;id]/r",
+            "ssh://h/x%40%5b$(id)%5d/r",
+            "ssh://h/x@%5b;id%5d/r",
+            "ssh://h/a%20b/r",
+            "ssh://[0:0:0:0:0:0:0:1]/x@[a]/r",
+            "https://h/x@[a]/r",
+            "https://h/r]",
+        ] {
+            let refused = Err(SourceRefusal::Network(NetworkRefusal::Path));
+            assert_eq!(SourceUrl::parse_in(raw), refused, "{raw:?}");
+            assert_eq!(sink_check(raw), refused.map(|_: SourceUrl| ()), "{raw:?}");
+            let shown = crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+            let err = SourceUrl::parse(&pn("p"), raw).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                crate::CliError::Resolve(crate::text::msg::index_source_url_path(&pn("p"), &shown))
+                    .to_string(),
+                "{raw:?}"
+            );
+        }
+        for admitted in ["https://h/a%20b/r", "ssh://h/~u/r@x", "https://h/r@x"] {
+            assert!(SourceUrl::parse_in(admitted).is_ok(), "{admitted:?}");
+            assert_eq!(sink_check(admitted), Ok(()), "{admitted:?}");
+        }
+        assert_eq!(
+            sink_check("ssh://h/r x"),
+            Err(SourceRefusal::Network(NetworkRefusal::Invalid))
+        );
+    }
+
+    /// For every admitted `ssh://` source, the host argument `git` itself hands
+    /// `ssh` is the judged `user@host`: the grammar splits where `git` splits.
+    /// The refused twin shows a path-borne `@[...]` would move it.
+    #[cfg(unix)]
+    #[test]
+    fn git_hands_ssh_the_judged_authority() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::scratch::ScratchDir::new("ipe-index-ssh-argv").unwrap();
+        let ssh = dir.path().join("ssh");
+        let argv = dir.path().join("argv");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$IPE_SSH_ARGV\"\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let host_argument = |url: &str| {
+            let _ = std::fs::remove_file(&argv);
+            let _ran = crate::remote_ingest::fixture_git(dir.path())
+                .args(["ls-remote", "--", url])
+                .env_remove("GIT_SSH_COMMAND")
+                .env("GIT_SSH", &ssh)
+                .env("GIT_SSH_VARIANT", "ssh")
+                .env("GIT_ALLOW_PROTOCOL", "ssh")
+                .env("IPE_SSH_ARGV", &argv)
+                .output()
+                .unwrap();
+            let lines = std::fs::read_to_string(&argv).unwrap();
+            let lines: Vec<&str> = lines.lines().collect();
+            let command = lines
+                .iter()
+                .position(|line| line.starts_with("git-upload-pack "))
+                .unwrap();
+            lines
+                .get(command.checked_sub(1).unwrap())
+                .unwrap()
+                .to_string()
+        };
+        for (admitted, host) in [
+            ("ssh://git@github.com/user/repo", "git@github.com"),
+            (
+                "ssh://git_user.x-y@h-1.example:2222/r",
+                "git_user.x-y@h-1.example",
+            ),
+            ("ssh://[fe80:0:0:0:0:0:0:1]:22/r", "fe80:0:0:0:0:0:0:1"),
+            ("ssh://u@[0:0:0:0:0:0:0:1]/r", "u@0:0:0:0:0:0:0:1"),
+            ("ssh://h/~u/r@x", "h"),
+            ("ssh://h/r;x=$y&z!@(a)", "h"),
+        ] {
+            assert!(SourceUrl::parse_in(admitted).is_ok(), "{admitted:?}");
+            assert_eq!(host_argument(admitted), host, "{admitted:?}");
+        }
+        let moved = "ssh://h/x@[a]/r";
+        assert!(SourceUrl::parse_in(moved).is_err());
+        assert_eq!(host_argument(moved), "h/x@a");
     }
 
     #[test]

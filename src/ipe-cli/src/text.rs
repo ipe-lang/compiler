@@ -2084,6 +2084,8 @@ messages! {
     index_source_url_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-invalid";
     /// An index `source` URL whose `[user@]host[:port]` is not a plain name.
     index_source_url_authority(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-authority";
+    /// An index `source` URL `git` would split into another host than its own.
+    index_source_url_path(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-path";
     /// An index `source` that is not an `https://` or `ssh://` URL.
     index_source_url_not_network(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-not-network";
     /// A lockfile escape `source` that is neither a network URL nor an absolute local location.
