@@ -234,10 +234,6 @@ pub enum CargoTarget {
     /// The browser bundle, `wasm32-unknown-unknown`.
     WasmBrowser,
     /// A WASI module, `wasm32-wasip1`.
-    ///
-    /// The emitted crate ships its own `.cargo/config.toml` linker override for
-    /// this target, which an ambient `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`
-    /// would outrank, so both are cleared from the child.
     Wasip1,
 }
 
@@ -249,6 +245,29 @@ impl CargoTarget {
             Self::Static(triple) => Some(triple.as_str()),
             Self::WasmBrowser => Some("wasm32-unknown-unknown"),
             Self::Wasip1 => Some("wasm32-wasip1"),
+        }
+    }
+
+    /// The cargo environment variable that sets this target's
+    /// `[target.<triple>] rustflags`, or `None` for the host.
+    ///
+    /// A target triple's build is governed by the target-scoped rustflags its
+    /// crate's own `.cargo/config.toml` carries (the wasm targets' shadow of a
+    /// host `build.rustflags`, a static build's `+crt-static`). An ambient
+    /// `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` outranks that table and this
+    /// variable replaces it, and a host's flags (a native linker's link-arg)
+    /// break a cross link, so a target build clears all three from its child.
+    pub(crate) const fn rustflags_env(self) -> Option<&'static str> {
+        match self {
+            Self::Host => None,
+            Self::Static(StaticTriple::X8664LinuxMusl) => {
+                Some("CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS")
+            }
+            Self::Static(StaticTriple::Aarch64LinuxMusl) => {
+                Some("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS")
+            }
+            Self::WasmBrowser => Some("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS"),
+            Self::Wasip1 => Some("CARGO_TARGET_WASM32_WASIP1_RUSTFLAGS"),
         }
     }
 }
@@ -735,9 +754,10 @@ fn build_command(
     if let Some(triple) = target.triple() {
         cmd.args(["--target", triple]);
     }
-    if target == CargoTarget::Wasip1 {
+    if let Some(target_rustflags) = target.rustflags_env() {
         cmd.env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS");
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove(target_rustflags);
     }
     cmd.arg("--message-format=json")
         .stdout(Stdio::piped())
@@ -1673,30 +1693,64 @@ mod tests {
         );
     }
 
+    /// Every target the build can name.
+    const EVERY_TARGET: [CargoTarget; 5] = [
+        CargoTarget::Host,
+        CargoTarget::Static(StaticTriple::X8664LinuxMusl),
+        CargoTarget::Static(StaticTriple::Aarch64LinuxMusl),
+        CargoTarget::WasmBrowser,
+        CargoTarget::Wasip1,
+    ];
+
     #[test]
-    fn only_a_wasip1_build_clears_the_ambient_rustflags() {
-        let wasi = super::build_command(
-            Path::new("cargo"),
-            Path::new("/c"),
-            Path::new("/t"),
-            BuildPosture::Release,
-            CargoTarget::Wasip1,
-            CargoOutput::JsonStream(Verbosity::Quiet),
-        );
-        assert_eq!(env(&wasi, "RUSTFLAGS"), Env::Removed);
-        assert_eq!(env(&wasi, "CARGO_ENCODED_RUSTFLAGS"), Env::Removed);
-        assert!(args(&wasi).iter().any(|a| a == "wasm32-wasip1"));
-        assert!(args(&wasi).iter().any(|a| a == "--message-format=json"));
-        for target in [CargoTarget::Host, CargoTarget::WasmBrowser] {
-            let other = super::build_command(
+    fn every_target_build_clears_the_ambient_rustflags_and_the_host_keeps_them() {
+        for target in EVERY_TARGET {
+            let build = super::build_command(
                 Path::new("cargo"),
                 Path::new("/c"),
                 Path::new("/t"),
-                BuildPosture::Dev,
+                BuildPosture::Release,
                 target,
-                CargoOutput::Human(Verbosity::Quiet),
+                CargoOutput::JsonStream(Verbosity::Quiet),
             );
-            assert_eq!(env(&other, "RUSTFLAGS"), Env::Inherited, "{target:?}");
+            assert_eq!(
+                target.rustflags_env().is_some(),
+                target.triple().is_some(),
+                "{target:?}"
+            );
+            if let Some(scoped) = target.rustflags_env() {
+                assert_eq!(env(&build, scoped), Env::Removed, "{target:?}");
+            }
+            let cleared = if target.triple().is_some() {
+                Env::Removed
+            } else {
+                Env::Inherited
+            };
+            assert_eq!(env(&build, "RUSTFLAGS"), cleared, "{target:?}");
+            assert_eq!(
+                env(&build, "CARGO_ENCODED_RUSTFLAGS"),
+                cleared,
+                "{target:?}"
+            );
+            assert!(args(&build).iter().any(|a| a == "--message-format=json"));
+        }
+    }
+
+    /// Each target's rustflags variable is cargo's spelling of its triple.
+    #[test]
+    fn every_target_rustflags_variable_names_its_own_triple() {
+        for target in EVERY_TARGET {
+            let derived = target.triple().map(|triple| {
+                format!(
+                    "CARGO_TARGET_{}_RUSTFLAGS",
+                    triple.to_ascii_uppercase().replace(['-', '.'], "_")
+                )
+            });
+            assert_eq!(
+                target.rustflags_env().map(str::to_owned),
+                derived,
+                "{target:?}"
+            );
         }
     }
 

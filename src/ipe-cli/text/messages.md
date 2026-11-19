@@ -515,10 +515,6 @@ a co-located `wasm32-wasip1` build cannot carry a `client` delivery. `client` is
 
 `ipe dev watch` rebuilds and restarts a served program, and `{delivery}` is a browser bundle with no server to restart. Build the bundle with `ipe dev build {delivery}`.
 
-## delivery-client-desktop-has-no-packer
-
-`web client desktop` names a desktop shell around the self-contained client, and no packer builds that shell yet, so nothing is built. Build the browser client with `web client`, or the desktop app with `web desktop`.
-
 ## delivery-wasi-requires-direct-shape
 
 a co-located `wasm32-wasip1` build carries only a `Direct` script (a plain `Task Error ()` `main`), but this is a `{shape}` app. A `tui`/`cli`/`web` TEA loop needs the reactor spine, which does not build on WASI. Build the `{shape}` app natively, or ship a `Direct` script to `wasm32-wasip1`.
@@ -848,7 +844,7 @@ the shared test build directory in the per-user cache
 
 ## cli-test-target-busy
 
-another `ipe test` held the test build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe test` is running, or set `CARGO_TARGET_DIR` to build elsewhere
+another `ipe` build held the build lock {path} for longer than {wall}; wait for it to finish, remove {path} if no `ipe` build is running, or set `CARGO_TARGET_DIR` to build elsewhere
 
 ## cli-test-runner-stale
 
@@ -2814,7 +2810,19 @@ cannot locate the ipe binary to build wasm: {detail}
 
 ## mobile-wasm-build-failed
 
-the `web client` build failed (exit {code}) — the mobile shell hosts that bundle, so it must build first
+the `web client` build failed (exit {code}) — the packed shell hosts that bundle, so it must build first
+
+## client-desktop-push
+
+`web client desktop` serves its bundle from a custom scheme, which is not a secure context for a push service worker on every desktop webview, so a project that accepts `JsPort Push` or names `delivery.mobile.push` is not packed. Ship push through `web client`, `web client ios` or `web client android`.
+
+## client-desktop-storage-key
+
+the bundle id `{id}` cannot name the desktop app's storage directory: {reason}. Declare another `delivery.mobile.bundleId` in package.ipe.
+
+## client-desktop-local-origin
+
+`delivery.servers` names `{origin}`, a loopback or `localhost` origin the `web client desktop` shell cannot tell apart from its own local origin. Name the server by its public host.
 
 ## emit-permissions-failed
 

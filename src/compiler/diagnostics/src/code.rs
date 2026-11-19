@@ -723,6 +723,12 @@ code! {
     /// a function needs to copy, compare, or share a value whose type cannot
     /// be copied, compared, or shared (a `Task` handed to `List.repeat`).
     IPE_L0164 = "IPE-L0164", "a function needs to copy a value that cannot be copied", "IPE-L0164";
+    /// the route table a `Web.pageLink` names is not a top-level list of
+    /// `Web.route` calls over a closed custom page type.
+    IPE_L0165 = "IPE-L0165", "the route table of `Web.pageLink` is not a top-level list of `Web.route` calls", "IPE-L0165";
+    /// a `Web.pageLink` table is not the one table of the program: the routed
+    /// app's `routes` binding, or the table every other page link names.
+    IPE_L0166 = "IPE-L0166", "a `Web.pageLink` table is not the routed app's `routes` binding", "IPE-L0166";
     /// expression nests too deeply for the backend
     IPE_L0200 = "IPE-L0200", "expression nests too deeply for the backend", "IPE-L0200";
     /// a type nests too deeply for the backend

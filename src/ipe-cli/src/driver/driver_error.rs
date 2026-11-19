@@ -269,7 +269,7 @@ pub enum CliError {
         /// The random source's failure.
         source: std::io::Error,
     },
-    /// Another `ipe test` held the shared test build directory past the wall.
+    /// Another `ipe` build held a shared build directory past the wall.
     TestTargetBusy {
         /// The held lock file, as display text.
         path: TerminalSafe,

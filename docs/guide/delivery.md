@@ -116,6 +116,41 @@ a Linux host; a macOS `.app` or a Windows `.exe` + zip has its *layout and
 manifest* written for inspection here, but the signed, runnable artifact must be
 finished on that OS's own runner (cross-OS toolchains are out of scope).
 
+## Desktop client: a wasm client in a native shell
+
+`web client desktop` packs the same wasm client a browser runs into a fixed
+native shell for the host OS. The shell serves the bundle from memory on one
+local origin: there is no server process, no port, no IPC bridge, and no file
+the page can name. The page carries the bundle's own `Content-Security-Policy`,
+and the shell sends the same policy as a header.
+
+```sh
+ipe release build web client desktop
+```
+
+The bundle lands under `out/release/web-client-desktop/dist/<os>/`, laid out
+as for `web desktop`; `build web client desktop` writes a fast dev bundle under
+`out/dist/`.
+
+- **Storage.** The webview keeps cookies, `localStorage` and caches in a private
+  directory keyed by the bundle id (`delivery.mobile.bundleId`, else the one
+  derived from the name): `$XDG_DATA_HOME/<bundle id>/webview/` on Linux
+  (`~/.local/share` when unset), `%LOCALAPPDATA%\<bundle id>\webview\` on
+  Windows, and WebKit's own store for the bundle id on macOS. A relative root, a
+  symlinked directory or one another user can read, and a bundle id no OS can
+  name a directory by (such as `con.acme`) are refused; the shell never falls
+  back to a shared profile.
+- **Threat model.** The OS user account is the isolation boundary. The bundle id
+  separates honest apps; it does not authenticate one, so any process of the
+  same user can read the directory. Dev and release builds of one bundle id share
+  it, it stays after the app is removed, and its quota is the engine's.
+- **Links.** An `https://` link to a public host opens in the system browser;
+  every other navigation away from the bundle is refused, and the window never
+  leaves the app.
+- **Refused before any build:** push (a custom-scheme page is not a secure
+  context for a push service worker on every desktop webview), and a
+  `delivery.servers` entry naming a loopback or `localhost` origin.
+
 ## Mobile: a wasm client in a system-webview shell
 
 A mobile app is the `Web` shape delivered as a `client` — the DOM app compiled to

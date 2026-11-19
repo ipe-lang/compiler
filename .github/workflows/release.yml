@@ -51,7 +51,9 @@ jobs:
   # Native/cross build per target. Linux is fully-static musl (copy-anywhere,
   # no runtime deps); the others are the platform-native binary. The checkout,
   # the shared .github/actions/release-target-toolchain step and the cargo
-  # command are ci.yml's release-targets-run's, pinned by check 23.
+  # command are those of ci.yml's release-targets-run (the Linux targets) and
+  # release-targets.yml's release-targets-native (the others), pinned by
+  # check 23.
   build:
     needs: resolve-tag
     strategy:

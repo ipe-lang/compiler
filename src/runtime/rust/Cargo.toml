@@ -66,7 +66,7 @@ url = { version = "2", optional = true }
 # runtime gets a working `tinyvec`. Optional so it is absent from dep graphs that
 # do not activate `url`.
 tinyvec = { version = "1", features = ["std"], optional = true }
-lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls"], optional = true }
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls"], optional = true }
 # Handshake only: the runtime owns the `wss://` TLS (`tokio-rustls` over the
 # `ring` provider, trusting `webpki-roots`), so tungstenite carries no TLS or
 # root-store feature of its own, and no native-tls dependency enters.
@@ -190,6 +190,12 @@ crossterm = { version = "0.29", optional = true }
 # macOS-15/Xcode-16 + Windows-2025; on Linux they target webkit2gtk-4.1 + libsoup-3.0.
 wry = { version = "0.55", optional = true }
 tao = { version = "0.35", optional = true }
+
+# Linux-only: the GTK tao and wry already build on, named directly for its
+# fallible `gtk::init` (`webview::shell::WindowSystem::open`); tao's own init
+# panics when no display answers.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = { version = "0.18", optional = true }
 
 # Unix-only syscalls go through rustix's safe wrappers — no hand-written `unsafe`
 # FFI. `pty` + `termios`: `Ipe.Process.runInPty` allocates a pseudo-terminal
@@ -473,7 +479,16 @@ web-core = ["dep:serde_json", "json", "serde", "dep:serde_urlencoded", "encoding
 # from `random`'s LCG (`super::random::lcg_next`) — every tokio-enabling feature
 # must also enable `random` or the module is absent (same invariant as `async`).
 # The no-server floor is machine-checked by `tests/webview_dep_floor.rs`.
-webview = ["wry", "tao", "web-core", "tokio", "random"]
+webview = ["webview-shell", "web-core", "tokio", "random"]
+# The `client desktop` shell: a native window serving an embedded bundle under
+# the shell's custom scheme, with no async runtime and no server. `encoding`
+# carries the bundle path grammar; `browser-open` the system-browser opener
+# its link policy hands public `https` links to. `gtk` (Linux) starts the window
+# system fallibly before tao, so a missing display is a typed refusal.
+webview-shell = ["wry", "tao", "dep:gtk", "encoding", "browser-open"]
+# The system-browser opener: a typed URL per origin and the platform opener,
+# started through the hardened spawner. Std-only.
+browser-open = []
 config = ["json", "toml", "dep:serde-saphyr"]
 # `tokio/net`+`tokio/sync`: axum binds a listener (`tokio::net`) and the
 # server/live loop uses `tokio::sync`.

@@ -258,7 +258,7 @@ fn pure_ui_app_emits_wasm_project() {
 ///
 /// `ipe_runtime::tea::WebApp` is a native-only type absent from the
 /// `wasm32-unknown-unknown` target; the emitted `ipe_main()` must return
-/// `IpeTask<()>` so `ipe_runtime::wasm::run_start(ipe_main())` type-checks and
+/// `IpeTask<()>` so the deferred `ipe_runtime::wasm::run_start` entry type-checks and
 /// `cargo build --target wasm32-unknown-unknown` succeeds. The body correctly
 /// calls `ipe_runtime::wasm::wasm_app`; only the declared return type was wrong
 /// before the fix in `emit_types.rs`. This test guards that exact regression.

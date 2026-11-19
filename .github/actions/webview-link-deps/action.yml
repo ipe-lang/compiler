@@ -4,11 +4,15 @@ description: >-
   and link against, so a webview build script finds them through pkg-config.
   This is the one place a job installs them. The `-dev` packages pull in the
   WebKitGTK/GStreamer runtime libraries as hard dependencies, a download that
-  varies from seconds to tens of minutes with the mirror. The fetched archives
-  are cached (only `main` saves, as everywhere else) so a restored run installs
-  from disk and only a cold or stale cache pays the mirror; the install goes
-  through the `apt-install` action, whose bounded attempts keep even that case
-  inside the job budget.
+  varies from seconds to tens of minutes with the mirror. Only the fetched
+  `.deb` archives are cached, never the package manager's working state, under
+  a key whose runner OS and architecture-variant prefix lets a newer image
+  build restore the newest seed `main` saved (only `main` saves, as everywhere
+  else), so the mirror pays only the packages that changed since. After the
+  install the archives no longer installed are pruned, and an archive that is
+  not a regular file the runner can read fails the job, so the save can never
+  fail silently. The install goes through the `apt-install` action, whose
+  bounded attempts keep even a cold cache inside the job budget.
 
 runs:
   using: composite
@@ -16,22 +20,104 @@ runs:
     - name: Identify the runner image
       id: apt-image
       shell: bash
-      run: echo "image=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        image_os="${ImageOS:-}"
+        image_version="${ImageVersion:-}"
+        arch_lines=""
+        if command -v apt-config >/dev/null 2>&1; then
+          arch_lines="$(apt-config dump | sed -n '/^APT::Architecture/p')"
+        fi
+        variant="$(printf '%s' "$arch_lines" | sha256sum | cut -c1-16)"
+        if [[ ! "$image_os" =~ ^[A-Za-z0-9._]+$ ]]; then
+          image_os=unknown
+        fi
+        if [[ ! "$image_version" =~ ^[A-Za-z0-9._]+$ ]]; then
+          image_version=unknown
+        fi
+        if [[ ! "$variant" =~ ^[A-Za-z0-9._]+$ ]]; then
+          variant=unknown
+        fi
+        echo "os=${image_os}" >> "$GITHUB_OUTPUT"
+        echo "variant=${variant}" >> "$GITHUB_OUTPUT"
+        echo "image=${image_version}" >> "$GITHUB_OUTPUT"
     - name: Restore webview link dep archives
       id: apt-cache
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
       with:
-        path: ${{ runner.temp }}/apt-archives
-        key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-${{ steps.apt-image.outputs.image }}
+        path: ${{ runner.temp }}/apt-archives/*.deb
+        key: ${{ runner.os }}-${{ runner.arch }}-apt-webview-v2-${{ steps.apt-image.outputs.os }}-${{ steps.apt-image.outputs.variant }}-${{ steps.apt-image.outputs.image }}
+        restore-keys: ${{ runner.os }}-${{ runner.arch }}-apt-webview-v2-${{ steps.apt-image.outputs.os }}-${{ steps.apt-image.outputs.variant }}-
     - name: Install webview link deps (wry/tao — GLib/GTK/WebKit)
       uses: ./.github/actions/apt-install
       with:
         packages: libwebkit2gtk-4.1-dev libsoup-3.0-dev
         archives: ${{ runner.temp }}/apt-archives
         no-install-recommends: "true"
+    # An archive's filename ends in the architecture apt fetched it for (an
+    # architecture variant such as `amd64v3`), not dpkg's `${Architecture}`
+    # (`amd64`), so an archive is kept by its package and version alone.
+    - name: Prune and check the webview link dep archives
+      id: apt-archives
+      shell: bash
+      env:
+        ARCHIVES_DIR: ${{ runner.temp }}/apt-archives
+      run: |
+        set -euo pipefail
+        export LC_ALL=C
+        shopt -s nullglob dotglob
+        if [[ ! -d "$ARCHIVES_DIR" || -L "$ARCHIVES_DIR" ]]; then
+          echo "::error::webview-link-deps: the archives directory is missing or not a directory" >&2
+          exit 1
+        fi
+        if [[ ! -r "$ARCHIVES_DIR" || ! -x "$ARCHIVES_DIR" ]]; then
+          echo "::error::webview-link-deps: the archives directory is not listable by the runner user, so it cannot be cached" >&2
+          exit 1
+        fi
+        installed="$(dpkg-query -W -f='${db:Status-Abbrev}\t${Package}_${Version}\n')"
+        declare -A keep=()
+        while IFS=$'\t' read -r status name; do
+          if [[ "${status:1:1}" == "i" && -n "$name" ]]; then
+            keep["${name//:/%3a}"]=1
+          fi
+        done <<< "$installed"
+        if [[ ${#keep[@]} -eq 0 ]]; then
+          echo "::error::webview-link-deps: dpkg-query listed no installed package" >&2
+          exit 1
+        fi
+        kept=0
+        pruned=0
+        for deb in "$ARCHIVES_DIR"/*.deb; do
+          base="${deb##*/}"
+          shown="$base"
+          if [[ ! "$shown" =~ ^[A-Za-z0-9._%+~-]+$ ]]; then
+            shown="an archive whose name is not printable"
+          fi
+          if [[ -L "$deb" || ! -f "$deb" ]]; then
+            echo "::error::webview-link-deps: ${shown} is not a regular file, so it cannot be cached" >&2
+            exit 1
+          fi
+          if [[ ! -r "$deb" ]]; then
+            echo "::error::webview-link-deps: ${shown} is not readable by the runner user, so it cannot be cached" >&2
+            exit 1
+          fi
+          stem=""
+          if [[ "$base" =~ ^([a-z0-9][a-z0-9.+-]*_[A-Za-z0-9.+~%-]+)_[a-z0-9]+\.deb$ ]]; then
+            stem="${BASH_REMATCH[1]}"
+          fi
+          if [[ -z "$stem" || -z "${keep[$stem]+set}" ]]; then
+            rm -f -- "$deb"
+            pruned=$((pruned + 1))
+            continue
+          fi
+          kept=$((kept + 1))
+        done
+        echo "webview-link-deps: kept ${kept} installed archives, pruned ${pruned} no longer installed"
+        echo "debs=${kept}" >> "$GITHUB_OUTPUT"
     - name: Save webview link dep archives
-      if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true'
+      if: github.ref == 'refs/heads/main' && steps.apt-cache.outputs.cache-hit != 'true' && steps.apt-archives.outputs.debs != '0'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
       with:
-        path: ${{ runner.temp }}/apt-archives
+        path: ${{ runner.temp }}/apt-archives/*.deb
         key: ${{ steps.apt-cache.outputs.cache-primary-key }}

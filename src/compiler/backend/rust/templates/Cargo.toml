@@ -52,10 +52,15 @@ web-core = []
 widget-assets = []
 web = ["web-core", "widget-assets"]
 redis_store = []
-# `webview = []` is a surgery anchor: `webview_cargo_toml` replaces it with the
-# wry+tao deps AND promotes `web-core` + `webview` into `default` — so a webview
-# build activates the render core without a static feature edge here.
+# `webview = []` and `webview-shell = ["browser-open"]` are surgery anchors:
+# `webview_cargo_toml` rewrites them to the runtime crate's own edges
+# (`webview` implies `webview-shell` and `web-core`; `webview-shell` pulls the
+# wry+tao deps and `browser-open`) and promotes `web-core` + `webview` into
+# `default`.
+# `browser-open` is inert: the system-browser opener is std-only.
 webview = []
+webview-shell = ["browser-open"]
+browser-open = []
 tui = []
 websocket_client = []
 # The outbound HTTP client. `http_client_cargo_toml` promotes it and adds

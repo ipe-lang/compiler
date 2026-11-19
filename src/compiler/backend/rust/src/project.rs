@@ -604,22 +604,37 @@ fn unclassified_wrapper(path: &str) -> Diagnostic {
     }
 }
 
+/// The `WasmClient` entry task: `ipe_main` is built on the task's first poll,
+/// so a program whose startup `run_start` refuses evaluates none of it, and a
+/// trip while building it is a trap under the installed panic hook.
+macro_rules! wasm_deferred_entry {
+    () => {
+        "let entry: IpeTask<()> = Box::pin(async { ipe_main().await });"
+    };
+}
+const WASM_DEFERRED_ENTRY: &str = wasm_deferred_entry!();
+
 /// The `WasmClient` entry: `#[wasm_bindgen(start)]` replacing `fn main`.
 /// The panic hook makes a residual trap die with a classified console error;
 /// the entry task runs on the browser microtask queue.
-const WASM_ENTRY: &str = "\
-#[wasm_bindgen::prelude::wasm_bindgen(start)]
-pub fn ipe_start() {
-    ipe_runtime::wasm::install_panic_hook();
-    ipe_runtime::wasm::run_start(ipe_main());
-}
-";
+const WASM_ENTRY: &str = concat!(
+    "#[wasm_bindgen::prelude::wasm_bindgen(start)]\n",
+    "pub fn ipe_start() {\n",
+    "    ipe_runtime::wasm::install_panic_hook();\n",
+    "    ",
+    wasm_deferred_entry!(),
+    "\n",
+    "    ipe_runtime::wasm::run_start(entry);\n",
+    "}\n",
+);
 
 /// The `[wasm] mode = "hydrate"` second entry: parses island JSON as the
 /// user-declared `HydrationState` type, converts via `fromHydrationState`
-/// (`main_from_hydration_state`), and adopts the server-rendered DOM.  On any
-/// parse error it falls back to a clean `ipe_main()` init (fault-tolerant: no
-/// white screen on a tampered or stale island blob).
+/// (`main_from_hydration_state`), and adopts the server-rendered DOM. The
+/// conversion and the adoption run inside the task `run_start` judges, so a
+/// program whose startup was refused evaluates neither.  On any
+/// parse error it falls back to a clean init through the deferred entry
+/// (fault-tolerant: no white screen on a tampered or stale island blob).
 ///
 /// `hydration_state_ty` is the Rust type name resolved by
 /// [`EmitCtx::resolve_hydration_state_rust_name`] — the SAME name the emitted
@@ -642,21 +657,24 @@ fn wasm_hydrate_entry(hydration_state_ty: &str) -> String {
 pub fn hydrate(model_json: &str) {{
     match serde_json::from_str::<crate::{hydration_state_ty}>(model_json) {{
         Ok(hs) => {{
-            let model = crate::main_from_hydration_state(hs);
-            ipe_runtime::wasm::run_start(ipe_runtime::wasm::wasm_adopt_app::<
-                String, _, _, _, _, _,
-            >(
-                model,
-                crate::main_update,
-                {wrapped_view},
-                crate::main_subscriptions,
-            ));
+            let adopt: ipe_runtime::IpeTask<String, ()> = Box::pin(async move {{
+                let model = crate::main_from_hydration_state(hs);
+                ipe_runtime::wasm::wasm_adopt_app::<String, _, _, _, _, _>(
+                    model,
+                    crate::main_update,
+                    {wrapped_view},
+                    crate::main_subscriptions,
+                )
+                .await
+            }});
+            ipe_runtime::wasm::run_start(adopt);
         }}
         Err(e) => {{
             ipe_runtime::wasm::console_warn(&format!(
                 \"hydrate: island JSON rejected ({{e}}); falling back to clean init\"
             ));
-            ipe_runtime::wasm::run_start(ipe_main());
+            {WASM_DEFERRED_ENTRY}
+            ipe_runtime::wasm::run_start(entry);
         }}
     }}
 }}
@@ -889,24 +907,121 @@ const RUNTIME_MOD_RS_CSV_APPEND: &str = "pub mod csv;\npub use csv::*;\n";
 
 // ── Shape-app entry-switch anchors ────────────────────────────────────────────
 //
-// When `ipe_main` returns a shape-app leaf (WebApp / TuiApp / CliApp — and a
-// `Web.tea` under a webview-native host renders `WebViewApp`), `emit_func`
-// emits the correct return type from the IR — no return-type rewrite is needed.
-// Only the epilogue `fn main` body needs updating:
-// `block_on(ipe_main())` → `ipe_main().run_blocking()`. Hoisted to module
-// scope so no `const` item appears after a statement.
+// When `ipe_main` returns a shape-app leaf (WebApp / TuiApp / CliApp / WorkerApp
+// — and a `Web.tea` under a webview-native host renders `WebViewApp`),
+// `emit_func` emits the correct return type from the IR — no return-type
+// rewrite is needed. Only the epilogue `fn main` entry line needs updating:
+// `match block_on_entry(ipe_main) {` → `match run_blocking_entry(ipe_main) {`.
+// Both hand `ipe_main` over unbuilt, so everything it evaluates runs inside the
+// entry's catch. Hoisted to module scope so no `const` item appears after a
+// statement.
 
-/// The `block_on(ipe_main())` call in `fn main`'s epilogue body.
-const SHAPE_APP_BLOCK_ON_ANCHOR: &str = "block_on(ipe_main())";
-/// Replacement: calls the leaf type's `run_blocking()` method.
-const SHAPE_APP_RUN_BLOCKING: &str = "ipe_main().run_blocking()";
-/// `ipe_main`'s RETURN-TYPE render for each shape-app leaf. The entry switch
-/// fires only when `ipe_main`'s own signature returns a leaf — NOT merely when a
-/// leaf constructor appears anywhere in the body. A `Server.mountApp
-/// (Web.embed { … })` program builds a `WebApp(…)` value inside `ipe_main`'s
-/// body but `ipe_main` itself returns `IpeTask<()>` (`Server.listen`), so it is
-/// a Program (`block_on`), not a shape app. Keying on the return type keeps the
-/// two apart.
+/// `fn main`'s entry line in the epilogue, matched as a whole trimmed line.
+const SHAPE_APP_BLOCK_ON_ANCHOR: &str = "match block_on_entry(ipe_main) {";
+/// Replacement: the shape-app entry, which builds and drives the leaf.
+const SHAPE_APP_RUN_BLOCKING: &str = "match run_blocking_entry(ipe_main) {";
+
+// The template carries the entry line exactly once and never the shape-app
+// spelling, so the switch has exactly one line to swap and the switched output
+// has exactly one entry: a drifted template breaks the build, not the emit.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template stops holding the `fn main` entry line exactly once [ledger #boundary]
+const _: () = assert!(
+    count_entry_lines(GOLDEN.as_bytes(), SHAPE_APP_BLOCK_ON_ANCHOR.as_bytes()) == 1,
+    "templates/main.rs must hold the `fn main` entry line exactly once"
+);
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template gains the shape-app entry line the switch writes [ledger #boundary]
+const _: () = assert!(
+    count_entry_lines(GOLDEN.as_bytes(), SHAPE_APP_RUN_BLOCKING.as_bytes()) == 0,
+    "templates/main.rs must not hold the shape-app entry line"
+);
+
+/// How many lines of `text` equal `line` once their indentation is skipped.
+const fn count_entry_lines(text: &[u8], line: &[u8]) -> usize {
+    let mut count: usize = 0;
+    let mut rest = text;
+    loop {
+        // Skip the line's indentation.
+        while let [b' ' | b'\t', tail @ ..] = rest {
+            rest = tail;
+        }
+        if is_line_then_end(rest, line) {
+            count = count.saturating_add(1);
+        }
+        // Advance past the next newline, to the start of the following line.
+        loop {
+            match rest {
+                [] => return count,
+                [b'\n', tail @ ..] => {
+                    rest = tail;
+                    break;
+                }
+                [_, tail @ ..] => rest = tail,
+            }
+        }
+    }
+}
+
+/// Whether `text` begins with `line`, then optional trailing blanks, then a
+/// newline or the end of `text`.
+const fn is_line_then_end(text: &[u8], line: &[u8]) -> bool {
+    let mut rest = text;
+    let mut want = line;
+    while let [w, want_tail @ ..] = want {
+        let [r, rest_tail @ ..] = rest else {
+            return false;
+        };
+        if *r != *w {
+            return false;
+        }
+        rest = rest_tail;
+        want = want_tail;
+    }
+    while let [b' ' | b'\t' | b'\r', tail @ ..] = rest {
+        rest = tail;
+    }
+    matches!(rest, [] | [b'\n', ..])
+}
+
+/// Swap the one `fn main` entry line for the shape-app entry, keeping its indent.
+///
+/// The line must occur exactly once as a whole trimmed line; zero or several
+/// occurrences are a drifted template, reported as `CompilerBug` at `where_`
+/// rather than an emit that keeps the eager entry or doubles it.
+fn switch_shape_app_entry(out: &str, where_: &'static str) -> Result<String, Diagnostic> {
+    let is_entry = |line: &str| line.trim() == SHAPE_APP_BLOCK_ON_ANCHOR;
+    let hits = out.split_inclusive('\n').filter(|l| is_entry(l)).count();
+    if hits != 1 {
+        return Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!(
+                "shape-app entry-switch: the entry line {SHAPE_APP_BLOCK_ON_ANCHOR:?} occurs \
+                 {hits} times in the emitted output, expected exactly once — the epilogue \
+                 template has drifted"
+            ),
+        });
+    }
+    let mut switched =
+        String::with_capacity(out.len().saturating_add(SHAPE_APP_RUN_BLOCKING.len()));
+    for line in out.split_inclusive('\n') {
+        if is_entry(line) {
+            let body = line.trim_end();
+            let indent_len = body.len().saturating_sub(body.trim_start().len());
+            switched.push_str(body.get(..indent_len).unwrap_or_default());
+            switched.push_str(SHAPE_APP_RUN_BLOCKING);
+            switched.push_str(line.get(body.len()..).unwrap_or_default());
+        } else {
+            switched.push_str(line);
+        }
+    }
+    Ok(switched)
+}
+
+/// `ipe_main`'s rendered signature for each shape-app leaf.
+///
+/// The entry switch is decided from the IR ([`ipe_ir::EntryRun`]); these
+/// renders are the independent second check that the single-file emit agrees
+/// with it, so a drift between the IR's run form and the emitted signature is a
+/// `CompilerBug` at `ipe` time, never an entry line `cargo` refuses.
 const SHAPE_APP_RETURN_TYPES: &[&str] = &[
     "fn ipe_main() -> ipe_runtime::tea::WebViewApp",
     "fn ipe_main() -> ipe_runtime::tea::WebApp",
@@ -1297,8 +1412,14 @@ const RUNTIME_MOD_RS_TUI_APPEND: &str = "pub mod terminal_access;\n\
 /// [`RUNTIME_MOD_RS_WEB_CORE_APPEND`] (which fires for `uses_web || uses_webview`
 /// and pulls in the ONE real `web` module — server items inside stay
 /// `#[cfg(feature = "web")]`, so a webview build compiles only the render core).
+///
+/// The window's link policy (`webview::nav_policy`, behind `webview-shell`)
+/// hands public links to `browser_open` and keeps webview data under
+/// `app_data`, so both are declared under the runtime crate's own gates.
 const RUNTIME_MOD_RS_WEBVIEW_APPEND: &str = "#[cfg(feature = \"webview\")]\npub mod webview;\n\
-     #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n";
+     #[cfg(feature = \"webview\")]\npub use webview::{webview_app, WebViewWindowCfg};\n\
+     #[cfg(any(feature = \"webview-shell\", feature = \"browser-open\"))]\npub mod app_data;\n\
+     #[cfg(feature = \"browser-open\")]\npub mod browser_open;\n";
 
 /// The server-free render core, declared for EVERY render host (`uses_web ||
 /// uses_webview`): the ONE real `web` module (which compiles to just its
@@ -1955,6 +2076,8 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         // Fixed kernel-wrapper prelude (IpeError, IpeTask<A>, Decoder<T>, …)
         // plus the TEA aliases and Auth wrappers the program reaches.
         file.push(&prelude_section(ctx)?);
+        // The page-link table's one renderer, shared by every link.
+        file.push(crate::emit_web::page_renderer_item(ctx));
 
         // User functions, walked via `func_order` (its OWN first-encounter
         // order over `program.modules[..].funcs`). `partition_items` never
@@ -1970,51 +2093,32 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         file.push(&epilogue_for_target(ctx)?);
         let mut out = file.render();
 
-        // Shape-app entry switch (Native only).
-        //
-        // When `ipe_main` returns a shape app leaf (`WebApp` / `TuiApp` /
-        // `CliApp`; a `Web.tea` under a webview host renders `WebViewApp`) its
-        // emitted body contains the corresponding
-        // `ipe_runtime::tea::<Leaf>(...)` constructor. The template declares
-        // `ipe_main() -> IpeTask<()>` and `match block_on(ipe_main()) { ... }` —
-        // both must be updated to use the concrete leaf type and its
-        // `run_blocking()` method.
-        //
-        // Detection is done by scanning the emitted body for the four known
-        // leaf constructors; this avoids a dependency on per-shape `uses_*` flags
-        // (CliApp programs, for example, do not set any shape flag in EmitCtx).
-        //
-        // WASM: `epilogue_wasm` has a different entry — no `block_on` call and
-        // a different `ipe_main` signature — so the switch is skipped there.
-        // Shape-app epilogue switch (Native only).
-        //
-        // When `ipe_main` returns a shape-app leaf (WebApp / TuiApp / CliApp; a
-        // `Web.tea` under a webview host renders WebViewApp), `emit_func` already
-        // emits the correct return type from the IR — no return-type rewrite is
-        // needed. Only the epilogue `fn main` body
-        // needs updating: `block_on(ipe_main())` → `ipe_main().run_blocking()`.
-        //
-        // Detection scans the emitted text for a known leaf constructor call; this
-        // naturally handles CliApp (which sets no shape flag in EmitCtx).
-        //
-        // WASM: `epilogue_wasm` uses a different entry without `block_on`, so
-        // the switch is skipped there.
+        // Shape-app entry switch (Native and WASI): an entry whose run form is
+        // `EntryRun::ShapeApp` swaps the epilogue's
+        // `match block_on_entry(ipe_main) {` for
+        // `match run_blocking_entry(ipe_main) {`. WASM's epilogue has no
+        // `block_on_entry` line, so it never switches.
         if matches!(
             ctx.target,
             ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
-        ) && SHAPE_APP_RETURN_TYPES.iter().any(|sig| out.contains(sig))
-        {
-            let replaced = out.replacen(SHAPE_APP_BLOCK_ON_ANCHOR, SHAPE_APP_RUN_BLOCKING, 1);
-            if replaced == out {
+        ) {
+            let shape_app = ipe_ir::EntryRun::ShapeApp.is_entry_of(program);
+            let renders_shape_app = SHAPE_APP_RETURN_TYPES.iter().any(|sig| out.contains(sig));
+            if shape_app != renders_shape_app {
                 return Err(Diagnostic::CompilerBug {
                     where_: "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
                     detail: format!(
-                        "shape-app entry-switch: anchor {SHAPE_APP_BLOCK_ON_ANCHOR:?} \
-                         not found in emitted output — epilogue golden has drifted"
+                        "shape-app entry-switch: the IR entry run form says shape app = \
+                         {shape_app}, the emitted `ipe_main` signature says {renders_shape_app}"
                     ),
                 });
             }
-            out = replaced;
+            if shape_app {
+                out = switch_shape_app_entry(
+                    &out,
+                    "ipe_backend_rust::project::emit_program::shape_app_entry_switch",
+                )?;
+            }
         }
 
         rust_sources.push((RelPath::new("src/main.rs")?, out));
@@ -2122,7 +2226,7 @@ fn escape_toml_basic(s: &str) -> String {
 /// — a drifted dep-model manifest template, surfaced loudly rather than emitting
 /// a manifest that names no runtime.
 fn dep_model_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
-    let mut manifest = substitute_dep_manifest_anchors(
+    let mut manifest = substitute_program_features(
         CARGO_DEP_TOML,
         ctx,
         "ipe_backend_rust::project::dep_model_cargo_toml",
@@ -2165,7 +2269,7 @@ fn dep_model_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
 /// splice keys on has drifted — each surfaced loudly rather than emitting a
 /// manifest that names no runtime or drops a referenced crate.
 fn dep_model_wasm_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
-    let mut manifest = substitute_dep_manifest_anchors(
+    let mut manifest = substitute_program_features(
         CARGO_WASM_DEP_TOML,
         ctx,
         "ipe_backend_rust::project::dep_model_wasm_cargo_toml",
@@ -2203,16 +2307,42 @@ fn dep_model_wasm_cargo_toml(ctx: &EmitCtx) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the features
 /// placeholder is absent from `template` — a drifted manifest template,
 /// surfaced loudly rather than emitting a manifest that names no runtime.
-fn substitute_dep_manifest_anchors(
+fn substitute_program_features(
     template: &str,
     ctx: &EmitCtx,
     where_: &'static str,
 ) -> DResult<String> {
+    let features = crate::runtime_features::runtime_features(ctx);
+    substitute_dep_manifest_anchors(template, &features.as_feature_names(), where_)
+}
+
+/// Render the native dependency-model `Cargo.toml` ([`CARGO_DEP_TOML`]) with
+/// exactly `features` selected on the runtime.
+///
+/// The manifest of a crate that is not an Ipê program, such as the
+/// `client desktop` shell.
+///
+/// # Errors
+///
+/// As [`substitute_dep_manifest_anchors`].
+pub fn dep_manifest_selecting(features: &[&str], where_: &'static str) -> DResult<String> {
+    substitute_dep_manifest_anchors(CARGO_DEP_TOML, features, where_)
+}
+
+/// Substitute the `__IPE_RUNTIME_FEATURES__` anchor in `template` with
+/// `features`, quoted and comma-separated.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (tagged `where_`) if the anchor is absent.
+fn substitute_dep_manifest_anchors(
+    template: &str,
+    features: &[&str],
+    where_: &'static str,
+) -> DResult<String> {
     const FEATURES_ANCHOR: &str = "__IPE_RUNTIME_FEATURES__";
 
-    let features = crate::runtime_features::runtime_features(ctx);
     let feature_list = features
-        .as_feature_names()
         .iter()
         .map(|f| format!("\"{f}\""))
         .collect::<Vec<_>>()
@@ -3728,47 +3858,26 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     file.push(&emit_db_projection_impls(ctx)?);
 
     file.push(&prelude_section(ctx)?);
+    file.push(crate::emit_web::page_renderer_item(ctx));
     file.push(&epilogue_for_target(ctx)?);
     let mut out = file.render();
 
-    // Shape-app epilogue switch in the spine (Native only).
-    //
-    // In the split layout `ipe_main` lives in a module file; its return type
-    // is already correct from the IR. Only the epilogue's `fn main` body needs
-    // updating: swap `block_on(ipe_main())` for `ipe_main().run_blocking()`.
-    //
-    // The switch fires iff the program's ENTRY function itself RETURNS a shape
-    // leaf (`WebApp`/`TuiApp`/`CliApp`; a `WebApp` renders `WebViewApp` under a
-    // webview host) — read directly from the IR,
-    // NOT from the coarse `uses_web` flag. A `Server.listen [ Server.mountApp
-    // (Web.embed { … }) … ]` program sets `uses_web` (it builds an embedded
-    // `WebApp` value) yet its `main` returns `IpeTask<()>`; it is a Program
-    // (`block_on`), not a shape app. Keying on the entry's return type keeps the
-    // two apart (and subsumes the old `CliApp`-has-no-flag special case).
-    let main_returns_shape_leaf = program.modules.iter().any(|m| {
-        m.entry.is_some_and(|eid| {
-            m.funcs.iter().any(|f| {
-                f.id == eid && matches!(f.ret, IrType::WebApp | IrType::TuiApp | IrType::CliApp)
-            })
-        })
-    });
+    // Shape-app entry switch in the spine (Native and WASI): `ipe_main` lives
+    // in a module file, so the run form is read from the IR alone — the same
+    // `EntryRun` the single-file layout and the lowerer's admissibility read.
+    // A `Server.listen [ Server.mountApp (Web.embed { … }) … ]` program sets
+    // `uses_web` yet its `main` returns a task, so it runs as a task.
+    let main_returns_shape_leaf = ipe_ir::EntryRun::ShapeApp.is_entry_of(program);
     if main_returns_shape_leaf
         && matches!(
             ctx.target,
             ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
         )
     {
-        let replaced = out.replacen(SHAPE_APP_BLOCK_ON_ANCHOR, SHAPE_APP_RUN_BLOCKING, 1);
-        if replaced == out {
-            return Err(Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
-                detail: format!(
-                    "shape-app entry-switch: anchor {SHAPE_APP_BLOCK_ON_ANCHOR:?} not found \
-                     in emitted spine — epilogue golden has drifted"
-                ),
-            });
-        }
-        out = replaced;
+        out = switch_shape_app_entry(
+            &out,
+            "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
+        )?;
     }
 
     Ok(out)
@@ -4285,38 +4394,47 @@ fn tui_cargo_toml(base: &str) -> DResult<String> {
 
 /// Build the webview-enabled `Cargo.toml` from the given base manifest by:
 ///
-/// 1. Adding `"webview"` to the `default` feature list.
-/// 2. Wiring the `webview = []` feature declaration to actually pull `wry` and
-///    `tao` (changes it to `webview = ["dep:wry", "dep:tao"]`).
+/// 1. Adding `"web-core"` and `"webview"` to the `default` feature list.
+/// 2. Rewriting the inert `webview` and `webview-shell` declarations to the
+///    runtime crate's own edges: `webview = ["webview-shell", "web-core"]` and
+///    `webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]`.
 /// 3. Appending `wry` and `tao` as optional dependencies to the `[dependencies]` table.
+/// 4. Appending `gtk` as an optional dependency in a Linux-only table, as the
+///    runtime crate declares it (`webview::shell::WindowSystem::open` starts
+///    GTK fallibly before tao).
 ///
-/// Called AFTER `server_cargo_toml` and `web_cargo_toml` so the live feature
-/// (which the webview backend imports from) is already promoted.
+/// A vendored webview build therefore enables exactly the features a
+/// runtime-crate `webview` selection enables among those the vendored
+/// manifest declares; `webview_edges_mirror_the_runtime_manifest` holds the
+/// two tables equal.
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if any anchor string is absent — a
-/// golden-drift invariant violation (fail-loud, never a silent no-op that
-/// ships a broken manifest or links the wrong backend).
+/// Returns [`Diagnostic::CompilerBug`] if any anchor line is absent or
+/// repeated — a golden-drift invariant violation (fail-loud, never a silent
+/// no-op that ships a broken manifest or links the wrong backend).
 fn webview_cargo_toml(base: &str) -> DResult<String> {
-    // All anchor consts must precede the first `let` statement.
+    const WHERE: &str = "ipe_backend_rust::project::webview_cargo_toml";
     const DEFAULT_PREFIX: &str = "default = [";
-    // Change the empty `webview = []` feature to pull wry + tao when active.
-    // The `dep:` prefix is Cargo's "explicit dep" syntax (Cargo ≥1.60), so
-    // `webview = ["dep:wry", "dep:tao"]` activates the optional deps ONLY when
-    // the `webview` feature is in the default list — the stub path gets no
-    // heavy system deps.
-    const WEBVIEW_EMPTY: &str = "webview = []";
-    const WEBVIEW_WITH_DEPS: &str = r#"webview = ["dep:wry", "dep:tao"]"#;
-    // wry + tao are declared optional so the stub path (no `webview` feature)
-    // never downloads or links them. Versions + names from the SSOT; the
-    // `optional = true` gate stays inline.
+    const WEBVIEW_INERT: &str = "webview = []";
+    const WEBVIEW_ACTIVE: &str = r#"webview = ["webview-shell", "web-core"]"#;
+    const SHELL_INERT: &str = r#"webview-shell = ["browser-open"]"#;
+    const SHELL_ACTIVE: &str =
+        r#"webview-shell = ["dep:wry", "dep:tao", "dep:gtk", "browser-open"]"#;
+    const LINUX_DEPS: &str = r#"[target.'cfg(target_os = "linux")'.dependencies]"#;
+    // wry, tao and gtk are declared optional so a manifest that leaves
+    // `webview-shell` off never downloads or links them. Versions + names from
+    // the SSOT.
+    let optional = |spec: crate_specs::CrateSpec| {
+        format!(
+            "{} = {{ version = \"{}\", optional = true }}\n",
+            spec.name, spec.version
+        )
+    };
     let webview_native_deps = format!(
-        "{} = {{ version = \"{}\", optional = true }}\n{} = {{ version = \"{}\", optional = true }}\n\n",
-        crate_specs::WRY.name,
-        crate_specs::WRY.version,
-        crate_specs::TAO.name,
-        crate_specs::TAO.version,
+        "{}{}\n",
+        optional(crate_specs::WRY),
+        optional(crate_specs::TAO)
     );
 
     // Step 1 — promote `webview` to the default feature list (generic
@@ -4324,7 +4442,7 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
     let pfx = base
         .find(DEFAULT_PREFIX)
         .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
+            where_: WHERE,
             detail: format!("Cargo.toml anchor {DEFAULT_PREFIX:?} not found — golden drifted"),
         })?;
     let search_from = pfx + DEFAULT_PREFIX.len();
@@ -4332,42 +4450,93 @@ fn webview_cargo_toml(base: &str) -> DResult<String> {
         .get(search_from..)
         .and_then(|s| s.find(']'))
         .ok_or_else(|| Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
+            where_: WHERE,
             detail: "default feature list has no closing ']' — golden drifted".to_owned(),
         })?;
     let close = search_from + rel;
     let mut step1 = String::with_capacity(base.len() + 64);
     step1.push_str(base.get(..close).unwrap_or(""));
-    // Promote the server-free render core (`web-core`) alongside `webview`: the
+    // The server-free render core (`web-core`) rides alongside `webview`: the
     // native backend renders through `crate::dom` + `style_inject` + `page_shell`
-    // (all `#[cfg(feature = "web-core")]` in the vendored source) over a local IPC
-    // bridge, with NO axum `server` and NO `web` surface. This is the vendored
-    // counterpart of the dep-model, where the runtime crate's own `webview`
-    // feature pulls `web-core`.
+    // over a local IPC bridge, with NO axum `server` and NO `web` surface.
     step1.push_str(r#", "web-core", "webview""#);
     step1.push_str(base.get(close..).unwrap_or(""));
 
-    // Step 2 — wire the `webview` feature to its deps (`dep:wry` + `dep:tao`).
-    // Fail-loud if the empty anchor drifted — a silent no-op here would promote
-    // `webview` to defaults without pulling wry/tao, shipping a build where the
-    // real backend compiles as stub (exit-0-then-runtime-Err).
-    let step2 = step1.replacen(WEBVIEW_EMPTY, WEBVIEW_WITH_DEPS, 1);
-    if step2 == step1 {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::project::webview_cargo_toml",
-            detail: format!(
-                "Cargo.toml anchor {WEBVIEW_EMPTY:?} not found — golden drifted; \
-                 the webview feature declaration must be present to wire wry + tao"
-            ),
-        });
-    }
+    // Step 2 — wire the feature edges, each anchor matched as a whole line so a
+    // comment naming it is never the one rewritten.
+    let step2 = replace_feature_line(&step1, WEBVIEW_INERT, WEBVIEW_ACTIVE, WHERE)?;
+    let step3 = replace_feature_line(&step2, SHELL_INERT, SHELL_ACTIVE, WHERE)?;
 
     // Step 3 — append wry + tao as optional deps to the `[dependencies]` table.
-    append_dependencies(
-        &step2,
-        &webview_native_deps,
-        "ipe_backend_rust::project::webview_cargo_toml",
-    )
+    let step4 = append_dependencies(&step3, &webview_native_deps, WHERE)?;
+
+    // Step 4 — gtk, Linux-only, in a table of its own at the end.
+    append_table(&step4, LINUX_DEPS, &optional(crate_specs::GTK), WHERE)
+}
+
+/// Append the table `header` holding `entries` at the end of `base`.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) when `base`
+/// already declares `header`: a second declaration of one table is a TOML
+/// error the emitted build would only meet in cargo.
+fn append_table(base: &str, header: &str, entries: &str, where_: &'static str) -> DResult<String> {
+    if base.lines().any(|line| line.trim() == header) {
+        return Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!("Cargo.toml already declares {header:?} — golden drifted"),
+        });
+    }
+    let mut out = String::with_capacity(base.len() + header.len() + entries.len() + 3);
+    out.push_str(base);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(header);
+    out.push('\n');
+    out.push_str(entries);
+    Ok(out)
+}
+
+/// Replace the one line of `base` equal to `inert` with `active`.
+///
+/// Only a whole line matches, so prose that quotes the declaration is never
+/// rewritten in its place.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] (attributed to `where_`) unless exactly
+/// one line equals `inert`.
+fn replace_feature_line(
+    base: &str,
+    inert: &str,
+    active: &str,
+    where_: &'static str,
+) -> DResult<String> {
+    let mut out = String::with_capacity(base.len() + active.len());
+    let mut hits = 0_usize;
+    for line in base.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        if body == inert {
+            hits += 1;
+            out.push_str(active);
+            out.push_str(line.get(body.len()..).unwrap_or(""));
+        } else {
+            out.push_str(line);
+        }
+    }
+    if hits == 1 {
+        Ok(out)
+    } else {
+        Err(Diagnostic::CompilerBug {
+            where_,
+            detail: format!(
+                "Cargo.toml declares {inert:?} on {hits} lines, not one — golden drifted"
+            ),
+        })
+    }
 }
 
 /// Build the websocket-client-enabled `Cargo.toml` from the given base manifest
@@ -7087,5 +7256,129 @@ mod test_runner_key_tests {
             open_main_with(&format!("a\n{NATIVE_MAIN_ANCHOR}}}\n"), "    x();\n").ok(),
             Some(format!("a\n{NATIVE_MAIN_ANCHOR}    x();\n}}\n"))
         );
+    }
+}
+
+#[cfg(test)]
+mod shape_entry_switch_tests {
+    use super::{
+        GOLDEN, SHAPE_APP_BLOCK_ON_ANCHOR, SHAPE_APP_RUN_BLOCKING, count_entry_lines,
+        switch_shape_app_entry,
+    };
+    use ipe_diagnostics::Diagnostic;
+
+    const WHERE: &str = "shape_entry_switch_tests";
+
+    fn entry_lines(text: &str, line: &str) -> usize {
+        count_entry_lines(text.as_bytes(), line.as_bytes())
+    }
+
+    fn is_drift(got: &Result<String, Diagnostic>) -> bool {
+        matches!(got, Err(Diagnostic::CompilerBug { where_: WHERE, .. }))
+    }
+
+    /// The emitted entry hands `ipe_main` over unbuilt: no epilogue form calls
+    /// `ipe_main()` itself on the bare main thread, before any catch exists.
+    #[test]
+    fn the_epilogue_never_calls_ipe_main_eagerly() -> ipe_diagnostics::DResult<()> {
+        let tail = crate::preamble::epilogue()?;
+        assert!(
+            !tail.contains("ipe_main()"),
+            "the epilogue calls `ipe_main()` before the entry catch: {tail}"
+        );
+        let shaped = switch_shape_app_entry(&tail, WHERE)?;
+        assert!(
+            !shaped.contains("ipe_main()"),
+            "the shape-app epilogue calls `ipe_main()` before the entry catch: {shaped}"
+        );
+        assert_eq!(entry_lines(&shaped, SHAPE_APP_RUN_BLOCKING), 1);
+        assert_eq!(entry_lines(&shaped, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
+        Ok(())
+    }
+
+    /// Both browser entries build `ipe_main` only inside the deferred entry
+    /// task, so a program whose startup `run_start` refuses evaluates none of
+    /// it: outside that one line no `ipe_main()` call remains.
+    #[test]
+    fn the_wasm_entries_build_ipe_main_only_when_polled() {
+        for entry in [
+            super::WASM_ENTRY.to_owned(),
+            super::wasm_hydrate_entry("MainHydrationState"),
+        ] {
+            assert_eq!(
+                entry_lines(&entry, super::WASM_DEFERRED_ENTRY),
+                1,
+                "the entry must carry the deferred entry line once: {entry}"
+            );
+            let rest = entry.replace(super::WASM_DEFERRED_ENTRY, "");
+            assert!(
+                !rest.contains("ipe_main()"),
+                "the entry builds `ipe_main` before `run_start` judges startup: {entry}"
+            );
+        }
+        let hydrate = super::wasm_hydrate_entry("MainHydrationState");
+        let deferred = hydrate.find("Box::pin(async move {");
+        let converted = hydrate.find("crate::main_from_hydration_state(hs)");
+        assert!(
+            matches!((deferred, converted), (Some(d), Some(c)) if d < c),
+            "the hydrate entry converts the island before `run_start` judges startup: {hydrate}"
+        );
+    }
+
+    #[test]
+    fn the_template_holds_the_entry_line_exactly_once() {
+        assert_eq!(entry_lines(GOLDEN, SHAPE_APP_BLOCK_ON_ANCHOR), 1);
+        assert_eq!(entry_lines(GOLDEN, SHAPE_APP_RUN_BLOCKING), 0);
+    }
+
+    #[test]
+    fn the_switch_keeps_the_entry_line_indent_and_newline() {
+        let out = format!("fn main() {{\n    {SHAPE_APP_BLOCK_ON_ANCHOR}\n    }}\n}}\n");
+        assert_eq!(
+            switch_shape_app_entry(&out, WHERE).ok(),
+            Some(format!(
+                "fn main() {{\n    {SHAPE_APP_RUN_BLOCKING}\n    }}\n}}\n"
+            ))
+        );
+    }
+
+    #[test]
+    fn the_switch_refuses_a_missing_entry_line() {
+        let got = switch_shape_app_entry("fn main() {\n    run();\n}\n", WHERE);
+        assert!(is_drift(&got), "a missing entry line is a drifted template");
+    }
+
+    #[test]
+    fn the_switch_refuses_a_doubled_entry_line() {
+        let out = format!("{SHAPE_APP_BLOCK_ON_ANCHOR}\n  {SHAPE_APP_BLOCK_ON_ANCHOR}\n");
+        let got = switch_shape_app_entry(&out, WHERE);
+        assert!(is_drift(&got), "a doubled entry line is a drifted template");
+    }
+
+    /// A mention of the entry inside other text is not the entry line.
+    #[test]
+    fn the_switch_ignores_a_mention_that_is_not_the_whole_line() {
+        let out = format!(
+            "// prose: {SHAPE_APP_BLOCK_ON_ANCHOR}\nlet s = \"{SHAPE_APP_BLOCK_ON_ANCHOR}\";\n"
+        );
+        let got = switch_shape_app_entry(&out, WHERE);
+        assert!(
+            is_drift(&got),
+            "a mention is not the entry line, so no line is switched"
+        );
+        assert_eq!(entry_lines(&out, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
+        let with_entry = format!("{out}  {SHAPE_APP_BLOCK_ON_ANCHOR}\n");
+        assert_eq!(
+            switch_shape_app_entry(&with_entry, WHERE).ok(),
+            Some(format!("{out}  {SHAPE_APP_RUN_BLOCKING}\n"))
+        );
+    }
+
+    /// The entry line is matched whole: a line that only starts with it is not it.
+    #[test]
+    fn a_line_that_extends_the_entry_is_not_the_entry() {
+        let out = format!("{SHAPE_APP_BLOCK_ON_ANCHOR} x\n");
+        assert_eq!(entry_lines(&out, SHAPE_APP_BLOCK_ON_ANCHOR), 0);
+        assert!(is_drift(&switch_shape_app_entry(&out, WHERE)));
     }
 }

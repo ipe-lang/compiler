@@ -4642,7 +4642,7 @@ mod tests {
         #[test]
         fn the_ambient_scan_sees_an_in_repo_runtime_lookup() {
             let mutated = format!(
-                "{AUDIT_SOURCE}\nfn in_repo_tree(p: &Path) -> bool {{ ipe_env::artifact::in_repo_runtime_src(p).is_ok() }}\n"
+                "{AUDIT_SOURCE}\nfn in_repo_tree(p: &Path) -> bool {{ e2e_support::bin::in_repo_runtime_src(p).is_ok() }}\n"
             );
             let hits = ambient_reads(&mutated).unwrap_or_default();
             assert_eq!(

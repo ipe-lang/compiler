@@ -112,6 +112,28 @@ view never names its own path. The `ipe-*`, `nonce` and `data-ipe-*` attribute
 names belong to the runtime, and a view that spells one as a literal is refused
 (`ipe doc IPE-L0163`).
 
+A link to one of the app's own pages is a `Web.pageLink`. It takes the route
+table, the link's attributes, and `{ to, current, label }`:
+
+```ipe ipe:skip fragment of a routed app; its Page, Msg, Web and Ui imports are the app's
+routes : List (WebRoute Page)
+routes =
+    [ Web.route "/" HomePage, Web.route "/about" AboutPage ]
+
+nav : Page -> Element Msg
+nav current =
+    Web.pageLink routes [] { to = AboutPage, current = current, label = Ui.text "About" }
+```
+
+The link's `href` is the path `routes` renders for `to`, so a link can never
+name an address the app does not route. When `to` is `current`, the link
+carries `aria-current="page"`. A plain click moves to the page in place, as one
+new history entry. A click with a modifier key, or on a link that sets `target`
+or `download`, is left to the browser. The table must be one top-level value,
+and in a routed app it must be the same value the app's `routes` names
+(`ipe doc IPE-L0165`, `ipe doc IPE-L0166`). A link to another site is a
+`Ui.link` over a `Ui.linkTarget`.
+
 ### Delivery: runtime × host
 
 Web is the only shape with a **delivery** choice — two axes ([full

@@ -223,6 +223,11 @@ pub const TAO: CrateSpec = CrateSpec {
     name: "tao",
     version: "0.35",
 };
+/// Linux-only: the GTK tao and wry build on, named for its fallible init.
+pub const GTK: CrateSpec = CrateSpec {
+    name: "gtk",
+    version: "0.18",
+};
 /// The `WebSocket` handshake only: the runtime owns the `wss://` TLS through
 /// [`TOKIO_RUSTLS`], so tungstenite carries no TLS or root-store feature.
 pub const TOKIO_TUNGSTENITE: PinnedCrate = PinnedCrate {
@@ -262,7 +267,7 @@ pub const WEBPKI_ROOTS: PinnedCrate = PinnedCrate {
 pub const LETTRE: PinnedCrate = PinnedCrate {
     spec: CrateSpec {
         name: "lettre",
-        version: "0.11",
+        version: "0.11.24",
     },
     default_features: false,
     features: &[
@@ -422,6 +427,7 @@ pub const ALL: &[CrateSpec] = &[
     UNICODE_WIDTH,
     WRY,
     TAO,
+    GTK,
     TOKIO_TUNGSTENITE.spec,
     TOKIO_RUSTLS.spec,
     RUSTLS.spec,
@@ -487,7 +493,7 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 38, "expected 38 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 39, "expected 39 surgery-emitted crate specs");
         for pinned in ALL_PINNED {
             assert!(
                 ALL.iter().any(|spec| spec.name == pinned.spec.name),
@@ -618,6 +624,95 @@ mod tests {
             "crate drift between the SSOT and the manifests:\n  {}",
             problems.join("\n  ")
         );
+    }
+
+    /// Lowest release of a crate that carries the fix for a published advisory.
+    struct AdvisoryFloor {
+        name: &'static str,
+        /// `major.minor.patch` of the first fixed release.
+        fixed: [u64; 3],
+        /// The advisories every release below `fixed` is subject to.
+        advisories: &'static str,
+    }
+
+    /// Crates whose requirement must exclude every release a `RustSec`
+    /// advisory names, so neither the workspace nor an emitted project
+    /// replaying an older `Cargo.lock` can resolve one.
+    const ADVISORY_FLOORS: &[AdvisoryFloor] = &[AdvisoryFloor {
+        name: "lettre",
+        fixed: [0, 11, 24],
+        advisories: "RUSTSEC-2026-0560..=RUSTSEC-2026-0565",
+    }];
+
+    /// The lowest version a caret requirement such as `0.11` or `0.11.24`
+    /// admits, omitted components read as zero; `None` for anything that is
+    /// not one to three dot-separated integers.
+    fn caret_lower_bound(requirement: &str) -> Option<[u64; 3]> {
+        let mut bound = [0_u64; 3];
+        let mut parts = requirement.split('.');
+        for (at, slot) in bound.iter_mut().enumerate() {
+            match parts.next() {
+                Some(part) => *slot = part.parse().ok()?,
+                None if at > 0 => return Some(bound),
+                None => return None,
+            }
+        }
+        parts.next().is_none().then_some(bound)
+    }
+
+    /// Whether `requirement` keeps every release below `floor.fixed` out.
+    fn excludes_vulnerable(requirement: &str, floor: &AdvisoryFloor) -> bool {
+        caret_lower_bound(requirement).is_some_and(|bound| bound >= floor.fixed)
+    }
+
+    /// Every advisory floor names a crate the SSOT emits, and its SSOT
+    /// requirement — held equal to the runtime manifest's by
+    /// `crate_specs_match_manifests` — admits no release below the fixed one.
+    #[test]
+    fn requirements_exclude_advised_releases() {
+        for floor in ADVISORY_FLOORS {
+            let spec = ALL.iter().find(|spec| spec.name == floor.name);
+            assert!(
+                spec.is_some_and(|spec| excludes_vulnerable(spec.version, floor)),
+                "{}: SSOT requirement {:?} admits a release below {:?} ({})",
+                floor.name,
+                spec.map(|spec| spec.version),
+                floor.fixed,
+                floor.advisories
+            );
+        }
+    }
+
+    /// A requirement whose lower bound sits below the floor, or that does not
+    /// parse as a caret requirement, is refused; one at or past it is admitted.
+    #[test]
+    fn a_requirement_below_an_advisory_floor_is_refused() {
+        let floor = AdvisoryFloor {
+            name: "lettre",
+            fixed: [0, 11, 24],
+            advisories: "test",
+        };
+        for refused in [
+            "0.11",
+            "0.11.23",
+            "0",
+            "0.10.99",
+            "",
+            "0.11.x",
+            "0.11.24.1",
+            "=0.11.24",
+        ] {
+            assert!(
+                !excludes_vulnerable(refused, &floor),
+                "{refused:?} must be refused"
+            );
+        }
+        for admitted in ["0.11.24", "0.11.25", "0.12", "1"] {
+            assert!(
+                excludes_vulnerable(admitted, &floor),
+                "{admitted:?} must be admitted"
+            );
+        }
     }
 
     /// Every vendored manifest the backend emits, and the jail-runner crate

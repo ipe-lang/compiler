@@ -75,6 +75,12 @@ use cfg_scan::{cfg_test_only, impl_item_attrs, item_attrs, trait_item_attrs};
 mod source_tree;
 use source_tree::rust_sources;
 
+// The out-of-line `#[cfg(test)] mod` resolution shared with the `LIKE` scan.
+#[allow(dead_code)] // the shared module's declaration readers serve the `LIKE` scan's fixtures
+#[path = "support/test_modules.rs"]
+mod test_modules;
+use test_modules::{production_sources, test_only_files};
+
 /// Field-name words that mark a field as holding secret-role data.
 const FIELD_WORDS: &[&str] = &[
     "headers",
@@ -297,6 +303,12 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
+        func: "append_table",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
         func: "assemble_split_manifest",
         count: 1,
         why: DIAGNOSTIC,
@@ -339,18 +351,6 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
-        func: "emit_program",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
-        func: "emit_spine",
-        count: 1,
-        why: DIAGNOSTIC,
-    },
-    DebugSite {
-        file: "rust/src/project.rs",
         func: "insert_app_serde_dependency",
         count: 1,
         why: DIAGNOSTIC,
@@ -387,6 +387,12 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/project.rs",
+        func: "replace_feature_line",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
         func: "secret_cargo_toml",
         count: 1,
         why: DIAGNOSTIC,
@@ -394,6 +400,12 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "substitute_dep_manifest_anchors",
+        count: 1,
+        why: DIAGNOSTIC,
+    },
+    DebugSite {
+        file: "rust/src/project.rs",
+        func: "switch_shape_app_entry",
         count: 1,
         why: DIAGNOSTIC,
     },
@@ -430,7 +442,7 @@ const DEBUG_SITES: &[DebugSite] = &[
     DebugSite {
         file: "rust/src/project.rs",
         func: "webview_cargo_toml",
-        count: 2,
+        count: 1,
         why: DIAGNOSTIC,
     },
     DebugSite {
@@ -694,7 +706,8 @@ impl<'ast> Visit<'ast> for DebugScan<'_> {
 #[allow(clippy::expect_used)] // an unparsable source must fail the scan, never be skipped
 fn debug_findings(sources: &[(String, String)]) -> DebugFindings {
     let mut found = DebugFindings::default();
-    for (name, src) in sources {
+    let test_only = test_only_files(sources);
+    for (name, src) in sources.iter().filter(|(name, _)| !test_only.contains(name)) {
         let tree = syn::parse_file(src).expect("a backend source parses");
         let mut scan = DebugScan {
             file: name,
@@ -932,7 +945,7 @@ fn allowed(hit: &Hit) -> bool {
 #[test]
 fn no_derived_debug_prints_a_secret() {
     let root = e2e_support::manifest_dir!().join("src");
-    let sources = rust_sources(&root);
+    let sources = production_sources(rust_sources(&root));
     for required in [
         "server.rs",
         "principal.rs",
@@ -1041,7 +1054,7 @@ fn stray_show_impls(sources: &[(String, String)]) -> Vec<String> {
 #[test]
 fn every_runtime_show_impl_is_a_listed_row() {
     let root = e2e_support::manifest_dir!().join("src");
-    let sources = rust_sources(&root);
+    let sources = production_sources(rust_sources(&root));
     assert_eq!(stray_show_impls(&sources), Vec::<String>::new());
     for file in SHOW_IMPL_FILES {
         let held = sources
@@ -1180,6 +1193,144 @@ fn one_more_debug_site_in_a_listed_function_is_refused() {
     assert_eq!(
         unlisted_debug_sites(&debug_findings(&two).sites, &listed),
         ["emit.rs:report: 2 `Debug` sites, listed 1"]
+    );
+}
+
+/// The `Debug` sites `files` hold outside test code, as `file:func`.
+fn sites_of(files: &[(&str, &str)]) -> Vec<String> {
+    let sources: Vec<(String, String)> = files
+        .iter()
+        .map(|(name, src)| ((*name).to_owned(), (*src).to_owned()))
+        .collect();
+    debug_findings(&sources)
+        .sites
+        .keys()
+        .map(|(file, func)| format!("{file}:{func}"))
+        .collect()
+}
+
+/// A probe file with one `Debug` site.
+const PROBE: &str = "fn probe(v: &str) -> String { format!(\"{v:?}\") }";
+
+/// A file only an out-of-line `#[cfg(test)] mod` loads is test code, exactly
+/// like an inline `#[cfg(test)] mod`: beside a non-root parent, under a
+/// `mod.rs`, through `#[path]`, and transitively below another test-only file.
+#[test]
+fn a_file_only_a_test_module_loads_is_not_scanned() {
+    assert_eq!(
+        sites_of(&[
+            ("rust/src/project.rs", "#[cfg(test)]\nmod helpers;\n"),
+            ("rust/src/project/helpers.rs", PROBE),
+        ]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "src/web/mod.rs",
+                "#[cfg(all(test, feature = \"web\"))]\nmod t;\n"
+            ),
+            ("src/web/t/mod.rs", PROBE),
+        ]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "src/web/mod.rs",
+                "#[cfg(test)]\n#[path = \"../x_test.rs\"]\nmod x;\n"
+            ),
+            ("src/x_test.rs", PROBE),
+        ]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        sites_of(&[
+            ("src/a.rs", "#[cfg(test)]\nmod b;\n"),
+            ("src/a/b.rs", "mod c;\n"),
+            ("src/a/b/c.rs", PROBE),
+        ]),
+        Vec::<String>::new()
+    );
+}
+
+/// A file a production path can also load stays scanned, so its `Debug` site
+/// stays red: an unconditional or not-provably-test `mod`, a second production
+/// declaration, a `cfg_attr` or a pathed inline parent the resolver does not
+/// model, an `include!`, a crate root, and a `..` above the walked root.
+#[test]
+fn a_file_production_can_load_is_still_scanned() {
+    let probe = |file: &str| vec![format!("{file}:probe")];
+    assert_eq!(
+        sites_of(&[
+            ("rust/src/project.rs", "mod helpers;\n"),
+            ("rust/src/project/helpers.rs", PROBE),
+        ]),
+        probe("rust/src/project/helpers.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            ("src/a.rs", "#[cfg(any(test, feature = \"x\"))]\nmod b;\n"),
+            ("src/a/b.rs", PROBE),
+        ]),
+        probe("src/a/b.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "src/a.rs",
+                "#[cfg(test)]\nmod b;\n#[path = \"a/b.rs\"]\nmod b_live;\n",
+            ),
+            ("src/a/b.rs", PROBE),
+        ]),
+        probe("src/a/b.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "src/a.rs",
+                "#[cfg(test)]\n#[cfg_attr(feature = \"x\", path = \"other.rs\")]\nmod b;\n",
+            ),
+            ("src/a/b.rs", PROBE),
+        ]),
+        probe("src/a/b.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "src/a.rs",
+                "#[path = \"elsewhere\"]\nmod inner {\n    #[cfg(test)]\n    mod b;\n}\n",
+            ),
+            ("src/a/inner/b.rs", PROBE),
+        ]),
+        probe("src/a/inner/b.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "src/a.rs",
+                "#[cfg(test)]\nmod b;\nfn live() { include!(\"a/b.rs\"); }\n",
+            ),
+            ("src/a/b.rs", PROBE),
+        ]),
+        probe("src/a/b.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            ("src/a.rs", "#[cfg(test)]\n#[path = \"lib.rs\"]\nmod l;\n"),
+            ("src/lib.rs", PROBE),
+        ]),
+        probe("src/lib.rs")
+    );
+    assert_eq!(
+        sites_of(&[
+            (
+                "web/mod.rs",
+                "#[cfg(test)]\n#[path = \"../../t.rs\"]\nmod t;\n"
+            ),
+            ("t.rs", PROBE),
+        ]),
+        probe("t.rs")
     );
 }
 

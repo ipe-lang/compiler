@@ -679,11 +679,16 @@ pub(crate) fn shown_env_value(raw: &[u8]) -> String {
 /// Reads the shared platform variable [`super::home_core::HOME_VAR`]
 /// (`USERPROFILE` on Windows, `HOME` elsewhere), overlay-aware like
 /// [`read_env_var`]. Gated to its readers: the console proxy's cached-binary
-/// lookup, and off Unix the scratch primitive's profile-containment check.
+/// lookup, the desktop shell's app-data root, and off Unix the scratch
+/// primitive's profile-containment check.
 ///
 /// # Errors
 /// The [`HomeRefusal`](super::home_core::HomeRefusal) the variable earns.
-#[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
+#[cfg(any(
+    all(feature = "web", feature = "http_client"),
+    feature = "webview-shell",
+    not(unix)
+))]
 pub(crate) fn home_dir() -> Result<super::home_core::HomeDir, super::home_core::HomeRefusal> {
     home_dir_from_var(read_env_var(super::home_core::HOME_VAR))
 }
@@ -695,7 +700,11 @@ pub(crate) fn home_dir() -> Result<super::home_core::HomeDir, super::home_core::
 /// `None`, a non-Unicode one keeps its raw value), so that parser owns every
 /// decision about what counts as a home directory and which refusal a bad
 /// value earns; this function makes none of them itself.
-#[cfg(any(all(feature = "web", feature = "http_client"), not(unix)))]
+#[cfg(any(
+    all(feature = "web", feature = "http_client"),
+    feature = "webview-shell",
+    not(unix)
+))]
 fn home_dir_from_var(
     raw: Result<String, std::env::VarError>,
 ) -> Result<super::home_core::HomeDir, super::home_core::HomeRefusal> {
@@ -1248,8 +1257,9 @@ pub(crate) fn listen_port_from_env(
 /// (`debugger` — the replay-root probe; `tui`'s colour decision reads the typed
 /// `TermProfile` through `read_env_var` instead, never `var_os`); widen the gate
 /// when another feature gains a `var_os` reader, so it never sits as dead code
-/// under `-D warnings`. A temp-root key reads as unset, as in `read_env_var`.
-#[cfg(feature = "debugger")]
+/// under `-D warnings`; `webview-shell` reads the app-data root variables
+/// through it. A temp-root key reads as unset, as in `read_env_var`.
+#[cfg(any(feature = "debugger", feature = "webview-shell"))]
 pub(crate) fn read_env_var_os(key: &str) -> Option<std::ffi::OsString> {
     if super::scratch_core::is_temp_root_key(key) {
         return None;

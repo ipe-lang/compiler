@@ -364,11 +364,23 @@ fn run_ipe(
     )
 }
 
-/// `release build web client desktop`, which no packer builds, is refused
-/// before anything is emitted.
+/// A served web project at `root` whose app bundle id is `bundle_id`, written
+/// through the scratch steps of test `name`.
+fn client_desktop_project(name: &str, bundle_id: &str) -> std::path::PathBuf {
+    let root = web_project(name, "");
+    let manifest = format!(
+        "module Package exposing (package)\n\n\npackage =\n    {{ name = {name:?}, delivery = {{ mobile = {{ bundleId = {bundle_id:?} }} }} }}\n"
+    );
+    support::expect_scratch_step(name, std::fs::write(root.join("package.ipe"), manifest));
+    root
+}
+
+/// `release build web client desktop` reaches the desktop client packer: a
+/// bundle id no OS can name a storage directory by is refused by that packer's
+/// gate, which runs before anything is emitted.
 #[test]
-fn release_build_web_client_desktop_is_refused_before_any_build() {
-    let root = web_project("release_client_desktop_refused", "");
+fn release_build_web_client_desktop_is_gated_by_its_packer_before_any_build() {
+    let root = client_desktop_project("release_client_desktop_gated", "con.acme");
     let out = root.join("out");
     let (ok, stderr, wrote) = run_ipe(
         &root,
@@ -384,18 +396,15 @@ fn release_build_web_client_desktop_is_refused_before_any_build() {
             out.as_os_str(),
         ],
     );
-    assert!(!ok, "`web client desktop` must refuse: {stderr}");
-    assert!(
-        stderr.contains("web client desktop"),
-        "names the delivery: {stderr}"
-    );
+    assert!(!ok, "a DOS device bundle id must refuse: {stderr}");
+    assert!(stderr.contains("con.acme"), "names the bundle id: {stderr}");
     assert!(!wrote, "a refused release writes no output");
 }
 
-/// `dev build web client desktop` is refused with the same reason.
+/// `dev build web client desktop` reaches the same packer gate.
 #[test]
-fn dev_build_web_client_desktop_is_refused() {
-    let root = web_project("dev_client_desktop_refused", "");
+fn dev_build_web_client_desktop_is_gated_by_its_packer_before_any_build() {
+    let root = client_desktop_project("dev_client_desktop_gated", "con.acme");
     let out = root.join("out");
     let (ok, stderr, wrote) = run_ipe(
         &root,
@@ -409,11 +418,8 @@ fn dev_build_web_client_desktop_is_refused() {
             "desktop".as_ref(),
         ],
     );
-    assert!(!ok, "`web client desktop` must refuse: {stderr}");
-    assert!(
-        stderr.contains("web client desktop"),
-        "names the delivery: {stderr}"
-    );
+    assert!(!ok, "a DOS device bundle id must refuse: {stderr}");
+    assert!(stderr.contains("con.acme"), "names the bundle id: {stderr}");
     assert!(!wrote, "a refused build writes no output");
 }
 

@@ -766,6 +766,87 @@ pub fn verify_private_dir(path: &Path) -> io::Result<()> {
     verify_private(path, &meta, EntryKind::Directory)
 }
 
+/// Why [`private_dir_under`] made no private directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateDirError {
+    /// Creating or inspecting a directory failed, or a component is not one plain name.
+    Io(io::ErrorKind),
+    /// A directory on the way is not private to the effective user.
+    NotPrivate(ScratchRefusal),
+}
+
+/// Create `base`, then each name of `rel` beneath it, every one of `rel` private to the effective user.
+///
+/// `base` is the caller's own parsed root: missing ancestors are created and
+/// existing ones are not re-judged. Each `rel` directory is created owner-only
+/// (an existing one is kept) and then proven a real directory, never a
+/// symlink; on Unix it is also proven owned by the effective user with no
+/// group or other bits. The proven path is returned.
+///
+/// # Errors
+/// `Io(InvalidInput)` for a `rel` entry that is not one plain name, `Io` for
+/// a failed create or lookup, and `NotPrivate` for a refused directory.
+pub fn private_dir_under(base: &Path, rel: &[&str]) -> Result<PathBuf, PrivateDirError> {
+    let io_error = |e: io::Error| PrivateDirError::Io(e.kind());
+    create_private_dirs(base, true).map_err(io_error)?;
+    let mut dir = base.to_path_buf();
+    for name in rel {
+        let mut components = Path::new(name).components();
+        if !matches!(
+            (components.next(), components.next()),
+            (Some(Component::Normal(_)), None)
+        ) {
+            return Err(PrivateDirError::Io(io::ErrorKind::InvalidInput));
+        }
+        dir.push(name);
+        match create_private_dirs(&dir, false) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_error(e)),
+        }
+        let meta = std::fs::symlink_metadata(&dir).map_err(io_error)?;
+        private_dir_verdict(&meta).map_err(PrivateDirError::NotPrivate)?;
+    }
+    Ok(dir)
+}
+
+/// Create `path` owner-only, with its missing ancestors when `recursive`.
+#[cfg(unix)]
+fn create_private_dirs(path: &Path, recursive: bool) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .recursive(recursive)
+        .mode(0o700)
+        .create(path)
+}
+
+/// Create `path`, with its missing ancestors when `recursive`; it inherits its parent's access control.
+#[cfg(not(unix))]
+fn create_private_dirs(path: &Path, recursive: bool) -> io::Result<()> {
+    std::fs::DirBuilder::new().recursive(recursive).create(path)
+}
+
+/// The verdict on a directory [`private_dir_under`] made or kept.
+#[cfg(unix)]
+fn private_dir_verdict(meta: &std::fs::Metadata) -> Result<(), ScratchRefusal> {
+    private_verdict(
+        platform::facts(meta),
+        EntryKind::Directory,
+        platform::identity(),
+    )
+}
+
+/// The verdict on a directory [`private_dir_under`] made or kept: a real directory, never a reparse point.
+#[cfg(not(unix))]
+fn private_dir_verdict(meta: &std::fs::Metadata) -> Result<(), ScratchRefusal> {
+    let ft = meta.file_type();
+    if ft.is_dir() && !ft.is_symlink() {
+        Ok(())
+    } else {
+        Err(ScratchRefusal::NotADirectory)
+    }
+}
+
 #[cfg(unix)]
 fn verify_private(path: &Path, meta: &std::fs::Metadata, kind: EntryKind) -> io::Result<()> {
     private_verdict(platform::facts(meta), kind, platform::identity()).map_err(|r| refused(path, r))

@@ -12,8 +12,9 @@
 //!   drives the reconciler through the REAL jail against the admission probe
 //!   fixture, proving at the OS boundary that a used-but-undeclared axis rejects
 //!   naming the axis, and a benign package declaring exactly its axes is
-//!   accepted. Skips cleanly (never a false pass) where the jail cannot be
-//!   established, mirroring the sandbox crate's `build_jail_e2e`.
+//!   accepted. Skips only where the jail primitive is absent from the host; a
+//!   present primitive that cannot establish the jail, an unresolvable cargo,
+//!   or an unprovisioned crate universe fails the test, never passes it.
 
 // A failed `expect` in test setup IS the failure signal the harness reports.
 #![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
@@ -407,17 +408,26 @@ mod real_jail {
         Some(RunJailTools::Native)
     }
 
-    /// Skip unless `IPE_E2E=1`, the jail primitive is present, AND a jail can
-    /// actually be established here (a clean-exit canary settles it once) —
-    /// mirroring the sandbox crate's gate. Never a false pass.
+    /// The jail tools at the end-to-end tier; `None` under the unit tier or
+    /// when the jail primitive is absent from this host, the one named skip.
+    ///
+    /// # Panics
+    ///
+    /// When the primitive is present but the clean-exit canary cannot
+    /// establish the jail: a host that offers the jail and cannot run it fails
+    /// the test rather than passing it unrun.
     fn e2e_tools() -> Option<RunJailTools> {
         if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
             return None;
         }
-        let tools = probe_tools()?;
-        if !jail_can_establish(&tools) {
+        let Some(tools) = probe_tools() else {
+            eprintln!("audit_native e2e: skipping — the OS jail primitive is absent on this host");
             return None;
-        }
+        };
+        e2e_support::require_host(
+            "the jail primitive is present but the jail cannot be established",
+            jail_establishes(&tools),
+        );
         Some(tools)
     }
 
@@ -443,28 +453,32 @@ mod real_jail {
         ]
     }
 
-    fn jail_can_establish(tools: &RunJailTools) -> bool {
-        static CANARY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *CANARY.get_or_init(|| {
-            let scoped = fresh_scratch("canary");
-            let _guard = JAIL_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mounts = JailMounts::of_invoker(scoped.clone(), scoped.clone(), default_ro_binds())
-                .expect("checked jail mounts");
-            let outcome = build_in_jail(
-                tools,
-                &SandboxProfile::maximally_isolated(),
-                &mounts,
-                &canary_payload(tools),
-            );
-            let _ = std::fs::remove_dir_all(scoped.as_path());
-            let established = outcome.is_clean();
-            if !established {
-                eprintln!("audit_native e2e: skipping — jail cannot be established ({outcome:?})");
-            }
-            established
-        })
+    /// Run the establishment canary once; `Err` names the non-clean outcome.
+    fn jail_establishes(tools: &RunJailTools) -> Result<(), String> {
+        static CANARY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+        CANARY
+            .get_or_init(|| {
+                let scoped = fresh_scratch("canary");
+                let _guard = JAIL_LOCK
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mounts =
+                    JailMounts::of_invoker(scoped.clone(), scoped.clone(), default_ro_binds())
+                        .expect("checked jail mounts");
+                let outcome = build_in_jail(
+                    tools,
+                    &SandboxProfile::maximally_isolated(),
+                    &mounts,
+                    &canary_payload(tools),
+                );
+                let _ = std::fs::remove_dir_all(scoped.as_path());
+                if outcome.is_clean() {
+                    Ok(())
+                } else {
+                    Err(format!("{outcome:?}"))
+                }
+            })
+            .clone()
     }
 
     fn fresh_scratch(tag: &str) -> CanonicalPath {
@@ -681,7 +695,7 @@ mod real_jail {
     /// bare `cargo` is unfindable; the toolchain bind makes the absolute path
     /// executable.
     fn min_build_argv(crate_dir: &std::path::Path) -> Vec<OsString> {
-        let cargo = which_cargo().map_or_else(|| OsString::from("cargo"), PathBuf::into_os_string);
+        let cargo = require_cargo().into_os_string();
         vec![
             cargo,
             OsString::from("build"),
@@ -725,11 +739,6 @@ mod real_jail {
         // unused → reconcile Ok. This is the shape production turns into the single
         // `Certified` — proven here through the REAL jail with a REAL cargo build.
         let Some(tools) = e2e_tools() else { return };
-        // `cargo` must be reachable inside the jail; skip cleanly if absent.
-        if which_cargo().is_none() {
-            eprintln!("audit_native e2e: skipping — cargo not found on PATH");
-            return;
-        }
         let declared = set(&[Capability::Network]);
         let scoped = scoped_profile(&declared).expect("lower profile");
         let harness = Harness::new("certify-clean");
@@ -753,15 +762,11 @@ mod real_jail {
             reaches: set(&[Capability::Network]),
         };
         let verdict = reconcile_native(&declared, &runner, &scan, &scoped);
-        // Skip (not fail) if this environment cannot compile the crate under the
-        // jail (no toolchain reachable inside bwrap): a BuildFailed here is an
-        // environment gap, never a false pass. A real clean IS the certification.
+        // The canary established the jail and cargo resolved, so a build that
+        // fails under it is a defect of the jail's toolchain reach, never an
+        // environment gap to pass over. A real clean IS the certification.
         if let Err(r) = verdict {
-            assert!(
-                r.message.contains("failed to build"),
-                "a confined clean build must certify, got: {r}"
-            );
-            eprintln!("audit_native e2e: skipping — cargo unavailable inside jail: {r}");
+            panic!("a confined clean build must certify, got: {r}");
         }
     }
 
@@ -773,10 +778,6 @@ mod real_jail {
         // probe under the same withheld jail is ALSO denied → Denied{network} →
         // REJECT naming the axis. A real OS denial, not a scripted-runner verdict.
         let Some(tools) = e2e_tools() else { return };
-        if which_cargo().is_none() {
-            eprintln!("audit_native e2e: skipping — cargo not found on PATH");
-            return;
-        }
         let declared = BTreeSet::new();
         let scoped = scoped_profile(&declared).expect("lower profile");
         let harness = Harness::new("reject-netbuild");
@@ -816,8 +817,17 @@ mod real_jail {
     }
 
     /// `cargo`, resolved from an absolute `PATH` entry as the audit resolves it.
-    fn which_cargo() -> Option<PathBuf> {
-        host_tool::resolve(HostTool::Cargo).ok().map(Into::into)
+    ///
+    /// # Panics
+    ///
+    /// When no cargo resolves: the end-to-end tier runs under cargo, so an
+    /// unresolvable one is a host defect, never a skip.
+    fn require_cargo() -> PathBuf {
+        e2e_support::require_host(
+            "cargo must resolve from an absolute PATH entry",
+            host_tool::resolve(HostTool::Cargo),
+        )
+        .into()
     }
 
     // Keep the imports honest under all cfgs.
@@ -940,9 +950,13 @@ mod real_jail {
 
     /// Set up a real `[rust.dependencies]` package that CALLS its binding, emit
     /// its app crate under `base/out`, and repoint the bound-crate pin at the
-    /// local fixture crate so an offline probe build resolves it. Returns the
-    /// package root and the emitted crate dir.
-    fn emit_real_native_package(base: &std::path::Path, net_reach: bool) -> (PathBuf, PathBuf) {
+    /// local fixture crate so an offline probe build resolves it, then
+    /// provision its dependency universe. Returns the package root and the
+    /// provisioned emitted crate.
+    fn emit_real_native_package(
+        base: &std::path::Path,
+        net_reach: bool,
+    ) -> (PathBuf, ProvisionedCrate) {
         let runtime = e2e_support::require_runtime().into_path_buf();
         let pkg = base.join("pkg");
         std::fs::create_dir_all(pkg.join("src")).expect("pkg src");
@@ -991,7 +1005,87 @@ mod real_jail {
             &format!("csum = {{ path = {:?} }}", csum.display().to_string()),
         );
         std::fs::write(&manifest_path, patched).expect("patched manifest");
-        (pkg, out)
+        (pkg, provision_offline_universe(out))
+    }
+
+    /// An emitted app crate whose whole dependency universe sits in the
+    /// invoker's registry cache, so every `--offline` build of it resolves and
+    /// finds its sources. Only [`provision_offline_universe`] builds one, so
+    /// holding one proves the provisioning step ran.
+    struct ProvisionedCrate {
+        dir: PathBuf,
+    }
+
+    impl ProvisionedCrate {
+        fn dir(&self) -> &std::path::Path {
+            &self.dir
+        }
+    }
+
+    /// The one provisioning step for an emitted crate's `--offline` builds.
+    ///
+    /// The production probe build resolves its lock `--offline` and builds
+    /// `--offline --locked` inside the jail, from the registry cache alone. The
+    /// emitted manifest's universe is wider than the workspace's (its optional
+    /// allocator dependency `dlmalloc` resolves into every
+    /// lock), so a cache warmed by the workspace build, or by whichever
+    /// test ran first, does not hold it. A networked `cargo fetch`, outside any
+    /// jail, resolves the full graph into `dir/Cargo.lock` and downloads every
+    /// locked package; the `--offline --locked` re-fetch then proves the cache
+    /// holds the universe before any offline build runs.
+    ///
+    /// # Panics
+    ///
+    /// When either fetch fails: an unprovisioned universe fails the test.
+    fn provision_offline_universe(dir: PathBuf) -> ProvisionedCrate {
+        provision_into(&dir, None);
+        ProvisionedCrate { dir }
+    }
+
+    /// The networked fetch, then the `--offline --locked` proof, of the crate
+    /// at `dir` into `cargo_home` (the invoker's when `None`).
+    fn provision_into(dir: &std::path::Path, cargo_home: Option<&std::path::Path>) {
+        for mode in [Fetch::Networked, Fetch::OfflineLocked] {
+            let out = cargo_fetch(dir, mode, cargo_home);
+            assert!(
+                out.status.success(),
+                "provisioning the emitted crate's dependency universe must succeed \
+                 ({mode:?}):\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// How a `cargo fetch` reaches the registry.
+    #[derive(Debug, Clone, Copy)]
+    enum Fetch {
+        Networked,
+        OfflineLocked,
+    }
+
+    /// `cargo fetch` over the crate at `dir`, in `mode`, against `cargo_home`
+    /// (the invoker's when `None`).
+    fn cargo_fetch(
+        dir: &std::path::Path,
+        mode: Fetch,
+        cargo_home: Option<&std::path::Path>,
+    ) -> e2e_support::BoundedOutput {
+        let mut fetch = std::process::Command::new(require_cargo());
+        fetch.arg("fetch");
+        match mode {
+            Fetch::Networked => {}
+            Fetch::OfflineLocked => {
+                fetch.arg("--offline").arg("--locked");
+            }
+        }
+        if let Some(home) = cargo_home {
+            fetch.env("CARGO_HOME", home);
+        }
+        fetch
+            .arg("--manifest-path")
+            .arg(dir.join("Cargo.toml"))
+            .stdin(std::process::Stdio::null());
+        e2e_support::require_host("cargo fetch must run", super::run_child(fetch))
     }
 
     /// Build the Tier-2 probe crate `native_tier2` emitted into `out`, OUTSIDE the
@@ -1000,12 +1094,13 @@ mod real_jail {
     /// reference exactly the DCE-emitted wrapper set — either broken yields an
     /// `E0425`/unresolved-path here, so this fails HARD rather than being masked by
     /// a jail/environment skip.
-    fn assert_probe_crate_compiles(out: &std::path::Path, probe_target: &std::path::Path) {
+    fn assert_probe_crate_compiles(provisioned: &ProvisionedCrate, probe_target: &std::path::Path) {
+        let out = provisioned.dir();
         assert!(
             out.join("src").join("tier2_probe.rs").is_file(),
             "native_tier2 must have emitted the probe crate"
         );
-        let mut probe_cmd = std::process::Command::new(which_cargo().expect("cargo present"));
+        let mut probe_cmd = std::process::Command::new(require_cargo());
         probe_cmd
             .arg("build")
             .arg("--offline")
@@ -1016,7 +1111,8 @@ mod real_jail {
             .arg(out.join("Cargo.toml"))
             .arg("--target-dir")
             .arg(probe_target);
-        let probe_build = super::run_child(probe_cmd).expect("run probe build");
+        let probe_build =
+            e2e_support::require_host("the probe build must run", super::run_child(probe_cmd));
         assert!(
             probe_build.status.success(),
             "the emitted Tier-2 probe crate must compile (THE SEAL: emit ⇒ build).\n\
@@ -1027,18 +1123,37 @@ mod real_jail {
     }
 
     #[test]
+    fn an_emitted_crate_offline_build_needs_the_provisioning_step() {
+        // The emitted crate's `--offline --locked` universe is NOT whatever cache
+        // the host happens to hold: against an empty registry cache the offline
+        // resolve fails, and the one provisioning step is what makes it succeed.
+        if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+            return;
+        }
+        let base = non_tmp_base("provision");
+        let (_pkg, provisioned) = emit_real_native_package(&base, false);
+        let empty_home = base.join("empty-cargo-home");
+        std::fs::create_dir_all(&empty_home).expect("empty cargo home");
+        let unprovisioned = cargo_fetch(provisioned.dir(), Fetch::OfflineLocked, Some(&empty_home));
+        assert!(
+            !unprovisioned.status.success(),
+            "an offline fetch against an empty registry cache must fail; otherwise the \
+             provisioning step proves nothing:\n{}",
+            String::from_utf8_lossy(&unprovisioned.stderr)
+        );
+        provision_into(provisioned.dir(), Some(&empty_home));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn a_real_native_package_with_a_probeable_binding_certifies_end_to_end() {
         // A legitimate native package must be REACHABLY certifiable, not only
         // fail-closed-rejectable: drive the whole `native_tier2` entry over a real
         // `[rust.dependencies]` package with a probeable binding and assert it
         // reaches `Certified`.
         let Some(_tools) = e2e_tools() else { return };
-        if which_cargo().is_none() {
-            eprintln!("audit_native e2e: skipping — cargo not found on PATH");
-            return;
-        }
         let base = non_tmp_base("certify");
-        let (pkg, out) = emit_real_native_package(&base, false);
+        let (pkg, provisioned) = emit_real_native_package(&base, false);
 
         let declared: BTreeSet<Capability> = set(&[Capability::NativeFfi]);
         let _guard = JAIL_LOCK
@@ -1048,9 +1163,9 @@ mod real_jail {
             declared: &declared,
             has_rust_deps: true,
             root: &pkg,
-            emitted_dir: &out,
+            emitted_dir: provisioned.dir(),
         });
-        assert_probe_crate_compiles(&out, &base.join("probe-target"));
+        assert_probe_crate_compiles(&provisioned, &base.join("probe-target"));
 
         match verdict {
             Ok(outcome) => {
@@ -1067,22 +1182,10 @@ mod real_jail {
                      (reachable native certification)"
                 );
             }
-            Err(e) => {
-                let msg = e.to_string();
-                // The probe crate compiled outside the jail (asserted above), so a
-                // BuildFailed here is a JAIL-environment gap (no toolchain reachable
-                // inside the sandbox), never a probe-emission regression — skip the
-                // certify assert, never a false pass, mirroring the sibling
-                // real-build tests.
-                assert!(
-                    msg.contains("failed to build") || msg.contains("could not be established"),
-                    "the only non-certify outcomes tolerated here are jail-environment \
-                     gaps, never a false reject of a benign package: {msg}"
-                );
-                eprintln!(
-                    "audit_native e2e: skipping certify assert — jail-environment gap: {msg}"
-                );
-            }
+            // The probe crate compiled outside the jail (asserted above) and the
+            // canary established the jail, so a reject here is a false reject of
+            // a benign package, never an environment gap to pass over.
+            Err(e) => panic!("a benign native package must certify on this host's jail: {e}"),
         }
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -1099,12 +1202,8 @@ mod real_jail {
         // package whose code demands a capability its consumer never consented to is
         // refused at the OS boundary by the production entry, never admitted.
         let Some(_tools) = e2e_tools() else { return };
-        if which_cargo().is_none() {
-            eprintln!("audit_native e2e: skipping — cargo not found on PATH");
-            return;
-        }
         let base = non_tmp_base("reject-undeclared");
-        let (pkg, out) = emit_real_native_package(&base, true);
+        let (pkg, provisioned) = emit_real_native_package(&base, true);
 
         // Declare only `native-ffi`: network is NOT in the consent surface, so the
         // declared-scoped jail withholds it.
@@ -1120,7 +1219,7 @@ mod real_jail {
             declared: &declared,
             has_rust_deps: true,
             root: &pkg,
-            emitted_dir: &out,
+            emitted_dir: provisioned.dir(),
         });
 
         // POSITIVE CONTROL: `native_tier2` above emitted the probe crate + generated
@@ -1128,30 +1227,14 @@ mod real_jail {
         // `build.rs` included — now builds OUTSIDE any jail. A clean unjailed build
         // proves the toolchain and crate are sound and outbound egress is available,
         // so the reject INSIDE the jail can only be the WITHHELD network capability,
-        // never a broken toolchain. If the unjailed build ALSO fails (no egress on
-        // this runner) the duality is unprovable — the reject is still valid and
-        // fail-closed (a native package reaching an unbuildable-under-jail surface is
-        // refused), but this test cannot attribute it to the withheld axis, so it
-        // skips the strict duality assert rather than mis-attribute.
-        let unjailed_clean = unjailed_probe_build_is_clean(&out, &base.join("control-target"));
+        // never a broken toolchain. A failing control fails the test: without it the
+        // reject below proves nothing about the jail.
+        assert_probe_crate_compiles(&provisioned, &base.join("control-target"));
 
         let err = verdict.expect_err(
             "a native package reaching an undeclared axis must reject end-to-end, never certify",
         );
         let msg = err.to_string();
-        if !unjailed_clean {
-            eprintln!(
-                "audit_native e2e: undeclared-axis package REJECTED end-to-end ({msg}); \
-                 no outbound egress to run the positive control, so the axis attribution \
-                 is unprovable here — the fail-closed refusal still holds."
-            );
-            assert!(
-                !msg.contains("passed"),
-                "a package reaching a withheld axis must never certify: {msg}"
-            );
-            let _ = std::fs::remove_dir_all(&base);
-            return;
-        }
         // The declared-scoped run of the full entry is child-exit-only (no
         // fabricated fixed-axis probe), so the signal is the child build's own
         // OS-boundary failure: the net-withheld build.rs connect fails → cargo
@@ -1169,33 +1252,6 @@ mod real_jail {
         );
         eprintln!("audit_native e2e: undeclared-axis native package REJECTED end-to-end: {msg}");
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// The positive control for the end-to-end reject: build the emitted probe
-    /// crate OUTSIDE any jail. A clean build proves the toolchain and the bound
-    /// crate (net-reaching `build.rs` included) are sound and outbound egress is
-    /// available, so a failure INSIDE the declared-scoped jail can only be the
-    /// withheld capability. `false` when the unjailed build itself fails (no
-    /// egress) — the duality is unprovable and the caller skips cleanly.
-    fn unjailed_probe_build_is_clean(
-        out: &std::path::Path,
-        probe_target: &std::path::Path,
-    ) -> bool {
-        let Some(cargo) = which_cargo() else {
-            return false;
-        };
-        let mut probe_cmd = std::process::Command::new(cargo);
-        probe_cmd
-            .arg("build")
-            .arg("--offline")
-            .arg("--locked")
-            .arg("--bin")
-            .arg("tier2_probe")
-            .arg("--manifest-path")
-            .arg(out.join("Cargo.toml"))
-            .arg("--target-dir")
-            .arg(probe_target);
-        super::run_child(probe_cmd).is_ok_and(|o| o.status.success())
     }
 
     /// Write a `package.ipe` for a `Rust.Csum`-crossing app whose `declares`
@@ -1833,10 +1889,11 @@ mod real_jail {
         );
     }
 
-    /// The binary `ipe dev run` built from the crate it emitted under `out`:
-    /// the crate's one bin target, in the target directory cargo reports for it.
+    /// The binary `ipe dev run` built from the crate it emitted under `out`
+    /// into the pinned build directory `target`: the crate's one bin target,
+    /// in the target directory cargo reports for it under that pin.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn dev_run_binary(out: &std::path::Path) -> PathBuf {
+    fn dev_run_binary(out: &std::path::Path, target: &std::path::Path) -> PathBuf {
         let crate_dir = out.join("rust");
         let mut cmd = std::process::Command::new(e2e_support::target::cargo_program());
         cmd.args([
@@ -1848,6 +1905,7 @@ mod real_jail {
         ])
         .current_dir(&crate_dir)
         .stdin(std::process::Stdio::null());
+        e2e_support::target::set_target_dir_env(&mut cmd, target);
         let meta = super::run_child(cmd).expect("run cargo metadata");
         assert!(
             meta.status.success(),
@@ -1908,6 +1966,7 @@ mod real_jail {
         )
         .expect("Main.ipe");
         let out = base.join("out");
+        let target = base.join("target");
         let mut cmd = std::process::Command::new(super::support::ipe_bin());
         cmd.args(["dev", "run"])
             .arg(&project)
@@ -1920,6 +1979,7 @@ mod real_jail {
             )
             .env("NO_COLOR", "1")
             .stdin(std::process::Stdio::null());
+        e2e_support::target::set_target_dir_env(&mut cmd, &target);
         let ran = super::run_child(cmd).expect("run ipe dev run");
         assert!(
             ran.status.success(),
@@ -1927,7 +1987,7 @@ mod real_jail {
             String::from_utf8_lossy(&ran.stderr)
         );
         let (dir, _) = floor_bundle(&base, &[]);
-        std::fs::copy(dev_run_binary(&out), dir.join("ipe-app"))
+        std::fs::copy(dev_run_binary(&out, &target), dir.join("ipe-app"))
             .expect("the dev run's binary becomes the bundle's app");
         std::fs::write(
             dir.join("ipe.profile"),

@@ -1521,6 +1521,8 @@ pub enum OutputArea {
     Bundle,
     /// The published `web client` bundle (`www/`).
     Www,
+    /// The `web client desktop` shell crate (`client-shell/`).
+    ClientShell,
 }
 
 impl OutputArea {
@@ -1535,6 +1537,7 @@ impl OutputArea {
             Self::App => "app",
             Self::Bundle => "bundle",
             Self::Www => "www",
+            Self::ClientShell => "client-shell",
         }
     }
 }

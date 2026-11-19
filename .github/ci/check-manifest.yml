@@ -68,6 +68,7 @@ checks:
       tier: quick
       run:
         - cargo clippy --all-targets {packages} -- -D warnings
+        - cargo clippy --locked --target x86_64-unknown-freebsd -p ipe_sandbox --all-targets -- -D warnings
   - context: runtime-feature-combos
     disposition: gate
     producer: ci.yml
@@ -93,6 +94,8 @@ checks:
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,tui --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features tui --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,encoding,json,random,time-core,uuid,webview --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features webview-shell --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features browser-open --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features crypto-core,encoding,json,jwt,secret,uuid --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,random,url,websocket_client --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,email,encoding,http_client,random,url --all-targets -- -D warnings
@@ -401,12 +404,13 @@ checks:
     local:
       ci-only: platform
     guards: >-
-      Every target release.yml builds type-checks on its own runner under the
-      pinned toolchain and the lockfile before merge, so a release target that
-      cannot compile surfaces in the merge queue, not on the release tag;
-      check 23 holds the matrix equal to release.yml's and pins each job's
+      Every Linux target release.yml builds type-checks on its own runner under
+      the pinned toolchain and the lockfile before merge, so a Linux release
+      target that cannot compile surfaces in the merge queue, not on the
+      release tag; check 23 holds its legs and release-targets.yml's, together,
+      equal to release.yml's, keeps every Linux leg here, and pins each job's
       checkout, shared toolchain step and cargo line, nothing between them.
-    aggregates: [release-targets-run, release-targets-freebsd]
+    aggregates: [release-targets-run]
 
   # ── Cancel-on-cheap-red watcher — informational (never a merge gate) ──────
   # Normally SKIPPED (its `needs:` all succeed and `failure()` is false), so it
@@ -725,6 +729,24 @@ checks:
       Advisory nightly/dispatch live-registry publish smoke; a red signals a
       broken live push-path but never blocks a merge or promotion. The
       registry-admission gate covers the publish logic over a local fixture.
+
+  # ── Release targets off the merge queue — informational ────────────────
+  - context: release-targets-native
+    disposition: informational
+    producer: release-targets.yml
+    owner: release
+    note: >-
+      The macOS and Windows release targets type-checked nightly and on
+      dispatch; a red is a release-target portability regression, which the
+      release tag's own build would also refuse.
+  - context: release-targets-freebsd
+    disposition: informational
+    producer: release-targets.yml
+    owner: release
+    note: >-
+      The FreeBSD release target type-checked in a VM nightly and on dispatch;
+      a red is a release-target portability regression, which the release
+      tag's own build would also refuse.
 
   # ── Install-smoke — informational (installer UX; artifact separately gated) ─
   - context: "install-smoke (ubuntu-latest)"

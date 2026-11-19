@@ -2162,6 +2162,11 @@ pub enum FieldTag {
     /// `"output"` — `Process.runInPty` output: the combined stream read from the
     /// pty master until the child exits.
     ProcessOutput,
+    // ── Web.pageLink ──
+    /// `"to"` — the page a `Web.pageLink` names.
+    PageTo,
+    /// `"current"` — the page on screen, which marks the link `aria-current`.
+    PageCurrent,
 }
 
 impl FieldTag {
@@ -2189,7 +2194,7 @@ impl FieldTag {
             Self::CacheEvictions => "evictions",
             Self::WsPingInterval => "pingInterval",
             Self::EmailFrom => "from",
-            Self::EmailTo => "to",
+            Self::EmailTo | Self::PageTo => "to",
             Self::EmailCc => "cc",
             Self::EmailBcc => "bcc",
             Self::EmailSubject => "subject",
@@ -2247,6 +2252,7 @@ impl FieldTag {
             Self::ProcessStderr => "stderr",
             Self::ProcessCols => "cols",
             Self::ProcessOutput => "output",
+            Self::PageCurrent => "current",
         }
     }
 
@@ -3635,6 +3641,9 @@ pub enum StdlibKernel {
     /// server router on one port. Shares `Web.tea`'s emit path.
     WebEmbed,
     WebRoute,
+    /// `Web.pageLink : List (WebRoute page) -> List (Attribute msg) -> { to : page, current : page, label : Element msg } -> Element msg`
+    /// — an `<a ipe-nav>` whose `href` the route table's own renderer mints.
+    WebPageLink,
     WebRenderStatic,
     // ── Ipe.Terminal app-entry kernels ───────────────────────────────────
     /// `Tui.tea` — full-screen TEA entry, `view : Model -> Element
@@ -6915,6 +6924,7 @@ impl StdlibKernel {
             // leaf from the same cfg); the runtime symbol is the same builder.
             Self::WebEmbed => d("Web", "embed", 1, Web, "web_app", IpeOrder),
             Self::WebRoute => d("Web", "route", 2, Web, "web_route", IpeOrder),
+            Self::WebPageLink => d("Web", "pageLink", 3, Web, "web_page_link", IpeOrder),
             // `Ipe.Html.renderStatic` is a shape-neutral static-render bridge, NOT
             // a TEA entry: it renders a `view` once to HTML and returns a `Task`, so
             // it lives under `Ipe.Html` next to `render`. `class = Web` because its
@@ -9233,6 +9243,7 @@ impl StdlibKernel {
         Self::WebAppRouted,
         Self::WebEmbed,
         Self::WebRoute,
+        Self::WebPageLink,
         Self::WebRenderStatic,
         // Terminal
         Self::TerminalAppScreen,
@@ -12453,6 +12464,24 @@ impl StdlibKernel {
         const WEB_ROUTE_A: TyShape = TyShape::Con(BuiltinTag::WebRoute, &[A]);
         const B_TO_WEB_ROUTE_A: TyShape = TyShape::Fun(&B, &WEB_ROUTE_A);
         const WEB_ROUTE_KERNEL: TyShape = TyShape::Fun(&STRING, &B_TO_WEB_ROUTE_A);
+        // `Web.pageLink : List (WebRoute page) -> List (Attribute msg)
+        //     -> { to : page, current : page, label : Element msg } -> Element msg`
+        // (msg = A, page = B).
+        const PAGE_LINK_CFG: TyShape = TyShape::Record {
+            fields: &[
+                (FieldTag::PageTo, &B),
+                (FieldTag::PageCurrent, &B),
+                (FieldTag::Label, &UI_ELEM_A),
+            ],
+            tail: RowTailShape::Closed,
+        };
+        const WEB_PAGE_LINK: TyShape = {
+            const WEB_ROUTE_B: TyShape = TyShape::Con(BuiltinTag::WebRoute, &[B]);
+            const LIST_WEB_ROUTE_B: TyShape = TyShape::Con(BuiltinTag::List, &[WEB_ROUTE_B]);
+            const CFG_TO_ELEM: TyShape = TyShape::Fun(&PAGE_LINK_CFG, &UI_ELEM_A);
+            const ATTRS_TO_CFG_TO_ELEM: TyShape = TyShape::Fun(&LIST_UI_ATTR_A, &CFG_TO_ELEM);
+            TyShape::Fun(&LIST_WEB_ROUTE_B, &ATTRS_TO_CFG_TO_ELEM)
+        };
         // `Web.renderStatic : (a -> Html b) -> a -> Task ()`.
         const HTML_B: TyShape = TyShape::Con(BuiltinTag::Html, &[B]);
         const A_TO_HTML_B: TyShape = TyShape::Fun(&A, &HTML_B);
@@ -13797,6 +13826,7 @@ impl StdlibKernel {
             Self::WebAuthRevocationMode => Some(&REVOCATION_MODE_TO_SETTING_WEB),
             Self::WebAppWith => Some(&WEB_APP_WITH),
             Self::WebRoute => Some(&WEB_ROUTE_KERNEL),
+            Self::WebPageLink => Some(&WEB_PAGE_LINK),
             Self::WebRenderStatic => Some(&WEB_RENDER_STATIC),
 
             // ── Ipe.Cache raw-Int-handle read/write. ──
@@ -14191,6 +14221,7 @@ impl StdlibKernel {
             | Self::UiInFront
             | Self::UiLayout
             | Self::UiLink
+            | Self::WebPageLink
             | Self::UiMediaQuery
             | Self::UiOnLeft
             | Self::UiOnPseudo
@@ -15236,6 +15267,7 @@ impl StdlibKernel {
             | Self::WebEmbed
             | Self::WebAppRouted
             | Self::WebRoute
+            | Self::WebPageLink
             | Self::WebRenderStatic
             | Self::TerminalAppScreen
             | Self::UiOnClick
@@ -17656,6 +17688,7 @@ impl StdlibKernel {
             | Self::WebAppRouted
             | Self::WebEmbed
             | Self::WebRoute
+            | Self::WebPageLink
             | Self::WebRenderStatic
             | Self::TerminalAppScreen
             | Self::WebAppWith
@@ -18401,7 +18434,11 @@ impl StdlibKernel {
             // the same M4 Cmd/Sub browser-effects bridge the TEA-side pub/sub uses.
             KernelClass::Web => matches!(
                 self,
-                Self::WebApp | Self::WebRoute | Self::PubSubPublish | Self::PubSubPublishNoEcho
+                Self::WebApp
+                    | Self::WebRoute
+                    | Self::WebPageLink
+                    | Self::PubSubPublish
+                    | Self::PubSubPublishNoEcho
             ),
             // TEA wiring the wasm scheduler drives today. `Cmd.perform` runs
             // on the browser microtask queue; `Sub.every`/`Time.every` run on
@@ -20032,6 +20069,7 @@ mod tests {
             StdlibKernel::CssSafetySafeValue,
             StdlibKernel::WebApp,
             StdlibKernel::WebRoute,
+            StdlibKernel::WebPageLink,
             StdlibKernel::CmdNone,
             StdlibKernel::CmdPerform,
             StdlibKernel::SubNone,
@@ -20452,6 +20490,7 @@ mod tests {
                     | StdlibKernel::WebAppRouted
                     | StdlibKernel::WebAppWith
                     | StdlibKernel::WebRoute
+                    | StdlibKernel::WebPageLink
                     | StdlibKernel::WebRenderStatic
                     | StdlibKernel::PubSubPublish
                     | StdlibKernel::PubSubPublishNoEcho

@@ -693,6 +693,8 @@ mod tests {
             | HtmlAttribute::BoolAttr(..)
             | HtmlAttribute::EventAttr(_)
             | HtmlAttribute::NoAttr => None,
+            #[cfg(feature = "web-core")]
+            HtmlAttribute::PageHref(_) => None,
         })
     }
 
@@ -705,6 +707,8 @@ mod tests {
             HtmlAttribute::Attr(k, _) => k == name,
             HtmlAttribute::BoolAttr(k, on) => k == name && *on,
             HtmlAttribute::EventAttr(_) | HtmlAttribute::NoAttr => false,
+            #[cfg(feature = "web-core")]
+            HtmlAttribute::PageHref(_) => false,
         })
     }
 

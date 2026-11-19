@@ -3567,6 +3567,109 @@ mod tests {
         );
     }
 
+    /// A gate's compile core emits the embedded runtime when handed an override.
+    ///
+    /// The override's bytes and digest never reach the emit: the core binds
+    /// only the runtime the gate origin admits.
+    #[test]
+    #[allow(clippy::expect_used)] // a failed scratch setup or compile is the test failure
+    fn a_gate_compile_never_emits_an_override_runtime() {
+        const MARKER: &str = "// override marker: never in a gate's emit\n";
+        let root = crate::scratch::ScratchDir::new("ipe-gate-override-admission")
+            .expect("scratch dir")
+            .into_path();
+        let runtime_root = root.join("runtime");
+        fs::create_dir_all(runtime_root.join("src")).expect("create runtime src/");
+        fs::write(
+            runtime_root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{}\"\nversion = \"{}\"\n",
+                runtime_embed::RUNTIME_PACKAGE,
+                runtime_embed::COMPILER_VERSION
+            ),
+        )
+        .expect("write the runtime manifest");
+        fs::write(runtime_root.join("src/lib.rs"), MARKER).expect("write the marked source");
+        let runtime = RuntimeSource::resolve(
+            runtime_embed::RuntimeOrigin::Developer,
+            Some(&runtime_root),
+            RuntimeRemedy::EnvOnly,
+        )
+        .expect("the scratch runtime proves");
+        assert!(
+            matches!(runtime, RuntimeSource::Override(_)),
+            "the fixture must hand the core an override"
+        );
+
+        let project = root.join("project");
+        fs::create_dir_all(&project).expect("project dir");
+        let entry_file = project.join("Main.ipe");
+        let target = EmitTarget::at(&root.join("out"), &ProjectPaths::of_file(&entry_file))
+            .expect("prove out");
+        let role = target.bundle_role();
+        let entry_path = vec!["Main".to_owned()];
+        let mut sources: BTreeMap<Vec<String>, (PathBuf, String)> = BTreeMap::new();
+        sources.insert(
+            entry_path.clone(),
+            (
+                entry_file.clone(),
+                "module Main exposing (main)\n\nimport Ipe.Io as Io\n\nmain : Task Error ()\nmain =\n    Io.println \"hi\"\n".to_owned(),
+            ),
+        );
+        let discovered = vec![project::DiscoveredModule::user(
+            entry_file,
+            entry_path.clone(),
+        )];
+        let (emitted, _) = compile_modules_observed(
+            sources,
+            discovered,
+            project::CompiledDeps::none(),
+            &entry_path,
+            &target,
+            &runtime,
+            &project,
+            &SettingsSource::Loose,
+            None,
+            BuildOptions::gate(),
+        );
+        let emitted = emitted.expect("the gate compile emits");
+        let dep = emitted.path().join(RUNTIME_DEP_DIR);
+        let embedded_bundle = RuntimeSource::Embedded
+            .bundled(role)
+            .expect("the embedded runtime bundles");
+        let embedded = embedded_bundle.digest();
+        let overridden = runtime
+            .bundled(role)
+            .expect("the override bundles")
+            .digest();
+        let differing = embedded_bundle
+            .files()
+            .iter()
+            .filter(|(rel, text)| fs::read_to_string(dep.join(rel)).ok().as_ref() != Some(*text))
+            .map(|(rel, _)| rel.clone())
+            .collect::<Vec<_>>();
+        let override_lib = fs::read_to_string(dep.join("src/lib.rs")).ok();
+        let manifest =
+            fs::read_to_string(dep.join("Cargo.toml")).expect("the bundled runtime's manifest");
+        let _ = fs::remove_dir_all(&root);
+        assert!(
+            differing.is_empty(),
+            "a gate's emit differs from the embedded bundle at {differing:?}"
+        );
+        assert!(
+            !override_lib.is_some_and(|lib| lib.contains(MARKER)),
+            "the override's source reached a gate's emit"
+        );
+        assert!(
+            manifest.contains(&runtime_embed::stamped_version(role, embedded)),
+            "a gate's emit carries the embedded runtime's digest:\n{manifest}"
+        );
+        assert!(
+            !manifest.contains(&overridden.hex()),
+            "the override's digest reached a gate's emit:\n{manifest}"
+        );
+    }
+
     /// The manifest refuses `.rs` text holding a raw bidi control or a bare CR,
     /// past every renderer, and names the hazard without echoing it.
     #[test]

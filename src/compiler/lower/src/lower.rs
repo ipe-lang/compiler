@@ -11504,38 +11504,13 @@ pub const fn float_key_rejected(ir: &IrType) -> bool {
 
 /// Whether `main`'s return type is a runnable program entry.
 ///
-/// The emitted `fn main` wraps the entry in the runtime's single run site, which
-/// needs a `Task` or a shape app handle. Four lowered return shapes reach that run
-/// site:
-///
-/// * `Task(_)` — a `Task Error a` written directly (a script `main = Io.println …`).
-///   The run site discards the produced value, so any `a` is admissible.
-/// * `Result(Error, _)` — a top-level `main = someTask |> Task.run`; the backend
-///   re-wraps the resolved `Result` into an already-settled `Task`.
-/// * `Unit` — a synchronous `Task.run`-calls idiom whose body evaluates to `()`;
-///   the backend wraps it as `task_succeed(())`.
-/// * Shape app leaves (`WebApp` / `TuiApp` / `CliApp`) — each
-///   wraps its own event-loop task; the backend calls the leaf's `run_blocking`
-///   wrapper in `fn main` instead of `block_on(ipe_main())`.
-///
-/// Any other type (an `Int`, a `String`, a function, …) has no effect to run and
-/// cannot reach the run site, so it is rejected ([`LowerError::NonEntryMain`]).
-/// The set here is exactly the one the backend's entry emission can build, so
-/// acceptance fails closed at `ipe` time instead of open at `cargo` time.
+/// The admitted set is exactly the one [`ipe_ir::EntryRun::of`] names a run form
+/// for — the same classification the backend reads to pick the emitted entry —
+/// so acceptance fails closed at `ipe` time instead of open at `cargo` time.
+/// Any other type (an `Int`, a `String`, a function, …) has no effect to run
+/// and is rejected ([`LowerError::NonEntryMain`]).
 fn main_ret_is_runnable_entry(ret: &IrType) -> bool {
-    match ret {
-        // Opaque shape-app leaves: each has a `run_blocking` entry the emitted
-        // `fn main` calls; accepting them here keeps the SEAL closed (a program
-        // whose `main` returns a shape handle still compiles and runs).
-        IrType::Task(_)
-        | IrType::Unit
-        | IrType::WebApp
-        | IrType::TuiApp
-        | IrType::CliApp
-        | IrType::WorkerApp => true,
-        IrType::Result(err, _) => matches!(**err, IrType::Error),
-        _ => false,
-    }
+    ipe_ir::EntryRun::of(ret).is_some()
 }
 
 /// A short, plain-English description of `main`'s inadmissible return type.
@@ -17225,11 +17200,11 @@ impl<'a> Lowerer<'a> {
             funcs.retain(|f| reachable.contains(&f.id));
         }
 
-        // Entry-admissibility gate (`IPE-L0136`): the emitted `fn main` calls the
-        // program's `main` with no arguments and wraps it in the runtime's single
-        // run site (`block_on(ipe_main())`), which needs a `Task`. A `main` that
-        // takes parameters (`block_on(ipe_main())` supplies none) or whose type
-        // cannot reach that site as a `Task` (an `Int`, a `String`, a function, …)
+        // Entry-admissibility gate (`IPE-L0136`): the emitted `fn main` hands the
+        // program's `main` to the runtime's single run site (`block_on_entry` or
+        // `run_blocking_entry`), which calls it with no arguments and needs a run
+        // form. A `main` that takes parameters (the run site supplies none) or
+        // whose type has no run form (an `Int`, a `String`, a function, …)
         // would ship a crate that cannot build — the cardinal SEAL breach. Reject
         // it here, before emission, with a friendly teaching diagnostic. Applied
         // only when this is the real demanded entry (`prune_dead` — `main`'s home
@@ -30119,7 +30094,10 @@ impl<'a> Lowerer<'a> {
                 // web::style_inject::build_mq (see ui_media_query_).
                 | KernelFn::UiMediaQuery
                 // `Terminal.Color.rgb : Int -> Int -> Int -> Color`
-                | KernelFn::TermColorRgb,
+                | KernelFn::TermColorRgb
+                // `Web.pageLink : List (WebRoute page) -> List (Attribute msg)
+                //     -> { to : page, current : page, label : Element msg } -> Element msg`
+                | KernelFn::WebPageLink,
             ) => Ok(3),
             // Arity 4: `Ui.rgba r g b a`, `Ui.animate name shorthand kf respect`.
             Callee::Kernel(
@@ -32428,6 +32406,7 @@ impl<'a> Lowerer<'a> {
                     ("Web", "embed") => Ok(Callee::Kernel(KernelFn::WebEmbed)),
                     ("Web", "appRouted") => Ok(Callee::Kernel(KernelFn::WebAppRouted)),
                     ("Web", "route") => Ok(Callee::Kernel(KernelFn::WebRoute)),
+                    ("Web", "pageLink") => Ok(Callee::Kernel(KernelFn::WebPageLink)),
                     // `Ipe.Html.renderStatic` — shape-neutral static-render bridge.
                     ("Html", "renderStatic") => Ok(Callee::Kernel(KernelFn::WebRenderStatic)),
                     // ── Ipe.Tui / Ipe.Cli app-entry kernels ───────────────

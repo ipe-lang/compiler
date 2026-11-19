@@ -278,7 +278,7 @@ fn main() {
     ipe_runtime::core::install_panic_classifier();
     // Both outcomes end through the runtime's one exit funnel, which runs the
     // exit hook and flushes buffered telemetry before the process ends.
-    match block_on(ipe_main()) {
+    match block_on_entry(ipe_main) {
         IpeResult::Ok(_) => {
             ipe_runtime::system::exit_process(ipe_runtime::system::ProcessStatus::SUCCESS)
         }
