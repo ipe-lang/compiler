@@ -193,12 +193,19 @@ pub enum MobileRefusal {
         /// The refused server origin.
         origin: ServerOrigin,
     },
+    /// `delivery.frameOrigins` names origins, which only a page a web server
+    /// serves may frame; a shell host refuses them.
+    FramesOnShell {
+        /// The shell's bundle host.
+        host: BundleHost,
+    },
 }
 
 impl From<ReachRefusal> for MobileRefusal {
     fn from(refusal: ReachRefusal) -> Self {
         match refusal {
             ReachRefusal::LocalOriginListed { origin } => Self::AssetOriginListed { origin },
+            ReachRefusal::FramesOnShell { host } => Self::FramesOnShell { host },
         }
     }
 }
@@ -241,6 +248,12 @@ impl std::fmt::Display for MobileRefusal {
             Self::AssetOriginListed { origin } => {
                 f.write_str(&text::mobile_asset_origin_listed(&origin.https()))
             }
+            Self::FramesOnShell { host } => write!(
+                f,
+                "error: {}\n  \
+                 = remove `delivery.frameOrigins`, or ship the app as a served web page.",
+                ReachRefusal::FramesOnShell { host: *host }
+            ),
         }
     }
 }
@@ -258,8 +271,9 @@ pub struct ManifestPin {
     /// `delivery.browser.basePath`: the mount path the bundle's URLs and the
     /// shell's handlers name.
     base: MountBase,
-    /// `delivery.servers`: the origins the bundle may reach besides its own,
-    /// read only as a [`BundleReach`].
+    /// `delivery.servers` and `delivery.frameOrigins`: the origins the bundle
+    /// may reach besides its own and the ones it may frame, read only as a
+    /// [`BundleReach`].
     servers: PinnedServers,
     /// `delivery.mobile.push`: the identifiers the shell registers for push
     /// with; its `Debug` never prints an identifier.
@@ -330,7 +344,10 @@ impl ManifestPin {
     pub fn of(manifest: &ProjectManifest) -> Self {
         Self {
             base: manifest.delivery.browser.base.clone(),
-            servers: PinnedServers::new(manifest.delivery.servers.clone()),
+            servers: PinnedServers::new(
+                manifest.delivery.servers.clone(),
+                manifest.delivery.frame_origins.clone(),
+            ),
             push: manifest.delivery.mobile.push.clone(),
             accepts: manifest.capabilities_accept.clone(),
         }
@@ -353,7 +370,9 @@ impl ManifestPin {
     ///
     /// # Errors
     /// [`MobileRefusal::AssetOriginListed`] when `host` is
-    /// [`BundleHost::AndroidAssets`] and `delivery.servers` names its asset host.
+    /// [`BundleHost::AndroidAssets`] and `delivery.servers` names its asset host;
+    /// [`MobileRefusal::FramesOnShell`] when `delivery.frameOrigins` names any
+    /// origin.
     pub fn reach(&self, host: BundleHost) -> Result<BundleReach<'_>, MobileRefusal> {
         Ok(self.servers.reach(host)?)
     }
@@ -422,9 +441,11 @@ impl ManifestPin {
             push: push_after,
             accepts: accepts_after,
         } = after;
+        let (servers_moved, frames_moved) = servers.moved(servers_after);
         let fields: Vec<PinnedField> = [
             (PinnedField::BasePath, base != base_after),
-            (PinnedField::Servers, servers != servers_after),
+            (PinnedField::Servers, servers_moved),
+            (PinnedField::FrameOrigins, frames_moved),
             (PinnedField::Push, push != push_after),
             (PinnedField::Accepts, accepts != accepts_after),
         ]
@@ -441,35 +462,44 @@ impl ManifestPin {
 
 mod pinned_servers {
     use ipe_runtime_rust::csp::{BundleHost, BundleReach, ReachRefusal};
-    use ipe_runtime_rust::encoding::ServerOrigins;
+    use ipe_runtime_rust::encoding::{FrameOriginEntries, ServerOrigins};
 
-    /// A pin's `delivery.servers`, readable only as a [`BundleReach`].
+    /// A pin's `delivery.servers` and `delivery.frameOrigins`, readable only
+    /// as a [`BundleReach`].
     ///
-    /// Its origins are private to this module, so every confinement list a
+    /// Both lists are private to this module, so every confinement list a
     /// shell renders is derived from one reach, never from the origins read
     /// again beside it.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct PinnedServers(ServerOrigins);
+    #[derive(Clone, Debug)]
+    pub struct PinnedServers(ServerOrigins, FrameOriginEntries);
 
     impl PinnedServers {
-        /// Pin `origins`.
+        /// Pin `origins` and `frames`.
         #[must_use]
-        pub const fn new(origins: ServerOrigins) -> Self {
-            Self(origins)
+        pub const fn new(origins: ServerOrigins, frames: FrameOriginEntries) -> Self {
+            Self(origins, frames)
+        }
+
+        /// Whether `after`'s servers, then its frame origins, differ from
+        /// this pin's.
+        #[must_use]
+        pub fn moved(&self, after: &Self) -> (bool, bool) {
+            (self.0 != after.0, self.1 != after.1)
         }
 
         /// What a bundle on `host` may reach.
         ///
         /// # Errors
-        /// The refusal of a server `host` answers locally.
+        /// The refusal of a server `host` answers locally, and of any frame
+        /// origin on a shell host.
         pub fn reach(&self, host: BundleHost) -> Result<BundleReach<'_>, ReachRefusal> {
-            BundleReach::new(host, &self.0)
+            BundleReach::new(host, &self.0, &self.1)
         }
 
         /// What the bundle a web server serves may reach.
         #[must_use]
         pub const fn served(&self) -> BundleReach<'_> {
-            BundleReach::served(&self.0)
+            BundleReach::served(&self.0, &self.1)
         }
 
         /// The pinned origins, for a test to render what the wasm build renders.
@@ -490,6 +520,8 @@ pub enum PinnedField {
     BasePath,
     /// `delivery.servers`.
     Servers,
+    /// `delivery.frameOrigins`.
+    FrameOrigins,
     /// `delivery.mobile.push`.
     Push,
     /// `capabilities.accepts`.
@@ -503,6 +535,7 @@ impl PinnedField {
         match self {
             Self::BasePath => "delivery.browser.basePath",
             Self::Servers => "delivery.servers",
+            Self::FrameOrigins => "delivery.frameOrigins",
             Self::Push => "delivery.mobile.push",
             Self::Accepts => "capabilities.accepts",
         }
@@ -4031,7 +4064,7 @@ mod tests {
     use crate::bundle_www::{MAX_ASSET_BYTES, MAX_INDEX_HTML_BYTES};
     use crate::output_dir::test_links::{staging_leftovers, tree_snapshot};
     use ipe_fs_open::FileKind;
-    use ipe_runtime_rust::encoding::ServerOrigins;
+    use ipe_runtime_rust::encoding::{FrameOriginEntries, ServerOrigins};
 
     fn accepts(items: &[Capability]) -> BTreeSet<Capability> {
         items.iter().copied().collect()
@@ -5453,6 +5486,7 @@ mod tests {
                     ipe_runtime_rust::encoding::ServerOrigin::parse(raw).expect("a legal origin")
                 }))
                 .expect("a legal origin set"),
+                FrameOriginEntries::none(),
             ),
             push: None,
             accepts: BTreeSet::new(),
@@ -5494,7 +5528,7 @@ mod tests {
     fn shell_pin(accepts: &BTreeSet<Capability>, base: &MountBase) -> ManifestPin {
         ManifestPin {
             base: base.clone(),
-            servers: PinnedServers::new(ServerOrigins::none()),
+            servers: PinnedServers::new(ServerOrigins::none(), FrameOriginEntries::none()),
             push: None,
             accepts: accepts.clone(),
         }
@@ -6394,8 +6428,12 @@ mod tests {
             ] {
                 let shell = android(&laid);
                 let header = string_constant(&shell, "CONTENT_SECURITY_POLICY");
-                let meta =
-                    ContentSecurityPolicy::bundle(laid.servers.origins(), worker).header_value();
+                let meta = ContentSecurityPolicy::bundle(
+                    laid.servers.origins(),
+                    &FrameOriginEntries::none(),
+                    worker,
+                )
+                .header_value();
                 assert_eq!(others(&header), others(&meta), "{header} / {meta}");
                 let mut admitted = connect_of(&meta);
                 assert!(admitted.remove("'self'"), "{meta}");
@@ -6403,6 +6441,54 @@ mod tests {
                 assert!(connect_of(&header).is_subset(&admitted), "{header}");
                 assert!(!connect_of(&header).contains("'self'"), "{header}");
             }
+        }
+    }
+
+    /// R18: the pack's policy swap stays exact with the frame list threaded.
+    ///
+    /// A pin listing frame origins renders served metas that frame exactly
+    /// the listed origins, and its served swaps map each meta to itself; an
+    /// empty list swaps a served page to the shell host's meta with only
+    /// `frame-src 'self'` and `object-src 'none'`.
+    #[test]
+    fn pack_meta_swap_keeps_frames() {
+        use ipe_runtime_rust::encoding::FrameOriginEntry;
+        let listed = FrameOriginEntries::new([
+            FrameOriginEntry::parse("https://player.example").expect("a frame origin")
+        ])
+        .expect("a frame list");
+        let framed = ManifestPin {
+            servers: PinnedServers::new(ServerOrigins::none(), listed),
+            ..pin("/", &[])
+        };
+        let served = framed.reach(BundleHost::Served).expect("a served reach");
+        let swaps = framed.policy_swaps(&served);
+        assert!(!swaps.is_empty());
+        for (_, meta) in framed.served_policies() {
+            assert!(meta.contains("frame-src https://player.example"), "{meta}");
+            assert!(meta.contains("object-src https://player.example"), "{meta}");
+            assert!(!meta.contains("frame-src 'self'"), "{meta}");
+            assert!(
+                swaps.contains(&PolicySwap::new(meta.clone(), meta.clone())),
+                "{meta}"
+            );
+            let page = format!("<html><head>{meta}</head></html>");
+            let shown = swapped_policy(Path::new("index.html"), page.clone().into_bytes(), &swaps);
+            assert_eq!(shown.ok(), Some(page));
+        }
+        let plain = pin("/", &[]);
+        let android = plain
+            .reach(BundleHost::AndroidAssets)
+            .expect("an Android reach");
+        let shell_swaps = plain.policy_swaps(&android);
+        for (_, meta) in plain.served_policies() {
+            assert!(meta.contains("frame-src 'self'"), "{meta}");
+            let page = format!("<html><head>{meta}</head></html>");
+            let shown = swapped_policy(Path::new("index.html"), page.into_bytes(), &shell_swaps)
+                .expect("the served meta swaps");
+            assert_eq!(shown.matches("frame-src 'self'").count(), 1, "{shown}");
+            assert_eq!(shown.matches("object-src 'none'").count(), 1, "{shown}");
+            assert!(!shown.contains("player.example"), "{shown}");
         }
     }
 
@@ -6421,19 +6507,24 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the pinned servers module");
         assert!(
-            module.contains("pub struct PinnedServers(ServerOrigins);"),
+            module.contains("pub struct PinnedServers(ServerOrigins, FrameOriginEntries);"),
             "the origins stay a private field: {module}"
         );
-        let readers: Vec<&str> = module
-            .match_indices("self.0")
-            .filter_map(|(at, _)| {
-                let (_, signature) = module.get(..at)?.rsplit_once("fn ")?;
-                signature.split_once('(').map(|(name, _)| name)
-            })
-            .collect();
-        assert_eq!(readers, ["reach", "served", "origins"]);
-        let fields = module.matches(".0").count();
-        assert_eq!(fields, 3, "every field read is one of the listed: {module}");
+        let readers = |field: &str| -> Vec<&str> {
+            module
+                .match_indices(field)
+                .filter_map(|(at, _)| {
+                    let (_, signature) = module.get(..at)?.rsplit_once("fn ")?;
+                    signature.split_once('(').map(|(name, _)| name)
+                })
+                .collect()
+        };
+        assert_eq!(readers("self.0"), ["moved", "reach", "served", "origins"]);
+        assert_eq!(readers("self.1"), ["moved", "reach", "served"]);
+        assert_eq!(readers("after.0"), ["moved"]);
+        assert_eq!(readers("after.1"), ["moved"]);
+        let fields = module.matches(".0").count() + module.matches(".1").count();
+        assert_eq!(fields, 9, "every field read is one of the listed: {module}");
         // A destructuring read (`let Self(o) = self`, `|PinnedServers(o)| o`)
         // names no `.0`, so every function and every tuple pattern the module
         // holds is listed too.
@@ -6442,7 +6533,11 @@ mod tests {
             .skip(1)
             .filter_map(|rest| rest.split_once('(').map(|(name, _)| name))
             .collect();
-        assert_eq!(functions, ["new", "reach", "served", "origins"], "{module}");
+        assert_eq!(
+            functions,
+            ["new", "moved", "reach", "served", "origins"],
+            "{module}"
+        );
         assert_eq!(
             module.matches("Self(").count(),
             1,
@@ -6552,7 +6647,7 @@ mod tests {
 
     /// The policy meta the wasm build renders for `servers` and `worker`.
     fn served_meta(servers: &ServerOrigins, worker: BundleWorker) -> String {
-        ContentSecurityPolicy::bundle(servers, worker).meta_element()
+        ContentSecurityPolicy::bundle(servers, &FrameOriginEntries::none(), worker).meta_element()
     }
 
     /// The `os` shell laid out from `laid` over `spa`, materialised under `base`.

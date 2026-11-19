@@ -2372,21 +2372,23 @@ pub fn verify_test_quiet(path: Option<&str>) -> Result<(), CliError> {
 
 pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
     let (format, positional) = cli_args::split_format(rest, "capabilities")?;
-    let caps = capabilities_in(&working_dir()?, positional.first().copied())?;
+    let (caps, frames) = capabilities_in(&working_dir()?, positional.first().copied())?;
     let names: Vec<&'static str> = caps.iter().map(|c| c.as_str()).collect();
     crate::screen::emit_report(
         format,
-        &render_capabilities(&names, format, &std::io::stdout()),
+        &render_capabilities(&names, frames.as_ref(), format, &std::io::stdout()),
     );
     Ok(())
 }
 
-/// The capabilities what `arg` names in the project at `cwd` exercises.
+/// The capabilities what `arg` names in the project at `cwd` exercises, with
+/// the reach its trusted frame origins give a page.
 ///
 /// No argument (or a directory, or `package.ipe`) is every entry of the
 /// project, their sets unioned. A file argument must name one of the
 /// project's entries: a capability set is a program's, and any other module
-/// is not one.
+/// is not one. The frame reach is the project's `delivery.frameOrigins`,
+/// `None` when the list is empty.
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`] and [`analysis_target`];
@@ -2395,7 +2397,13 @@ pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
 pub fn capabilities_in(
     cwd: &Path,
     arg: Option<&str>,
-) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+) -> Result<
+    (
+        std::collections::BTreeSet<ipe_ir::Capability>,
+        Option<crate::frame_reach::FrameReach>,
+    ),
+    CliError,
+> {
     let (root, file) = analysis_root(cwd, arg.map(Path::new))?;
     let target = analysis_target(&root, file.as_ref())?;
     if let (Some(file), AnalysisTarget::Module { dir, module, .. }) = (file.as_ref(), &target) {
@@ -2411,7 +2419,8 @@ pub fn capabilities_in(
             )));
         }
     }
-    target_capabilities(&target)
+    let frames = crate::frame_reach::FrameReach::of(&root.manifest().delivery.frame_origins);
+    Ok((target_capabilities(&target)?, frames))
 }
 
 /// The union of the capabilities every entry `target` names exercises.
@@ -2442,14 +2451,19 @@ fn target_capabilities(
 /// Render a program's inferred capability set in the requested [`OutputFormat`].
 ///
 /// - Human (default): a guttered, labelled report — a heading and one bullet per
-///   capability, or a line saying the program is pure.
+///   capability, or a line saying the program is pure; with a `frames` reach,
+///   the frame notice follows as a second block and the program is never
+///   called pure.
 /// - `--plain`: the bare capability names, one per line, flush-left (or nothing
-///   at all for a pure program — the scriptable form pipelines already consume).
+///   at all for a pure program — the scriptable form pipelines already
+///   consume), then one `frame:<origin>` line per trusted frame origin.
 /// - `--json`: the shared `{schema, status, command, payload}` machine envelope
 ///   (`ipe.cli.capabilities/1`), with the sorted capability name array under
-///   `payload.capabilities` (empty for a pure program).
+///   `payload.capabilities` (empty for a pure program); with a `frames` reach,
+///   `payload.frameOrigins` and `payload.undisclosedThroughFrames` too.
 pub fn render_capabilities(
     names: &[&str],
+    frames: Option<&crate::frame_reach::FrameReach>,
     format: cli_args::OutputFormat,
     stream: &impl std::io::IsTerminal,
 ) -> String {
@@ -2465,13 +2479,27 @@ pub fn render_capabilities(
                 out.push_str(name);
                 out.push('\n');
             }
+            for origin in frames.map_or(&[][..], |reach| reach.origins()) {
+                let _ = writeln!(out, "frame:{origin}");
+            }
             out
         }
         Json => {
             // The shared machine envelope: a command may never hand-roll a bare
             // success object. The capability list rides under `payload`.
-            let payload =
-                cli_args::json::object(&[("capabilities", cli_args::json::string_array(names))]);
+            let mut fields = vec![("capabilities", cli_args::json::string_array(names))];
+            if let Some(reach) = frames {
+                let origins: Vec<&str> = reach.origins().iter().map(String::as_str).collect();
+                let undisclosed: Vec<&str> = crate::frame_reach::FrameReach::undisclosed()
+                    .map(|row| row.name)
+                    .collect();
+                fields.push(("frameOrigins", cli_args::json::string_array(&origins)));
+                fields.push((
+                    "undisclosedThroughFrames",
+                    cli_args::json::string_array(&undisclosed),
+                ));
+            }
+            let payload = cli_args::json::object(&fields);
             crate::machine_output::MachineOutput::ok(
                 "ipe.cli.capabilities/1",
                 "capabilities",
@@ -2482,7 +2510,9 @@ pub fn render_capabilities(
         Human => {
             let p = style::Palette::for_stream(stream);
             let mut body = String::new();
-            if names.is_empty() {
+            if names.is_empty() && frames.is_some() {
+                body.push_str("This program exercises no security capabilities of its own.\n");
+            } else if names.is_empty() {
                 body.push_str("This program is pure — it exercises no security capabilities.\n");
             } else {
                 let noun = if names.len() == 1 {
@@ -2509,7 +2539,14 @@ pub fn render_capabilities(
                     );
                 }
             }
-            style::frame(&style::gutter(&body))
+            let mut out = style::frame(&style::gutter(&body));
+            if let Some(reach) = frames {
+                out.push_str(&style::frame(&style::gutter(&format!(
+                    "{}\n",
+                    reach.notice()
+                ))));
+            }
+            out
         }
     }
 }
@@ -5241,6 +5278,127 @@ mod mobile_base_tests {
                 "{packed}"
             );
         }
+    }
+
+    /// R36: a manifest listing frame origins, driven through the desktop
+    /// bundle site and through the mobile pin, is refused by the reach on each
+    /// shell host, naming the host; the served reach keeps the list.
+    #[test]
+    fn shell_hosts_refuse_declared_frames_on_the_real_path() {
+        use ipe_runtime_rust::csp;
+        use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
+        let mut manifest = client_desktop_project(
+            "client_desktop_refuses_frames",
+            "{ bundleId = \"io.acme.app\" }",
+        );
+        let entry = FrameOriginEntry::parse("https://player.example");
+        assert!(entry.is_ok(), "{entry:?}");
+        let Ok(entry) = entry else { return };
+        let frames = FrameOriginEntries::new([entry]);
+        assert!(frames.is_ok(), "{frames:?}");
+        let Ok(frames) = frames else { return };
+        manifest.delivery.frame_origins = frames;
+        let pin = pack::mobile::ManifestPin::of(&manifest);
+        for os in [
+            pack::desktop::DesktopOs::Linux,
+            pack::desktop::DesktopOs::MacOs,
+            pack::desktop::DesktopOs::Windows,
+        ] {
+            let policy = client_desktop_policy(&pin, os);
+            assert!(
+                matches!(&policy, Err(CliError::ProjectRefused(shown))
+                    if shown.as_str().contains("delivery.frameOrigins")
+                        && shown.as_str().contains("desktop shell")),
+                "{os:?}: {policy:?}"
+            );
+        }
+        for host in [csp::BundleHost::AndroidAssets, csp::BundleHost::IosScheme] {
+            let reach = pin.reach(host);
+            assert!(
+                matches!(&reach, Err(pack::mobile::MobileRefusal::FramesOnShell { host: refused })
+                    if *refused == host),
+                "{host:?}: {reach:?}"
+            );
+            let shown = reach
+                .err()
+                .map(|refusal| refusal.to_string())
+                .unwrap_or_default();
+            assert!(shown.contains(host.shell_name()), "{shown}");
+        }
+        let served = pin.reach(csp::BundleHost::Served);
+        assert!(
+            served
+                .as_ref()
+                .is_ok_and(|reach| csp::ContentSecurityPolicy::for_bundle(
+                    reach,
+                    csp::BundleWorker::None
+                )
+                .header_value()
+                .contains("frame-src https://player.example")),
+            "the served reach frames the listed origin"
+        );
+    }
+
+    /// R30: the capability report with a frame reach carries the notice in
+    /// human form and never calls the program pure, names the origins and the
+    /// undisclosed features in JSON, and ends with one `frame:` line per
+    /// origin in plain form; without a reach every form is unchanged.
+    #[test]
+    fn capabilities_report_names_frame_reach() {
+        use crate::cli_args::OutputFormat;
+        use crate::frame_reach::FrameReach;
+        use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
+        let entries = FrameOriginEntries::new(
+            ["https://b.example", "https://a.example"]
+                .into_iter()
+                .filter_map(|text| FrameOriginEntry::parse(text).ok()),
+        );
+        let reach = entries.as_ref().ok().and_then(FrameReach::of);
+        assert!(reach.is_some(), "{entries:?}");
+        let Some(reach) = reach else { return };
+        let stream = std::io::stdout();
+        for names in [&[][..], &["network"][..]] {
+            let human = render_capabilities(names, Some(&reach), OutputFormat::Human, &stream);
+            assert!(human.contains(&reach.notice()), "{human}");
+            assert!(!human.contains("pure"), "{human}");
+            if names.is_empty() {
+                assert!(
+                    human.contains("This program exercises no security capabilities of its own."),
+                    "{human}"
+                );
+            }
+            let plain = render_capabilities(names, Some(&reach), OutputFormat::Plain, &stream);
+            let lines: Vec<&str> = plain.lines().collect();
+            let mut want: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
+            want.extend(
+                reach
+                    .origins()
+                    .iter()
+                    .map(|origin| format!("frame:{origin}")),
+            );
+            assert_eq!(lines, want, "{plain}");
+            let json = render_capabilities(names, Some(&reach), OutputFormat::Json, &stream);
+            assert!(json.contains("\"frameOrigins\""), "{json}");
+            for origin in reach.origins() {
+                assert!(json.contains(&format!("\"{origin}\"")), "{json}");
+            }
+            for row in FrameReach::undisclosed() {
+                assert!(json.contains(&format!("\"{}\"", row.name)), "{json}");
+            }
+            assert!(json.contains("\"undisclosedThroughFrames\""), "{json}");
+        }
+        let pure_human = render_capabilities(&[], None, OutputFormat::Human, &stream);
+        assert!(pure_human.contains("This program is pure"), "{pure_human}");
+        assert!(!pure_human.contains("frame"), "{pure_human}");
+        assert_eq!(
+            render_capabilities(&["network"], None, OutputFormat::Plain, &stream),
+            "network\n"
+        );
+        let json = render_capabilities(&["network"], None, OutputFormat::Json, &stream);
+        assert!(
+            !json.contains("frameOrigins") && !json.contains("undisclosedThroughFrames"),
+            "{json}"
+        );
     }
 
     /// The client desktop's publish refuses an asset whose name the bundle path grammar cannot carry.

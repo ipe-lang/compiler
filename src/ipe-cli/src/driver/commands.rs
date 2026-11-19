@@ -2940,7 +2940,11 @@ fn serve_client_bundle(
     let policies: Vec<(String, String)> = [BundleWorker::None, BundleWorker::Push]
         .into_iter()
         .map(|worker| {
-            let policy = ContentSecurityPolicy::bundle(&manifest.delivery.servers, worker);
+            let policy = ContentSecurityPolicy::bundle(
+                &manifest.delivery.servers,
+                &manifest.delivery.frame_origins,
+                worker,
+            );
             (policy.header_value(), policy.meta_element())
         })
         .collect();

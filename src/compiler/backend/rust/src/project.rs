@@ -20,7 +20,7 @@ use ipe_backend::{EmittedProject, RelPath};
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_ir::{IrType, ModPath, Program};
 use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
-use ipe_runtime_rust::encoding::{BundlePath, MountBase, ServerOrigins};
+use ipe_runtime_rust::encoding::{BundlePath, FrameOriginEntries, MountBase, ServerOrigins};
 
 use crate::EmitCtx;
 use crate::crate_specs::{self, TokioFeature};
@@ -313,6 +313,7 @@ pub mod stringify;
 pub mod system;
 pub mod telemetry;
 pub mod csp;
+pub mod frames;
 pub mod entropy;
 pub mod time;
 pub mod transport_timeout;
@@ -2468,8 +2469,9 @@ fn rewrite_runtime_paths_for_dep(src: &str) -> String {
 ///
 /// Every URL the shell loads is `base.url_of` of its bundle path, so a deep
 /// link under the base still reaches the boot script, the glue and the module.
-/// The shell's policy is [`ContentSecurityPolicy::bundle`] of `servers` and
-/// `worker`, so the origins it admits are exactly the parsed ones.
+/// The shell's policy is [`ContentSecurityPolicy::bundle`] of `servers`,
+/// `frames` and `worker`, so the origins it admits and frames are exactly the
+/// parsed ones.
 ///
 /// # Errors
 ///
@@ -2479,6 +2481,7 @@ fn insert_wasm_shared_files(
     files: &mut BTreeMap<RelPath, String>,
     base: &MountBase,
     servers: &ServerOrigins,
+    frames: &FrameOriginEntries,
     worker: BundleWorker,
 ) -> DResult<()> {
     // Host/global cargo configs may carry native-linker rustflags (e.g. mold),
@@ -2508,7 +2511,7 @@ fn insert_wasm_shared_files(
         "<!doctype html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
             .to_owned()
-            + &ContentSecurityPolicy::bundle(servers, worker).meta_element()
+            + &ContentSecurityPolicy::bundle(servers, frames, worker).meta_element()
             + "<title>Ip\u{ea} App</title>\n</head>\n<body>\n"
             + &shell_port_glue_script(
                 &base.url_of(&glue),
@@ -3111,7 +3114,13 @@ fn assemble_project_text(
         } else {
             BundleWorker::None
         };
-        insert_wasm_shared_files(&mut files, &ctx.mount_base, &ctx.server_origins, worker)?;
+        insert_wasm_shared_files(
+            &mut files,
+            &ctx.mount_base,
+            &ctx.server_origins,
+            &FrameOriginEntries::none(),
+            worker,
+        )?;
 
         if ctx.runtime_dep.is_some() {
             // Dependency model: the runtime is a relative path dependency selected
@@ -6637,7 +6646,9 @@ mod wasm_shell_tests {
     };
     use ipe_backend::RelPath;
     use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
-    use ipe_runtime_rust::encoding::{MountBase, ServerOrigin, ServerOrigins};
+    use ipe_runtime_rust::encoding::{
+        FrameOriginEntries, FrameOriginEntry, MountBase, ServerOrigin, ServerOrigins,
+    };
     use ipe_runtime_rust::js_port_glue::{port_glue_integrity, port_glue_js, port_glue_path};
     use std::collections::BTreeMap;
 
@@ -6655,6 +6666,7 @@ mod wasm_shell_tests {
                 &mut files,
                 &base,
                 &ServerOrigins::none(),
+                &FrameOriginEntries::none(),
                 BundleWorker::None,
             )
             .map_err(|d| format!("{d:?}"))?;
@@ -6698,8 +6710,14 @@ mod wasm_shell_tests {
     /// The emitted `www/index.html` and `www/boot.js` under `base`.
     fn shell(base: &MountBase) -> Result<(String, String), String> {
         let mut files: BTreeMap<RelPath, String> = BTreeMap::new();
-        insert_wasm_shared_files(&mut files, base, &ServerOrigins::none(), BundleWorker::None)
-            .map_err(|d| format!("{d:?}"))?;
+        insert_wasm_shared_files(
+            &mut files,
+            base,
+            &ServerOrigins::none(),
+            &FrameOriginEntries::none(),
+            BundleWorker::None,
+        )
+        .map_err(|d| format!("{d:?}"))?;
         let index = files.get("www/index.html").ok_or("no index.html")?.clone();
         let boot = files.get("www/boot.js").ok_or("no boot.js")?.clone();
         Ok((index, boot))
@@ -6726,11 +6744,15 @@ mod wasm_shell_tests {
         Ok(())
     }
 
-    /// The shell's policy of `servers` and `worker`, read back from its
-    /// emitted `index.html`.
-    fn shell_policy(servers: &ServerOrigins, worker: BundleWorker) -> Result<String, String> {
+    /// The shell's policy of `servers`, `frames` and `worker`, read back
+    /// from its emitted `index.html`.
+    fn shell_policy(
+        servers: &ServerOrigins,
+        frames: &FrameOriginEntries,
+        worker: BundleWorker,
+    ) -> Result<String, String> {
         let mut files: BTreeMap<RelPath, String> = BTreeMap::new();
-        insert_wasm_shared_files(&mut files, &MountBase::root(), servers, worker)
+        insert_wasm_shared_files(&mut files, &MountBase::root(), servers, frames, worker)
             .map_err(|d| format!("{d:?}"))?;
         let index = files.get("www/index.html").ok_or("no index.html")?;
         let (_, rest) = index
@@ -6757,11 +6779,12 @@ mod wasm_shell_tests {
             parse("https://media.example:8443")?,
         ])
         .map_err(|r| r.to_string())?;
-        let value = shell_policy(&servers, BundleWorker::None)?;
+        let none = FrameOriginEntries::none();
+        let value = shell_policy(&servers, &none, BundleWorker::None)?;
         assert_eq!(
             value,
             ipe_runtime_rust::escape::html_attr(
-                &ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value()
+                &ContentSecurityPolicy::bundle(&servers, &none, BundleWorker::None).header_value()
             )
         );
         let named: Vec<&str> = value
@@ -6777,15 +6800,44 @@ mod wasm_shell_tests {
                 "wss://media.example:8443",
             ]
         );
-        let offline = shell_policy(&ServerOrigins::none(), BundleWorker::None)?;
+        let offline = shell_policy(&ServerOrigins::none(), &none, BundleWorker::None)?;
         assert!(!offline.contains("://"), "{offline}");
         assert_eq!(
             offline,
             ipe_runtime_rust::escape::html_attr(
-                &ContentSecurityPolicy::bundle(&ServerOrigins::none(), BundleWorker::None)
+                &ContentSecurityPolicy::bundle(&ServerOrigins::none(), &none, BundleWorker::None)
                     .header_value()
             )
         );
+        Ok(())
+    }
+
+    /// R16c: a shell built over a declared frame list writes exactly that
+    /// list in `frame-src` and `object-src`, never `'self'` beside it, and is
+    /// the builder's policy for the list.
+    #[test]
+    fn wasm_shell_meta_lists_the_declared_frames() -> Result<(), String> {
+        let frames = FrameOriginEntries::new([
+            FrameOriginEntry::parse("https://b.example").map_err(|r| r.to_string())?,
+            FrameOriginEntry::parse("https://a.example:8443").map_err(|r| r.to_string())?,
+        ])
+        .map_err(|r| r.to_string())?;
+        let value = shell_policy(&ServerOrigins::none(), &frames, BundleWorker::None)?;
+        assert_eq!(
+            value,
+            ipe_runtime_rust::escape::html_attr(
+                &ContentSecurityPolicy::bundle(&ServerOrigins::none(), &frames, BundleWorker::None)
+                    .header_value()
+            )
+        );
+        assert!(
+            value.ends_with(
+                "; frame-src https://a.example:8443 https://b.example; \
+                 object-src https://a.example:8443 https://b.example"
+            ),
+            "{value}"
+        );
+        assert!(!value.contains("frame-src &#39;self&#39;"), "{value}");
         Ok(())
     }
 
@@ -6793,9 +6845,15 @@ mod wasm_shell_tests {
     /// `worker-src`; one that does not names none.
     #[test]
     fn shell_policy_names_a_worker_only_for_push() -> Result<(), String> {
-        let push = shell_policy(&ServerOrigins::none(), BundleWorker::Push)?;
-        assert!(push.ends_with("; worker-src &#39;self&#39;"), "{push}");
-        let plain = shell_policy(&ServerOrigins::none(), BundleWorker::None)?;
+        let none = FrameOriginEntries::none();
+        let push = shell_policy(&ServerOrigins::none(), &none, BundleWorker::Push)?;
+        assert!(
+            push.ends_with(
+                "; worker-src &#39;self&#39;; frame-src &#39;self&#39;; object-src &#39;none&#39;"
+            ),
+            "{push}"
+        );
+        let plain = shell_policy(&ServerOrigins::none(), &none, BundleWorker::None)?;
         assert!(!plain.contains("worker-src"), "{plain}");
         Ok(())
     }

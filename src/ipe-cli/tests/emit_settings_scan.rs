@@ -84,6 +84,7 @@ const SETTERS: &[&str] = &[
 const MEMBER_CHAINS: &[&[&str]] = &[
     &["delivery", "browser", "base"],
     &["delivery", "servers"],
+    &["delivery", "frame_origins"],
     &["delivery", "mobile", "push"],
     &["public_env"],
     &["capabilities_accept"],
@@ -197,6 +198,24 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "field delivery.servers",
         "src/ipe-cli/src/driver/commands.rs",
         "serve_client_bundle",
+        1,
+    ),
+    (
+        "field delivery.frame_origins",
+        "src/ipe-cli/src/driver/commands.rs",
+        "serve_client_bundle",
+        1,
+    ),
+    (
+        "field delivery.frame_origins",
+        "src/ipe-cli/src/pack/mobile.rs",
+        "of",
+        1,
+    ),
+    (
+        "field delivery.frame_origins",
+        "src/ipe-cli/src/driver/commands_pkg.rs",
+        "capabilities_in",
         1,
     ),
     // The mobile shell is laid out from the manifest pin, and a pin that

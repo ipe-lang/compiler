@@ -772,7 +772,7 @@ mod tests {
     use std::io::{Read as _, Write as _};
 
     use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
-    use ipe_runtime_rust::encoding::ServerOrigins;
+    use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry, ServerOrigins};
 
     /// A site holding `files` under `base`, with the policy `csp`.
     fn bundle_site(base: &str, files: &[(&str, &[u8])], csp: &str) -> BundleSite {
@@ -1051,54 +1051,67 @@ mod tests {
     #[test]
     fn bundle_responses_carry_nosniff_and_a_csp_header_equal_to_the_meta() {
         let servers = ServerOrigins::none();
-        let candidates: Vec<(String, String)> = [BundleWorker::None, BundleWorker::Push]
-            .into_iter()
-            .map(|worker| {
-                let policy = ContentSecurityPolicy::bundle(&servers, worker);
-                (policy.header_value(), policy.meta_element())
-            })
-            .collect();
-        for (header_value, meta) in &candidates {
-            let page = format!("<html><head>{meta}</head></html>");
-            let (chosen, _) =
-                crate::bundle_www::sole_policy(&page, &candidates, |(_, m)| m.as_str())
-                    .expect("the page carries one policy");
-            assert_eq!(chosen, header_value);
-            let site = bundle_site(
-                "/",
-                &[("index.html", page.as_bytes()), ("x.unknown", b"x")],
-                chosen,
-            );
-            for target in ["/", "/index.html", "/x.unknown", "/missing.js"] {
-                let response = exchange(&site, &request("GET", target));
-                assert_eq!(
-                    header(&response, "Content-Security-Policy"),
-                    Some(header_value.as_str()),
-                    "{target}"
-                );
-                assert!(
-                    meta.contains(&ipe_runtime_rust::escape::html_attr(header_value)),
-                    "{target}: the header is the policy the meta carries"
-                );
-                assert_eq!(
-                    header(&response, "X-Content-Type-Options"),
-                    Some("nosniff"),
-                    "{target}"
-                );
-                assert_eq!(header(&response, "Referrer-Policy"), Some("no-referrer"));
-                assert_eq!(
-                    header(&response, "Cross-Origin-Resource-Policy"),
-                    Some("same-origin"),
-                    "{target}: no other origin loads it as a subresource"
-                );
-                assert_eq!(header(&response, "Cache-Control"), Some("no-store"));
-                assert_eq!(header(&response, "X-Frame-Options"), None, "{target}");
-            }
-            let unknown = exchange(&site, &request("GET", "/x.unknown"));
+        let listed = FrameOriginEntries::new([
+            FrameOriginEntry::parse("https://player.example").expect("a frame origin")
+        ])
+        .expect("a frame list");
+        for frames in [FrameOriginEntries::none(), listed] {
+            let candidates: Vec<(String, String)> = [BundleWorker::None, BundleWorker::Push]
+                .into_iter()
+                .map(|worker| {
+                    let policy = ContentSecurityPolicy::bundle(&servers, &frames, worker);
+                    (policy.header_value(), policy.meta_element())
+                })
+                .collect();
             assert_eq!(
-                header(&unknown, "Content-Type"),
-                Some("application/octet-stream")
+                candidates
+                    .iter()
+                    .all(|(header_value, _)| header_value.contains("https://player.example")),
+                !frames.is_empty(),
+                "the header lists exactly the declared frames"
             );
+            for (header_value, meta) in &candidates {
+                let page = format!("<html><head>{meta}</head></html>");
+                let (chosen, _) =
+                    crate::bundle_www::sole_policy(&page, &candidates, |(_, m)| m.as_str())
+                        .expect("the page carries one policy");
+                assert_eq!(chosen, header_value);
+                let site = bundle_site(
+                    "/",
+                    &[("index.html", page.as_bytes()), ("x.unknown", b"x")],
+                    chosen,
+                );
+                for target in ["/", "/index.html", "/x.unknown", "/missing.js"] {
+                    let response = exchange(&site, &request("GET", target));
+                    assert_eq!(
+                        header(&response, "Content-Security-Policy"),
+                        Some(header_value.as_str()),
+                        "{target}"
+                    );
+                    assert!(
+                        meta.contains(&ipe_runtime_rust::escape::html_attr(header_value)),
+                        "{target}: the header is the policy the meta carries"
+                    );
+                    assert_eq!(
+                        header(&response, "X-Content-Type-Options"),
+                        Some("nosniff"),
+                        "{target}"
+                    );
+                    assert_eq!(header(&response, "Referrer-Policy"), Some("no-referrer"));
+                    assert_eq!(
+                        header(&response, "Cross-Origin-Resource-Policy"),
+                        Some("same-origin"),
+                        "{target}: no other origin loads it as a subresource"
+                    );
+                    assert_eq!(header(&response, "Cache-Control"), Some("no-store"));
+                    assert_eq!(header(&response, "X-Frame-Options"), None, "{target}");
+                }
+                let unknown = exchange(&site, &request("GET", "/x.unknown"));
+                assert_eq!(
+                    header(&unknown, "Content-Type"),
+                    Some("application/octet-stream")
+                );
+            }
         }
         let wasm = exchange(&plain_site(), &request("GET", "/pkg/ipe_app_bg.wasm"));
         assert_eq!(header(&wasm, "Content-Type"), Some("application/wasm"));

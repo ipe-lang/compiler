@@ -56,6 +56,7 @@ pub mod task;
 pub mod threads;
 pub mod telemetry;
 pub mod csp;
+pub mod frames;
 pub mod entropy;
 pub mod time;
 pub mod trace;

@@ -14,8 +14,8 @@ use std::sync::OnceLock;
 pub use crate::encoding::FRAME_HEADER_BUDGET;
 #[cfg(feature = "encoding")]
 use crate::encoding::{
-    FRAME_LIST_FIXED_COST, FRAME_WIDENED_DIRECTIVES, FrameOrigin, FrameOriginRefusal, FrameOrigins,
-    FrameOriginsRefusal, frame_header_cost,
+    FRAME_LIST_FIXED_COST, FRAME_UNDISCLOSED_FIXED_COST, FRAME_WIDENED_DIRECTIVES, FrameOrigin,
+    FrameOriginRefusal, FrameOrigins, FrameOriginsRefusal, frame_header_cost,
 };
 
 /// A web-capability suffix that opens a capability-gated feature.
@@ -433,10 +433,10 @@ const fn widened_rows(mut rows: &[DelegationFeature]) -> usize {
     count
 }
 
-/// The header bytes a non-empty list adds whatever its origins: each
-/// `Undisclosed` row written as `, <feature>=(self)`.
+/// The header bytes the `Undisclosed` rows add for a non-empty list, each
+/// written as `, <feature>=(self)`.
 #[cfg(feature = "encoding")]
-const fn list_fixed_cost(mut rows: &[DelegationFeature]) -> usize {
+const fn undisclosed_fixed_cost(mut rows: &[DelegationFeature]) -> usize {
     let mut cost = 0usize;
     while let [row, rest @ ..] = rows {
         if matches!(row.class, FeatureClass::Undisclosed) {
@@ -451,7 +451,9 @@ const fn list_fixed_cost(mut rows: &[DelegationFeature]) -> usize {
 #[cfg(feature = "encoding")]
 const _: () = assert!(
     widened_rows(DELEGATION_FEATURES) == FRAME_WIDENED_DIRECTIVES
-        && list_fixed_cost(DELEGATION_FEATURES) == FRAME_LIST_FIXED_COST
+        && undisclosed_fixed_cost(DELEGATION_FEATURES) == FRAME_UNDISCLOSED_FIXED_COST
+        && undisclosed_fixed_cost(DELEGATION_FEATURES) - 2 * ("'self'".len() + 1)
+            == FRAME_LIST_FIXED_COST
 );
 
 /// The header bytes a list of trusted origins adds to a served page's
@@ -1044,5 +1046,56 @@ mod register_tests {
             &[],
         );
         assert_eq!(folded.map(|p| p.origins().len()), Ok(2));
+    }
+}
+
+#[cfg(all(test, feature = "web", not(target_arch = "wasm32")))]
+mod header_cost_tests {
+    use super::*;
+    use crate::csp::{ContentSecurityPolicy, Guarded, Profile};
+    use crate::telemetry::{FrameAllowlist, permissions_policy_from};
+    use std::collections::BTreeSet;
+
+    /// The `WebPage` CSP and `Permissions-Policy` bytes a page trusting
+    /// `origins` sends under the granted suffixes `granted`.
+    fn shipped(origins: &FrameOrigins, granted: &[&str]) -> usize {
+        let guard = Guarded::sample(Profile::WebPage, 0x11);
+        let policy = FramePolicy::trusting(origins.clone(), FrameGrants::none());
+        let csp = ContentSecurityPolicy::for_guard_trusting(&guard, None, &policy).header_value();
+        let set: BTreeSet<String> = granted.iter().map(|s| (*s).to_string()).collect();
+        let allowlist = if origins.is_empty() {
+            FrameAllowlist::none()
+        } else {
+            FrameAllowlist::of(origins.origins())
+        };
+        csp.len() + permissions_policy_from(Some(&set), &allowlist).len()
+    }
+
+    /// R16d: for one origin and two, with every `Gated` row granted, the bytes
+    /// the widened headers add over the unframed ones are exactly
+    /// [`header_cost`]; with fewer grants they are at most it.
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn frame_header_cost_is_the_shipped_delta() {
+        let every_gated = ["camera", "geolocation", "microphone"];
+        let none = FrameOrigins::none();
+        for texts in [
+            &["https://x.example"][..],
+            &["https://player.example.com:8443", "https://a.example"][..],
+        ] {
+            let origins = FrameOrigins::new(
+                texts
+                    .iter()
+                    .map(|text| FrameOrigin::parse(text).expect("origin")),
+            )
+            .expect("origins");
+            let cost = header_cost(origins.origins());
+            let delta = shipped(&origins, &every_gated) - shipped(&none, &every_gated);
+            assert_eq!(delta, cost, "{texts:?}");
+            for granted in [&[][..], &["camera"][..], &["recorder"][..]] {
+                let delta = shipped(&origins, granted) - shipped(&none, granted);
+                assert!(delta <= cost, "{texts:?} {granted:?}");
+            }
+        }
     }
 }

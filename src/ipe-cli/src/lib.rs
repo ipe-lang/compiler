@@ -46,6 +46,7 @@ pub mod doc_type_search;
 pub mod env_dir;
 pub mod ffi;
 pub mod fmt;
+pub mod frame_reach;
 pub mod health;
 pub mod help;
 pub mod help_page;
