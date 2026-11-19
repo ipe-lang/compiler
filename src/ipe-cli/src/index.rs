@@ -520,7 +520,7 @@ fn sink_check(arg: &str) -> Result<(), SourceRefusal> {
 /// shell line, so the authority admits only name characters:
 /// - user: ASCII letters, digits, `.`, `_`, `-`, not starting with `-`;
 /// - host: ASCII letters, digits, `.`, `-`, not starting with `-` or `.`, or a
-///   bracketed IPv6 literal of hex digits, `:` and `.`;
+///   bracketed IPv6 address;
 /// - port: 1 to 65535 in decimal digits.
 ///
 /// The authority ends at the first `/`, which must follow it. `git` must split
@@ -601,15 +601,18 @@ impl NetworkAuthority {
     }
 
     /// The text after the `]` closing a bracketed IPv6 literal (`bracketed`
-    /// starts after its `[`), or `None` when the literal is unclosed, empty,
-    /// or holds a character other than a hex digit, `:` or `.`.
+    /// starts after its `[`), or `None` when the literal is unclosed or is not
+    /// an [`std::net::Ipv6Addr`].
+    ///
+    /// An IPv6 address holds at least two `:`, so `git`, which reads the text
+    /// after a bracketed host's only `:` as a port, keeps it whole: `[a.b:22]`
+    /// would reach `ssh` as host `a.b`, port `22`.
     fn bracketed_host(bracketed: &str) -> Option<&str> {
         let (literal, after) = bracketed.split_once(']')?;
-        (!literal.is_empty()
-            && literal
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.')))
-        .then_some(after)
+        literal
+            .parse::<std::net::Ipv6Addr>()
+            .is_ok()
+            .then_some(after)
     }
 }
 
@@ -2676,6 +2679,12 @@ mod tests {
             "ssh://h%3bid/r",
             "ssh://[h;id]/r",
             "ssh://[fe80:1]x/r",
+            "ssh://[ab.cd:2222]/r",
+            "ssh://u@[1:2]/r",
+            "ssh://[a]/r",
+            "ssh://[1.2]/r",
+            "ssh://[fe80:0:0:0:0:0:0:1%25eth0]/r",
+            "https://[ab.cd:2222]/r",
             "ssh://h",
             "https://u:pw@h/r",
             "https://h!x/r",
@@ -2710,6 +2719,8 @@ mod tests {
             "ssh://git@github.com/user/repo",
             "ssh://git_user.x-y@h-1.example:2222/r",
             "ssh://[fe80:0:0:0:0:0:0:1]:22/r",
+            "ssh://u@[0:0:0:0:0:ffff:1.2.3.4]/r",
+            "https://[0:0:0:0:0:0:0:1]:8443/r",
             "https://github.com/user/repo.git",
             "https://127.0.0.1:65535/r/0",
             "https://h/r;x=$y&z!",
@@ -2773,13 +2784,16 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The production shape: `Git::isolated` runs ssh through
+        // `core.sshCommand`, which git hands to a shell with the host as `$@`.
+        let ssh_command = format!("core.sshCommand={} -o BatchMode=yes", ssh.display());
         let host_argument = |url: &str| {
             let _ = std::fs::remove_file(&argv);
             let _ran = crate::remote_ingest::fixture_git(dir.path())
-                .args(["ls-remote", "--", url])
+                .args(["-c", ssh_command.as_str(), "ls-remote", "--", url])
                 .env_remove("GIT_SSH_COMMAND")
-                .env("GIT_SSH", &ssh)
-                .env("GIT_SSH_VARIANT", "ssh")
+                .env_remove("GIT_SSH")
+                .env_remove("GIT_SSH_VARIANT")
                 .env("GIT_ALLOW_PROTOCOL", "ssh")
                 .env("IPE_SSH_ARGV", &argv)
                 .output()
@@ -2803,15 +2817,24 @@ mod tests {
             ),
             ("ssh://[fe80:0:0:0:0:0:0:1]:22/r", "fe80:0:0:0:0:0:0:1"),
             ("ssh://u@[0:0:0:0:0:0:0:1]/r", "u@0:0:0:0:0:0:0:1"),
+            (
+                "ssh://u@[0:0:0:0:0:ffff:1.2.3.4]/r",
+                "u@0:0:0:0:0:ffff:1.2.3.4",
+            ),
+            ("ssh://[fe80:0:0:0:0:0:0:1]/r", "fe80:0:0:0:0:0:0:1"),
             ("ssh://h/~u/r@x", "h"),
             ("ssh://h/r;x=$y&z!@(a)", "h"),
         ] {
             assert!(SourceUrl::parse_in(admitted).is_ok(), "{admitted:?}");
             assert_eq!(host_argument(admitted), host, "{admitted:?}");
         }
-        let moved = "ssh://h/x@[a]/r";
-        assert!(SourceUrl::parse_in(moved).is_err());
-        assert_eq!(host_argument(moved), "h/x@a");
+        for (moved, host) in [
+            ("ssh://h/x@[a]/r", "h/x@a"),
+            ("ssh://[ab.cd:2222]/r", "ab.cd"),
+        ] {
+            assert!(SourceUrl::parse_in(moved).is_err(), "{moved:?}");
+            assert_eq!(host_argument(moved), host, "{moved:?}");
+        }
     }
 
     #[test]
