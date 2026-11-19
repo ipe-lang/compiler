@@ -40,6 +40,8 @@ pub enum ThreadRole {
     WatchCargoWaiter,
     /// Enforces a WASI run's wall-clock ceiling.
     WasiWallClock,
+    /// Paints a progress spinner on stderr while a slow step runs.
+    ProgressTicker,
 }
 
 impl ThreadRole {
@@ -56,6 +58,7 @@ impl ThreadRole {
             Self::Compile => "ipe-compile",
             Self::WatchCargoWaiter => "ipe-watch-cargo-waiter",
             Self::WasiWallClock => "ipe-wasi-wall-clock",
+            Self::ProgressTicker => "ipe-progress-ticker",
         }
     }
 
@@ -73,7 +76,8 @@ impl ThreadRole {
             | Self::WatchStopRelay
             | Self::WatchResolveRetry
             | Self::WatchCargoWaiter
-            | Self::WasiWallClock => None,
+            | Self::WasiWallClock
+            | Self::ProgressTicker => None,
         }
     }
 
@@ -99,6 +103,7 @@ impl fmt::Display for ThreadRole {
             Self::Compile => text::thread_role_compile(),
             Self::WatchCargoWaiter => text::thread_role_watch_cargo_waiter(),
             Self::WasiWallClock => text::thread_role_wasi_wall_clock(),
+            Self::ProgressTicker => text::thread_role_progress_ticker(),
         })
     }
 }

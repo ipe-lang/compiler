@@ -1073,6 +1073,10 @@ watch cargo-build waiter
 
 WASI wall-clock deadline
 
+## thread-role-progress-ticker
+
+progress spinner ticker
+
 ## watch-thread-refused
 
 [ipe dev watch] warning: {detail}; the dependency-resolve retry is skipped
@@ -2041,6 +2045,10 @@ Not a listed number.
 ## doc-pick-none
 
 ipe doc: no entry opened
+
+## doc-lookup-pending
+
+looking up the documentation…
 
 ## doc-ambiguous-module
 
