@@ -503,15 +503,16 @@ impl LinkableTargetDir {
     /// that `cargo` builds, for the active toolchain's host linker.
     ///
     /// The directory comes from [`Self::resolve_scratch`]. A shared scratch
-    /// directory first prunes its stale siblings ([`prune_siblings`]).
+    /// directory first prunes its stale siblings ([`prune_siblings`]), which
+    /// reports what it could not remove and never fails the claim.
     /// The lock is then held ([`TargetLock`] under
     /// [`crate::cargo_step::CARGO_BUILD_WALL`]) for as long as the returned
     /// [`ScratchTarget`] lives, pinned directory or not.
     ///
     /// # Errors
-    /// The refusals of [`TargetDirSources::gather`], [`Self::resolve_scratch`],
-    /// [`prune_siblings`] and [`TargetLock`]; [`CliError::Io`]
-    /// when the directory cannot be created.
+    /// The refusals of [`TargetDirSources::gather`], [`Self::resolve_scratch`]
+    /// and [`TargetLock`]; [`CliError::Io`] when the directory cannot be
+    /// created.
     pub fn for_scratch(
         cargo: &Path,
         scratch: &crate::scratch::ScratchDir,
@@ -526,7 +527,8 @@ impl LinkableTargetDir {
     ///
     /// Every attempt at the lock brings the directory into being again
     /// ([`DirPrep`]): a shared one is re-proven private, so one a pruner
-    /// removed is recreated owner-only, never with the default mode.
+    /// removed is recreated owner-only, never with the default mode. The
+    /// prune only reports: the result depends on `dir`'s own state alone.
     fn lock_scratch(
         dir: Self,
         wall: crate::remote_ingest::LocalWall,
@@ -535,7 +537,7 @@ impl LinkableTargetDir {
         prep.apply(&dir.path)
             .map_err(|e| crate::io_err(&dir.path, e))?;
         if let (Some(shared), Some(root)) = (SharedDir::of(dir.origin), dir.path.parent()) {
-            prune_siblings(shared, root, &dir.path, SHARED_RETENTION)?;
+            prune_siblings(shared, root, &dir.path, SHARED_RETENTION).report();
         }
         let lock = TargetLock::acquire_in(&dir.path, prep, wall)?;
         Ok(ScratchTarget { dir, lock })
@@ -565,13 +567,14 @@ impl LinkableTargetDir {
     ///
     /// The directory is brought into being owner-only again, its stale
     /// siblings pruned, and its lock taken and released, which sets its
-    /// last-use stamp, so a prune keeps it for [`SHARED_RETENTION`] more. Any
+    /// last-use stamp, so a prune keeps it for [`SHARED_RETENTION`] more. A
+    /// sibling the prune cannot remove is reported, never a refusal. Any
     /// other directory is left as it is. A session that builds many times
     /// claims its directory before each build.
     ///
     /// # Errors
-    /// The refusals of [`prune_siblings`] and [`TargetLock`]; [`CliError::Io`]
-    /// when the directory cannot be created or is not private.
+    /// The refusals of [`TargetLock`]; [`CliError::Io`] when the directory
+    /// cannot be created or is not private.
     pub fn claim(&self) -> Result<(), CliError> {
         match self.origin {
             TargetDirOrigin::DevCache => {
@@ -1204,29 +1207,191 @@ fn open_no_follow(path: &Path, how: LockOpen) -> std::io::Result<std::fs::File> 
     options.open(path)
 }
 
+/// What a prune of one sibling did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pruned {
+    /// This prune removed the directory.
+    Removed,
+    /// This prune removed nothing: the directory is in use, young, re-entered or already gone.
+    Kept,
+}
+
+/// Why one sibling was left in place unjudged or half-removed.
+#[derive(Debug)]
+struct SiblingFault {
+    /// The entry whose read, lock or removal failed.
+    path: PathBuf,
+    /// The kind of that failure.
+    kind: std::io::ErrorKind,
+}
+
+impl SiblingFault {
+    /// The fault of `path`, failing with `error`.
+    fn io(path: &Path, error: &std::io::Error) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            kind: error.kind(),
+        }
+    }
+
+    /// The fault of `path`, refused with `refusal`.
+    fn refused(path: &Path, refusal: ipe_fs_open::OpenRefusal) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            kind: refusal.kind(),
+        }
+    }
+}
+
+/// Why the root of a prune was not walked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootRefusal {
+    /// More than this many entries: nothing was judged.
+    Crowded(ipe_fs_open::EntryCap),
+    /// The listing failed with this kind.
+    Unlisted(std::io::ErrorKind),
+}
+
+/// What a prune of the shared root did, reported once per process.
+///
+/// Its size is fixed whatever the number of siblings: a count and the first
+/// fault, never a list.
+#[derive(Debug)]
+#[must_use = "a prune's skips are reported, never dropped"]
+struct PruneReport {
+    /// The directory whose siblings were judged.
+    root: PathBuf,
+    /// Whether the root was walked, and what the walk left in place.
+    outcome: PruneOutcome,
+}
+
+/// Whether a prune walked its root: a refused root judged no sibling, so it
+/// has no skips to carry.
+#[derive(Debug)]
+enum PruneOutcome {
+    /// Every listed sibling was judged; `None` when no fault left one in place.
+    Walked(Option<Skips>),
+    /// The root was not walked: nothing was judged.
+    Refused(RootRefusal),
+}
+
+/// The siblings a walk left in place by a fault: at least one, at most the
+/// listing cap.
+#[derive(Debug)]
+struct Skips {
+    /// How many; saturating, though the listing cap bounds it first.
+    count: std::num::NonZeroU32,
+    /// The first of them.
+    first: SiblingFault,
+}
+
+impl Skips {
+    /// Count `fault` as one more sibling left in place in `skips`.
+    fn record(skips: &mut Option<Self>, fault: SiblingFault) {
+        match skips {
+            Some(seen) => seen.count = seen.count.saturating_add(1),
+            None => {
+                *skips = Some(Self {
+                    count: std::num::NonZeroU32::MIN,
+                    first: fault,
+                });
+            }
+        }
+    }
+}
+
+/// Whether some prune of this process already reported what it left in place.
+static PRUNE_REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this is the first report through `latch`, which it then closes.
+fn first_report(latch: &std::sync::atomic::AtomicBool) -> bool {
+    !latch.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl PruneReport {
+    /// The one message this report shows; `None` for a clean walk.
+    fn message(&self) -> Option<crate::text::Message> {
+        let root = self.root.display();
+        match &self.outcome {
+            PruneOutcome::Walked(None) => None,
+            PruneOutcome::Walked(Some(skips)) => Some(crate::text::build_dir_prune_skipped(
+                &skips.count,
+                &skips.first.path.display(),
+                &skips.first.kind,
+            )),
+            PruneOutcome::Refused(RootRefusal::Crowded(cap)) => {
+                Some(crate::text::build_dir_prune_crowded(&root, &cap.get()))
+            }
+            PruneOutcome::Refused(RootRefusal::Unlisted(kind)) => {
+                Some(crate::text::build_dir_prune_unlisted(&root, kind))
+            }
+        }
+    }
+
+    /// Say on stderr what the prune left in place, once per process; a clean prune says nothing.
+    fn report(self) {
+        let Some(message) = self.message() else {
+            return;
+        };
+        if first_report(&PRUNE_REPORTED) {
+            crate::screen::chatter(
+                crate::screen::Stream::Stderr,
+                crate::screen::Tone::UserError,
+                &message,
+            );
+        }
+    }
+}
+
 /// Remove every `shared` build directory under `root` but `keep` that the
 /// effective user owns, no run has used within `retention`, and no run holds
-/// now.
+/// now, reporting what was left in place.
 ///
 /// Only names carrying `shared`'s own prefix are judged: another kind of
 /// shared directory and a project's relocated directory never are. Another
 /// user's directory is never judged either, so it can neither be removed nor
 /// stop a prune. A directory is removed only while this process holds its
-/// lock ([`prune_if_stale`]).
-///
-/// # Errors
-/// [`CliError::Io`] when `root` cannot be listed (more than
-/// [`SCRATCH_SIBLING_CAP`] entries included) or a stale directory's lock or
-/// removal fails.
+/// lock ([`prune_if_stale`]). A sibling that cannot be read, locked or
+/// removed is skipped and counted; a root holding more than
+/// [`SCRATCH_SIBLING_CAP`] entries is not walked at all. Neither stops the
+/// build: the report has no error.
 fn prune_siblings(
     shared: SharedDir,
     root: &Path,
     keep: &Path,
     retention: std::time::Duration,
-) -> Result<(), CliError> {
-    let entries = ipe_fs_open::HeldDir::open_root(root)
-        .and_then(|dir| dir.entries(sibling_cap()))
-        .map_err(|refusal| crate::io_err(root, refusal.into_io()))?;
+) -> PruneReport {
+    prune_siblings_with(shared, root, keep, retention, sibling_cap(), prune_if_stale)
+}
+
+/// [`prune_siblings`] with the listing cap `cap` and the per-sibling `prune` injected.
+fn prune_siblings_with(
+    shared: SharedDir,
+    root: &Path,
+    keep: &Path,
+    retention: std::time::Duration,
+    cap: ipe_fs_open::EntryCap,
+    mut prune: impl FnMut(
+        &Path,
+        std::time::SystemTime,
+        std::time::Duration,
+    ) -> Result<Pruned, SiblingFault>,
+) -> PruneReport {
+    let report = |outcome| PruneReport {
+        root: root.to_path_buf(),
+        outcome,
+    };
+    let entries = match ipe_fs_open::HeldDir::open_root(root).and_then(|dir| dir.entries(cap)) {
+        Ok(entries) => entries,
+        Err(ipe_fs_open::OpenRefusal::Absent) => return report(PruneOutcome::Walked(None)),
+        Err(ipe_fs_open::OpenRefusal::TooManyEntries(over)) => {
+            return report(PruneOutcome::Refused(RootRefusal::Crowded(over)));
+        }
+        Err(refusal) => {
+            return report(PruneOutcome::Refused(RootRefusal::Unlisted(refusal.kind())));
+        }
+    };
+    let mut skips = None;
     let now = std::time::SystemTime::now();
     for (name, kind) in entries {
         let is_own_kind = name
@@ -1240,13 +1405,20 @@ fn prune_siblings(
         let access = match std::fs::symlink_metadata(&sibling) {
             Ok(meta) => Access::of(&meta),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(crate::io_err(&sibling, e)),
+            Err(e) => {
+                Skips::record(&mut skips, SiblingFault::io(&sibling, &e));
+                continue;
+            }
         };
-        if is_prunable(kind, access) {
-            prune_if_stale(&sibling, now, retention)?;
+        if !is_prunable(kind, access) {
+            continue;
+        }
+        match prune(&sibling, now, retention) {
+            Ok(Pruned::Removed | Pruned::Kept) => {}
+            Err(fault) => Skips::record(&mut skips, fault),
         }
     }
-    Ok(())
+    report(PruneOutcome::Walked(skips))
 }
 
 /// The last use a prune judged a scratch build directory by.
@@ -1262,12 +1434,12 @@ enum LastUse {
 /// `retention` at `now` and its lock is free.
 ///
 /// # Errors
-/// The refusals of [`prune_if_stale_with`].
+/// The faults of [`prune_if_stale_with`].
 fn prune_if_stale(
     dir: &Path,
     now: std::time::SystemTime,
     retention: std::time::Duration,
-) -> Result<(), CliError> {
+) -> Result<Pruned, SiblingFault> {
     prune_if_stale_with(dir, now, retention, || {})
 }
 
@@ -1281,34 +1453,38 @@ fn prune_if_stale(
 /// removed, or a run re-entered, is left alone.
 ///
 /// # Errors
-/// [`CliError::Io`] when a stat, the lock, or the removal fails.
+/// A [`SiblingFault`] when a stat, the lock, or the removal fails; nothing is
+/// removed after it.
 fn prune_if_stale_with(
     dir: &Path,
     now: std::time::SystemTime,
     retention: std::time::Duration,
     between: impl FnOnce(),
-) -> Result<(), CliError> {
+) -> Result<Pruned, SiblingFault> {
     let lock_path = dir.join(TEST_LOCK_FILE);
     let is_stale =
         |at: std::time::SystemTime| now.duration_since(at).is_ok_and(|age| age > retention);
     let last_use = match std::fs::symlink_metadata(&lock_path) {
-        Ok(meta) => LastUse::Locked(meta.modified().map_err(|e| crate::io_err(&lock_path, e))?),
+        Ok(meta) => LastUse::Locked(
+            meta.modified()
+                .map_err(|e| SiblingFault::io(&lock_path, &e))?,
+        ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             match std::fs::symlink_metadata(dir) {
-                Ok(meta) if is_stale(meta.modified().map_err(|e| crate::io_err(dir, e))?) => {
+                Ok(meta) if is_stale(meta.modified().map_err(|e| SiblingFault::io(dir, &e))?) => {
                     LastUse::Unlocked
                 }
-                Ok(_) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-                Err(e) => return Err(crate::io_err(dir, e)),
+                Ok(_) => return Ok(Pruned::Kept),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Pruned::Kept),
+                Err(e) => return Err(SiblingFault::io(dir, &e)),
             }
         }
-        Err(e) => return Err(crate::io_err(&lock_path, e)),
+        Err(e) => return Err(SiblingFault::io(&lock_path, &e)),
     };
     if let LastUse::Locked(at) = last_use
         && !is_stale(at)
     {
-        return Ok(());
+        return Ok(Pruned::Kept);
     }
     between();
     let how = match last_use {
@@ -1323,24 +1499,24 @@ fn prune_if_stale_with(
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::AlreadyExists
             ) =>
         {
-            return Ok(());
+            return Ok(Pruned::Kept);
         }
-        Err(e) => return Err(crate::io_err(&lock_path, e)),
+        Err(e) => return Err(SiblingFault::io(&lock_path, &e)),
     };
     let judged = match last_use {
         LastUse::Locked(at) => at,
         LastUse::Unlocked => lock
             .metadata()
             .and_then(|meta| meta.modified())
-            .map_err(|e| crate::io_err(&lock_path, e))?,
+            .map_err(|e| SiblingFault::io(&lock_path, &e))?,
     };
     match lock.try_lock() {
         Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => return Ok(()),
-        Err(std::fs::TryLockError::Error(e)) => return Err(crate::io_err(&lock_path, e)),
+        Err(std::fs::TryLockError::WouldBlock) => return Ok(Pruned::Kept),
+        Err(std::fs::TryLockError::Error(e)) => return Err(SiblingFault::io(&lock_path, &e)),
     }
     if !still_judged(dir, &lock, judged)? {
-        return Ok(());
+        return Ok(Pruned::Kept);
     }
     remove_locked_dir(dir, || {})
 }
@@ -1355,15 +1531,16 @@ fn prune_if_stale_with(
 /// no error, and nothing else is removed after it.
 ///
 /// # Errors
-/// [`CliError::Io`] when `dir` cannot be listed (more than
-/// [`SCRATCH_SIBLING_CAP`] entries included) or an entry cannot be removed.
-fn remove_locked_dir(dir: &Path, after_contents: impl FnOnce()) -> Result<(), CliError> {
+/// A [`SiblingFault`] when `dir` cannot be listed (more than
+/// [`SCRATCH_SIBLING_CAP`] entries included) or an entry cannot be removed;
+/// the lock file is then still in place, so the next prune judges `dir` again.
+fn remove_locked_dir(dir: &Path, after_contents: impl FnOnce()) -> Result<Pruned, SiblingFault> {
     let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let entries =
         match ipe_fs_open::HeldDir::open_root(dir).and_then(|held| held.entries(sibling_cap())) {
             Ok(entries) => entries,
-            Err(ipe_fs_open::OpenRefusal::Absent) => return Ok(()),
-            Err(refusal) => return Err(crate::io_err(dir, refusal.into_io())),
+            Err(ipe_fs_open::OpenRefusal::Absent) => return Ok(Pruned::Kept),
+            Err(refusal) => return Err(SiblingFault::refused(dir, refusal)),
         };
     for (name, kind) in entries {
         if name.as_os_str() == TEST_LOCK_FILE {
@@ -1382,7 +1559,7 @@ fn remove_locked_dir(dir: &Path, after_contents: impl FnOnce()) -> Result<(), Cl
         match removed {
             Ok(()) => {}
             Err(e) if gone(&e) => {}
-            Err(e) => return Err(crate::io_err(&entry, e)),
+            Err(e) => return Err(SiblingFault::io(&entry, &e)),
         }
     }
     after_contents();
@@ -1390,12 +1567,12 @@ fn remove_locked_dir(dir: &Path, after_contents: impl FnOnce()) -> Result<(), Cl
     match std::fs::remove_file(&lock_path) {
         Ok(()) => {}
         Err(e) if gone(&e) => {}
-        Err(e) => return Err(crate::io_err(&lock_path, e)),
+        Err(e) => return Err(SiblingFault::io(&lock_path, &e)),
     }
     match std::fs::remove_dir(dir) {
-        Ok(()) => Ok(()),
-        Err(e) if gone(&e) || e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(()),
-        Err(e) => Err(crate::io_err(dir, e)),
+        Ok(()) => Ok(Pruned::Removed),
+        Err(e) if gone(&e) || e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Ok(Pruned::Kept),
+        Err(e) => Err(SiblingFault::io(dir, &e)),
     }
 }
 
@@ -1409,25 +1586,27 @@ fn sibling_cap() -> ipe_fs_open::EntryCap {
 /// Whether the held lock file `lock` is still the one `dir` names, last used at `judged`.
 ///
 /// # Errors
-/// [`CliError::Io`] when the handle or `dir` cannot be read.
+/// A [`SiblingFault`] when the handle or `dir` cannot be read.
 fn still_judged(
     dir: &Path,
     lock: &std::fs::File,
     judged: std::time::SystemTime,
-) -> Result<bool, CliError> {
+) -> Result<bool, SiblingFault> {
     let lock_path = dir.join(TEST_LOCK_FILE);
-    let name = lock_entry_name()
-        .ok_or_else(|| crate::io_err(&lock_path, std::io::ErrorKind::InvalidInput.into()))?;
+    let name = lock_entry_name().ok_or_else(|| SiblingFault {
+        path: lock_path.clone(),
+        kind: std::io::ErrorKind::InvalidInput,
+    })?;
     let held_at = lock
         .metadata()
         .and_then(|meta| meta.modified())
-        .map_err(|e| crate::io_err(&lock_path, e))?;
+        .map_err(|e| SiblingFault::io(&lock_path, &e))?;
     let held = ipe_fs_open::FileId::of_file(lock)
-        .map_err(|refusal| crate::io_err(&lock_path, refusal.into_io()))?;
+        .map_err(|refusal| SiblingFault::refused(&lock_path, refusal))?;
     match ipe_fs_open::HeldDir::open_root(dir).and_then(|parent| parent.entry_id(&name)) {
         Ok(named) => Ok(held_at == judged && named == Some(held)),
         Err(ipe_fs_open::OpenRefusal::Absent) => Ok(false),
-        Err(refusal) => Err(crate::io_err(dir, refusal.into_io())),
+        Err(refusal) => Err(SiblingFault::refused(dir, refusal)),
     }
 }
 
@@ -2133,13 +2312,14 @@ mod tests {
             let base = temp("prune-retaken");
             let root = user_cache_root(&base);
             let old = sibling(&root, "scratch-old", OLD);
-            prune_if_stale_with(&old, std::time::SystemTime::now(), SHARED_RETENTION, || {
-                drop(
-                    TargetLock::acquire(&old, crate::remote_ingest::LocalWall::of_secs::<1>())
-                        .expect("a run takes the lock"),
-                );
-            })
-            .expect("prunes");
+            let pruned =
+                prune_if_stale_with(&old, std::time::SystemTime::now(), SHARED_RETENTION, || {
+                    drop(
+                        TargetLock::acquire(&old, crate::remote_ingest::LocalWall::of_secs::<1>())
+                            .expect("a run takes the lock"),
+                    );
+                });
+            assert!(matches!(pruned, Ok(Pruned::Kept)), "{pruned:?}");
             assert!(old.exists(), "a dir used since the check is kept");
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2151,13 +2331,14 @@ mod tests {
             let dir = root.join("scratch-lockless");
             std::fs::create_dir_all(&dir).expect("dir");
             age(&dir, OLD);
-            prune_if_stale_with(&dir, std::time::SystemTime::now(), SHARED_RETENTION, || {
-                drop(
-                    TargetLock::acquire(&dir, crate::remote_ingest::LocalWall::of_secs::<1>())
-                        .expect("a run takes and frees the lock"),
-                );
-            })
-            .expect("prunes");
+            let pruned =
+                prune_if_stale_with(&dir, std::time::SystemTime::now(), SHARED_RETENTION, || {
+                    drop(
+                        TargetLock::acquire(&dir, crate::remote_ingest::LocalWall::of_secs::<1>())
+                            .expect("a run takes and frees the lock"),
+                    );
+                });
+            assert!(matches!(pruned, Ok(Pruned::Kept)), "{pruned:?}");
             assert!(dir.exists(), "a dir a run entered is kept");
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2171,15 +2352,15 @@ mod tests {
             std::fs::write(old.join("ipe-test-run-1"), "runner").expect("runner");
             let lock_path = old.join(TEST_LOCK_FILE);
             let mut seen = None;
-            remove_locked_dir(&old, || {
+            let removed = remove_locked_dir(&old, || {
                 let left = std::fs::read_dir(&old)
                     .expect("dir kept")
                     .filter_map(Result::ok)
                     .map(|entry| entry.file_name())
                     .collect::<Vec<_>>();
                 seen = Some((left, lock_path.is_file()));
-            })
-            .expect("removes");
+            });
+            assert!(matches!(removed, Ok(Pruned::Removed)), "{removed:?}");
             let (left, locked) = seen.expect("called once");
             assert_eq!(left, vec![std::ffi::OsString::from(TEST_LOCK_FILE)]);
             assert!(locked, "the lock file is the last entry left");
@@ -2196,7 +2377,7 @@ mod tests {
             let removed = remove_locked_dir(&old, || {
                 std::fs::write(&late, "").expect("a run's late entry");
             });
-            assert!(removed.is_ok(), "{removed:?}");
+            assert!(matches!(removed, Ok(Pruned::Kept)), "{removed:?}");
             assert!(
                 late.exists(),
                 "nothing made after the contents went is removed"
@@ -2213,7 +2394,7 @@ mod tests {
                 prune_if_stale_with(&old, std::time::SystemTime::now(), SHARED_RETENTION, || {
                     std::fs::remove_dir_all(&old).expect("the other pruner");
                 });
-            assert!(pruned.is_ok(), "{pruned:?}");
+            assert!(matches!(pruned, Ok(Pruned::Kept)), "{pruned:?}");
             assert!(!old.exists(), "the lock file is never recreated");
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2318,7 +2499,11 @@ mod tests {
                 .expect("holder");
             holder.try_lock().expect("held elsewhere");
 
-            prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION).expect("prunes");
+            let report = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
+            assert!(
+                matches!(report.outcome, PruneOutcome::Walked(None)),
+                "{report:?}"
+            );
 
             assert!(!old.exists(), "an old unheld sibling is removed");
             assert!(own.exists(), "the run's own dir is kept");
@@ -2334,7 +2519,7 @@ mod tests {
 
         #[cfg(unix)]
         #[test]
-        fn prune_over_an_unreadable_sibling_is_a_typed_error() {
+        fn prune_over_an_unreadable_sibling_skips_it() {
             use std::os::unix::fs::PermissionsExt as _;
             if rustix::process::geteuid().is_root() {
                 return;
@@ -2343,17 +2528,185 @@ mod tests {
             let root = user_cache_root(&base);
             let own = sibling(&root, "scratch-own", OLD);
             let sealed = sibling(&root, "scratch-sealed", OLD);
+            let old = sibling(&root, "scratch-old", OLD);
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000))
                 .expect("seal");
-            let pruned = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
+            let report = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
             std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700))
                 .expect("unseal");
             assert!(
-                matches!(pruned, Err(CliError::Io { .. })),
-                "an unreadable sibling is an error, never a skip: {pruned:?}"
+                matches!(
+                    &report.outcome,
+                    PruneOutcome::Walked(Some(skips))
+                        if skips.count.get() == 1 && skips.first.path.starts_with(&sealed)
+                ),
+                "{report:?}"
             );
-            assert!(sealed.exists());
+            assert!(sealed.exists(), "an unreadable sibling is left in place");
+            assert!(!old.exists(), "the other old sibling is still pruned");
+            assert!(own.exists());
             let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_sibling_whose_prune_fails_is_skipped_and_the_rest_are_pruned() {
+            let base = temp("prune-faulted");
+            let root = user_cache_root(&base);
+            let own = sibling(&root, "scratch-own", OLD);
+            let faulted = sibling(&root, "scratch-faulted", OLD);
+            let old = sibling(&root, "scratch-old", OLD);
+            let held = sibling(&root, "scratch-held", OLD);
+            let holder = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(held.join(TEST_LOCK_FILE))
+                .expect("holder");
+            holder.try_lock().expect("held elsewhere");
+            let report = prune_siblings_with(
+                SharedDir::Scratch,
+                &root,
+                &own,
+                SHARED_RETENTION,
+                sibling_cap(),
+                |dir, now, retention| {
+                    if dir == faulted {
+                        Err(SiblingFault {
+                            path: dir.to_path_buf(),
+                            kind: std::io::ErrorKind::PermissionDenied,
+                        })
+                    } else {
+                        prune_if_stale(dir, now, retention)
+                    }
+                },
+            );
+            assert!(
+                matches!(
+                    &report.outcome,
+                    PruneOutcome::Walked(Some(skips))
+                        if skips.count.get() == 1 && skips.first.path == faulted
+                ),
+                "{report:?}"
+            );
+            assert!(!old.exists(), "a fault never stops the other siblings");
+            assert!(faulted.exists(), "the faulted sibling is left in place");
+            assert!(held.exists(), "a sibling another run holds is kept");
+            assert!(own.exists());
+            drop(holder);
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_root_past_the_entry_cap_judges_nothing_and_reports_it() {
+            let base = temp("prune-crowded");
+            let root = user_cache_root(&base);
+            let own = sibling(&root, "scratch-own", OLD);
+            let old = sibling(&root, "scratch-old", OLD);
+            for name in ["a", "b", "c"] {
+                std::fs::write(root.join(name), "").expect("entry");
+            }
+            let cap = ipe_fs_open::EntryCap::new(4).expect("non-zero");
+            let mut calls = 0_u32;
+            let report = prune_siblings_with(
+                SharedDir::Scratch,
+                &root,
+                &own,
+                SHARED_RETENTION,
+                cap,
+                |dir, now, retention| {
+                    calls = calls.saturating_add(1);
+                    prune_if_stale(dir, now, retention)
+                },
+            );
+            assert!(
+                matches!(
+                    report.outcome,
+                    PruneOutcome::Refused(RootRefusal::Crowded(over)) if over == cap
+                ),
+                "{report:?}"
+            );
+            assert_eq!(calls, 0, "no sibling is judged past the cap");
+            assert!(old.exists(), "nothing is removed past the cap");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_linked_sibling_is_never_followed_by_a_prune() {
+            let base = temp("prune-linked");
+            let root = user_cache_root(&base);
+            let own = sibling(&root, "scratch-own", OLD);
+            let elsewhere = sibling(&base, "elsewhere", OLD);
+            std::fs::write(elsewhere.join("debug").join("unit.rlib"), "unit").expect("unit");
+            let linked = root.join("scratch-linked");
+            std::os::unix::fs::symlink(&elsewhere, &linked).expect("planted link");
+            let report = prune_siblings(SharedDir::Scratch, &root, &own, SHARED_RETENTION);
+            assert!(
+                matches!(report.outcome, PruneOutcome::Walked(None)),
+                "{report:?}"
+            );
+            assert!(
+                elsewhere.join("debug").join("unit.rlib").is_file(),
+                "nothing is removed through the link"
+            );
+            assert!(elsewhere.join(TEST_LOCK_FILE).is_file());
+            assert!(
+                std::fs::symlink_metadata(&linked).is_ok(),
+                "the link is left"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_prune_report_shows_one_sanitised_message_per_outcome() {
+            let root = PathBuf::from("/cache/ipe/t");
+            let report = |outcome| PruneReport {
+                root: root.clone(),
+                outcome,
+            };
+            assert_eq!(report(PruneOutcome::Walked(None)).message(), None);
+            let mut skips = None;
+            for name in ["dev-\u{1b}[31mred", "dev-second"] {
+                Skips::record(
+                    &mut skips,
+                    SiblingFault {
+                        path: root.join(name),
+                        kind: std::io::ErrorKind::PermissionDenied,
+                    },
+                );
+            }
+            let skipped = report(PruneOutcome::Walked(skips))
+                .message()
+                .expect("a skip is shown");
+            assert!(skipped.contains("2 in all"), "{skipped}");
+            assert!(skipped.contains("dev-"), "{skipped}");
+            assert!(
+                !skipped.contains("dev-second"),
+                "only the first skip is named: {skipped}"
+            );
+            assert!(
+                !skipped.contains('\u{1b}'),
+                "a listed name is sanitised: {skipped:?}"
+            );
+            let crowded = report(PruneOutcome::Refused(RootRefusal::Crowded(sibling_cap())))
+                .message()
+                .expect("a crowded root is shown");
+            assert!(
+                crowded.contains(&SCRATCH_SIBLING_CAP.to_string()),
+                "{crowded}"
+            );
+            let unlisted = report(PruneOutcome::Refused(RootRefusal::Unlisted(
+                std::io::ErrorKind::PermissionDenied,
+            )))
+            .message()
+            .expect("an unlisted root is shown");
+            assert!(unlisted.contains("/cache/ipe/t"), "{unlisted}");
+        }
+
+        #[test]
+        fn a_prune_report_is_shown_once_per_process() {
+            let latch = std::sync::atomic::AtomicBool::new(false);
+            assert!(first_report(&latch));
+            assert!(!first_report(&latch));
         }
 
         #[test]
@@ -2849,6 +3202,81 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
 
+        /// The age of `dir`'s lock file, or `None` when it has none.
+        fn lock_age(dir: &Path) -> Option<std::time::Duration> {
+            let stamp = std::fs::symlink_metadata(dir.join(TEST_LOCK_FILE))
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(stamp)
+                    .unwrap_or_default(),
+            )
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn a_claim_succeeds_over_an_unremovable_stale_sibling() {
+            use std::os::unix::fs::PermissionsExt as _;
+            if rustix::process::geteuid().is_root() {
+                return;
+            }
+            let base = temp("dev-unremovable");
+            let root = user_cache_root(&base);
+            let crate_dir = base.join("crate");
+            let resolved =
+                LinkableTargetDir::resolve(LINKER, BuildPosture::Dev, &crate_dir, &cache(&base))
+                    .expect("resolves");
+            assert_eq!(resolved.origin(), TargetDirOrigin::DevCache);
+            let other = sibling(&root, "dev-other", OLD);
+            let sealed = other.join("sealed");
+            std::fs::create_dir_all(&sealed).expect("sealed subdir");
+            std::fs::write(sealed.join("unit.rlib"), "unit").expect("unit");
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o500))
+                .expect("seal");
+            let claimed = resolved.claim();
+            std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o700))
+                .expect("unseal");
+            assert!(
+                claimed.is_ok(),
+                "a sibling never fails the claim: {claimed:?}"
+            );
+            assert!(
+                lock_age(resolved.path()).is_some_and(|age| age < OLD),
+                "the claim stamps the dir's last use"
+            );
+            assert!(sealed.join("unit.rlib").is_file(), "the sibling is left");
+            assert!(
+                other.join(TEST_LOCK_FILE).is_file(),
+                "a half-removed sibling keeps its lock file"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_claim_succeeds_over_a_root_past_the_entry_cap() {
+            let base = temp("dev-crowded");
+            let root = user_cache_root(&base);
+            let crate_dir = base.join("crate");
+            let resolved =
+                LinkableTargetDir::resolve(LINKER, BuildPosture::Dev, &crate_dir, &cache(&base))
+                    .expect("resolves");
+            assert_eq!(resolved.origin(), TargetDirOrigin::DevCache);
+            for n in 0..=SCRATCH_SIBLING_CAP {
+                std::fs::write(root.join(format!("entry-{n}")), "").expect("entry");
+            }
+            let claimed = resolved.claim();
+            assert!(
+                claimed.is_ok(),
+                "a crowded root never fails the claim: {claimed:?}"
+            );
+            assert!(
+                lock_age(resolved.path()).is_some_and(|age| age < OLD),
+                "the claim stamps the dir's last use"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
         #[test]
         fn a_dev_sibling_another_pruner_removed_is_no_error() {
             let base = temp("dev-prune-raced");
@@ -2858,7 +3286,7 @@ mod tests {
                 prune_if_stale_with(&old, std::time::SystemTime::now(), SHARED_RETENTION, || {
                     std::fs::remove_dir_all(&old).expect("the other pruner");
                 });
-            assert!(pruned.is_ok(), "{pruned:?}");
+            assert!(matches!(pruned, Ok(Pruned::Kept)), "{pruned:?}");
             assert!(!old.exists(), "the lock file is never recreated");
             let _ = std::fs::remove_dir_all(&base);
         }

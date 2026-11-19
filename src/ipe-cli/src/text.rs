@@ -1183,6 +1183,12 @@ messages! {
     lock_behind_manifest = "lock-behind-manifest";
     /// A file was written, but syncing its directory after the rename failed.
     write_unsynced(path, kind) = "write-unsynced";
+    /// Unused build directories a prune could not remove; the build went on.
+    build_dir_prune_skipped(count, path, kind) = "build-dir-prune-skipped";
+    /// The build-directory cache root holds too many entries to prune; the build went on.
+    build_dir_prune_crowded(root, cap) = "build-dir-prune-crowded";
+    /// The build-directory cache root could not be listed for a prune; the build went on.
+    build_dir_prune_unlisted(root, kind) = "build-dir-prune-unlisted";
     /// A version string that is not valid semver.
     version_refused_malformed(raw, reason) = "version-refused-malformed";
     /// A version carrying build metadata.
