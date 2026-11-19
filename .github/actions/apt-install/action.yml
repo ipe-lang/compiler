@@ -17,9 +17,9 @@ description: >-
   and SHA-256 of every archive the install needs, and removes every cached
   entry in it (apart from apt's own `partial` directory and `lock` file)
   that is not a listed archive or whose size or hash differs (a hash type other
-  than SHA-256 or SHA-512 counts as differing), so apt installs only archives
-  the signed index vouches for. When every attempt fails the step fails, and
-  so does a spent budget.
+  than SHA-256 or SHA-512 counts as differing), and makes `partial` a
+  directory again, so apt installs only archives the signed index vouches
+  for. When every attempt fails the step fails, and so does a spent budget.
 inputs:
   packages:
     description: Space-separated Debian package names on one line (lower-case ASCII letters, digits and `.+:-`, never a leading `-`).
@@ -85,7 +85,7 @@ runs:
             echo "::error::apt-install: RUNNER_TEMP must be an existing absolute directory to list the signed archives in" >&2
             exit 1
           fi
-          mkdir -p "$APT_ARCHIVES/partial"
+          mkdir -p "$APT_ARCHIVES"
           archive_flags=(-o "Dir::Cache::archives=$APT_ARCHIVES")
           listing_dir="$(mktemp -d -p "$RUNNER_TEMP" apt-listing.XXXXXX)"
           mkdir "$listing_dir/partial"
@@ -203,6 +203,7 @@ runs:
                   echo "::warning::apt-install: cached ${name} does not match the signed index, so it is removed and fetched again"
                 fi
               done
+              mkdir -p -- "$APT_ARCHIVES/partial"
               echo "apt attempt $attempt keeps ${kept} cached archives the signed index lists and removes ${removed}"
             fi
           done

@@ -30,6 +30,7 @@ import importlib.util
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import tempfile
@@ -6246,7 +6247,33 @@ class TestAptInstallScript(unittest.TestCase):
             os.symlink(os.path.join(outside, "lock"), os.path.join(archives, "lock"))
             code, _calls = self.run_script("x", archives=archives, uris=self._listing())
             self.assertEqual(code, 0, self.stderr)
-            self.assertEqual(self.left, [])
+            # apt needs a real `partial` directory beside the archives, so the
+            # filter makes one again after removing the planted link.
+            self.assertEqual(self.left, ["partial"])
+            self.assertEqual(os.listdir(outside), [])
+            self.assertTrue(os.path.isdir(os.path.join(archives, "partial")) and not os.path.islink(os.path.join(archives, "partial")))
+
+    def test_partial_not_a_directory_replaced(self) -> None:
+        # A cached `partial` that is a file or a socket is removed like any
+        # unlisted entry and apt gets a real directory in its place, never a
+        # step that dies on the stale entry.
+        for kind in ("file", "socket"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as tmp:
+                archives = os.path.join(tmp, "archives")
+                os.makedirs(archives)
+                partial = os.path.join(archives, "partial")
+                if kind == "file":
+                    with open(partial, "wb") as f:
+                        f.write(b"x")
+                else:
+                    sock = socket.socket(socket.AF_UNIX)
+                    sock.bind(partial)
+                    sock.close()
+                code, calls = self.run_script("x", archives=archives, uris=self._listing())
+                self.assertEqual(code, 0, self.stderr)
+                self.assertEqual(self.left, ["partial"])
+                self.assertTrue(os.path.isdir(partial) and not os.path.islink(partial))
+                self.assertTrue(calls[-1].endswith(" install x"), calls)
 
     def test_directory_named_as_archive_refused(self) -> None:
         code, calls = self.run_script("x", archives="{tmp}/archives", uris=self._listing(), debs={"odd_1_amd64.deb": None})
