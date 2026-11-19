@@ -258,6 +258,49 @@ fn icon_refusal(raw: &str, refusal: &PwaIconRefusal) -> text::Message {
     }
 }
 
+/// One field of the `delivery` record.
+#[derive(Clone, Copy)]
+enum DeliveryField {
+    /// `ships`: the deliveries `ipe release` produces.
+    Ships,
+    /// `desktop`: the desktop host section.
+    Desktop,
+    /// `mobile`: the mobile host section.
+    Mobile,
+    /// `browser`: the browser host section.
+    Browser,
+    /// `servers`: the origins a client bundle may reach.
+    Servers,
+    /// `frameOrigins`: the origins a served page may frame.
+    FrameOrigins,
+}
+
+/// The `delivery` fields [`Reader::read_delivery`] accepts, by name.
+///
+/// The reader dispatches only through this table, so its accepted names are
+/// exactly these; a unit test pins them to the `Delivery` schema.
+const DELIVERY_FIELDS: [(&str, DeliveryField); 6] = [
+    ("ships", DeliveryField::Ships),
+    ("desktop", DeliveryField::Desktop),
+    ("mobile", DeliveryField::Mobile),
+    ("browser", DeliveryField::Browser),
+    ("servers", DeliveryField::Servers),
+    ("frameOrigins", DeliveryField::FrameOrigins),
+];
+
+/// The accepted `delivery` field names, quoted, as one English list.
+fn delivery_field_names() -> String {
+    let quoted: Vec<String> = DELIVERY_FIELDS
+        .iter()
+        .map(|(known, _)| format!("`{known}`"))
+        .collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// One field of the `delivery.browser` record.
 #[derive(Clone, Copy)]
 enum BrowserField {
@@ -1097,24 +1140,27 @@ impl Reader<'_> {
         let mut install_request = None;
         let mut frames_span = None;
         for (fname, value) in self.expect_record(expr)? {
-            match self.text(fname.value) {
-                "ships" => config.set_ships(self.read_ships(value)?),
-                "desktop" => config.desktop = self.read_desktop(value)?,
-                "mobile" => config.mobile = self.read_mobile(value)?,
-                "browser" => (config.browser, install_request) = self.read_browser(value)?,
-                "servers" => config.servers = self.read_servers(value)?,
-                "frameOrigins" => {
+            let name = self.text(fname.value);
+            let Some((_, field)) = DELIVERY_FIELDS.iter().find(|(known, _)| *known == name) else {
+                return Err(self.reject(
+                    fname.span,
+                    &format!(
+                        "`{name}` is not a delivery field — expected {}",
+                        delivery_field_names()
+                    ),
+                ));
+            };
+            match field {
+                DeliveryField::Ships => config.set_ships(self.read_ships(value)?),
+                DeliveryField::Desktop => config.desktop = self.read_desktop(value)?,
+                DeliveryField::Mobile => config.mobile = self.read_mobile(value)?,
+                DeliveryField::Browser => {
+                    (config.browser, install_request) = self.read_browser(value)?;
+                }
+                DeliveryField::Servers => config.servers = self.read_servers(value)?,
+                DeliveryField::FrameOrigins => {
                     config.frame_origins = self.read_frame_origins(value)?;
                     frames_span = Some(value.span);
-                }
-                other => {
-                    return Err(self.reject(
-                        fname.span,
-                        &format!(
-                            "`{other}` is not a delivery field — expected `ships`, `desktop`, \
-                             `mobile`, `browser`, `servers`, or `frameOrigins`"
-                        ),
-                    ));
                 }
             }
         }
@@ -3145,6 +3191,24 @@ mod tests {
             .map(|(name, _)| name.trim())
             .collect();
         let reader_fields: Vec<&str> = BROWSER_FIELDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(schema_fields, reader_fields);
+    }
+
+    /// The field names of `Delivery` in the `Ipe.Package` schema are the fields the reader accepts.
+    #[test]
+    fn delivery_fields_match_the_package_schema() {
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib/Ipe/Package.ipe");
+        let schema = std::fs::read_to_string(&schema_path).expect("read Ipe.Package schema");
+        let (_, alias) = schema
+            .split_once("type alias Delivery =")
+            .expect("Delivery alias in the schema");
+        let (record, _) = alias.split_once('}').expect("Delivery record closes");
+        let schema_fields: Vec<&str> = record
+            .split(['{', ','])
+            .filter_map(|field| field.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        let reader_fields: Vec<&str> = DELIVERY_FIELDS.iter().map(|(name, _)| *name).collect();
         assert_eq!(schema_fields, reader_fields);
     }
 
