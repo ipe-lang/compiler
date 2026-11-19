@@ -102,7 +102,7 @@ pub fn emit_web_call(
                         .into(),
                 });
             };
-            let mountable = crate::emit_settings::mounts_into_server(k);
+            let mountable = crate::emit_settings::mounts_into_server(*k);
             emit_web_app_inner(ctx, fields, indent, child, generics, mountable)
         }
 
