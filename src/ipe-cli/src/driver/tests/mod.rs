@@ -3768,7 +3768,7 @@ fn temp_dir_unique(tag: &str) -> PathBuf {
 
 /// `repo` served over a loopback HTTPS fixture this process's isolated git
 /// trusts, with its source URL; the server lives as long as the fixture.
-fn served(repo: &Path) -> (git_https_fixture::GitHttpsFixture, String) {
+fn served_repo(repo: &Path) -> (git_https_fixture::GitHttpsFixture, String) {
     let (fixture, urls) =
         git_https_fixture::GitHttpsFixture::start(&[repo]).expect("fixture server starts");
     crate::remote_ingest::trust_fixture(crate::remote_ingest::FixtureTrust::new(
@@ -4047,7 +4047,7 @@ fn audit_entry_rejects_on_hash_mismatch() {
         .output()
         .expect("git rev-parse");
     let rev = String::from_utf8_lossy(&rev_out.stdout).trim().to_owned();
-    let (_server, url) = served(&repo);
+    let (_server, url) = served_repo(&repo);
 
     // Write an entry that points at this repo but with a deliberately wrong
     // sha256. It is well-formed (64 lowercase-hex chars) so it clears the
@@ -5421,7 +5421,7 @@ fn audited_version(
     let rev = String::from_utf8(git(&["rev-parse", "HEAD"])).expect("utf-8 rev");
     let hash = crate::resolve::hash_source_tree(&source).expect("hash source");
     let sha256 = sha256.unwrap_or(hash.as_str());
-    let (fixture, url) = served(&source);
+    let (fixture, url) = served_repo(&source);
     let index_root = root.join("index");
     let packages = index_root.join("packages");
     std::fs::create_dir_all(&packages).expect("packages dir");
