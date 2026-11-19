@@ -684,6 +684,10 @@ pub mod telemetry;
 // security headers are assembled from.
 pub mod csp;
 
+// The frame origins a program trusts and what a trusted frame may be
+// delegated: the delegation table, the `allow` parser, the registered policy.
+pub mod frames;
+
 // The runtime's one OS entropy source: every random mint draws through
 // `entropy::fill_entropy`, which refuses instead of panicking.
 pub mod entropy;
