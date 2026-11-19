@@ -3766,6 +3766,19 @@ fn temp_dir_unique(tag: &str) -> PathBuf {
     dir
 }
 
+/// `repo` served over a loopback HTTPS fixture this process's isolated git
+/// trusts, with its source URL; the server lives as long as the fixture.
+fn served(repo: &Path) -> (git_https_fixture::GitHttpsFixture, String) {
+    let (fixture, urls) =
+        git_https_fixture::GitHttpsFixture::start(&[repo]).expect("fixture server starts");
+    crate::remote_ingest::trust_fixture(crate::remote_ingest::FixtureTrust::new(
+        fixture.client_env(),
+    ))
+    .expect("one trust per process");
+    let url = urls.first().expect("one served repository").to_string();
+    (fixture, url)
+}
+
 /// Write a minimal well-formed `packages/<name>.toml` entry into `root`.
 fn write_entry(root: &Path, name: &str, versions: &[(&str, &str, &str, &str)]) {
     use std::fmt::Write as _;
@@ -4010,7 +4023,7 @@ fn audit_entry_rejects_rewriting_a_published_version() {
 /// `run_audit_entry` — a new version whose `sha256` does not match the fetched
 /// tree is a hard [`CliError::HashMismatch`] (verify-before-trust, §0).
 ///
-/// Uses a local git repo as the source so the test runs offline.
+/// Serves a fresh git repo over the loopback HTTPS fixture so the test runs offline.
 #[test]
 fn audit_entry_rejects_on_hash_mismatch() {
     // Build a tiny local git repo.
@@ -4034,6 +4047,7 @@ fn audit_entry_rejects_on_hash_mismatch() {
         .output()
         .expect("git rev-parse");
     let rev = String::from_utf8_lossy(&rev_out.stdout).trim().to_owned();
+    let (_server, url) = served(&repo);
 
     // Write an entry that points at this repo but with a deliberately wrong
     // sha256. It is well-formed (64 lowercase-hex chars) so it clears the
@@ -4047,7 +4061,7 @@ fn audit_entry_rejects_on_hash_mismatch() {
          version = \"1.0.0\"\nsource = \"{}\"\nrev = \"{rev}\"\n\
          sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\
          capabilities = []\n",
-        repo.display()
+        url
     );
     std::fs::write(pkgs.join("testlib.toml"), entry_text).expect("write entry");
 
@@ -5382,8 +5396,14 @@ fn sited_error_with_unknown_home_fails_closed() {
 
 /// Version `1.0.0` of `audited`, published from a fresh one-file repo under
 /// `root` and pinned to `sha256` (the tree's own hash when `None`), read back
-/// through the index parser.
-fn audited_version(root: &Path, sha256: Option<&str>) -> crate::index::EntryVersion {
+/// through the index parser, with the server its source URL names.
+fn audited_version(
+    root: &Path,
+    sha256: Option<&str>,
+) -> (
+    crate::index::EntryVersion,
+    git_https_fixture::GitHttpsFixture,
+) {
     let source = root.join("source");
     std::fs::create_dir_all(&source).expect("source dir");
     let git = |args: &[&str]| -> Vec<u8> {
@@ -5401,21 +5421,22 @@ fn audited_version(root: &Path, sha256: Option<&str>) -> crate::index::EntryVers
     let rev = String::from_utf8(git(&["rev-parse", "HEAD"])).expect("utf-8 rev");
     let hash = crate::resolve::hash_source_tree(&source).expect("hash source");
     let sha256 = sha256.unwrap_or(hash.as_str());
+    let (fixture, url) = served(&source);
     let index_root = root.join("index");
     let packages = index_root.join("packages");
     std::fs::create_dir_all(&packages).expect("packages dir");
     let entry = format!(
         "name = \"audited\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"1.0.0\"\n\
-         source = \"{}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = []\n",
-        source.display(),
+         source = \"{url}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = []\n",
         rev.trim(),
     );
     std::fs::write(packages.join("audited.toml"), entry).expect("write entry");
     let entry = crate::index::read_entry(&index_root, "audited").expect("fixture entry parses");
     let req = "^1".parse().expect("valid req");
-    crate::index::resolve_version(&entry, &req)
+    let version = crate::index::resolve_version(&entry, &req)
         .expect("fixture version resolves")
-        .clone()
+        .clone();
+    (version, fixture)
 }
 
 /// Every way `certify_versions` ends — a pass, an audit rejection, a hash
@@ -5433,7 +5454,7 @@ fn certify_versions_leaves_no_scratch_under_the_cache_base() {
     let scratch_parent = cache.path().join("ipe");
     let leftovers = || std::fs::read_dir(&scratch_parent).map_or(0, Iterator::count);
     let name = crate::package_name::PackageName::parse("audited").expect("name parses");
-    let good = audited_version(&fixture.path().join("good"), None);
+    let (good, _good_server) = audited_version(&fixture.path().join("good"), None);
 
     let mut audited = Vec::new();
     let certified = certify_versions(
@@ -5466,7 +5487,7 @@ fn certify_versions_leaves_no_scratch_under_the_cache_base() {
     assert_eq!(leftovers(), 0, "an audit rejection leaves no scratch dir");
 
     let zeros = "0".repeat(64);
-    let forged = audited_version(&fixture.path().join("forged"), Some(&zeros));
+    let (forged, _forged_server) = audited_version(&fixture.path().join("forged"), Some(&zeros));
     let mismatch = certify_versions(cache.path(), &name, &[&forged], &PACKAGE_SOURCE, |_, _| {
         Ok(())
     });

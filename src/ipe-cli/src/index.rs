@@ -3926,9 +3926,10 @@ mod tests {
         assert!(SourceUrl::parse(&pn("p"), "https://example.invalid/a-b_c~d%20e?f=g#h").is_ok());
         #[cfg(unix)]
         {
-            assert!(SourceUrl::parse(&pn("p"), "/srv/repo\u{202e}x").is_err());
-            assert!(SourceUrl::parse(&pn("p"), "/srv/repo\u{2066}x").is_err());
-            assert!(SourceUrl::parse(&pn("p"), "/srv/r\u{e9}po with space").is_ok());
+            use super::EscapeSource;
+            assert!(EscapeSource::parse(&pn("p"), "/srv/repo\u{202e}x").is_err());
+            assert!(EscapeSource::parse(&pn("p"), "/srv/repo\u{2066}x").is_err());
+            assert!(EscapeSource::parse(&pn("p"), "/srv/r\u{e9}po with space").is_ok());
         }
     }
 

@@ -564,8 +564,8 @@ impl Wanted {
 /// checkout. A pre-existing `dest` is removed first so
 /// a re-add always fetches fresh.
 ///
-/// `url` is a [`SourceUrl`] newtype — a raw unvalidated string cannot reach
-/// this function — and `wanted` is built only from a [`PinnedRev`], which
+/// `url` is a [`SourceUrl`] newtype — an `https://` or `ssh://` URL; a raw
+/// unvalidated string or a local repository cannot reach this function — and `wanted` is built only from a [`PinnedRev`], which
 /// never begins with `-`, so its spelling is safe to pass to `git checkout`
 /// without `--`.
 ///
@@ -1068,11 +1068,12 @@ mod tests {
     use crate::package_name::PackageName;
     use crate::published_version::PublishedVersion;
     use crate::remote_ingest::{
-        self, ByteBudget, ChildStderr, FetchBudget, IngestLimit, IngestRefusal, IngestSource,
-        LocalRefusal, LocalSource, PACKAGE_FILE_MAX_BYTES, PACKAGE_SOURCE, PACKAGE_TREE_MAX_BYTES,
-        PACKAGE_TREE_MAX_DEPTH, PACKAGE_TREE_MAX_ENTRIES, REFS_MAX_BYTES, REFS_MAX_COUNT,
-        RefsCeiling, RunError, Stream, Transfer, TreeCeiling,
+        self, ByteBudget, ChildStderr, FetchBudget, FixtureTrust, IngestLimit, IngestRefusal,
+        IngestSource, LocalRefusal, LocalSource, PACKAGE_FILE_MAX_BYTES, PACKAGE_SOURCE,
+        PACKAGE_TREE_MAX_BYTES, PACKAGE_TREE_MAX_DEPTH, PACKAGE_TREE_MAX_ENTRIES, REFS_MAX_BYTES,
+        REFS_MAX_COUNT, RefsCeiling, RunError, Stream, Transfer, TreeCeiling,
     };
+    use git_https_fixture::GitHttpsFixture;
     use ipe_ir::Capability;
     use std::collections::BTreeSet;
     use std::ffi::OsString;
@@ -1130,6 +1131,17 @@ mod tests {
         repo
     }
 
+    /// `repo` served over a loopback HTTPS fixture this process's isolated git
+    /// trusts, with its source URL; the server lives as long as the fixture.
+    fn served(repo: &Path) -> (GitHttpsFixture, SourceUrl) {
+        let (fixture, urls) = GitHttpsFixture::start(&[repo]).expect("fixture server starts");
+        remote_ingest::trust_fixture(FixtureTrust::new(fixture.client_env()))
+            .expect("one trust per process");
+        let url = urls.first().expect("one served repository");
+        let source = SourceUrl::parse(&pn("p"), url.as_str()).expect("fixture URL is a source");
+        (fixture, source)
+    }
+
     /// The HEAD commit of the fixture repo `repo`.
     fn head_rev(repo: &Path) -> String {
         let out = remote_ingest::fixture_git(repo)
@@ -1140,15 +1152,17 @@ mod tests {
     }
 
     /// Version `1.0.0` of `name`, published from `source` at its HEAD and
-    /// pinned to `sha256`, read back through the index parser.
-    fn index_version(name: &str, source: &Path, sha256: &str) -> EntryVersion {
+    /// pinned to `sha256`, read back through the index parser, with the
+    /// server its source URL names.
+    fn index_version(name: &str, source: &Path, sha256: &str) -> (EntryVersion, GitHttpsFixture) {
+        let (fixture, url) = served(source);
         let index_root = temp_dir("index");
         let packages = index_root.join("packages");
         std::fs::create_dir_all(&packages).expect("packages dir");
         let entry = format!(
             "name = \"{name}\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"1.0.0\"\n\
              source = \"{}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = []\n",
-            source.display(),
+            url.as_str(),
             head_rev(source),
         );
         std::fs::write(packages.join(format!("{name}.toml")), entry).expect("write entry");
@@ -1158,7 +1172,7 @@ mod tests {
             .expect("fixture version resolves")
             .clone();
         let _ = std::fs::remove_dir_all(&index_root);
-        version
+        (version, fixture)
     }
 
     /// A fixture git repo with `count` small files at HEAD.
@@ -1400,8 +1414,7 @@ mod tests {
         // `fetch_git_into` directly, enforcing parse-don't-validate at the sink.
         let src = git_source("dash-url-clone", "module Lib\n");
         let dest = temp_dir("dash-url-dest");
-        let url = SourceUrl::parse(&pn("p"), &src.display().to_string())
-            .expect("local path is a valid source URL");
+        let (_server, url) = served(&src);
         let checkout = fetch_git_into(
             &pn("p"),
             &url,
@@ -1409,7 +1422,7 @@ mod tests {
             &dest,
             &PACKAGE_SOURCE,
         )
-        .expect("clone succeeds for a valid local repo");
+        .expect("clone succeeds for a served repo");
         assert_eq!(head_rev(&dest), head_rev(&src));
         assert!(checkout.keep().is_dir(), "destination was populated");
         let _ = std::fs::remove_dir_all(&src);
@@ -1472,13 +1485,13 @@ mod tests {
         u64::try_from(out.len()).expect("advertisement length fits u64")
     }
 
-    /// `dest` staged with `src` as its origin, and the fresh transfer it is under.
-    fn staged(src: &Path, dest: &Path) -> Transfer {
-        let url = SourceUrl::parse(&pn("p"), &src.display().to_string())
-            .expect("local path is a valid source URL");
+    /// `dest` staged with served `src` as its origin, the fresh transfer it is
+    /// under, and the server, which must outlive the fetch.
+    fn staged(src: &Path, dest: &Path) -> (Transfer, GitHttpsFixture) {
+        let (fixture, url) = served(src);
         let transfer = Transfer::begin(*PACKAGE_SOURCE.transfer());
         stage_origin(&pn("p"), &url, dest, &transfer).expect("origin stages");
-        transfer
+        (transfer, fixture)
     }
 
     /// No object pack reached `dest`.
@@ -1520,7 +1533,7 @@ mod tests {
     fn an_advertisement_at_the_ref_count_ceiling_fetches_the_tip() {
         let (src, head) = tagged_source("refs-at", REFS_MAX_COUNT - 1);
         let dest = temp_dir("refs-at-dest");
-        let transfer = staged(&src, &dest);
+        let (transfer, _server) = staged(&src, &dest);
         fetch_advertised(
             &pn("p"),
             &commit(&head),
@@ -1544,7 +1557,7 @@ mod tests {
     fn an_advertisement_past_the_ref_count_ceiling_is_refused_before_any_fetch() {
         let (src, head) = tagged_source("refs-past", REFS_MAX_COUNT);
         let dest = temp_dir("refs-past-dest");
-        let transfer = staged(&src, &dest);
+        let (transfer, _server) = staged(&src, &dest);
         let result = fetch_advertised(
             &pn("p"),
             &commit(&head),
@@ -1573,7 +1586,7 @@ mod tests {
         let len = advertisement_len(&src);
 
         let past_dest = temp_dir("refs-bytes-past");
-        let transfer = staged(&src, &past_dest);
+        let (transfer, _server) = staged(&src, &past_dest);
         let past = RefsCeiling::for_test(byte_budget(len - 1), REFS_MAX_COUNT);
         let result = fetch_advertised(&pn("p"), &commit(&head), &past_dest, &transfer, &past);
         assert!(
@@ -1587,7 +1600,7 @@ mod tests {
         assert_no_pack(&past_dest);
 
         let at_dest = temp_dir("refs-bytes-at");
-        let transfer = staged(&src, &at_dest);
+        let (transfer, _server) = staged(&src, &at_dest);
         let at = RefsCeiling::for_test(byte_budget(len), REFS_MAX_COUNT);
         fetch_advertised(&pn("p"), &commit(&head), &at_dest, &transfer, &at)
             .expect("an advertisement at its byte ceiling is read");
@@ -1611,7 +1624,7 @@ mod tests {
         );
         run_fixture(&src, &["reset", "--hard", "--quiet", &base], b"");
         let dest = temp_dir("refs-dash-dest");
-        let transfer = staged(&src, &dest);
+        let (transfer, _server) = staged(&src, &dest);
         fetch_advertised(
             &pn("p"),
             &commit(&tip),
@@ -1636,7 +1649,7 @@ mod tests {
         commit_file(&src, "hostile.ipe");
         run_fixture(&src, &["tag", &wanted_sha], b"");
         let dest = temp_dir("refs-sha-named-dest");
-        let transfer = staged(&src, &dest);
+        let (transfer, _server) = staged(&src, &dest);
         let wanted = commit(&wanted_sha);
         fetch_advertised(&pn("p"), &wanted, &dest, &transfer, PACKAGE_SOURCE.refs())
             .expect("the requested commit fetches");
@@ -1678,8 +1691,7 @@ mod tests {
         commit_file(&src, "served.ipe");
         run_fixture(&src, &["tag", "v1.0.0"], b"");
         run_fixture(&src, &["tag", absent], b"");
-        let url = SourceUrl::parse(&pn("p"), &src.display().to_string())
-            .expect("local path is a valid source URL");
+        let (_server, url) = served(&src);
         let dest = temp_dir("commit-absent-dest");
         let result = fetch_git_into(&pn("p"), &url, &commit(absent), &dest, &PACKAGE_SOURCE);
         assert!(
@@ -1700,7 +1712,7 @@ mod tests {
         commit_file(&src, "later.ipe");
 
         let by_sha = temp_dir("refs-peeled-sha");
-        let transfer = staged(&src, &by_sha);
+        let (transfer, _server) = staged(&src, &by_sha);
         fetch_advertised(
             &pn("p"),
             &commit(&tagged),
@@ -1725,7 +1737,7 @@ mod tests {
         let old = commit_file(&src, "old.ipe");
         commit_file(&src, "new.ipe");
         let dest = temp_dir("refs-history-dest");
-        let transfer = staged(&src, &dest);
+        let (transfer, _server) = staged(&src, &dest);
         fetch_advertised(
             &pn("p"),
             &commit(&old),
@@ -1958,7 +1970,7 @@ mod tests {
     fn an_index_add_past_its_tree_entry_ceiling_records_nothing() {
         let src = git_source_of("tree-entries", 5);
         let sha = hash_source_tree(&src).expect("hash source");
-        let version = index_version("wide", &src, sha.as_str());
+        let (version, _server) = index_version("wide", &src, sha.as_str());
         let proj = temp_dir("tree-entries");
         scaffold_project(&proj);
         let manifest_before = std::fs::read(proj.join("package.ipe")).expect("manifest");
@@ -1995,7 +2007,7 @@ mod tests {
     fn an_index_add_at_its_tree_entry_ceiling_is_locked() {
         let src = git_source_of("tree-entries-at", 3);
         let sha = hash_source_tree(&src).expect("hash source");
-        let version = index_version("snug", &src, sha.as_str());
+        let (version, _server) = index_version("snug", &src, sha.as_str());
         let proj = temp_dir("tree-entries-at");
         scaffold_project(&proj);
         let budget = with_tree(
@@ -2027,7 +2039,7 @@ mod tests {
     fn a_signed_add_past_its_tree_ceiling_is_refused_once_before_any_signature_check() {
         let src = git_source_of("signed-tree", 5);
         let sha = hash_source_tree(&src).expect("hash source");
-        let mut version = index_version("signed", &src, sha.as_str());
+        let (mut version, _server) = index_version("signed", &src, sha.as_str());
         version.signature = Some(
             crate::signing::SignatureBundle::parse("signed", r#"{ "dsseEnvelope": {} }"#)
                 .expect("bundle parses"),
@@ -2087,7 +2099,7 @@ mod tests {
     #[test]
     fn an_index_add_with_a_wrong_pin_records_nothing() {
         let src = git_source("wrong-pin", "module Lib\n");
-        let version = index_version("pinned", &src, &"0".repeat(64));
+        let (version, _server) = index_version("pinned", &src, &"0".repeat(64));
         let proj = temp_dir("wrong-pin");
         scaffold_project(&proj);
         let manifest_before = std::fs::read(proj.join("package.ipe")).expect("manifest");
@@ -2108,7 +2120,7 @@ mod tests {
     fn a_baseline_fetch_past_its_transfer_ceiling_leaves_nothing() {
         let src = git_source("baseline", "module Lib\n");
         let sha = hash_source_tree(&src).expect("hash source");
-        let version = index_version("baseline", &src, sha.as_str());
+        let (version, _server) = index_version("baseline", &src, sha.as_str());
         let proj = temp_dir("baseline");
         scaffold_project(&proj);
         let name = pn("baseline");
@@ -2276,26 +2288,5 @@ mod tests {
                 "IPE_INDEX_DIR={raw:?} must be refused: {root:?}"
             );
         }
-    }
-
-    #[test]
-    fn a_file_url_source_reaches_git_as_its_plain_path() {
-        let src = git_source("file-url-origin", "module Lib\n");
-        let dest = temp_dir("file-url-origin-dest").join("slot");
-        let plain = src.display().to_string();
-        // A Windows drive path is spelled `file:///C:\…`; a Unix one `file:///home/…`.
-        let file_url = if cfg!(windows) {
-            format!("file:///{plain}")
-        } else {
-            format!("file://{plain}")
-        };
-        let url = SourceUrl::parse(&pn("p"), &file_url)
-            .expect("file URL of an absolute path is a valid source");
-        let transfer = Transfer::begin(*PACKAGE_SOURCE.transfer());
-        stage_origin(&pn("p"), &url, &dest, &transfer).expect("origin stages");
-        let origin = run_fixture(&dest, &["remote", "get-url", "origin"], b"");
-        assert_eq!(String::from_utf8_lossy(&origin).trim_end(), plain);
-        let _ = std::fs::remove_dir_all(&src);
-        let _ = dest.parent().map(std::fs::remove_dir_all);
     }
 }
