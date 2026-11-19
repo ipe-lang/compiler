@@ -917,26 +917,27 @@ fn a_project_module_that_does_not_type_check_is_reported_not_missed() -> io::Res
     Ok(())
 }
 
-/// A reserved-namespace miss never reads the package, so an unreadable `src/`
-/// cannot turn a clean miss into an I/O error.
-#[cfg(unix)]
+/// A reserved-namespace miss never resolves the package, so a package that
+/// cannot resolve (here: a manifest with no `src/`) still misses cleanly,
+/// while a project-shaped name in the same directory reports the refusal.
 #[test]
-fn a_reserved_miss_in_an_unreadable_package_still_misses_cleanly() -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = package_dir("unreadable_package")?;
-    let src = dir.join("src");
-    fs::set_permissions(&src, fs::Permissions::from_mode(0o000))?;
-    let probe = fs::read_dir(&src).is_ok();
-    let outcome = (!probe).then(|| run_in(&dir, &["doc", "Ipe.Nope"]));
-    fs::set_permissions(&src, fs::Permissions::from_mode(0o755))?;
-    // A reader that ignores permissions (root) cannot exercise the refusal.
-    let Some((ok, stdout, stderr)) = outcome else {
-        return Ok(());
-    };
+fn a_reserved_miss_in_an_unresolvable_package_still_misses_cleanly() -> io::Result<()> {
+    let dir = fresh_dir("unresolvable_package")?;
+    fs::write(
+        dir.join("package.ipe"),
+        support::package_ipe("unresolvable_package"),
+    )?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Ipe.Nope"]);
     assert!(!ok, "`ipe doc Ipe.Nope` must miss:\n{stdout}");
     assert!(
         stderr.contains("no documentation entry is named `Ipe.Nope`"),
         "{stderr}"
+    );
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Shapes"]);
+    assert!(!ok, "`ipe doc Shapes` must fail:\n{stdout}");
+    assert!(
+        !stderr.contains("no documentation entry is named `Shapes`"),
+        "the unresolvable package is reported, not read as a miss:\n{stderr}"
     );
     Ok(())
 }
