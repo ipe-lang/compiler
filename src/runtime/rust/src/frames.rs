@@ -1021,7 +1021,7 @@ mod tests {
 
     /// R10, dev copy: a loopback origin is withdrawn on the loopback page at
     /// its port and kept at another port or another host.
-    #[cfg(feature = "dev-posture")]
+    #[cfg(all(feature = "dev-posture", feature = "encoding"))]
     #[test]
     #[allow(clippy::expect_used)] // every vector is a well-formed origin
     fn dev_posture_pin_own_loopback_origin_is_never_trusted() {

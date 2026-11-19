@@ -1128,7 +1128,7 @@ fn frame_refusal<'a>(
 
 /// The ordered patch plan of a frame element, which the browser clients
 /// apply in place of per-key writes.
-#[cfg(any(test, feature = "wasm-client"))]
+#[cfg(any(all(test, feature = "encoding"), feature = "wasm-client"))]
 pub(crate) mod frame_patch {
     use super::{
         ALLOW_ATTR, ALLOWFULLSCREEN_ATTR, EscapedPopups, FRAME_PERMISSIONS, FramePolicy,
@@ -3039,6 +3039,7 @@ mod tests {
 
     /// The origins every listed-frame test trusts: the first is the page's
     /// own when the page is served on `app.example`.
+    #[cfg(feature = "encoding")]
     const LISTED: [&str; 2] = ["https://app.example", "https://frames.example"];
 
     /// [`LISTED`] as a policy granting `camera`.
@@ -3055,6 +3056,7 @@ mod tests {
     }
 
     /// Client marks for a page shown on `host`, popups `popups`.
+    #[cfg(feature = "encoding")]
     fn client_on(host: &str, popups: EscapedPopups) -> ClientMarks {
         ClientMarks {
             page: PageAuthority::of_location_host(host),
@@ -3073,6 +3075,7 @@ mod tests {
 
     /// R8 target vectors: a `src` and whether it names a listed origin. An
     /// unlisted one keeps the frame opaque.
+    #[cfg(feature = "encoding")]
     const TARGET_VECTORS: [(&str, bool); 19] = [
         ("https://app.example", true),
         ("https://app.example/", true),
