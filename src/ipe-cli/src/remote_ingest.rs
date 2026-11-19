@@ -5614,25 +5614,32 @@ mod tests {
             git(&["commit", "--quiet", "--allow-empty", "-m", "seed"]),
             Ok(true)
         ));
-        let plain = repo.path().display().to_string();
+        let shown = repo.path().display().to_string();
+        let plain = shown
+            .strip_prefix(r"\\?\")
+            .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+            .unwrap_or(&shown);
         let file_url = if cfg!(windows) {
-            format!("file:///{plain}")
+            format!("file:///{}", plain.replace('\\', "/"))
         } else {
             format!("file://{plain}")
         };
         let cwd = scratch();
-        for remote in [file_url.as_str(), plain.as_str()] {
+        for remote in [file_url.as_str(), plain] {
             let out = Git::isolated(cwd.path())
                 .args(["ls-remote", "--", remote])
                 .command
+                .env("LC_ALL", "C")
                 .output();
             assert!(
-                matches!(&out, Ok(out) if !out.status.success() && out.stdout.is_empty()),
+                matches!(&out, Ok(out) if !out.status.success()
+                    && out.stdout.is_empty()
+                    && String::from_utf8_lossy(&out.stderr).contains("transport 'file' not allowed")),
                 "{remote:?}: {out:?}"
             );
         }
         let control = super::fixture_git(cwd.path())
-            .args(["ls-remote", "--", plain.as_str()])
+            .args(["ls-remote", "--", plain])
             .output();
         assert!(
             matches!(&control, Ok(out) if out.status.success()

@@ -1271,6 +1271,7 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TEST_INT_BAD",
     "IPE_TEST_INT_OK",
     "IPE_TEST_INT_UNSET",
+    "IPE_TEST_ISOLATED_GIT_DIR", // remote-ingest test: the scratch dir handed to the isolated-git re-exec child
     "IPE_TEST_PG_URL",
     "IPE_TEST_REDIS_URL",
     "IPE_TEST_RUN_KEY", // `ipe test`: the run key handed to the test runner crate at compile time
