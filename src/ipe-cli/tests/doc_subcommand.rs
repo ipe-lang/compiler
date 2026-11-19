@@ -951,6 +951,49 @@ fn a_reserved_miss_in_an_unresolvable_package_still_misses_cleanly() -> io::Resu
     Ok(())
 }
 
+/// Under `--json`/`--plain`, a package that cannot be read or typed is
+/// refused through the machine error envelope, never the human frame.
+#[test]
+fn a_package_refusal_under_a_machine_format_is_the_machine_envelope() -> io::Result<()> {
+    let ill_typed = package_dir("machine_refusal_ill_typed")?;
+    fs::write(
+        ill_typed.join("src").join("Shapes.ipe"),
+        "module Shapes exposing (shapeMarker)\n\nshapeMarker : Int\nshapeMarker =\n    \"not an int\"\n",
+    )?;
+    let unresolvable = fresh_dir("machine_refusal_unresolvable")?;
+    fs::write(
+        unresolvable.join("package.ipe"),
+        support::package_ipe("machine_refusal_unresolvable"),
+    )?;
+    let cases: [(&Path, &[&str]); 4] = [
+        (&ill_typed, &["Shapes"]),
+        (&ill_typed, &["--type", "List a -> Int"]),
+        (&unresolvable, &["Shapes"]),
+        (&unresolvable, &["list"]),
+    ];
+    for (dir, query) in cases {
+        for format in ["--json", "--plain"] {
+            let mut args = vec!["doc"];
+            args.extend(query);
+            args.push(format);
+            let (ok, stdout, stderr) = run_in(dir, &args);
+            assert!(!ok, "{args:?} must fail:\n{stdout}");
+            assert!(stdout.is_empty(), "{args:?}:\n{stdout}");
+            assert!(
+                !stderr.contains("Ipê language"),
+                "{args:?} wrote the human frame:\n{stderr}"
+            );
+            if format == "--json" {
+                assert!(
+                    stderr.contains("\"ipe.cli.error/1\""),
+                    "{args:?}:\n{stderr}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Outside a package, a type search ranks the stdlib alone.
 #[test]
 fn type_search_outside_a_package_searches_the_stdlib() -> io::Result<()> {

@@ -1460,13 +1460,46 @@ pub fn run_doc(rest: &[String]) -> Result<(), CliError> {
             ..
         }
     );
-    match dispatch(mode, &scope) {
+    let format = output_format(&mode);
+    let outcome = match dispatch(mode, &scope) {
         Err(CliError::DocNotFound { miss })
             if human && !miss.hits.is_empty() && crate::unsafe_ack::is_interactive() =>
         {
             open_picked(miss, &scope)
         }
         outcome => outcome,
+    };
+    in_machine_form(format, outcome)
+}
+
+/// The output format a mode renders in; `None` for a mode with no format.
+const fn output_format(mode: &DocMode) -> Option<OutputFormat> {
+    match mode {
+        DocMode::List { format, .. }
+        | DocMode::Query { format, .. }
+        | DocMode::TypeSearch { format, .. }
+        | DocMode::Lookup { format, .. } => Some(*format),
+        DocMode::Generate { .. }
+        | DocMode::Serve { .. }
+        | DocMode::Check { .. }
+        | DocMode::CheckExamples => None,
+    }
+}
+
+/// `outcome` with any refusal not yet written put in the machine error
+/// envelope under `--json`/`--plain`, so no refusal of a machine-format
+/// command reaches the human frame.
+fn in_machine_form(
+    format: Option<OutputFormat>,
+    outcome: Result<(), CliError>,
+) -> Result<(), CliError> {
+    match (format, outcome) {
+        (_, Ok(())) => Ok(()),
+        (_, Err(CliError::DiagnosticJsonEmitted)) => Err(CliError::DiagnosticJsonEmitted),
+        (None | Some(OutputFormat::Human), Err(err)) => Err(err),
+        (Some(format @ (OutputFormat::Plain | OutputFormat::Json)), Err(err)) => {
+            Err(crate::driver::emit_machine_error(format, "doc", &err))
+        }
     }
 }
 
@@ -2467,8 +2500,7 @@ fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
 /// * `--json`: `{"modules":["Ipe.List","Ipe.String",…]}`.
 ///
 /// # Errors
-/// The refusal of a package or named tree that cannot be read, written as the
-/// machine error envelope under a machine format.
+/// The refusal of a package or named tree that cannot be read.
 fn list_modules(
     target: &ListTarget,
     scope: &ProjectScope,
@@ -2477,17 +2509,7 @@ fn list_modules(
     use crate::screen::{Screen, Stream, emit_machine};
     use crate::style::GUTTER;
 
-    let project_names = match list_project_names(target, scope) {
-        Ok(names) => names,
-        Err(err) => {
-            return Err(match format {
-                OutputFormat::Human => err,
-                OutputFormat::Plain | OutputFormat::Json => {
-                    crate::driver::emit_machine_error(format, "doc", &err)
-                }
-            });
-        }
-    };
+    let project_names = list_project_names(target, scope)?;
 
     // Collect stdlib names.
     let stdlib: Vec<String> = stdlib_module_names();

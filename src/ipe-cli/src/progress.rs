@@ -820,6 +820,25 @@ mod tests {
     }
 
     #[test]
+    fn a_painted_label_carries_no_escape_control_or_bidi_byte() {
+        let (first, painted) = mpsc::channel();
+        let writer = Signalling {
+            bytes: Vec::new(),
+            first: Some(first),
+        };
+        let hostile = "a\u{1b}]0;title\u{7}b\u{1b}[2Jc\u{202e}d\re";
+        let (value, writer) = while_pending_on(Indicator::Spinner, writer, QUICK, hostile, || {
+            painted.recv_timeout(Duration::from_secs(5)).is_ok()
+        });
+        assert!(value, "the ticker painted while the body ran");
+        let Some(writer) = writer else { return };
+        let out = String::from_utf8_lossy(&writer.bytes).into_owned();
+        for injected in ["\u{1b}]", "\u{7}", "\u{1b}[2J", "\u{202e}", "d\re"] {
+            assert!(!out.contains(injected), "{injected:?} reached {out:?}");
+        }
+    }
+
+    #[test]
     fn a_pending_label_is_one_terminal_line() {
         let label = crate::text::doc_lookup_pending();
         assert_eq!(TerminalLine::sanitize(label).as_str(), label);
