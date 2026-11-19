@@ -1,0 +1,23 @@
+[package]
+name = "ipe-git-https-fixture"
+description = "A read-only git smart-HTTP server over TLS on loopback: the test source every index-fetch fixture records"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "git_https_fixture"
+path = "src/lib.rs"
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+httparse = "1"
+ipe-test-temp = { path = "../test-temp" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -3007,6 +3007,7 @@ dependencies = [
  "hex",
  "include_dir",
  "ipe",
+ "ipe-git-https-fixture",
  "ipe-runtime-rust",
  "ipe-test-temp",
  "ipe_backend",
@@ -3067,6 +3068,17 @@ dependencies = [
  "ipe_sandbox",
  "serde",
  "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "ipe-git-https-fixture"
+version = "0.7.4"
+dependencies = [
+ "httparse",
+ "ipe-test-temp",
+ "rustls",
+ "rustls-pki-types",
  "tempfile",
 ]
 
