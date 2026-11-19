@@ -11,8 +11,11 @@
 // A failed `expect` in test setup IS the failure signal the harness reports.
 #![allow(clippy::expect_used, clippy::panic)]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use git_https_fixture::GitHttpsFixture;
 
 mod support;
 
@@ -56,12 +59,22 @@ ipe_does_not_exist_xyz_q9z = \"*\"\n";
 /// Run `ipe package audit <pkg>` with an isolated (empty) index directory unless
 /// `index` overrides it, returning `(success, stdout, stderr)`.
 fn run_audit(pkg: &Path, index: &Path) -> (bool, String, String) {
+    run_audit_with(pkg, index, [])
+}
+
+/// [`run_audit`] with `env` added to the child, e.g. a fixture server's trust.
+fn run_audit_with(
+    pkg: &Path,
+    index: &Path,
+    env: impl IntoIterator<Item = (&'static str, OsString)>,
+) -> (bool, String, String) {
     let out = Command::new(support::ipe_bin())
         .arg("package")
         .arg("audit")
         .arg(pkg)
         .arg("--index")
         .arg(index)
+        .envs(env)
         .current_dir(support::repo_root())
         .output()
         .expect("run ipe package audit");
@@ -385,7 +398,7 @@ import Ipe.Io
          main : Task ()\nmain =\n\x20   Io.println \"hi\"\n",
     );
 
-    let (ok, stdout, stderr) = run_audit(&pkg, &index.index_root);
+    let (ok, stdout, stderr) = run_audit_with(&pkg, &index.index_root, index.server.client_env());
     assert!(
         !ok,
         "a breaking change under a patch bump must reject; stdout:\n{stdout}\nstderr:\n{stderr}"
@@ -564,11 +577,13 @@ fn committed_bindings_are_ignored_for_native_packages() {
     );
 }
 
-/// A published-predecessor index backed by a real git repo, so the audit's
-/// semver check can fetch + hash-verify the baseline source exactly as it would
-/// in production.
+/// A published-predecessor index backed by a real git repo served over a
+/// loopback HTTPS fixture, so the audit's semver check can fetch + hash-verify
+/// the baseline source exactly as it would in production.
 struct PublishedIndex {
     index_root: PathBuf,
+    /// The server the entry's `source` names; it must outlive the audit run.
+    server: GitHttpsFixture,
 }
 
 /// Build a git repo holding version `version` of `name` (a `src/Lib.ipe` +
@@ -605,11 +620,12 @@ fn published_predecessor_index(name: &str, version: &str, lib: &str, main: &str)
     // hash-mismatch boundary.
     let sha = ipe::resolve::hash_source_tree(&src_repo).expect("hash baseline tree");
 
+    let (server, urls) = GitHttpsFixture::start(&[&src_repo]).expect("fixture server starts");
+    let url = urls.first().expect("one served repository");
     let index_root = empty_index(&format!("{name}-{version}"));
     let entry = format!(
         "name = \"{name}\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"{version}\"\n\
-         source = \"{}\"\nrev = \"{rev}\"\nsha256 = \"{sha}\"\ncapabilities = []\n",
-        src_repo.display()
+         source = \"{url}\"\nrev = \"{rev}\"\nsha256 = \"{sha}\"\ncapabilities = []\n",
     );
     std::fs::write(
         index_root.join("packages").join(format!("{name}.toml")),
@@ -617,7 +633,7 @@ fn published_predecessor_index(name: &str, version: &str, lib: &str, main: &str)
     )
     .expect("write index entry");
 
-    PublishedIndex { index_root }
+    PublishedIndex { index_root, server }
 }
 
 fn git(dir: &Path, args: &[&str]) {

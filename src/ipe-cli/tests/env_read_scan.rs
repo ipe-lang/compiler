@@ -91,6 +91,23 @@ const HOST_NAMES: &[&str] = &[
     "SystemRoot",
     "DATABASE_URL",
     "CARGO",
+    // The host values an isolated git keeps, forwarded uninterpreted.
+    "SSH_AUTH_SOCK",
+    "LANG",
+    "LC_ALL",
+    "LC_MESSAGES",
+    "LANGUAGE",
+    "http_proxy",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "GIT_SSL_CAINFO",
+    "GIT_SSL_CAPATH",
 ];
 
 /// The prefix of the Cargo build variables, all host variables; `CARGO`

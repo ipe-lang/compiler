@@ -214,6 +214,8 @@ win32job = "2"
 # release build spells its feature bare (`.github/ci/release_build.py`).
 ipe = { path = ".", features = ["test-fixtures"] }
 ipe-test-temp = { path = "../../tools/test-temp" }
+# The loopback HTTPS git server every index-fetch fixture records as its source.
+ipe-git-https-fixture = { path = "../../tools/git-https-fixture" }
 # The nesting shapes at the parser's ceiling, shared with the in-browser test.
 nesting-shapes = { path = "../../tools/nesting-shapes" }
 # Build + run plumbing shared by the golden E2E tests (tests/support/mod.rs).

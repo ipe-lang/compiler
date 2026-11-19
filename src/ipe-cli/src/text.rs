@@ -2080,8 +2080,16 @@ messages! {
     publish_fresh_needs_blessing(name, reason) = "publish-fresh-needs-blessing";
     /// A blessing proof that does not cover the claimed publisher.
     publish_fresh_claim_not_covered(claimed) = "publish-fresh-claim-not-covered";
-    /// An index `source` that is not an accepted URL.
+    /// An index `source` that is an injection-shaped or off-alphabet network URL.
     index_source_url_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-invalid";
+    /// An index `source` URL whose `[user@]host[:port]` is not a plain name.
+    index_source_url_authority(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-authority";
+    /// An index `source` URL `git` would split into another host than its own.
+    index_source_url_path(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-path";
+    /// An index `source` that is not an `https://` or `ssh://` URL.
+    index_source_url_not_network(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-not-network";
+    /// A lockfile escape `source` that is neither a network URL nor an absolute local location.
+    lock_escape_source_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "lock-escape-source-invalid";
     /// An index `source` that names a network share or device.
     index_source_url_remote(pkg: &crate::package_name::PackageName, kind, raw: &crate::style::TerminalSafe) = "index-source-url-remote";
     /// An index `source` on the plaintext `git://` transport.
@@ -2257,7 +2265,7 @@ mod tests {
             ),
             (
                 index_source_url_invalid(&pkg, &hostile),
-                "package `pkg`: `source` must be an https://, ssh://, or file:// URL (or a bare absolute path), got: xyz",
+                "package `pkg`: `source` must be an https:// or ssh:// URL with no option-shaped or transport-helper text, got: xyz",
             ),
             (
                 registry_json_malformed(&pkg, &hostile),
@@ -2864,5 +2872,29 @@ mod tests {
         for src in clean {
             assert!(literal_message_calls(src).is_empty(), "flagged: {src}");
         }
+    }
+
+    /// The index-route refusal names only the network remedy; the escape route keeps its local grammar.
+    #[test]
+    #[allow(clippy::expect_used)] // the fixture name is a literal registry name
+    fn the_index_route_refusal_text_names_its_remedy() {
+        let pkg = crate::package_name::PackageName::parse("pkg").expect("fixture name parses");
+        let raw = crate::style::TerminalSafe::sanitize("/srv/repo");
+        let not_network = msg::index_source_url_not_network(&pkg, &raw);
+        for remedy in ["https://", "ssh://"] {
+            assert!(not_network.as_str().contains(remedy), "{not_network:?}");
+        }
+        assert!(
+            not_network.as_str().contains("is never an index source"),
+            "{not_network:?}"
+        );
+        let invalid = msg::index_source_url_invalid(&pkg, &raw);
+        assert!(!invalid.as_str().contains("file://"), "{invalid:?}");
+        assert!(
+            !invalid.as_str().contains("bare absolute path"),
+            "{invalid:?}"
+        );
+        let escape = msg::lock_escape_source_invalid(&pkg, &raw);
+        assert!(escape.as_str().contains("file://"), "{escape:?}");
     }
 }

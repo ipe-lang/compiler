@@ -8,7 +8,7 @@
 //!    `admission_precheck` DENIES the structural attacks (name-squat via a
 //!    divergent source, a rewritten immutable version, an over-long version list).
 //! 2. **Ephemeral local git index E2E** — build a temp git index + a temp git
-//!    source, insert an entry whose sha256 is the source tree's real hash, run the
+//!    source served over a loopback HTTPS fixture, insert an entry whose sha256 is the source tree's real hash, run the
 //!    resolver → success; then tamper (an entry whose sha256 no longer matches) →
 //!    the resolver rejects with `HashMismatch` and writes nothing.
 //! 3. **Full `audit-entry` receiving gate** — the same call `admission.yml` runs
@@ -30,11 +30,13 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git_https_fixture::GitHttpsFixture;
 use ipe::index::{self, EntryVersion, IndexEntry, PinnedRev, Sha256Hex, SourceUrl};
 use ipe::lockfile::Lockfile;
 use ipe::package_name::PackageName;
 use ipe::published_version::{PublishedVersion, VersionRefusal};
 use ipe::publisher::{AttestedActor, SelfDeclaredPublisher};
+use ipe::remote_ingest::{FixtureTrust, trust_fixture};
 use ipe::resolve::{self, hash_source_tree};
 
 // ── temp / git helpers ──────────────────────────────────────────────────────
@@ -84,20 +86,31 @@ fn fixture_source(tag: &str) -> PathBuf {
     repo
 }
 
-/// A fixture index holding one package version pointing at `source`, pinned to
-/// its HEAD, with the given `sha256`. Returns the index root.
-fn fixture_index(tag: &str, name: &str, version: &str, source: &Path, sha256: &str) -> PathBuf {
+/// A fixture index holding one package version pointing at `source`, served
+/// over a loopback HTTPS fixture this process's isolated git trusts, pinned to
+/// its HEAD, with the given `sha256`. Returns the index root and the server,
+/// which must outlive every fetch; a spawned `ipe` trusts it through
+/// [`GitHttpsFixture::client_env`].
+fn fixture_index(
+    tag: &str,
+    name: &str,
+    version: &str,
+    source: &Path,
+    sha256: &str,
+) -> (PathBuf, GitHttpsFixture) {
+    let (fixture, urls) = GitHttpsFixture::start(&[source]).expect("fixture server starts");
+    trust_fixture(FixtureTrust::new(fixture.client_env())).expect("one trust per process");
+    let url = urls.first().expect("one served repository");
     let index = temp_dir(&format!("index-{tag}"));
     let packages = index.join("packages");
     std::fs::create_dir_all(&packages).expect("packages dir");
     let entry = format!(
         "name = \"{name}\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"{version}\"\n\
-         source = \"{}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = [\"network\"]\n",
-        source.display(),
+         source = \"{url}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = [\"network\"]\n",
         head_rev(source),
     );
     std::fs::write(packages.join(format!("{name}.toml")), entry).expect("write entry");
-    index
+    (index, fixture)
 }
 
 fn scaffold_project(tag: &str) -> PathBuf {
@@ -625,7 +638,7 @@ fn precheck_denies_a_reserved_blessed_rewrite() {
 fn ephemeral_index_resolves_and_verifies_a_faithful_entry() {
     let source = fixture_source("e2e-ok");
     let sha = hash_source_tree(&source).expect("hash source");
-    let index = fixture_index("e2e-ok", "http-extras", "1.2.0", &source, sha.as_str());
+    let (index, _server) = fixture_index("e2e-ok", "http-extras", "1.2.0", &source, sha.as_str());
     let proj = scaffold_project("e2e-ok");
 
     let req = "^1".parse().expect("valid req");
@@ -650,7 +663,7 @@ fn ephemeral_index_rejects_a_tampered_tree() {
     // The index pins a (well-formed) hash the fetched source does not match:
     // verify-before-trust rejects it and writes nothing.
     let source = fixture_source("e2e-tamper");
-    let index = fixture_index("e2e-tamper", "http-extras", "1.2.0", &source, VALID_SHA);
+    let (index, _server) = fixture_index("e2e-tamper", "http-extras", "1.2.0", &source, VALID_SHA);
     let proj = scaffold_project("e2e-tamper");
 
     let req = "^1".parse().expect("valid req");
@@ -726,7 +739,7 @@ fn audit_entry_rejects_a_package_that_fails_the_tier1_audit() {
     // A well-formed entry whose sha256 is the source tree's real hash and whose
     // rev is the committed HEAD: schema + fetch + integrity all pass, so the ONLY
     // reachable rejection is the Tier-1 audit.
-    let index = fixture_index(
+    let (index, server) = fixture_index(
         "audit-tier1",
         "leaky-entry-pkg",
         "1.0.0",
@@ -738,6 +751,7 @@ fn audit_entry_rejects_a_package_that_fails_the_tier1_audit() {
     let out = Command::new(ipe_bin())
         .args(["package", "audit-entry"])
         .arg(&entry_path)
+        .envs(server.client_env())
         // No `--index`: an isolated (empty) baseline, so the version is "new" and
         // fully audited, and the enforced-semver check has no predecessor to fetch.
         .env("IPE_REGISTRY_URL", "")
@@ -799,18 +813,12 @@ fn ipe_bin() -> PathBuf {
     e2e_support::cargo_bin!("ipe").into_path_buf()
 }
 
-#[test]
-fn publish_dry_run_computes_a_correct_entry_offline() {
-    // Gated: the dry-run still runs the local audit gate, which builds the package.
-    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        eprintln!("skipping publish_dry_run_computes_a_correct_entry_offline (set IPE_E2E=1)");
-        return;
-    }
-
-    // A publishable package: a git repo with a committed package.ipe, its HEAD
-    // pushed to a local bare "remote" so publish's committed+pushed precondition
-    // holds without any network.
-    let work = temp_dir("dry-run");
+/// A publishable package under a fresh `tag` work dir: a git repo with a
+/// committed package.ipe, its HEAD pushed to a local bare `origin` so publish's
+/// committed+pushed precondition holds without any network. Returns the work
+/// dir and the package root.
+fn pushed_package(tag: &str) -> (PathBuf, PathBuf) {
+    let work = temp_dir(tag);
     let remote = work.join("remote.git");
     std::fs::create_dir_all(&remote).expect("remote dir");
     git(&remote, &["init", "--quiet", "--bare"]);
@@ -835,17 +843,44 @@ fn publish_dry_run_computes_a_correct_entry_offline() {
         &["remote", "add", "origin", &remote.to_string_lossy()],
     );
     git(&pkg, &["push", "--quiet", "origin", "HEAD"]);
+    (work, pkg)
+}
+
+/// `ipe package publish --dry-run` in `pkg`, air-gapped.
+fn publish_dry_run(pkg: &Path) -> std::process::Output {
+    Command::new(ipe_bin())
+        .args(["package", "publish", "--dry-run"])
+        .current_dir(pkg)
+        // Air-gap the run: an empty registry URL disables the Pages fast-path.
+        .env("IPE_REGISTRY_URL", "")
+        .output()
+        .expect("ipe runs")
+}
+
+#[test]
+fn publish_dry_run_computes_a_correct_entry_offline() {
+    // Gated: the dry-run still runs the local audit gate, which builds the package.
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping publish_dry_run_computes_a_correct_entry_offline (set IPE_E2E=1)");
+        return;
+    }
+    let (work, pkg) = pushed_package("dry-run");
+    // The recorded source is the network URL; the remote-tracking ref the push
+    // left keeps HEAD pushed, so the dry run still touches no network.
+    git(
+        &pkg,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://example.invalid/pkg.git",
+        ],
+    );
 
     let expected_rev = head_rev(&pkg);
     let expected_sha = hash_source_tree(&pkg).expect("hash pkg");
 
-    let out = Command::new(ipe_bin())
-        .args(["package", "publish", "--dry-run"])
-        .current_dir(&pkg)
-        // Air-gap the run: an empty registry URL disables the Pages fast-path.
-        .env("IPE_REGISTRY_URL", "")
-        .output()
-        .expect("ipe runs");
+    let out = publish_dry_run(&pkg);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -864,6 +899,36 @@ fn publish_dry_run_computes_a_correct_entry_offline() {
     assert!(
         stdout.contains("No network"),
         "the dry-run touches no network:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("https://example.invalid/pkg.git"),
+        "the network origin is the recorded source:\n{stdout}"
+    );
+
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// A package whose `origin` is a local repository has no index source: the
+/// dry run refuses it, naming `source` and the https/ssh remedy.
+#[test]
+fn publish_dry_run_refuses_a_local_origin() {
+    // Gated beside its control twin above, which needs the audit build.
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping publish_dry_run_refuses_a_local_origin (set IPE_E2E=1)");
+        return;
+    }
+    let (work, pkg) = pushed_package("dry-run-local");
+
+    let out = publish_dry_run(&pkg);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a local origin must be refused:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("source") && stderr.contains("https://") && stderr.contains("ssh://"),
+        "the refusal names the source and its remedy:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&work);
@@ -909,7 +974,7 @@ fn audit_entry_refuses_capabilities_other_than_the_audited_set() {
     // it records `network` for a package whose audit infers no capability. The
     // admitted set is the audit's own output, so the entry is refused.
     let (source, sha) = fixture_pure_package("lying-caps", "lying-caps-pkg");
-    let index = fixture_index(
+    let (index, server) = fixture_index(
         "lying-caps",
         "lying-caps-pkg",
         "1.0.0",
@@ -921,6 +986,7 @@ fn audit_entry_refuses_capabilities_other_than_the_audited_set() {
     let out = Command::new(ipe_bin())
         .args(["package", "audit-entry"])
         .arg(&entry_path)
+        .envs(server.client_env())
         .env("IPE_REGISTRY_URL", "")
         .output()
         .expect("ipe runs");

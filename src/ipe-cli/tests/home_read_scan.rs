@@ -1306,6 +1306,12 @@ mod lexical {
             reason: "writes the accessor's validated home into a child's environment; reads nothing",
         },
         Allowed {
+            file: "src/ipe-cli/src/remote_ingest.rs",
+            func: "isolated_home_env",
+            reason: "writes the accessor's validated home into the isolated git's emptied \
+                     environment; reads nothing",
+        },
+        Allowed {
             file: WINDOWS_JAIL_FILE,
             func: "name",
             reason: WINDOWS_JAIL_HOST_ENV,
