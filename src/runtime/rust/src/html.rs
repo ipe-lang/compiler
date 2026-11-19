@@ -3,6 +3,10 @@ use std::collections::HashMap;
 
 use super::css_safety;
 use crate::csp::StyleNonce;
+use crate::frames::{
+    Delegation, EscapedPopups, FrameGrants, FramePolicy, ListedOrigin, PageAuthority,
+};
+use crate::inbound_authority::Authority;
 use crate::retained::{Bytes, RetainedBytes};
 
 /// Form data delivered to an `OnForm` handler (lower-cased keys; see dispatch).
@@ -250,6 +254,34 @@ pub enum RenderCtx<'a> {
     Unstamped,
     /// A session's render, under that session's marks.
     Session(&'a SessionMarks),
+    /// The browser client's render, under the marks it read at mount.
+    Client(&'a ClientMarks),
+}
+
+/// The page authority of a render that names none: it trusts no frame.
+static UNKNOWN_PAGE: PageAuthority = PageAuthority::Unknown;
+
+impl RenderCtx<'_> {
+    /// The page authority and escaped-popup mark a frame verdict reads under
+    /// this render; an unstamped render knows no page and holds no popup.
+    pub(crate) fn frame_marks(&self) -> (&PageAuthority, EscapedPopups) {
+        match self {
+            Self::Unstamped => (&UNKNOWN_PAGE, EscapedPopups::Dropped),
+            Self::Session(marks) => (&marks.page, marks.popups),
+            Self::Client(marks) => (&marks.page, marks.popups),
+        }
+    }
+}
+
+/// What the browser client's every render carries: the page's own
+/// authority, read from its location, and whether a trusted frame's popups
+/// may leave its sandbox.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClientMarks {
+    /// The authority the page is shown on.
+    pub page: PageAuthority,
+    /// Whether escaped popups are held.
+    pub popups: EscapedPopups,
 }
 
 /// What a session's every render carries: its style nonce and the mount base
@@ -261,16 +293,43 @@ pub struct SessionMarks {
     /// The base every page link's route is joined to.
     #[cfg(feature = "web-core")]
     pub base: crate::encoding::EncodedBase,
+    /// The authority the session's page is served on; `Unknown` trusts no
+    /// frame.
+    pub page: PageAuthority,
+    /// Whether a trusted frame's popups may leave its sandbox.
+    pub popups: EscapedPopups,
 }
 
 impl SessionMarks {
-    /// Marks stamping `nonce`, with page links at the root base.
+    /// Marks stamping `nonce`, with page links at the root base, no known
+    /// page authority and no escaped popup.
     #[must_use]
     pub fn new(nonce: StyleNonce) -> Self {
         Self {
             nonce,
             #[cfg(feature = "web-core")]
             base: crate::encoding::MountBase::root().encoded(),
+            page: PageAuthority::Unknown,
+            popups: EscapedPopups::Dropped,
+        }
+    }
+
+    /// These marks serving a page on `page`, with `popups` held or dropped.
+    #[must_use]
+    pub fn serving(self, page: PageAuthority, popups: EscapedPopups) -> Self {
+        Self {
+            page,
+            popups,
+            ..self
+        }
+    }
+
+    /// Withdraw the page authority unless `admitted` names it.
+    ///
+    /// A narrowing only: no call makes a withdrawn authority known again.
+    pub fn narrow_page(&mut self, admitted: Option<&Authority>) {
+        if !self.page.is_admitted(admitted) {
+            self.page = PageAuthority::Unknown;
         }
     }
 
@@ -313,7 +372,7 @@ pub(crate) const PAGE_NAV_ATTR: &str = "ipe-nav";
 fn page_href_value(route: &crate::web::route::RoutePath, stamp: &RenderCtx<'_>) -> String {
     let joined = match stamp {
         RenderCtx::Session(marks) => crate::dom::dispatch::BrowserPath::of(&marks.base, route),
-        RenderCtx::Unstamped => crate::dom::dispatch::BrowserPath::of(
+        RenderCtx::Unstamped | RenderCtx::Client(_) => crate::dom::dispatch::BrowserPath::of(
             &crate::encoding::MountBase::root().encoded(),
             route,
         ),
@@ -766,6 +825,85 @@ pub(crate) const SANDBOX_ATTR: &str = "sandbox";
 /// The sandboxed frame element.
 pub(crate) const IFRAME_TAG: &str = "iframe";
 
+/// The `sandbox` tokens a trusted `iframe` may hold, in the order the runtime
+/// paints them: [`SANDBOX_TOKENS`] with `allow-popups-to-escape-sandbox` and
+/// `allow-same-origin`.
+///
+/// Only a [`FrameGrant::Trusted`] holds a value over it. The browser client
+/// mirrors this table in `__IPE_TRUSTED_SANDBOX_TOKENS`.
+pub(crate) const TRUSTED_SANDBOX_TOKENS: [&str; 14] = [
+    "allow-downloads",
+    "allow-forms",
+    "allow-modals",
+    "allow-orientation-lock",
+    "allow-pointer-lock",
+    "allow-popups",
+    "allow-popups-to-escape-sandbox",
+    "allow-presentation",
+    "allow-same-origin",
+    "allow-scripts",
+    "allow-storage-access-by-user-activation",
+    "allow-top-navigation",
+    "allow-top-navigation-by-user-activation",
+    "allow-top-navigation-to-custom-protocols",
+];
+
+/// The token that lets a popup a trusted frame opens leave its sandbox.
+const ESCAPE_POPUPS_TOKEN: &str = "allow-popups-to-escape-sandbox";
+
+/// The token without which [`ESCAPE_POPUPS_TOKEN`] is dead.
+const POPUPS_TOKEN: &str = "allow-popups";
+
+/// The attribute a trusted `iframe`'s delegated features are painted to.
+pub(crate) const ALLOW_ATTR: &str = "allow";
+
+/// The boolean attribute that asks for `fullscreen`.
+const ALLOWFULLSCREEN_ATTR: &str = "allowfullscreen";
+
+/// The permission attributes a frame element may carry.
+///
+/// None is painted as written: a trusted `iframe` paints its parsed `allow`
+/// alone, every other frame element none. The browser client mirrors this
+/// table in `__IPE_FRAME_PERMISSIONS`.
+pub(crate) const FRAME_PERMISSIONS: [&str; 4] = [
+    ALLOW_ATTR,
+    ALLOWFULLSCREEN_ATTR,
+    "allowpaymentrequest",
+    "allowusermedia",
+];
+
+/// The attribute an `iframe` loads inline markup from, ahead of its `src`.
+const SRCDOC_ATTR: &str = "srcdoc";
+
+/// The frame-loading element no origin is trusted for.
+const UNTRUSTED_FRAME_TAG: &str = "frame";
+
+/// The tokens of `value` that `table` names, split on ASCII whitespace as the
+/// browser splits them and matched without regard to ASCII case.
+fn held_tokens<const N: usize>(value: &str, table: &[&str; N]) -> [bool; N] {
+    let mut held = [false; N];
+    for token in value.split_ascii_whitespace() {
+        for (slot, known) in held.iter_mut().zip(table) {
+            if known.eq_ignore_ascii_case(token) {
+                *slot = true;
+            }
+        }
+    }
+    held
+}
+
+/// The held tokens of `table`, space-separated, in table order.
+fn joined_tokens(held: &[bool], table: &[&str]) -> String {
+    let mut out = String::new();
+    for (_, token) in held.iter().zip(table).filter(|(on, _)| **on) {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(token);
+    }
+    out
+}
+
 /// A `sandbox` value that can never grant the app's origin back: a set over
 /// [`SANDBOX_TOKENS`], painted lowercase, once each, in table order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -776,11 +914,35 @@ impl SandboxTokens {
     /// splits them and matched without regard to ASCII case; every other
     /// token, a forbidden one included, is dropped.
     pub(crate) fn parse(value: &str) -> Self {
-        let mut held = [false; SANDBOX_TOKENS.len()];
-        for token in value.split_ascii_whitespace() {
-            for (slot, known) in held.iter_mut().zip(SANDBOX_TOKENS) {
-                if known.eq_ignore_ascii_case(token) {
-                    *slot = true;
+        Self(held_tokens(value, &SANDBOX_TOKENS))
+    }
+
+    /// The canonical `sandbox` value: the held tokens, space-separated.
+    pub(crate) fn canonical(self) -> String {
+        joined_tokens(&self.0, &SANDBOX_TOKENS)
+    }
+}
+
+/// A trusted `iframe`'s `sandbox` value: a set over
+/// [`TRUSTED_SANDBOX_TOKENS`] holding only tokens the app wrote.
+///
+/// Only [`frame_grant`] builds one, from a [`FrameTarget::Trusted`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TrustedSandboxTokens([bool; TRUSTED_SANDBOX_TOKENS.len()]);
+
+impl TrustedSandboxTokens {
+    /// The known tokens of `value`. The escape token is kept only beside
+    /// `allow-popups` and when `popups` are held.
+    fn parse(value: &str, popups: EscapedPopups) -> Self {
+        let mut held = held_tokens(value, &TRUSTED_SANDBOX_TOKENS);
+        let popups_written = TRUSTED_SANDBOX_TOKENS
+            .iter()
+            .zip(held.iter())
+            .any(|(token, on)| *on && *token == POPUPS_TOKEN);
+        if !(popups_written && popups == EscapedPopups::Held) {
+            for (slot, token) in held.iter_mut().zip(TRUSTED_SANDBOX_TOKENS) {
+                if token == ESCAPE_POPUPS_TOKEN {
+                    *slot = false;
                 }
             }
         }
@@ -789,27 +951,145 @@ impl SandboxTokens {
 
     /// The canonical `sandbox` value: the held tokens, space-separated.
     pub(crate) fn canonical(self) -> String {
-        let mut out = String::new();
-        for (_, token) in self.0.iter().zip(SANDBOX_TOKENS).filter(|(held, _)| **held) {
-            if !out.is_empty() {
-                out.push(' ');
-            }
-            out.push_str(token);
-        }
-        out
+        joined_tokens(&self.0, &TRUSTED_SANDBOX_TOKENS)
     }
 }
 
-/// What the frame rule makes of an element before it renders.
+/// Where a frame element's document loads from, decided from its painted
+/// pairs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FrameVerdict {
-    /// Not a frame-loading element: render as is.
-    NotAFrame,
-    /// An `iframe`: render with this one canonical `sandbox` value, and drop
-    /// every `sandbox` pair the app wrote.
-    Sandboxed(SandboxTokens),
-    /// A frame-loading element carrying its loading attribute.
-    Refused(ElementRefusal),
+pub(crate) enum FrameTarget<'p> {
+    /// A listed origin that is not the page's own.
+    Trusted(&'p ListedOrigin),
+    /// Anything else: the frame gets an opaque origin.
+    Untrusted,
+}
+
+/// The listed origin of `policy` that `url` loads from, by bytes.
+///
+/// `url` must hold no byte at or below `0x20`, no `0x7F` and no `\` (the
+/// URL parser strips or rewrites these, so the bytes would not be the URL the
+/// browser loads), and start with a listed origin's exact written bytes
+/// followed by its end, `/`, `?` or `#`. A relative or scheme-relative URL,
+/// another case, a default port, a user part or an encoded host names no
+/// listed origin.
+pub(crate) fn listed_origin<'p>(url: &str, policy: &'p FramePolicy) -> Option<&'p ListedOrigin> {
+    if url.bytes().any(|b| b <= 0x20 || b == 0x7F || b == b'\\') {
+        return None;
+    }
+    policy.origins().iter().find(|origin| {
+        url.strip_prefix(origin.written().as_str())
+            .is_some_and(|rest| matches!(rest.bytes().next(), None | Some(b'/' | b'?' | b'#')))
+    })
+}
+
+/// The attribute a frame element `tag` loads a trustable document from:
+/// `src` for an `iframe` and an `embed`, `data` for an `object`; `None` for a
+/// `frame` and every other tag.
+fn trusted_load_key(tag: &str) -> Option<&'static str> {
+    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+        return Some("src");
+    }
+    if tag.eq_ignore_ascii_case(UNTRUSTED_FRAME_TAG) {
+        return None;
+    }
+    frame_loader_key(tag)
+}
+
+/// The target of a frame element `tag` whose painted pairs are `pairs`,
+/// under `policy`, on a page served on `page`.
+///
+/// Trusted only when the element is an `iframe`, `embed` or `object`, holds
+/// no `srcdoc` (an `iframe`; any value and key case), holds its loading
+/// attribute exactly once, that URL names a listed origin
+/// ([`listed_origin`]), and that origin is not the page's own
+/// ([`crate::frames::served_on`]).
+pub(crate) fn frame_target<'a, 'p>(
+    tag: &str,
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    policy: &'p FramePolicy,
+    page: &PageAuthority,
+) -> FrameTarget<'p> {
+    let Some(loads) = trusted_load_key(tag) else {
+        return FrameTarget::Untrusted;
+    };
+    let iframe = tag.eq_ignore_ascii_case(IFRAME_TAG);
+    let mut url = None;
+    for (key, value) in pairs {
+        if iframe && key.eq_ignore_ascii_case(SRCDOC_ATTR) {
+            return FrameTarget::Untrusted;
+        }
+        if key.eq_ignore_ascii_case(loads) && url.replace(value).is_some() {
+            return FrameTarget::Untrusted;
+        }
+    }
+    url.and_then(|url| listed_origin(url, policy))
+        .filter(|origin| !crate::frames::served_on(origin, page))
+        .map_or(FrameTarget::Untrusted, FrameTarget::Trusted)
+}
+
+/// What an `iframe` is granted: every `sandbox` and permission attribute it
+/// paints comes from this one value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FrameGrant {
+    /// Untrusted: the opaque sandbox and no permission attribute.
+    Opaque(SandboxTokens),
+    /// Trusted: built only from a [`FrameTarget::Trusted`].
+    Trusted {
+        /// The written tokens, `allow-same-origin` among them when written.
+        sandbox: TrustedSandboxTokens,
+        /// The written features, each scoped to the frame's own origin.
+        allow: Delegation,
+    },
+}
+
+impl FrameGrant {
+    /// The one canonical `sandbox` value.
+    pub(crate) fn sandbox(self) -> String {
+        match self {
+            Self::Opaque(tokens) => tokens.canonical(),
+            Self::Trusted { sandbox, .. } => sandbox.canonical(),
+        }
+    }
+
+    /// The canonical `allow` value, or `None` when the frame carries none.
+    pub(crate) fn allow(self) -> Option<String> {
+        match self {
+            Self::Opaque(_) => None,
+            Self::Trusted { allow, .. } => allow.painted(),
+        }
+    }
+}
+
+/// The grant of an `iframe` aimed at `target` whose painted pairs are
+/// `pairs`, under the app's `grants`, with `popups` held or dropped.
+///
+/// The last `sandbox` of any key case is read (absent, it is the empty
+/// sandbox), and on a trusted target the last `allow` and the presence of
+/// `allowfullscreen`; an untrusted target reads no permission attribute.
+pub(crate) fn frame_grant<'a>(
+    target: FrameTarget<'_>,
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    grants: FrameGrants,
+    popups: EscapedPopups,
+) -> FrameGrant {
+    let (mut sandbox, mut allow, mut fullscreen) = ("", None, false);
+    for (key, value) in pairs {
+        if key.eq_ignore_ascii_case(SANDBOX_ATTR) {
+            sandbox = value;
+        } else if key.eq_ignore_ascii_case(ALLOW_ATTR) {
+            allow = Some(value);
+        } else if key.eq_ignore_ascii_case(ALLOWFULLSCREEN_ATTR) {
+            fullscreen = true;
+        }
+    }
+    match target {
+        FrameTarget::Trusted(origin) => FrameGrant::Trusted {
+            sandbox: TrustedSandboxTokens::parse(sandbox, popups),
+            allow: Delegation::parse(allow, fullscreen, &origin.written(), grants),
+        },
+        FrameTarget::Untrusted => FrameGrant::Opaque(SandboxTokens::parse(sandbox)),
+    }
 }
 
 /// The attribute a [`FRAME_LOADERS`] element `tag` loads its document from;
@@ -821,31 +1101,197 @@ pub(crate) fn frame_loader_key(tag: &str) -> Option<&'static str> {
         .map(|(_, key)| *key)
 }
 
-/// The frame rule for an element `tag` whose attributes, in order, are the
-/// pairs `attrs`.
+/// Whether a frame element `tag` whose attributes are the pairs `attrs` is
+/// refused at construction, under `policy`.
 ///
-/// No document such an element loads can share the app's origin: an `iframe`
-/// always renders one sandbox, the last `sandbox` of any ASCII case read (an
-/// absent, empty or unknown value gives the empty sandbox), and a
-/// [`FRAME_LOADERS`] element that carries its loading attribute at all, in any
-/// key case and with any value, is refused, as `" "` resolves to the page
-/// itself. Tags and keys match without regard to ASCII case only.
-pub(crate) fn frame_verdict<'a>(
+/// A [`FRAME_LOADERS`] element is refused when it carries its loading
+/// attribute, in any key case and with any value, unless it is an `embed` or
+/// an `object` and every such value names a listed origin
+/// ([`listed_origin`]); a `frame` is refused for every value, as `" "`
+/// resolves to the page itself. An `iframe` is never refused: its sandbox
+/// is painted at the sink.
+fn frame_refusal<'a>(
     tag: &str,
-    mut attrs: impl Iterator<Item = (&'a str, &'a str)>,
-) -> FrameVerdict {
-    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
-        let value = attrs
-            .filter(|(k, _)| k.eq_ignore_ascii_case(SANDBOX_ATTR))
-            .last()
-            .map_or("", |(_, v)| v);
-        return FrameVerdict::Sandboxed(SandboxTokens::parse(value));
-    }
-    match frame_loader_key(tag) {
-        Some(key) if attrs.any(|(k, _)| k.eq_ignore_ascii_case(key)) => {
-            FrameVerdict::Refused(ElementRefusal::UnsandboxableFrame)
+    attrs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    policy: &FramePolicy,
+) -> Option<ElementRefusal> {
+    let loads = frame_loader_key(tag)?;
+    let trustable = trusted_load_key(tag).is_some();
+    attrs
+        .into_iter()
+        .any(|(key, value)| {
+            key.eq_ignore_ascii_case(loads)
+                && !(trustable && listed_origin(value, policy).is_some())
+        })
+        .then_some(ElementRefusal::UnsandboxableFrame)
+}
+
+/// The ordered patch plan of a frame element, which the browser clients
+/// apply in place of per-key writes.
+#[cfg(any(test, feature = "wasm-client"))]
+pub(crate) mod frame_patch {
+    use super::{
+        ALLOW_ATTR, ALLOWFULLSCREEN_ATTR, EscapedPopups, FRAME_PERMISSIONS, FramePolicy,
+        FrameTarget, IFRAME_TAG, PageAuthority, SANDBOX_ATTR, SRCDOC_ATTR, frame_grant,
+        frame_loader_key, frame_target,
+    };
+
+    /// The keys a patch of an `iframe` plans as one: its grant keys, then its
+    /// navigation keys.
+    const IFRAME_PATCH_KEYS: [&str; 7] = [
+        SANDBOX_ATTR,
+        ALLOW_ATTR,
+        ALLOWFULLSCREEN_ATTR,
+        "allowpaymentrequest",
+        "allowusermedia",
+        "src",
+        SRCDOC_ATTR,
+    ];
+
+    /// The keys a patch of an `embed` or a `frame` plans as one.
+    const SRC_LOADER_PATCH_KEYS: [&str; 5] = [
+        ALLOW_ATTR,
+        ALLOWFULLSCREEN_ATTR,
+        "allowpaymentrequest",
+        "allowusermedia",
+        "src",
+    ];
+
+    /// The keys a patch of an `object` plans as one.
+    const DATA_LOADER_PATCH_KEYS: [&str; 5] = [
+        ALLOW_ATTR,
+        ALLOWFULLSCREEN_ATTR,
+        "allowpaymentrequest",
+        "allowusermedia",
+        "data",
+    ];
+
+    /// The keys a patch of a frame element `tag` plans as one; empty for every
+    /// other tag.
+    fn frame_patch_keys(tag: &str) -> &'static [&'static str] {
+        if tag.eq_ignore_ascii_case(IFRAME_TAG) {
+            return &IFRAME_PATCH_KEYS;
         }
-        Some(_) | None => FrameVerdict::NotAFrame,
+        match frame_loader_key(tag) {
+            Some("data") => &DATA_LOADER_PATCH_KEYS,
+            Some(_) => &SRC_LOADER_PATCH_KEYS,
+            None => &[],
+        }
+    }
+
+    /// The stored name of `key` when a patch of a frame element `tag` plans it
+    /// with the element's other frame keys, matched without regard to ASCII case.
+    pub(crate) fn frame_patch_key(tag: &str, key: &str) -> Option<&'static str> {
+        frame_patch_keys(tag)
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(key))
+            .copied()
+    }
+
+    /// One write of a frame patch plan: set the attribute to the value, or
+    /// remove it.
+    pub(crate) type FrameWrite = (&'static str, Option<String>);
+
+    /// The ordered writes that patch a frame element `tag` by `delta`, the
+    /// patch's frame keys and their new values (`None` removes).
+    ///
+    /// The element's final state is read first: each frame key from `delta`
+    /// when present (the last entry of any key case), else from `live`. The
+    /// target and grant are decided from that state under `policy`, on a page
+    /// served on `page` with `popups` held or dropped. Every grant key is
+    /// written first, set canonical or removed (`allowfullscreen`,
+    /// `allowpaymentrequest` and `allowusermedia` always removed); then each
+    /// navigation key `delta` names. A loader's navigation key is written only
+    /// toward a trusted target and is removed otherwise. So a patch that moves a
+    /// frame off a trusted origin withdraws its grant before it navigates, and a
+    /// grant on an untrusted frame is the opaque one, whatever was asked.
+    pub(crate) fn plan_frame_patch<'a>(
+        tag: &str,
+        delta: &[(&'a str, Option<&'a str>)],
+        live: impl Fn(&str) -> Option<String>,
+        policy: &FramePolicy,
+        page: &PageAuthority,
+        popups: EscapedPopups,
+    ) -> Vec<FrameWrite> {
+        let keys = frame_patch_keys(tag);
+        let asked = |name: &str| {
+            delta
+                .iter()
+                .rev()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| *value)
+        };
+        let finals: Vec<(&'static str, String)> = keys
+            .iter()
+            .filter_map(|name| {
+                asked(name)
+                    .map_or_else(|| live(name), |value| value.map(str::to_owned))
+                    .map(|value| (*name, value))
+            })
+            .collect();
+        let painted = || finals.iter().map(|(key, value)| (*key, value.as_str()));
+        let target = frame_target(tag, painted(), policy, page);
+        let iframe = tag.eq_ignore_ascii_case(IFRAME_TAG);
+        let mut writes: Vec<FrameWrite> = Vec::with_capacity(keys.len());
+        if iframe {
+            let grant = frame_grant(target, painted(), policy.grants(), popups);
+            writes.push((SANDBOX_ATTR, Some(grant.sandbox())));
+            writes.push((ALLOW_ATTR, grant.allow()));
+        }
+        for permission in FRAME_PERMISSIONS {
+            if !(iframe && permission == ALLOW_ATTR) {
+                writes.push((permission, None));
+            }
+        }
+        let grant_keys = writes.len();
+        for name in keys {
+            if writes.iter().take(grant_keys).any(|(key, _)| key == name) {
+                continue;
+            }
+            let Some(value) = asked(name) else {
+                continue;
+            };
+            let trusted = matches!(target, FrameTarget::Trusted(_));
+            let value = value.filter(|_| iframe || trusted).map(str::to_owned);
+            writes.push((name, value));
+        }
+        writes
+    }
+
+    /// How a frame element parsed detached is fenced before it connects.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(crate) enum FrameFence {
+        /// Apply these writes, in order.
+        Write(Vec<FrameWrite>),
+        /// Remove the element: a loader whose URL names no trusted origin.
+        Remove,
+    }
+
+    /// The fence of a frame element `tag` whose attributes are `live`: the
+    /// grant its own state earns ([`plan_frame_patch`] with that state as the
+    /// patch), or removal of an `embed`, `object` or `frame` that holds a URL
+    /// the plan would not keep.
+    pub(crate) fn fence_frame(
+        tag: &str,
+        live: impl Fn(&str) -> Option<String>,
+        policy: &FramePolicy,
+        page: &PageAuthority,
+        popups: EscapedPopups,
+    ) -> FrameFence {
+        let url = (!tag.eq_ignore_ascii_case(IFRAME_TAG))
+            .then(|| frame_loader_key(tag))
+            .flatten()
+            .and_then(|loads| live(loads).map(|url| (loads, url)));
+        let delta: Vec<(&str, Option<&str>)> = url
+            .iter()
+            .map(|(loads, url)| (*loads, Some(url.as_str())))
+            .collect();
+        let writes = plan_frame_patch(tag, &delta, &live, policy, page, popups);
+        if url.is_some() && writes.last().is_some_and(|(_, value)| value.is_none()) {
+            FrameFence::Remove
+        } else {
+            FrameFence::Write(writes)
+        }
     }
 }
 
@@ -949,9 +1395,20 @@ impl ParseContext {
 /// elements (`title`, `textarea`, `noscript`, `iframe`, `xmp`, `noembed`,
 /// `noframes`) are admitted as markup: their text children are entity-escaped
 /// and any trusted `<style>` inside them is markup-neutralised, so no child can
-/// end them early. A frame-loading element runs [`frame_verdict`]: an
-/// `embed`, `object` or `frame` carrying its loading attribute is refused.
+/// end them early. A frame-loading element runs the frame refusal under the
+/// program's frame policy: a `frame` carrying its loading attribute, and an
+/// `embed` or `object` whose loading URL names no listed origin, is refused.
 pub(crate) fn admit_element<K: TrustedRawChild, M>(
+    tag: &str,
+    attrs: &[Attribute<M>],
+    kids: &[K],
+) -> Result<ElementBody, ElementRefusal> {
+    admit_element_under(crate::frames::policy(), tag, attrs, kids)
+}
+
+/// [`admit_element`] under the frame policy `policy`.
+pub(crate) fn admit_element_under<K: TrustedRawChild, M>(
+    policy: &FramePolicy,
     tag: &str,
     attrs: &[Attribute<M>],
     kids: &[K],
@@ -959,7 +1416,7 @@ pub(crate) fn admit_element<K: TrustedRawChild, M>(
     if !is_safe_html_name(tag) {
         return Err(ElementRefusal::UnsafeName);
     }
-    if let FrameVerdict::Refused(refusal) = frame_verdict(tag, painted_pairs(attrs)) {
+    if let Some(refusal) = frame_refusal(tag, painted_pairs(attrs), policy) {
         return Err(refusal);
     }
     if tag.eq_ignore_ascii_case("plaintext") {
@@ -1233,10 +1690,13 @@ fn stored_attr_key(child_ctx: ParseContext, key: &str) -> Cow<'_, str> {
 /// painted document: last write wins across case, and a diff never sets one
 /// spelling while removing another.
 ///
-/// An `iframe` carries exactly one `sandbox`, last: the canonical value of
-/// [`frame_verdict`], in place of every ASCII case variant of `sandbox` the
-/// app wrote. Its old and new sides therefore always both hold `sandbox`, so
-/// no diff removes it.
+/// An `iframe` carries exactly one `sandbox`, and on a trusted target at
+/// most one `allow`, last: its [`FrameGrant`] under the program's frame
+/// policy and `stamp`'s page, in place of every `sandbox` and permission
+/// attribute the app wrote. Its old and new sides therefore always both hold
+/// `sandbox`, so no diff removes it. An `embed`, `object` or `frame` carries
+/// no permission attribute, and its loading attribute only toward a trusted
+/// target.
 ///
 /// A `BoolAttr` that holds is the value `"true"`; a false one, an event and
 /// `NoAttr` carry no pair. `class` (space-separated) and `style`
@@ -1249,8 +1709,18 @@ pub(crate) fn attribute_pairs<'a, M>(
     child_ctx: ParseContext,
     tag: &str,
     attrs: &'a [Attribute<M>],
-    // Read only by a page link, which exists only under `web-core`.
-    #[cfg_attr(not(feature = "web-core"), allow(unused_variables))] stamp: &RenderCtx<'_>,
+    stamp: &RenderCtx<'_>,
+) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
+    attribute_pairs_under(crate::frames::policy(), child_ctx, tag, attrs, stamp)
+}
+
+/// [`attribute_pairs`] under the frame policy `policy`.
+pub(crate) fn attribute_pairs_under<'a, M>(
+    policy: &FramePolicy,
+    child_ctx: ParseContext,
+    tag: &str,
+    attrs: &'a [Attribute<M>],
+    stamp: &RenderCtx<'_>,
 ) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
     /// Pair count past which a key lookup goes through a hash index rather
     /// than a scan, so a long attribute list costs linear time.
@@ -1330,11 +1800,58 @@ pub(crate) fn attribute_pairs<'a, M>(
             None => *existing = Cow::Borrowed(v),
         }
     }
-    if let FrameVerdict::Sandboxed(tokens) = frame_verdict(tag, painted_pairs(attrs)) {
-        pairs.retain(|(k, _)| !k.eq_ignore_ascii_case(SANDBOX_ATTR));
-        pairs.push((Cow::Borrowed(SANDBOX_ATTR), Cow::Owned(tokens.canonical())));
-    }
+    paint_frame(tag, &mut pairs, policy, stamp);
     pairs
+}
+
+/// Paint a frame element `tag`'s grant over its collected `pairs`, under
+/// `policy` and `stamp`'s page.
+///
+/// An `iframe` loses every `sandbox` and permission pair and gains its
+/// [`FrameGrant`]'s; an `embed`, `object` or `frame` loses every permission
+/// pair, and its loading pair unless its target is trusted. Every other tag
+/// is untouched.
+fn paint_frame(
+    tag: &str,
+    pairs: &mut Vec<(Cow<'_, str>, Cow<'_, str>)>,
+    policy: &FramePolicy,
+    stamp: &RenderCtx<'_>,
+) {
+    let iframe = tag.eq_ignore_ascii_case(IFRAME_TAG);
+    let loads = frame_loader_key(tag);
+    if !iframe && loads.is_none() {
+        return;
+    }
+    let (page, popups) = stamp.frame_marks();
+    let target = frame_target(
+        tag,
+        pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+        policy,
+        page,
+    );
+    let permission = |key: &str| {
+        FRAME_PERMISSIONS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(key))
+    };
+    if iframe {
+        let grant = frame_grant(
+            target,
+            pairs.iter().map(|(k, v)| (k.as_ref(), v.as_ref())),
+            policy.grants(),
+            popups,
+        );
+        pairs.retain(|(k, _)| !k.eq_ignore_ascii_case(SANDBOX_ATTR) && !permission(k));
+        pairs.push((Cow::Borrowed(SANDBOX_ATTR), Cow::Owned(grant.sandbox())));
+        if let Some(allow) = grant.allow() {
+            pairs.push((Cow::Borrowed(ALLOW_ATTR), Cow::Owned(allow)));
+        }
+    } else {
+        let untrusted = target == FrameTarget::Untrusted;
+        pairs.retain(|(k, _)| {
+            !permission(k) && !(untrusted && loads.is_some_and(|l| k.eq_ignore_ascii_case(l)))
+        });
+    }
 }
 
 /// The attribute `Html.keyed` sets; the stamper reads it as the key segment.
@@ -2433,21 +2950,60 @@ mod tests {
         assert!(matches!(kept, Html::HElement(..)));
     }
 
-    /// The browser client's literal copy of the frame tables equals the
-    /// runtime's, and the rule covers exactly the four document-loading tags.
+    /// The JS array literal of `items`, each already a JS literal.
+    fn js_array(items: impl IntoIterator<Item = String>) -> String {
+        format!("[{}]", items.into_iter().collect::<Vec<_>>().join(", "))
+    }
+
+    /// The JS string literal of `text`, which holds no quote or backslash.
+    fn js_string(text: &str) -> String {
+        format!("\"{text}\"")
+    }
+
+    /// R14: the browser client's literal copy of every frame table equals the
+    /// runtime's (`DELEGATION_FEATURES` with each class, every `Undisclosed`
+    /// row included), and the rule covers exactly the four document-loading
+    /// tags.
     #[test]
-    fn client_js_frame_table_matches_the_runtime() {
+    fn client_js_frame_vectors_match_the_runtime() {
+        use crate::frames::{DELEGATION_FEATURES, FeatureClass};
         const CLIENT_JS: &str = include_str!("web/client.js");
-        let tokens: Vec<String> = SANDBOX_TOKENS.iter().map(|t| format!("\"{t}\"")).collect();
-        let tokens = format!("var __IPE_SANDBOX_TOKENS = [{}];", tokens.join(", "));
-        let loaders: Vec<String> = FRAME_LOADERS
-            .iter()
-            .map(|(t, k)| format!("[\"{t}\", \"{k}\"]"))
-            .collect();
-        let loaders = format!("var __IPE_FRAME_LOADERS = [{}];", loaders.join(", "));
+        let strings = |table: &[&str]| js_array(table.iter().map(|t| js_string(t)));
+        let tokens = format!("var __IPE_SANDBOX_TOKENS = {};", strings(&SANDBOX_TOKENS));
+        let loaders = js_array(
+            FRAME_LOADERS
+                .iter()
+                .map(|(t, k)| js_array([js_string(t), js_string(k)])),
+        );
+        let loaders = format!("var __IPE_FRAME_LOADERS = {loaders};");
+        let trusted = format!(
+            "var __IPE_TRUSTED_SANDBOX_TOKENS = {};",
+            strings(&TRUSTED_SANDBOX_TOKENS)
+        );
+        let permissions = format!(
+            "var __IPE_FRAME_PERMISSIONS = {};",
+            strings(&FRAME_PERMISSIONS)
+        );
+        let features = js_array(DELEGATION_FEATURES.iter().map(|row| {
+            let (class, suffixes): (&str, &[crate::frames::GrantSuffix]) = match row.class {
+                FeatureClass::Plain => ("plain", &[]),
+                FeatureClass::Gated(suffixes) => ("gated", suffixes),
+                FeatureClass::Undisclosed => ("undisclosed", &[]),
+                FeatureClass::Never => ("never", &[]),
+            };
+            js_array([
+                js_string(row.name),
+                js_string(class),
+                js_array(suffixes.iter().map(|suffix| js_string(suffix.as_str()))),
+            ])
+        }));
+        let features = format!("var __IPE_DELEGATION_FEATURES = {features};");
         for (decl, name) in [
             (tokens, "__IPE_SANDBOX_TOKENS ="),
             (loaders, "__IPE_FRAME_LOADERS ="),
+            (trusted, "__IPE_TRUSTED_SANDBOX_TOKENS ="),
+            (permissions, "__IPE_FRAME_PERMISSIONS ="),
+            (features, "__IPE_DELEGATION_FEATURES ="),
         ] {
             assert_eq!(CLIENT_JS.matches(name).count(), 1, "one {name}");
             assert_eq!(CLIENT_JS.matches(decl.as_str()).count(), 1, "{decl}");
@@ -2459,6 +3015,589 @@ mod tests {
         for forbidden in ["allow-same-origin", "allow-popups-to-escape-sandbox"] {
             assert!(!SANDBOX_TOKENS.contains(&forbidden), "{forbidden}");
             assert_eq!(SandboxTokens::parse(forbidden).canonical(), "");
+            assert!(TRUSTED_SANDBOX_TOKENS.contains(&forbidden), "{forbidden}");
+        }
+        let mut widened: Vec<&str> = SANDBOX_TOKENS.to_vec();
+        widened.extend(["allow-same-origin", "allow-popups-to-escape-sandbox"]);
+        widened.sort_unstable();
+        assert_eq!(widened, TRUSTED_SANDBOX_TOKENS);
+        for name in [
+            "__ipeListedOrigin(",
+            "__ipeServedOn(",
+            "__ipeFrameTarget(",
+            "__ipeTrustedSandbox(",
+            "__ipeAllow(",
+            "__ipeFramePlan(",
+        ] {
+            assert_eq!(
+                CLIENT_JS.matches(&format!("function {name}")).count(),
+                1,
+                "{name}"
+            );
+        }
+    }
+
+    /// The origins every listed-frame test trusts: the first is the page's
+    /// own when the page is served on `app.example`.
+    const LISTED: [&str; 2] = ["https://app.example", "https://frames.example"];
+
+    /// [`LISTED`] as a policy granting `camera`.
+    #[cfg(feature = "encoding")]
+    #[allow(clippy::expect_used)] // the listed origins form a policy
+    fn listed_policy() -> FramePolicy {
+        crate::frames::policy_of(&LISTED, &["camera"]).expect("listed policy")
+    }
+
+    /// Register [`listed_policy`] as the program's frame policy.
+    #[cfg(feature = "encoding")]
+    fn register_listed() {
+        crate::frames::register(&LISTED, &["camera"]);
+    }
+
+    /// Client marks for a page shown on `host`, popups `popups`.
+    fn client_on(host: &str, popups: EscapedPopups) -> ClientMarks {
+        ClientMarks {
+            page: PageAuthority::of_location_host(host),
+            popups,
+        }
+    }
+
+    /// An `iframe` of `attrs` as the client on `other.example` paints it,
+    /// popups `popups`, under the registered [`LISTED`] policy.
+    #[cfg(feature = "encoding")]
+    fn painted_frame(attrs: Vec<Attribute<()>>, popups: EscapedPopups) -> String {
+        register_listed();
+        let marks = client_on("other.example", popups);
+        render_html_in(&bare("iframe", attrs), &RenderCtx::Client(&marks))
+    }
+
+    /// R8 target vectors: a `src` and whether it names a listed origin. An
+    /// unlisted one keeps the frame opaque.
+    const TARGET_VECTORS: [(&str, bool); 19] = [
+        ("https://app.example", true),
+        ("https://app.example/", true),
+        ("https://app.example?q", true),
+        ("https://app.example#f", true),
+        ("https://frames.example/p/q", true),
+        ("/p", false),
+        ("//app.example/p", false),
+        ("HTTPS://app.example", false),
+        ("https://APP.example", false),
+        ("https://app.example:443", false),
+        ("https://app%2Eexample", false),
+        ("https://user@app.example", false),
+        ("https://app.example\t/", false),
+        ("https://app.example\n", false),
+        ("https://app.example\\p", false),
+        ("https://app.example.evil", false),
+        (" https://app.example", false),
+        ("https://app.examplex", false),
+        ("", false),
+    ];
+
+    /// R8: an `iframe` whose `src` names no listed origin, that holds no
+    /// `src`, or that holds a `srcdoc` of any value and key case beside a
+    /// listed `src`, gets the opaque sandbox and no `allow`, whatever it
+    /// wrote; a listed `src` alone is trusted.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn untrusted_src_never_holds_a_widened_grant() {
+        let wide = || {
+            vec![
+                attr("sandbox", "allow-same-origin allow-scripts"),
+                attr("allow", "camera; autoplay"),
+            ]
+        };
+        let opaque = " sandbox=\"allow-scripts\"";
+        for (src, listed) in TARGET_VECTORS {
+            let mut attrs = wide();
+            attrs.push(attr("src", src));
+            let out = painted_frame(attrs, EscapedPopups::Held);
+            assert_eq!(sandboxes(&out), 1, "{out}");
+            if listed {
+                assert!(
+                    out.contains(" sandbox=\"allow-same-origin allow-scripts\""),
+                    "{out}"
+                );
+                assert!(
+                    out.contains(" allow=\"autoplay &#39;src&#39;; camera &#39;src&#39;\""),
+                    "{out}"
+                );
+            } else {
+                assert!(out.contains(opaque), "{src:?}: {out}");
+                assert!(!out.contains(" allow="), "{src:?}: {out}");
+            }
+        }
+        for srcdoc in ["", "x"] {
+            for key in ["srcdoc", "SRCDOC", "SrcDoc"] {
+                let mut attrs = wide();
+                attrs.push(attr("src", "https://app.example"));
+                attrs.push(attr(key, srcdoc));
+                let out = painted_frame(attrs, EscapedPopups::Held);
+                assert!(out.contains(opaque), "{key}={srcdoc:?}: {out}");
+                assert!(!out.contains(" allow="), "{out}");
+            }
+        }
+        let out = painted_frame(wide(), EscapedPopups::Held);
+        assert!(out.contains(opaque) && !out.contains(" allow="), "{out}");
+        let policy = listed_policy();
+        let page = PageAuthority::of_location_host("other.example");
+        let twice = [
+            ("src", "https://app.example"),
+            ("SRC", "https://app.example"),
+        ];
+        assert_eq!(
+            frame_target("iframe", twice, &policy, &page),
+            FrameTarget::Untrusted
+        );
+        for tag in ["frame", "FRAME", "div"] {
+            assert_eq!(
+                frame_target(tag, [("src", "https://app.example")], &policy, &page),
+                FrameTarget::Untrusted,
+                "{tag}"
+            );
+        }
+    }
+
+    /// R9: a trusted `iframe` keeps exactly the tokens it wrote, the two
+    /// widening ones included; the escape token stays only beside
+    /// `allow-popups` with popups held; an untrusted frame never holds it.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn trusted_src_keeps_only_written_tokens() {
+        let src = || attr("src", "https://frames.example/");
+        let out = painted_frame(
+            vec![
+                src(),
+                attr("sandbox", "ALLOW-SCRIPTS allow-same-origin bogus"),
+            ],
+            EscapedPopups::Held,
+        );
+        assert!(
+            out.contains(" sandbox=\"allow-same-origin allow-scripts\""),
+            "{out}"
+        );
+        let out = painted_frame(vec![src()], EscapedPopups::Held);
+        assert!(out.contains(" sandbox=\"\""), "{out}");
+        let escape = "allow-popups allow-popups-to-escape-sandbox";
+        for (sandbox, popups, painted) in [
+            (escape, EscapedPopups::Held, escape),
+            (escape, EscapedPopups::Dropped, "allow-popups"),
+            ("allow-popups-to-escape-sandbox", EscapedPopups::Held, ""),
+        ] {
+            let out = painted_frame(vec![src(), attr("sandbox", sandbox)], popups);
+            assert!(
+                out.contains(&format!(" sandbox=\"{painted}\"")),
+                "{sandbox} {popups:?}: {out}"
+            );
+        }
+        let out = painted_frame(
+            vec![attr("src", "/"), attr("sandbox", escape)],
+            EscapedPopups::Held,
+        );
+        assert!(out.contains(" sandbox=\"allow-popups\""), "{out}");
+    }
+
+    /// R10e: the client withdraws its own origin, and a location that does
+    /// not parse, or an unstamped render, trusts no frame.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn client_context_withdraws_own_origin() {
+        register_listed();
+        let frame = || {
+            bare(
+                "iframe",
+                vec![
+                    attr("src", "https://app.example/p"),
+                    attr("sandbox", "allow-same-origin"),
+                ],
+            )
+        };
+        let trusted = " sandbox=\"allow-same-origin\"";
+        let paint = |host: &str| {
+            let marks = client_on(host, EscapedPopups::Dropped);
+            render_html_in(&frame(), &RenderCtx::Client(&marks))
+        };
+        assert!(paint("other.example").contains(trusted));
+        for host in ["app.example", "app.example:8443", "app.example.", "", "a b"] {
+            let out = paint(host);
+            assert!(out.contains(" sandbox=\"\""), "{host:?}: {out}");
+        }
+        let out = render_html_in(&frame(), &RenderCtx::Unstamped);
+        assert!(out.contains(" sandbox=\"\""), "{out}");
+        let session = SessionMarks::new(StyleNonce::from_random_bytes([7; 16]));
+        let out = render_html_in(&frame(), &RenderCtx::Session(&session));
+        assert!(out.contains(" sandbox=\"\""), "unknown session page: {out}");
+        let Ok(other) = Authority::parse("other.example") else {
+            return;
+        };
+        let served = session.serving(PageAuthority::Known(other), EscapedPopups::Dropped);
+        let out = render_html_in(&frame(), &RenderCtx::Session(&served));
+        assert!(out.contains(trusted), "{out}");
+    }
+
+    /// R10f: the wasm client paints and diffs only under its client marks.
+    #[test]
+    fn wasm_paints_under_the_client_context() {
+        const WASM: &str = include_str!("wasm/mod.rs");
+        let production: String = WASM
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!production.contains("RenderCtx::Unstamped"));
+        assert!(!production.contains("render_html("));
+        for call in ["diff(", "paint_first("] {
+            let mut sites = 0;
+            for (at, _) in production.match_indices(call) {
+                let before = production.get(..at).unwrap_or_default();
+                if before.ends_with("fn ") || before.ends_with('_') || before.ends_with("::") {
+                    continue;
+                }
+                let line = production.get(at..).and_then(|rest| rest.split(';').next());
+                assert!(
+                    line.is_some_and(|line| line.contains("RenderCtx::Client(")),
+                    "{call} at {at}: {line:?}"
+                );
+                sites += 1;
+            }
+            assert!(sites > 0, "{call}");
+        }
+    }
+
+    /// R11: no permission attribute, of any case, reaches an untrusted
+    /// `iframe`, nor any `embed` or `object`, trusted or not.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn untrusted_frames_paint_no_permission_attribute() {
+        register_listed();
+        let marks = client_on("other.example", EscapedPopups::Held);
+        let permissions = || {
+            vec![
+                attr("allow", "camera"),
+                attr("ALLOW", "autoplay"),
+                Attribute::BoolAttr("AllowFullscreen".into(), true),
+                attr("allowpaymentrequest", ""),
+                attr("ALLOWUSERMEDIA", ""),
+            ]
+        };
+        for (tag, key, url) in [
+            ("iframe", "src", "/"),
+            ("iframe", "src", "https://unlisted.example"),
+            ("embed", "src", "https://app.example"),
+            ("embed", "type", "x"),
+            ("object", "data", "https://frames.example"),
+            ("OBJECT", "type", "x"),
+        ] {
+            let mut attrs = permissions();
+            attrs.push(attr(key, url));
+            let out = render_html_in(&bare(tag, attrs), &RenderCtx::Client(&marks));
+            let lower = out.to_ascii_lowercase();
+            for permission in FRAME_PERMISSIONS {
+                for end in ['=', ' ', '>'] {
+                    assert!(
+                        !lower.contains(&format!(" {permission}{end}")),
+                        "{tag}: {out}"
+                    );
+                }
+            }
+            assert!(
+                lower.contains(&format!("<{}", tag.to_ascii_lowercase())),
+                "{out}"
+            );
+        }
+        let out = render_html_in(
+            &bare("embed", vec![attr("src", "https://app.example/v")]),
+            &RenderCtx::Client(&marks),
+        );
+        assert_eq!(out, "<embed src=\"https://app.example/v\" />");
+        for host in ["app.example", ""] {
+            let own = client_on(host, EscapedPopups::Held);
+            let out = render_html_in(
+                &bare("embed", vec![attr("src", "https://app.example/v")]),
+                &RenderCtx::Client(&own),
+            );
+            assert_eq!(out, "<embed />", "{host:?}");
+        }
+    }
+
+    /// R12: an `embed` or `object` loading a listed origin is admitted, one
+    /// loading anything else refused; a `frame` is refused for every URL.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn trusted_loader_admitted_untrusted_refused() {
+        let policy = listed_policy();
+        let none = &[] as &[Html<()>];
+        for (tag, key) in [("embed", "src"), ("OBJECT", "DATA")] {
+            for url in ["https://app.example", "https://frames.example/x?y"] {
+                assert!(
+                    admit_element_under(&policy, tag, &[attr(key, url)], none).is_ok(),
+                    "{tag} {url}"
+                );
+            }
+            for url in ["/", "https://other.example", "https://app.example.evil", ""] {
+                assert_eq!(
+                    admit_element_under(&policy, tag, &[attr(key, url)], none),
+                    Err(ElementRefusal::UnsandboxableFrame),
+                    "{tag} {url}"
+                );
+            }
+            let twice = [attr(key, "https://app.example"), attr(key, "/")];
+            assert_eq!(
+                admit_element_under(&policy, tag, &twice, none),
+                Err(ElementRefusal::UnsandboxableFrame)
+            );
+        }
+        for url in ["https://app.example", "/"] {
+            assert_eq!(
+                admit_element_under(&policy, "frame", &[attr("src", url)], none),
+                Err(ElementRefusal::UnsandboxableFrame)
+            );
+        }
+        assert_eq!(
+            admit_element_under(
+                &FramePolicy::none(),
+                "embed",
+                &[attr("src", LISTED[0])],
+                none
+            ),
+            Err(ElementRefusal::UnsandboxableFrame)
+        );
+    }
+
+    /// The writes `delta` plans on an `iframe` whose live attributes are
+    /// `live`, under [`listed_policy`] on `other.example`.
+    #[cfg(feature = "encoding")]
+    fn planned(
+        tag: &str,
+        live: &[(&str, &str)],
+        delta: &[(&str, Option<&str>)],
+    ) -> Vec<frame_patch::FrameWrite> {
+        let page = PageAuthority::of_location_host("other.example");
+        frame_patch::plan_frame_patch(
+            tag,
+            delta,
+            |key| {
+                live.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_owned())
+            },
+            &listed_policy(),
+            &page,
+            EscapedPopups::Held,
+        )
+    }
+
+    /// R13: every planned grant write precedes every navigation write, in
+    /// either delta order; leaving a trusted origin withdraws
+    /// `allow-same-origin`, the escape token and `allow` before navigating;
+    /// a grant-only patch of an untrusted frame writes opaque values.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn a_patch_writes_grants_before_navigation() {
+        let wide = "allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-scripts";
+        let trusted: &[(&str, &str)] = &[
+            ("src", "https://app.example"),
+            ("sandbox", wide),
+            ("allow", "camera"),
+        ];
+        let untrusted: &[(&str, &str)] = &[("src", "/"), ("sandbox", "allow-scripts")];
+        let navigations: [&[(&str, Option<&str>)]; 4] = [
+            &[("src", Some("/away")), ("sandbox", Some(wide))],
+            &[
+                ("SRC", Some("https://frames.example")),
+                ("allow", Some("camera")),
+            ],
+            &[("srcdoc", Some("<p>")), ("sandbox", Some(wide))],
+            &[("src", Some("https://app.example")), ("srcdoc", None)],
+        ];
+        for live in [trusted, untrusted] {
+            for delta in navigations {
+                for order in [delta.to_vec(), delta.iter().rev().copied().collect()] {
+                    let writes = planned("iframe", live, &order);
+                    let first_nav = writes
+                        .iter()
+                        .position(|(k, _)| matches!(*k, "src" | "srcdoc"))
+                        .unwrap_or(writes.len());
+                    let last_grant = writes
+                        .iter()
+                        .rposition(|(k, _)| !matches!(*k, "src" | "srcdoc"))
+                        .unwrap_or(0);
+                    assert!(last_grant < first_nav, "{writes:?}");
+                    assert_eq!(writes.first().map(|(k, _)| *k), Some(SANDBOX_ATTR));
+                }
+            }
+        }
+        let away = planned("iframe", trusted, &[("src", Some("/away"))]);
+        assert_eq!(
+            away,
+            [
+                (SANDBOX_ATTR, Some("allow-popups allow-scripts".to_owned())),
+                (ALLOW_ATTR, None),
+                ("allowfullscreen", None),
+                ("allowpaymentrequest", None),
+                ("allowusermedia", None),
+                ("src", Some("/away".to_owned())),
+            ]
+        );
+        let doc = planned("iframe", trusted, &[("srcdoc", Some(""))]);
+        assert_eq!(
+            doc.first(),
+            Some(&(SANDBOX_ATTR, Some("allow-popups allow-scripts".to_owned())))
+        );
+        assert_eq!(doc.last(), Some(&("srcdoc", Some(String::new()))));
+        let grant_only = planned(
+            "iframe",
+            untrusted,
+            &[("sandbox", Some(wide)), ("allow", Some("camera"))],
+        );
+        assert_eq!(
+            grant_only.get(..2),
+            Some(
+                &[
+                    (SANDBOX_ATTR, Some("allow-popups allow-scripts".to_owned())),
+                    (ALLOW_ATTR, None)
+                ][..]
+            )
+        );
+        let toward = planned(
+            "iframe",
+            untrusted,
+            &[("src", Some("https://frames.example"))],
+        );
+        assert_eq!(
+            toward.first(),
+            Some(&(SANDBOX_ATTR, Some("allow-scripts".to_owned())))
+        );
+        let kept = planned("iframe", trusted, &[("title", Some("t"))]);
+        assert_eq!(kept.first(), Some(&(SANDBOX_ATTR, Some(wide.to_owned()))));
+        assert_eq!(
+            kept.get(1),
+            Some(&(ALLOW_ATTR, Some("camera 'src'".to_owned())))
+        );
+        let embed = planned("embed", &[], &[("src", Some("https://elsewhere.example"))]);
+        assert_eq!(embed.last(), Some(&("src", None)));
+        let embed = planned("embed", &[], &[("src", Some("https://app.example"))]);
+        assert_eq!(
+            embed.last(),
+            Some(&("src", Some("https://app.example".to_owned())))
+        );
+        let object = planned("object", &[], &[("DATA", Some("/x"))]);
+        assert_eq!(object.last(), Some(&("data", None)));
+        let frame = planned("frame", &[], &[("src", Some("https://app.example"))]);
+        assert_eq!(frame.last(), Some(&("src", None)));
+        for (tag, key, planned_as) in [
+            ("IFRAME", "SrcDoc", Some("srcdoc")),
+            ("iframe", "ALLOW", Some("allow")),
+            ("object", "Data", Some("data")),
+            ("object", "src", None),
+            ("embed", "type", None),
+            ("div", "src", None),
+        ] {
+            assert_eq!(
+                frame_patch::frame_patch_key(tag, key),
+                planned_as,
+                "{tag} {key}"
+            );
+        }
+    }
+
+    /// The fence of a frame element whose attributes are `live`, under
+    /// [`listed_policy`] on `other.example`.
+    #[cfg(feature = "encoding")]
+    fn fenced(tag: &str, live: &[(&str, &str)]) -> frame_patch::FrameFence {
+        let page = PageAuthority::of_location_host("other.example");
+        frame_patch::fence_frame(
+            tag,
+            |key| {
+                live.iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| (*v).to_owned())
+            },
+            &listed_policy(),
+            &page,
+            EscapedPopups::Dropped,
+        )
+    }
+
+    /// A detached frame is fenced to the grant its own state earns: an
+    /// untrusted `iframe` to the opaque sandbox, a trusted one to its written
+    /// tokens; a loader with an unlisted URL is removed, one with a listed
+    /// URL or none keeps itself, and every loader loses its permissions.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn a_fence_earns_the_grant_of_the_frames_own_state() {
+        use frame_patch::FrameFence;
+        let wide = "allow-same-origin allow-scripts";
+        let opaque = fenced("iframe", &[("src", "/"), ("sandbox", wide)]);
+        assert!(
+            matches!(opaque, FrameFence::Write(_)),
+            "an iframe is never removed"
+        );
+        let FrameFence::Write(opaque) = opaque else {
+            return;
+        };
+        assert_eq!(
+            opaque.first(),
+            Some(&(SANDBOX_ATTR, Some("allow-scripts".to_owned())))
+        );
+        assert!(!opaque.iter().any(|(k, _)| *k == "src"));
+        let trusted = fenced(
+            "iframe",
+            &[
+                ("src", "https://frames.example"),
+                ("sandbox", wide),
+                ("allow", "camera"),
+            ],
+        );
+        assert!(
+            matches!(trusted, FrameFence::Write(_)),
+            "an iframe is never removed"
+        );
+        let FrameFence::Write(trusted) = trusted else {
+            return;
+        };
+        assert_eq!(
+            trusted.first(),
+            Some(&(SANDBOX_ATTR, Some(wide.to_owned())))
+        );
+        assert_eq!(
+            trusted.get(1),
+            Some(&(ALLOW_ATTR, Some("camera 'src'".to_owned())))
+        );
+        for (tag, live) in [
+            ("embed", &[("src", "/")][..]),
+            ("EMBED", &[("src", "")][..]),
+            ("object", &[("data", "https://unlisted.example")][..]),
+            ("frame", &[("src", "https://app.example")][..]),
+        ] {
+            assert_eq!(fenced(tag, live), FrameFence::Remove, "{tag} {live:?}");
+        }
+        for (tag, live) in [
+            (
+                "embed",
+                &[("src", "https://app.example/v"), ("allow", "camera")][..],
+            ),
+            ("object", &[("data", "https://frames.example")][..]),
+            ("embed", &[("type", "x")][..]),
+        ] {
+            let fence = fenced(tag, live);
+            assert!(
+                matches!(fence, FrameFence::Write(_)),
+                "{tag} {live:?} is kept"
+            );
+            let FrameFence::Write(writes) = fence else {
+                return;
+            };
+            assert!(
+                writes
+                    .iter()
+                    .all(|(k, v)| FRAME_PERMISSIONS.contains(k) == v.is_none()),
+                "{writes:?}"
+            );
         }
     }
 

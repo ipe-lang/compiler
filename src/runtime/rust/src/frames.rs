@@ -10,6 +10,8 @@
 
 use std::sync::OnceLock;
 
+use crate::inbound_authority::{Authority, AuthorityHost};
+
 #[cfg(feature = "encoding")]
 pub use crate::encoding::FRAME_HEADER_BUDGET;
 #[cfg(feature = "encoding")]
@@ -601,6 +603,139 @@ impl Delegation {
     }
 }
 
+/// One trusted frame origin, as the frame verdict reads it.
+///
+/// With `encoding` it is the re-parsed [`FrameOrigin`]. Without it no origin
+/// can be parsed, so the type has no value and every verdict over it is
+/// untrusted by construction.
+#[cfg(feature = "encoding")]
+pub type ListedOrigin = FrameOrigin;
+
+/// One trusted frame origin, as the frame verdict reads it.
+///
+/// A build without `encoding` parses no origin, so this type has no value.
+#[cfg(not(feature = "encoding"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ListedOrigin {}
+
+#[cfg(not(feature = "encoding"))]
+impl ListedOrigin {
+    /// The written origin; no value reaches it.
+    #[must_use]
+    pub const fn written(&self) -> String {
+        match *self {}
+    }
+}
+
+/// The authority a page is served on, as its frame verdict reads it.
+///
+/// `Unknown` trusts no frame: a page whose own origin is not known cannot
+/// prove a listed origin is not its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum PageAuthority {
+    /// The authority the host admission judged, or the browser's location.
+    Known(Authority),
+    /// No judged authority.
+    #[default]
+    Unknown,
+}
+
+impl PageAuthority {
+    /// The authority of a browser location's `host`.
+    ///
+    /// `host` is `host` or `host:port`; a value that does not parse gives
+    /// `Unknown`.
+    #[must_use]
+    pub fn of_location_host(host: &str) -> Self {
+        Authority::parse(host).map_or(Self::Unknown, Self::Known)
+    }
+
+    /// Whether `self` and `admitted` name the same host and port.
+    ///
+    /// `Unknown`, or an absent `admitted`, never does.
+    #[must_use]
+    pub fn is_admitted(&self, admitted: Option<&Authority>) -> bool {
+        match (self, admitted) {
+            (Self::Known(page), Some(admitted)) => page == admitted,
+            (Self::Known(_) | Self::Unknown, _) => false,
+        }
+    }
+}
+
+/// Whether a popup a trusted frame opens may leave the frame's sandbox.
+///
+/// `Held` only where the page's `Cross-Origin-Opener-Policy: same-origin`
+/// binds, so such a popup is opened with no handle on the app's tab: a
+/// served page with a listed origin that is not framed by another site.
+/// Everywhere else, the browser client's default included, it is `Dropped`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EscapedPopups {
+    /// The escape token is kept where the author wrote it beside
+    /// `allow-popups`.
+    Held,
+    /// The escape token is dropped from every frame.
+    #[default]
+    Dropped,
+}
+
+impl EscapedPopups {
+    /// `Held` when `held`, else `Dropped`.
+    #[must_use]
+    pub const fn when(held: bool) -> Self {
+        if held { Self::Held } else { Self::Dropped }
+    }
+
+    /// Whether popups escape.
+    #[must_use]
+    pub const fn is_held(self) -> bool {
+        matches!(self, Self::Held)
+    }
+}
+
+/// Whether `origin` may be the page's own origin, so its frame is untrusted.
+///
+/// True for an `Unknown` page; for an `https` origin whose host is the
+/// page's name, at any port (cookies ignore the port); for a dev loopback
+/// origin on a loopback page at its port; and for an origin whose host does
+/// not parse as an authority. An IP-literal page never matches a listed
+/// origin, since no listed origin names an IP literal.
+#[must_use]
+pub fn served_on(origin: &ListedOrigin, page: &PageAuthority) -> bool {
+    match page {
+        PageAuthority::Known(page) => origin_served_on(origin, page),
+        PageAuthority::Unknown => true,
+    }
+}
+
+/// Whether the listed `origin` may be served on the known `page`.
+#[cfg(feature = "encoding")]
+fn origin_served_on(origin: &ListedOrigin, page: &Authority) -> bool {
+    match origin {
+        FrameOrigin::Https(server) => Authority::parse(server.authority()).map_or(true, |listed| {
+            match (listed.host(), page.host()) {
+                (AuthorityHost::Name(listed), AuthorityHost::Name(page)) => listed == page,
+                (
+                    AuthorityHost::Name(_) | AuthorityHost::Ip(_) | AuthorityHost::LoopbackName,
+                    _,
+                ) => false,
+            }
+        }),
+        #[cfg(feature = "dev-posture")]
+        FrameOrigin::DevLoopback(port) => {
+            matches!(page.host(), AuthorityHost::LoopbackName)
+                && page.port().map(std::num::NonZeroU16::get) == Some(port.get())
+        }
+    }
+}
+
+/// Whether the listed `origin` may be served on the known `page`.
+///
+/// No value reaches it without `encoding`.
+#[cfg(not(feature = "encoding"))]
+const fn origin_served_on(origin: &ListedOrigin, _page: &Authority) -> bool {
+    match *origin {}
+}
+
 /// The value every frame verdict reads: the trusted origins and the app's
 /// granted web capabilities.
 ///
@@ -631,11 +766,17 @@ impl FramePolicy {
         Self { origins, grants }
     }
 
-    /// The trusted origins, in sorted order.
-    #[cfg(feature = "encoding")]
+    /// The trusted origins, in sorted order; none without `encoding`.
     #[must_use]
-    pub const fn origins(&self) -> &[FrameOrigin] {
-        self.origins.origins()
+    pub const fn origins(&self) -> &[ListedOrigin] {
+        #[cfg(feature = "encoding")]
+        {
+            self.origins.origins()
+        }
+        #[cfg(not(feature = "encoding"))]
+        {
+            &[]
+        }
     }
 
     /// The app's granted web capabilities.
@@ -830,6 +971,135 @@ mod tests {
         assert_eq!(
             Delegation::parse(Some("camera"), true, own, camera).0,
             bit("camera") | bit("fullscreen")
+        );
+    }
+
+    /// The page authority of `host`, which must parse.
+    #[cfg(feature = "encoding")]
+    #[allow(clippy::expect_used)] // every vector is a well-formed authority
+    fn page(host: &str) -> PageAuthority {
+        PageAuthority::Known(Authority::parse(host).expect("authority"))
+    }
+
+    /// R10: an origin is withdrawn on its own host at any port, kept on any
+    /// other host, a subdomain, a suffix or an IP literal, and withdrawn for
+    /// every origin on an `Unknown` page.
+    #[cfg(feature = "encoding")]
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn own_origin_is_never_trusted() {
+        let app = FrameOrigin::parse("https://app.example").expect("origin");
+        let ported = FrameOrigin::parse("https://app.example:8443").expect("origin");
+        for host in ["app.example", "app.example:8443", "APP.example"] {
+            assert!(served_on(&app, &page(host)), "{host}");
+        }
+        for host in [
+            "other.example",
+            "app.example.evil",
+            "sub.app.example",
+            "127.0.0.1",
+            "[::1]",
+            "localhost:8443",
+        ] {
+            assert!(!served_on(&app, &page(host)), "{host}");
+        }
+        assert!(served_on(&ported, &page("app.example")));
+        assert!(!served_on(&ported, &page("other.example:8443")));
+        for origin in [&app, &ported] {
+            assert!(served_on(origin, &PageAuthority::Unknown));
+        }
+        for host in ["app.example.", "", "a b"] {
+            assert_eq!(
+                PageAuthority::of_location_host(host),
+                PageAuthority::Unknown,
+                "{host:?}"
+            );
+        }
+    }
+
+    /// R10, dev copy: a loopback origin is withdrawn on the loopback page at
+    /// its port and kept at another port or another host.
+    #[cfg(feature = "dev-posture")]
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn dev_posture_pin_own_loopback_origin_is_never_trusted() {
+        let dev = FrameOrigin::parse("http://localhost:3000").expect("origin");
+        assert!(served_on(&dev, &page("localhost:3000")));
+        assert!(!served_on(&dev, &page("localhost:3001")));
+        assert!(!served_on(&dev, &page("app.example")));
+        assert!(served_on(&dev, &PageAuthority::Unknown));
+    }
+
+    /// A page authority narrows only to the authority it was admitted under.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn page_authority_admits_only_its_own_authority() {
+        let minted = page("app.example:8080");
+        let Ok(same) = Authority::parse("app.example:8080") else {
+            return;
+        };
+        assert!(minted.is_admitted(Some(&same)));
+        for other in ["app.example:8081", "other.example:8080", "app.example"] {
+            let Ok(other) = Authority::parse(other) else {
+                return;
+            };
+            assert!(!minted.is_admitted(Some(&other)));
+        }
+        assert!(!minted.is_admitted(None));
+        assert!(!PageAuthority::Unknown.is_admitted(Some(&same)));
+    }
+
+    /// R23: a gated feature needs its grant (`recorder` opens camera and
+    /// microphone), `payment` is never delegated, and every `Undisclosed`
+    /// row is delegated scoped to the frame with no grant at all, and
+    /// dropped under any wider scope.
+    #[test]
+    fn gated_features_need_the_grant() {
+        let none = FrameGrants::none();
+        for (feature, suffix) in [
+            ("camera", "camera"),
+            ("microphone", "microphone"),
+            ("geolocation", "geolocation"),
+        ] {
+            let expected = Some(format!("{feature} 'src'"));
+            assert_eq!(painted(feature, none), None, "{feature}");
+            assert_eq!(
+                painted(feature, FrameGrants::from_suffixes(&[suffix])),
+                expected,
+                "{feature}"
+            );
+        }
+        let recorder = FrameGrants::from_suffixes(&["recorder"]);
+        assert_eq!(painted("camera", recorder), Some("camera 'src'".to_owned()));
+        assert_eq!(
+            painted("microphone", recorder),
+            Some("microphone 'src'".to_owned())
+        );
+        assert_eq!(painted("geolocation", recorder), None);
+        let every =
+            FrameGrants::from_suffixes(&["camera", "geolocation", "microphone", "recorder"]);
+        assert_eq!(painted("payment", every), None);
+        assert_eq!(painted("payment 'src'", every), None);
+        let undisclosed: Vec<&str> = DELEGATION_FEATURES
+            .iter()
+            .filter(|row| matches!(row.class, FeatureClass::Undisclosed))
+            .map(|row| row.name)
+            .collect();
+        assert_eq!(undisclosed.len(), 21);
+        for name in undisclosed {
+            assert_eq!(painted(name, none), Some(format!("{name} 'src'")), "{name}");
+            for scope in ["*", "'self'", "https://y.example"] {
+                assert_eq!(
+                    painted(&format!("{name} {scope}"), none),
+                    None,
+                    "{name} {scope}"
+                );
+            }
+        }
+        let own = "https://x.example";
+        assert_eq!(
+            Delegation::parse(None, true, own, none).painted(),
+            Some("fullscreen 'src'".to_owned())
         );
     }
 

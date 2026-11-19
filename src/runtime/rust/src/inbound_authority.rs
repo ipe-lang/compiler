@@ -565,6 +565,21 @@ mod served {
             .into_response()
     }
 
+    /// The authority the host admission judged and admitted for a request.
+    ///
+    /// Only this module constructs it, so a request extension holding one was
+    /// inserted by [`HostAdmissionService`] after the judgement.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct AdmittedAuthority(Authority);
+
+    impl AdmittedAuthority {
+        /// The admitted authority.
+        #[must_use]
+        pub const fn authority(&self) -> &Authority {
+            &self.0
+        }
+    }
+
     /// The layer that judges every request's authority before the wrapped
     /// service sees it.
     #[derive(Clone, Debug)]
@@ -628,21 +643,24 @@ mod served {
         }
 
         fn call(&mut self, request: axum::extract::Request) -> Self::Future {
-            let (parts, body) = request.into_parts();
+            let (mut parts, body) = request.into_parts();
             let admitted = match Authority::from_request(&parts) {
                 Ok(authority) => match self.shared.admission.judge(&authority) {
-                    Ok(()) => true,
+                    Ok(()) => Some(AdmittedAuthority(authority)),
                     Err(refusal) => {
                         self.shared.log_refusal(&parts, &refusal);
-                        false
+                        None
                     }
                 },
                 Err(refusal) => {
                     self.shared.log_refusal(&parts, &refusal);
-                    false
+                    None
                 }
             };
-            if admitted {
+            if let Some(admitted) = admitted {
+                // The one source of the page's authority: the value judged
+                // here, never a later re-parse of `Host`.
+                parts.extensions.insert(admitted);
                 futures_util::future::Either::Right(
                     self.inner
                         .call(axum::extract::Request::from_parts(parts, body)),
@@ -699,6 +717,82 @@ mod served {
             builder.body(()).unwrap().into_parts().0
         }
 
+        /// The status and body of `builder`'s request through a host
+        /// admission of `app.example` around a handler that answers with the
+        /// admitted authority it reads, counting each request it is reached by.
+        async fn through_admission(
+            builder: axum::http::request::Builder,
+            reached: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        ) -> (axum::http::StatusCode, String) {
+            use super::{AdmittedAuthority, HostAdmission, HostAdmissionLayer};
+            use crate::inbound_authority::DeclaredNames;
+            use tower::{Layer, ServiceExt};
+            let count = std::sync::Arc::clone(reached);
+            let router = axum::Router::new().route(
+                "/",
+                axum::routing::get(
+                    move |admitted: Option<axum::Extension<AdmittedAuthority>>| async move {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        format!("{:?}", admitted.map(|e| e.authority().clone()))
+                    },
+                ),
+            );
+            let admission = HostAdmission::new(DeclaredNames::parse("app.example").unwrap());
+            let service = HostAdmissionLayer::new(admission, "test").layer(router);
+            let request = builder.body(axum::body::Body::empty()).unwrap();
+            let response = service
+                .oneshot(request)
+                .await
+                .unwrap_or_else(|e| match e {});
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap_or_default();
+            (status, String::from_utf8(body.to_vec()).unwrap_or_default())
+        }
+
+        /// An admitted request reaches the inner service carrying exactly the
+        /// authority the layer judged; a refused one never reaches it.
+        #[tokio::test]
+        async fn host_admission_inserts_the_judged_authority() {
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let reached = Arc::new(AtomicUsize::new(0));
+            for host in [
+                "app.example",
+                "app.example:8443",
+                "127.0.0.1:8000",
+                "localhost:3000",
+            ] {
+                let judged =
+                    Authority::from_request(&parts(Request::get("/").header("host", host)));
+                let (status, body) =
+                    through_admission(Request::get("/").header("host", host), &reached).await;
+                assert_eq!(status, axum::http::StatusCode::OK, "{host}");
+                assert_eq!(body, format!("{:?}", judged.ok()), "{host}");
+                assert!(body.starts_with("Some("), "{host}: {body}");
+            }
+            assert_eq!(reached.load(Ordering::SeqCst), 4);
+            let refused = [
+                Request::get("/")
+                    .header("host", "app.example")
+                    .header("host", "app.example"),
+                Request::get("/"),
+                Request::get("http://127.0.0.1/").header("host", "app.example"),
+                Request::get("/").header("host", "app example"),
+                Request::get("/").header("host", "evil.example"),
+            ];
+            for builder in refused {
+                let (status, _) = through_admission(builder, &reached).await;
+                assert_eq!(status, axum::http::StatusCode::MISDIRECTED_REQUEST);
+            }
+            assert_eq!(
+                reached.load(Ordering::SeqCst),
+                4,
+                "a refusal reached the app"
+            );
+        }
+
         #[test]
         fn duplicate_absent_and_disagreeing_authorities_refuse() {
             let two_hosts = parts(
@@ -741,7 +835,9 @@ mod served {
 }
 
 #[cfg(feature = "server")]
-pub use served::{HostAdmission, HostAdmissionLayer, HostAdmissionService, HostRefusal};
+pub use served::{
+    AdmittedAuthority, HostAdmission, HostAdmissionLayer, HostAdmissionService, HostRefusal,
+};
 
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
