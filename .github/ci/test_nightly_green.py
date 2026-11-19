@@ -854,27 +854,111 @@ class JobListingTest(unittest.TestCase):
                     ng.jobs_of([page], 5, 1)
 
     def test_listing_past_the_page_bound_refused(self) -> None:
-        total = ng.JOBS_PAGE * ng.MAX_JOB_PAGES + 1
+        size = ng.JOBS_PAGES[0]
+        bound = ng.MAX_JOBS // size
         pages = [
-            _jobs_page(SANDBOX_ID, *((f"j{p}-{i}", "success") for i in range(ng.JOBS_PAGE)), total=total)
-            for p in range(ng.MAX_JOB_PAGES + 1)
+            _jobs_page(SANDBOX_ID, *((f"j{p}-{i}", "success") for i in range(size)), total=ng.MAX_JOBS + 1)
+            for p in range(bound + 1)
         ]
         api = FakeApi(_listing(_run()), jobs={SANDBOX_ID: pages})
         with self.assertRaises(ng.NightlyError):
             _verdict(api)
-        self.assertEqual(sum(f"actions/runs/{SANDBOX_ID}/attempts/1/jobs?" in c for c in api.calls), ng.MAX_JOB_PAGES)
+        self.assertEqual(sum(f"actions/runs/{SANDBOX_ID}/attempts/1/jobs?" in c for c in api.calls), bound)
+
+    def _gateway_failing(self, api: FakeApi, sizes: tuple[int, ...]) -> object:
+        def gateway(path: str) -> object:
+            if "/jobs?" in path and any(f"per_page={size}&" in path for size in sizes):
+                api.calls.append(path)
+                raise ng.GhTransient(f"`gh api {path}` failed transiently {ng.GH_TRIES} times")
+            return api(path)
+
+        return gateway
+
+    def test_job_listing_falls_back_to_a_smaller_page(self) -> None:
+        api = FakeApi(_listing(_run()))
+        with _patched(_gh_json=self._gateway_failing(api, ng.JOBS_PAGES[:1])):
+            self.assertEqual(ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW), [])
+        smaller = [c for c in api.calls if f"/attempts/1/jobs?per_page={ng.JOBS_PAGES[1]}&" in c]
+        self.assertTrue(smaller, api.calls)
+
+    def test_job_listing_transient_at_every_size_stays_red(self) -> None:
+        api = FakeApi(_listing(_run()))
+        with _patched(_gh_json=self._gateway_failing(api, ng.JOBS_PAGES)):
+            with self.assertRaises(ng.GhTransient):
+                ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW)
+        for size in ng.JOBS_PAGES:
+            self.assertTrue(any(f"per_page={size}&" in c for c in api.calls), size)
+
+    def test_job_listing_refusal_never_falls_back(self) -> None:
+        api = FakeApi(_listing(_run()))
+
+        def refusing(path: str) -> object:
+            if "/jobs?" in path:
+                api.calls.append(path)
+                raise ng.NightlyError(f"`gh api {path}` exited 1: gh: Not Found (HTTP 404)")
+            return api(path)
+
+        with _patched(_gh_json=refusing):
+            with self.assertRaises(ng.NightlyError):
+                ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW)
+        self.assertFalse(any(f"per_page={ng.JOBS_PAGES[1]}&" in c for c in api.calls), api.calls)
+
+    def test_page_sizes_descend_and_divide_the_bound(self) -> None:
+        self.assertEqual(list(ng.JOBS_PAGES), sorted(set(ng.JOBS_PAGES), reverse=True))
+        self.assertGreater(len(ng.JOBS_PAGES), 1)
+        self.assertTrue(all(ng.MAX_JOBS % size == 0 for size in ng.JOBS_PAGES))
+        self.assertTrue(0 < ng.JOBS_PAGES[-1] and ng.JOBS_PAGES[0] <= 100)
+
+    def test_job_listing_restarts_whole_after_a_midread_transient(self) -> None:
+        # Page 1 at the first size is served, page 2 fails transiently: the next
+        # size starts again at page 1 and judges only its own pages.
+        api = FakeApi(_listing(_run()))
+        names = sorted(SANDBOX.gates)
+        first, second = ng.JOBS_PAGES[0], ng.JOBS_PAGES[1]
+        partial = _jobs_page(SANDBOX_ID, (names[0], "success"), total=len(names))
+        whole = _jobs_page(SANDBOX_ID, *((n, "success") for n in names))
+
+        def gateway(path: str) -> object:
+            if f"/runs/{SANDBOX_ID}/attempts/1/jobs?per_page={first}&" in path:
+                api.calls.append(path)
+                if path.endswith("&page=1"):
+                    return partial
+                raise ng.GhTransient(path)
+            if f"/runs/{SANDBOX_ID}/attempts/1/jobs?per_page={second}&" in path:
+                api.calls.append(path)
+                return whole if path.endswith("&page=1") else {"total_count": len(names), "jobs": []}
+            return api(path)
+
+        with _patched(_gh_json=gateway):
+            self.assertEqual(ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW), [])
+        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, first, 2), api.calls)
+        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, second, 1), api.calls)
+
+    def test_run_over_job_bound_refused_at_every_size(self) -> None:
+        for i, size in enumerate(ng.JOBS_PAGES):
+            with self.subTest(size=size):
+                pages = [
+                    _jobs_page(SANDBOX_ID, *((f"j{p}-{k}", "success") for k in range(size)), total=ng.MAX_JOBS + 1)
+                    for p in range(ng.MAX_JOBS // size + 1)
+                ]
+                api = FakeApi(_listing(_run()), jobs={SANDBOX_ID: pages})
+                with _patched(_gh_json=self._gateway_failing(api, ng.JOBS_PAGES[:i])):
+                    with self.assertRaises(ng.NightlyError):
+                        ng.verdict({"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}, NOW)
+                self.assertEqual(sum(f"per_page={size}&" in c for c in api.calls), ng.MAX_JOBS // size)
 
     def test_every_page_read(self) -> None:
         names = sorted(SANDBOX.gates)
         pages = [_jobs_page(SANDBOX_ID, (names[0], "success"), total=2), _jobs_page(SANDBOX_ID, (names[1], "success"), total=2)]
         api = FakeApi(_listing(_run()), jobs={SANDBOX_ID: pages})
         self.assertEqual(_verdict(api), [])
-        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, 2), api.calls)
+        self.assertIn(ng._jobs_path(REPO, SANDBOX_ID, 1, ng.JOBS_PAGES[0], 2), api.calls)
 
     def test_jobs_read_the_judged_attempt_listing(self) -> None:
-        path = ng._jobs_path(REPO, 5, 2, 1)
+        path = ng._jobs_path(REPO, 5, 2, 30, 1)
         self.assertIn(f"repos/{REPO}/actions/runs/5/attempts/2/jobs?", path)
-        self.assertIn("per_page=30", path)
+        self.assertIn("per_page=30&page=1", path)
+        self.assertEqual(ng.JOBS_PAGES[0], 30)
         self.assertNotIn("filter=", path)
         self.assertNotIn("status=", path)
 

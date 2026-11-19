@@ -30,5 +30,7 @@ mod golden_m7_live_lambda_view_routed;
 mod golden_m7_live_routed_empty_routes;
 #[path = "g_http_live/golden_middleware_csrf.rs"]
 mod golden_middleware_csrf;
+#[path = "g_http_live/golden_page_link.rs"]
+mod golden_page_link;
 #[path = "g_http_live/golden_t0020_web_view_html.rs"]
 mod golden_t0020_web_view_html;

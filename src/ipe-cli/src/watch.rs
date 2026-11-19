@@ -1626,23 +1626,31 @@ fn run_inner(
                         ) {
                             post_watch_recompiling(app_port, tok);
                         }
-                        if session_target.is_none() {
-                            match LinkableTargetDir::for_crate(
-                                &opts.cargo_path,
-                                marked.path(),
-                                opts.target_dir.as_deref(),
-                            ) {
-                                Ok(resolved) => session_target = Some(resolved),
-                                Err(e) => {
-                                    emit_watch_line(
-                                        &crate::style::TerminalSafe::sanitize(&format!(
-                                            "[ipe dev watch] cannot start cargo build:\n{e}"
-                                        )),
-                                        WatchRole::Failure,
-                                    );
-                                    emit(opts, WatchEvent::CargoFailed { generation });
-                                    continue;
-                                }
+                        // The session's directory is resolved once and claimed
+                        // before every build; one whose claim fails is resolved
+                        // afresh on the next generation.
+                        let claimed = session_target.take().map_or_else(
+                            || {
+                                LinkableTargetDir::for_crate(
+                                    &opts.cargo_path,
+                                    crate::cargo_step::BuildPosture::Dev,
+                                    marked.path(),
+                                    opts.target_dir.as_deref(),
+                                )
+                            },
+                            |resolved| resolved.claim().map(|()| resolved),
+                        );
+                        match claimed {
+                            Ok(resolved) => session_target = Some(resolved),
+                            Err(e) => {
+                                emit_watch_line(
+                                    &crate::style::TerminalSafe::sanitize(&format!(
+                                        "[ipe dev watch] cannot start cargo build:\n{e}"
+                                    )),
+                                    WatchRole::Failure,
+                                );
+                                emit(opts, WatchEvent::CargoFailed { generation });
+                                continue;
                             }
                         }
                         let Some(target_dir) = session_target.as_ref() else {

@@ -816,6 +816,9 @@ fn walk_attrs<M>(attrs: &[Attribute<M>], inherited: Style) -> Walked {
             Attribute::AttrOverflow(_, _) => {}
             // Web-only: CSS hover/focus/active pseudo-class rules, no terminal equivalent.
             Attribute::AttrPseudoRule(_, _) => {}
+            // Web-only: a page link's route; the terminal renders the label only.
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => {}
             // Web-only: CSS transition animation, no terminal equivalent.
             Attribute::AttrTransition(_, _) => {}
             // Web-only: CSS @keyframes animation, no terminal equivalent.
@@ -1124,6 +1127,8 @@ fn render_input<M: Clone>(
             | Attribute::AttrGridTracks(_, _)
             | Attribute::AttrAnimation(_, _, _, _)
             | Attribute::AttrFontWhiteSpace(_) => {}
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => {}
         }
     }
     // A `<textarea>` carries no `type` attr; mark it "textarea" so the cursor

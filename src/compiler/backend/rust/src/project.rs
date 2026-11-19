@@ -2076,6 +2076,8 @@ pub fn emit_program(ctx: &EmitCtx, program: &Program) -> DResult<EmittedProject>
         // Fixed kernel-wrapper prelude (IpeError, IpeTask<A>, Decoder<T>, …)
         // plus the TEA aliases and Auth wrappers the program reaches.
         file.push(&prelude_section(ctx)?);
+        // The page-link table's one renderer, shared by every link.
+        file.push(crate::emit_web::page_renderer_item(ctx));
 
         // User functions, walked via `func_order` (its OWN first-encounter
         // order over `program.modules[..].funcs`). `partition_items` never
@@ -3856,6 +3858,7 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     file.push(&emit_db_projection_impls(ctx)?);
 
     file.push(&prelude_section(ctx)?);
+    file.push(crate::emit_web::page_renderer_item(ctx));
     file.push(&epilogue_for_target(ctx)?);
     let mut out = file.render();
 

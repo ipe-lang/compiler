@@ -1,0 +1,63 @@
+# The release workflow's macOS, Windows and FreeBSD targets, type-checked off
+# the merge queue: each release leg's `cargo build` is a `cargo check` here, on
+# the same runner, target and pinned toolchain. Their runners and the FreeBSD
+# VM's package mirror sit outside the repository's control, so these legs run
+# nightly and on dispatch, never as a required check; the Linux legs stay in
+# ci.yml's merge-queue `release-targets-run`. ci/verify-manifest.py check 23
+# holds the two workflows' legs, together, equal to release.yml's, each target
+# in exactly one of them, and pins every job's checkout, shared toolchain step
+# and cargo line, nothing between them. `cargo check` does not link.
+name: Release targets
+
+on:
+  schedule:
+    - cron: '41 5 * * *'      # nightly, offset from the other scheduled workflows
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-targets-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release-targets-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/release-target-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - name: Check ipe + ipe-ffi-inspector
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+
+  # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
+  # that leg's check: release.yml's VM step, its cargo line pinned by check 23.
+  release-targets-freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check in FreeBSD VM
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          # The VM image and apt cache are saved only on `main`; off it the action
+          # neither saves nor restores (verify-manifest check 6).
+          disable-cache: ${{ github.ref != 'refs/heads/main' }}
+          prepare: pkg install -y rust
+          run: cargo check --release --locked --features wasi_run -p ipe -p ipe-ffi-inspector

@@ -1018,7 +1018,7 @@ messages! {
     cli_target_dir_user_cache = "cli-target-dir-user-cache";
     /// An unlinkable shared test build directory in the per-user cache.
     cli_target_dir_scratch_cache = "cli-target-dir-scratch-cache";
-    /// Another `ipe test` held the shared test build directory past the wall.
+    /// Another `ipe` build held a shared build directory past the wall.
     cli_test_target_busy(path: &crate::style::TerminalSafe, wall) = "cli-test-target-busy";
     /// The test runner found does not carry this `ipe test` run's key.
     cli_test_runner_stale(binary: &crate::style::TerminalSafe) = "cli-test-runner-stale";

@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from unittest import mock
 
@@ -5890,31 +5891,81 @@ class TestAptOnePath(unittest.TestCase):
 
 class TestAptInstallScript(unittest.TestCase):
     """The apt action's own `run` text, executed with `sudo` stubbed (an apt
-    or dpkg command exits `rc`, the mirror edit succeeds): it refuses every
-    input it cannot pass to apt as written, and fails when both attempts
-    fail."""
+    or dpkg command exits `rc`; the mirror edit runs for real on source files
+    under a scratch `/etc/apt`): it refuses every input it cannot pass to apt
+    as written, repoints each failed attempt to the next mirror and names each
+    file it repointed, warns when an attempt has nothing to repoint, kills a
+    command that ignores its cap's stop, and fails when every attempt fails."""
 
-    def run_script(self, packages: str, archives: str = "", recommends: str = "false", rc: int = 0, lc_all: str = "en_US.UTF-8") -> tuple[int, list[str]]:
+    _OPTS = "-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+    _CAP = "timeout -k 30 360"
+    # A runner's mirror list and deb822 sources, as the Ubuntu runner images
+    # ship them (the mirror host varies with the provider).
+    _SOURCES = {
+        "apt-mirrors.txt": "http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\n",
+        "sources.list.d/ubuntu.sources": "Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\n",
+    }
+
+    def run_script(
+        self,
+        packages: str,
+        archives: str = "",
+        recommends: str = "false",
+        rc: int = 0,
+        lc_all: str = "en_US.UTF-8",
+        sources: dict[str, str] | None = None,
+        hang: bool = False,
+        script: str | None = None,
+    ) -> tuple[int, list[str]]:
         """Exit status and recorded `sudo` argv lines; `{tmp}` in `archives`
-        is a writable scratch directory."""
-        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
-        script = doc["runs"]["steps"][0]["run"]
+        is a writable scratch directory. `/etc/apt/` in the script reads a
+        scratch directory holding `sources`, so the host's own apt sources are
+        never read or edited. `hang` runs each capped command, its durations
+        cut to one second, as a process that ignores the stop signal."""
+        if script is None:
+            doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+            script = doc["runs"]["steps"][0]["run"]
         with tempfile.TemporaryDirectory() as tmp:
+            etc = os.path.join(tmp, "etc", "apt")
+            os.makedirs(os.path.join(etc, "sources.list.d"))
+            for name, text in (sources or {}).items():
+                with open(os.path.join(etc, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+            self.etc = etc
+            script = script.replace("/etc/apt/", etc + "/")
             log = os.path.join(tmp, "sudo.log")
             stub = os.path.join(tmp, "sudo")
             with open(stub, "w", encoding="utf-8") as f:
-                f.write('#!/bin/sh\nprintf \'%s\\n\' "$*" >> "$SUDO_LOG"\n[ "$1" = timeout ] || exit 0\nexit "$SUDO_RC"\n')
+                f.write(
+                    "#!/bin/bash\n"
+                    'printf \'%s\\n\' "$*" >> "$SUDO_LOG"\n'
+                    'if [ "$1" = sed ]; then exec "$@"; fi\n'
+                    '[ "$1" = timeout ] || exit 0\n'
+                    'if [ -n "$SUDO_HANG" ]; then\n'
+                    "  shift\n"
+                    "  pre=()\n"
+                    '  while [[ "$1" == -* ]]; do pre+=("$1" 1); shift 2; done\n'
+                    "  exec timeout \"${pre[@]}\" 1 bash -c 'trap \"\" TERM; sleep 20'\n"
+                    "fi\n"
+                    'exit "$SUDO_RC"\n'
+                )
             os.chmod(stub, 0o755)
             env = {
                 "PATH": tmp + os.pathsep + os.environ.get("PATH", ""),
                 "SUDO_LOG": log,
                 "SUDO_RC": str(rc),
+                "SUDO_HANG": "1" if hang else "",
                 "LC_ALL": lc_all,
                 "APT_PACKAGES": packages,
                 "APT_ARCHIVES": archives.replace("{tmp}", tmp),
                 "APT_NO_RECOMMENDS": recommends,
             }
             done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
+            self.stdout, self.stderr = done.stdout, done.stderr
+            self.edited = {}
+            for name in (sources or {}):
+                with open(os.path.join(etc, name), encoding="utf-8") as f:
+                    self.edited[name] = f.read()
             calls = open(log, encoding="utf-8").read().splitlines() if os.path.exists(log) else []
         return done.returncode, calls
 
@@ -5925,9 +5976,9 @@ class TestAptInstallScript(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                "timeout 360 dpkg --configure -a",
-                "timeout 360 apt-get -o Acquire::Retries=3 update",
-                f"timeout 360 apt-get -o Acquire::Retries=3 -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
+                f"{self._CAP} dpkg --configure -a",
+                f"{self._CAP} apt-get {self._OPTS} update",
+                f"{self._CAP} apt-get {self._OPTS} -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
             ],
         )
 
@@ -5954,10 +6005,100 @@ class TestAptInstallScript(unittest.TestCase):
                 self.assertNotEqual(code, 0)
                 self.assertEqual(calls, [])
 
-    def test_both_attempts_failing_fails(self) -> None:
+    def test_every_attempt_failing_fails(self) -> None:
         code, calls = self.run_script("bubblewrap", rc=1)
         self.assertNotEqual(code, 0)
-        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], ["timeout 360 dpkg --configure -a"] * 2)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], [f"{self._CAP} dpkg --configure -a"] * 3)
+
+    def test_each_failed_attempt_repoints_to_the_next_mirror(self) -> None:
+        code, _calls = self.run_script("bubblewrap", rc=1, sources=self._SOURCES)
+        self.assertNotEqual(code, 0)
+        mirrors = f"{self.etc}/apt-mirrors.txt"
+        deb822 = f"{self.etc}/sources.list.d/ubuntu.sources"
+        self.assertEqual(
+            [line for line in self.stdout.splitlines() if "repoints" in line],
+            [
+                f"apt attempt 2 repoints {mirrors} to archive.ubuntu.com",
+                f"apt attempt 2 repoints {deb822} to archive.ubuntu.com",
+                f"apt attempt 3 repoints {mirrors} to mirrors.edge.kernel.org",
+                f"apt attempt 3 repoints {deb822} to mirrors.edge.kernel.org",
+            ],
+        )
+        self.assertEqual(
+            self.edited,
+            {
+                "apt-mirrors.txt": "http://mirrors.edge.kernel.org/ubuntu/\tpriority:1\nhttps://mirrors.edge.kernel.org/ubuntu/\tpriority:2\n",
+                "sources.list.d/ubuntu.sources": "Types: deb\nURIs: http://mirrors.edge.kernel.org/ubuntu/\nSuites: noble-security\n",
+            },
+        )
+        self.assertNotIn("::warning::", self.stdout)
+        self.assertIn("every mirror failed", self.stderr)
+
+    def test_attempt_with_nothing_to_repoint_warns(self) -> None:
+        # An arm64 runner's sources name ports.ubuntu.com, which no fallback
+        # mirror serves: the attempt says so instead of claiming a repoint.
+        ports = {"sources.list.d/ubuntu.sources": "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"}
+        for sources in (None, ports):
+            with self.subTest(sources=sources):
+                code, _calls = self.run_script("bubblewrap", rc=1, sources=sources)
+                self.assertNotEqual(code, 0)
+                self.assertNotIn("repoints", self.stdout)
+                self.assertEqual(
+                    [line for line in self.stdout.splitlines() if line.startswith("::warning::")],
+                    [
+                        f"::warning::apt-install: attempt {n} found no Ubuntu archive or security source to repoint, so it retries the same mirrors"
+                        for n in (2, 3)
+                    ],
+                )
+                self.assertEqual(self.edited, sources or {})
+
+    def test_command_ignoring_its_stop_is_killed(self) -> None:
+        # Each capped command ignores SIGTERM for 20 s; the kill grace ends it
+        # within a second of its (shortened) cap, so all three attempts finish
+        # well inside the subprocess timeout.
+        start = time.monotonic()
+        code, calls = self.run_script("bubblewrap", hang=True)
+        self.assertNotEqual(code, 0)
+        self.assertLess(time.monotonic() - start, 15)
+        self.assertEqual([c for c in calls if "dpkg --configure -a" in c], [f"{self._CAP} dpkg --configure -a"] * 3)
+
+    def test_first_success_stops(self) -> None:
+        code, calls = self.run_script("bubblewrap")
+        self.assertEqual(code, 0)
+        self.assertNotIn("repoints", self.stdout)
+        self.assertEqual(len(calls), 3)
+
+    def test_mirror_edit_rewrites_every_ubuntu_archive_host(self) -> None:
+        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+        script = doc["runs"]["steps"][0]["run"]
+        edit = next(line.strip() for line in script.splitlines() if "sed -i -E" in line)
+        expr = edit.split('"')[1]
+        host = next(line.strip() for line in script.splitlines() if line.strip().startswith("source_host="))
+        source_host = host.split("'")[1]
+        sources = (
+            "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+            "URIs: http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\n"
+            "URIs: http://security.ubuntu.com/ubuntu/\n"
+            "URIs: https://archive.ubuntu.com/ubuntu/\n"
+            "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"
+        )
+        for mirror in ("archive.ubuntu.com", "mirrors.edge.kernel.org"):
+            with self.subTest(mirror=mirror):
+                done = subprocess.run(
+                    ["bash", "-c", f'printf "{sources}" | sed -E "{expr}"'],
+                    env={"PATH": os.environ.get("PATH", ""), "mirror": mirror, "source_host": source_host},
+                    capture_output=True, text=True, timeout=30, check=True,
+                )
+                self.assertEqual(
+                    done.stdout.splitlines(),
+                    [
+                        f"http://{mirror}/ubuntu/\tpriority:1",
+                        f"URIs: http://{mirror}/ubuntu/",
+                        f"URIs: http://{mirror}/ubuntu/",
+                        f"URIs: https://{mirror}/ubuntu/",
+                        "URIs: http://ports.ubuntu.com/ubuntu-ports/",
+                    ],
+                )
 
 
 _DU_WF = """\
@@ -6789,6 +6930,26 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@0000000000000000000000000000000000000000
+      - uses: ./.github/actions/release-target-toolchain
+        with:
+          target: ${{ matrix.target }}
+      - name: Check ipe + ipe-ffi-inspector
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo check --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+"""
+_RT_MANUAL = """\
+on: workflow_dispatch
+jobs:
+  release-targets-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
           - os: macos-latest
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -6911,10 +7072,13 @@ class TestReleaseTargetParity(unittest.TestCase):
         action: str | None = _RT_ACTION,
         toolchain: str | None = _RT_TOOLCHAIN,
         apt: str | None = _RT_APT,
+        manual: str | None = _RT_MANUAL,
     ) -> list[str]:
         with tempfile.TemporaryDirectory() as repo:
             root = os.path.join(repo, ".github")
             _write(os.path.join(root, "workflows", "ci.yml"), ci)
+            if manual is not None:
+                _write(os.path.join(root, "workflows", "release-targets.yml"), manual)
             _write(os.path.join(root, "workflows", "release.yml"), release)
             if action is not None:
                 _write(os.path.join(root, "actions", "rust-toolchain-pinned", "action.yml"), action)
@@ -6934,8 +7098,9 @@ class TestReleaseTargetParity(unittest.TestCase):
         action: str | None = _RT_ACTION,
         toolchain: str | None = _RT_TOOLCHAIN,
         apt: str | None = _RT_APT,
+        manual: str | None = _RT_MANUAL,
     ) -> None:
-        errors = self.errors(ci, release, action, toolchain, apt)
+        errors = self.errors(ci, release, action, toolchain, apt, manual)
         self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
 
     @staticmethod
@@ -6985,9 +7150,9 @@ class TestReleaseTargetParity(unittest.TestCase):
         release = self.swap(_RT_RELEASE, self._REL_CARGO_RUN, f"        run: |\n          {at(10)}\n          cargo build --release")
         self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci)
         self.assertRefused("release.yml job 'build' step 3.run is", release=release)
-        ci = self.swap(_RT_CI, self._CI_VM_RUN, f"          run: |\n            {at(12)}\n            cargo check")
+        manual = self.swap(_RT_MANUAL, self._CI_VM_RUN, f"          run: |\n            {at(12)}\n            cargo check")
         release = self.swap(_RT_RELEASE, self._REL_VM_RUN, f"          run: |\n            {at(12)}\n            cargo build")
-        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", ci)
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2.with.run is", manual=manual)
         self.assertRefused("release.yml job 'build-freebsd' step 2.with.run is", release=release)
         toolchain = self.swap(
             _RT_TOOLCHAIN, "    - name: Install musl toolchain (linux)\n", f"    - shell: bash\n      run: |\n        {at(8)}\n    - name: Install musl toolchain (linux)\n"
@@ -7002,11 +7167,43 @@ class TestReleaseTargetParity(unittest.TestCase):
         check_release_target_parity(_load(verify_manifest.REPO_ROOT, errors), errors)
         self.assertEqual(errors, [])
 
-    def test_target_missing_from_ci_refused(self) -> None:
-        ci = self.swap(
-            _RT_CI, "          - os: macos-latest\n            target: aarch64-apple-darwin\n", ""
+    def test_target_checked_nowhere_refused(self) -> None:
+        unchecked = "but neither ci.yml's release-targets-run nor release-targets.yml's release-targets-native checks it"
+        manual = self.swap(_RT_MANUAL, "target: aarch64-apple-darwin", "target: x86_64-apple-darwin")
+        self.assertRefused("'aarch64-apple-darwin' " + unchecked, manual=manual)
+        ci = self.swap(_RT_CI, "target: x86_64-unknown-linux-musl", "target: aarch64-unknown-linux-musl")
+        self.assertRefused("'x86_64-unknown-linux-musl' " + unchecked, ci)
+
+    def test_linux_leg_outside_the_merge_queue_refused(self) -> None:
+        linux = "          - os: ubuntu-latest\n            target: x86_64-unknown-linux-musl\n"
+        mac = "          - os: macos-latest\n            target: aarch64-apple-darwin\n"
+        ci = self.swap(_RT_CI, linux, mac)
+        manual = self.swap(_RT_MANUAL, mac, linux)
+        self.assertRefused(
+            "release-targets.yml checks 'x86_64-unknown-linux-musl' on 'ubuntu-latest', a Linux runner", ci, manual=manual
         )
-        self.assertRefused("aarch64-apple-darwin' but ci.yml's release-targets-run never checks it", ci)
+        self.assertEqual(
+            [e for e in self.errors(ci, manual=manual) if "Linux runner" not in e], []
+        )
+
+    def test_target_checked_twice_refused(self) -> None:
+        leg = "          - os: macos-latest\n            target: aarch64-apple-darwin\n"
+        ci = self.swap(_RT_CI, "        include:\n", "        include:\n" + leg)
+        self.assertRefused("'aarch64-apple-darwin' is checked by both ci.yml's release-targets-run and", ci)
+
+    def test_missing_manual_workflow_refused(self) -> None:
+        self.assertRefused(".github/workflows/release-targets.yml is missing", manual=None)
+        head, _, _ = _RT_MANUAL.partition("  release-targets-native:\n")
+        self.assertRefused("release-targets.yml has no job 'release-targets-native'", manual=head)
+
+    def test_manual_native_job_pinned_like_ci(self) -> None:
+        manual = _RT_MANUAL.replace("cargo check --release --locked --features wasi_run --target", "cargo build --release --locked --features wasi_run --target", 1)
+        self.assertNotEqual(manual, _RT_MANUAL)
+        self.assertRefused("release-targets.yml job 'release-targets-native' step 3.run is", manual=manual)
+        manual = self.swap(_RT_MANUAL, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv:\n  RUSTFLAGS: --cfg broken\n")
+        self.assertRefused("release-targets.yml workflow env has keys ['RUSTFLAGS']", manual=manual)
+        manual = self.swap(_RT_MANUAL, "  release-targets-native:\n", "  release-targets-native:\n    continue-on-error: true\n")
+        self.assertRefused("release-targets.yml job 'release-targets-native' has a job `continue-on-error`", manual=manual)
 
     def test_target_only_in_ci_refused(self) -> None:
         release = self.swap(
@@ -7018,8 +7215,10 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("which release.yml does not build", release=release)
 
     def test_different_os_for_the_same_target_refused(self) -> None:
-        ci = self.swap(_RT_CI, "os: macos-latest", "os: macos-15-intel")
-        self.assertRefused("runs on 'macos-15-intel' in ci.yml but 'macos-latest' in release.yml", ci)
+        manual = self.swap(_RT_MANUAL, "os: macos-latest", "os: macos-15-intel")
+        self.assertRefused("runs on 'macos-15-intel' in release-targets.yml but 'macos-latest' in release.yml", manual=manual)
+        ci = self.swap(_RT_CI, "os: ubuntu-latest", "os: ubuntu-24.04")
+        self.assertRefused("runs on 'ubuntu-24.04' in ci.yml but 'ubuntu-latest' in release.yml", ci)
 
     def test_cargo_line_drift_refused(self) -> None:
         for old, new in (
@@ -7064,7 +7263,8 @@ class TestReleaseTargetParity(unittest.TestCase):
     def test_ci_must_check_not_build(self) -> None:
         ci = self.swap(_RT_CI, "cargo check --release --locked --features", "cargo build --release --locked --features")
         self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci)
-        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", ci)
+        manual = self.swap(_RT_MANUAL, "cargo check --release --locked --features", "cargo build --release --locked --features")
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2.with.run is", manual=manual)
 
     def test_toolchain_or_musl_drift_refused(self) -> None:
         self.assertRefused(
@@ -7076,10 +7276,16 @@ class TestReleaseTargetParity(unittest.TestCase):
         toolchain = self.swap(_RT_TOOLCHAIN, "packages: musl-tools", "packages: musl-tools\n        no-install-recommends: \"true\"")
         self.assertRefused("release-target-toolchain' step 3.with has keys", toolchain=toolchain)
         for old, new in (
-            ("sudo timeout 360 dpkg --configure -a \\\n", ""),
-            ("timeout 360 apt-get -o Acquire::Retries=3 update", "apt-get update"),
-            ("for attempt in 1 2; do", "for attempt in 1; do"),
-            ("archive.ubuntu.com|g'", "mirror.invalid|g'"),
+            ("configure) sudo timeout -k 30 \"$left\" dpkg --configure -a", "configure) true"),
+            ('update) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" update', 'update) sudo apt-get "${apt_opts[@]}" update'),
+            ('install) sudo timeout -k 30 "$left" apt-get', 'install) sudo timeout "$left" apt-get'),
+            ("            if ((repointed == 0)); then\n", "            if false; then\n"),
+            ("for stage in configure update install; do", "for stage in update install; do"),
+            ('    exit 1\n            fi\n            if ((left > 360))', '    break\n            fi\n            if ((left > 360))'),
+            ("for attempt in 1 2 3; do", "for attempt in 1; do"),
+            ('mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)', 'mirrors=("" mirror.invalid mirrors.edge.kernel.org)'),
+            ("deadline=$((SECONDS + 900))", "deadline=$((SECONDS + 9000))"),
+            ("              left=360\n", "              left=3600\n"),
         ):
             with self.subTest(apt=new):
                 self.assertRefused(self._APT_PINNED, apt=self.swap(_RT_APT, old, new))
@@ -7101,40 +7307,40 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("expects 'ipe-haiku-x64', which no job publishes", release=release)
 
     def test_missing_freebsd_leg_refused(self) -> None:
-        head, _, _ = _RT_CI.partition("  release-targets-freebsd:\n")
-        self.assertRefused("has no job 'release-targets-freebsd'", head)
+        head, _, _ = _RT_MANUAL.partition("  release-targets-freebsd:\n")
+        self.assertRefused("release-targets.yml has no job 'release-targets-freebsd'", manual=head)
 
     def test_freebsd_prelude_drift_refused(self) -> None:
         self.assertRefused(
-            "ci.yml job 'release-targets-freebsd' step 2.with.prepare is",
-            self.swap(_RT_CI, "pkg install -y rust", "pkg install -y rust-nightly"),
+            "release-targets.yml job 'release-targets-freebsd' step 2.with.prepare is",
+            manual=self.swap(_RT_MANUAL, "pkg install -y rust", "pkg install -y rust-nightly"),
         )
         self.assertRefused(
-            "ci.yml job 'release-targets-freebsd' step 2.with.disable-cache is",
-            self.swap(_RT_CI, "disable-cache: ${{ github.ref != 'refs/heads/main' }}", "disable-cache: false"),
+            "release-targets.yml job 'release-targets-freebsd' step 2.with.disable-cache is",
+            manual=self.swap(_RT_MANUAL, "disable-cache: ${{ github.ref != 'refs/heads/main' }}", "disable-cache: false"),
         )
         self.assertRefused(
-            "ci.yml job 'release-targets-freebsd' step 2.with has keys",
-            self.swap(_RT_CI, "          disable-cache: ${{ github.ref != 'refs/heads/main' }}\n", ""),
+            "release-targets.yml job 'release-targets-freebsd' step 2.with has keys",
+            manual=self.swap(_RT_MANUAL, "          disable-cache: ${{ github.ref != 'refs/heads/main' }}\n", ""),
         )
         self.assertRefused(
-            "ci.yml job 'release-targets-freebsd' step 2.with has keys",
-            self.swap(_RT_CI, "          prepare: pkg install -y rust\n", "          usesh: true\n          prepare: pkg install -y rust\n"),
+            "release-targets.yml job 'release-targets-freebsd' step 2.with has keys",
+            manual=self.swap(_RT_MANUAL, "          prepare: pkg install -y rust\n", "          usesh: true\n          prepare: pkg install -y rust\n"),
         )
         self.assertRefused(
             "FreeBSD VM action",
-            self.swap(_RT_CI, "freebsd-vm@0000000000000000000000000000000000000000", "freebsd-vm@1111111111111111111111111111111111111111"),
+            manual=self.swap(_RT_MANUAL, "freebsd-vm@0000000000000000000000000000000000000000", "freebsd-vm@1111111111111111111111111111111111111111"),
         )
         self.assertRefused(
-            "ci.yml job 'release-targets-freebsd' step 2.uses is",
-            self.swap(_RT_CI, "vmactions/freebsd-vm@", "VMActions/freebsd-vm@"),
+            "release-targets.yml job 'release-targets-freebsd' step 2.uses is",
+            manual=self.swap(_RT_MANUAL, "vmactions/freebsd-vm@", "VMActions/freebsd-vm@"),
         )
 
     def test_freebsd_cargo_drift_refused(self) -> None:
         for old, new in (("--release --locked --features", "--release --features"), (" -p ipe-ffi-inspector\n", "\n")):
             with self.subTest(change=new):
-                ci = _RT_CI.rsplit(old, 1)
-                self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", new.join(ci))
+                manual = _RT_MANUAL.rsplit(old, 1)
+                self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2.with.run is", manual=new.join(manual))
 
     def test_conditional_ci_cargo_step_refused(self) -> None:
         masks = ("if: github.event_name == 'workflow_dispatch'", "continue-on-error: true")
@@ -7143,20 +7349,23 @@ class TestReleaseTargetParity(unittest.TestCase):
                 ci = self.swap(_RT_CI, "        shell: bash\n", f"        {mask}\n        shell: bash\n")
                 self.assertRefused("ci.yml job 'release-targets-run' step 3 has keys", ci)
             with self.subTest(job="freebsd", mask=mask):
-                ci = self.swap(
-                    _RT_CI, "      - uses: vmactions/freebsd-vm@", f"      - {mask}\n        uses: vmactions/freebsd-vm@"
+                manual = self.swap(
+                    _RT_MANUAL, "      - uses: vmactions/freebsd-vm@", f"      - {mask}\n        uses: vmactions/freebsd-vm@"
                 )
-                self.assertRefused("ci.yml job 'release-targets-freebsd' step 2 has keys", ci)
-        for job in ("release-targets-run", "release-targets-freebsd"):
+                self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2 has keys", manual=manual)
+        with self.subTest(job="release-targets-run", mask="job continue-on-error"):
+            ci = self.swap(_RT_CI, "  release-targets-run:\n", "  release-targets-run:\n    continue-on-error: true\n")
+            self.assertRefused("ci.yml job 'release-targets-run' has a job `continue-on-error`", ci)
+        for job in ("release-targets-native", "release-targets-freebsd"):
             with self.subTest(job=job, mask="job continue-on-error"):
-                ci = self.swap(_RT_CI, f"  {job}:\n", f"  {job}:\n    continue-on-error: true\n")
-                self.assertRefused(f"ci.yml job '{job}' has a job `continue-on-error`", ci)
+                manual = self.swap(_RT_MANUAL, f"  {job}:\n", f"  {job}:\n    continue-on-error: true\n")
+                self.assertRefused(f"release-targets.yml job '{job}' has a job `continue-on-error`", manual=manual)
 
     def test_runs_on_drift_refused(self) -> None:
         ci = self.swap(_RT_CI, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ubuntu-latest\n")
         self.assertRefused("ci.yml job 'release-targets-run' runs on 'ubuntu-latest'; it must be exactly", ci)
-        ci = self.swap(_RT_CI, "  release-targets-freebsd:\n    runs-on: ubuntu-latest\n", "  release-targets-freebsd:\n    runs-on: ubuntu-22.04\n")
-        self.assertRefused("ci.yml job 'release-targets-freebsd' runs on 'ubuntu-22.04'; it must be exactly", ci)
+        manual = self.swap(_RT_MANUAL, "  release-targets-freebsd:\n    runs-on: ubuntu-latest\n", "  release-targets-freebsd:\n    runs-on: ubuntu-22.04\n")
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' runs on 'ubuntu-22.04'; it must be exactly", manual=manual)
         ci = self.swap(_RT_CI, "    runs-on: ${{ matrix.os }}\n", "    runs-on: ${{ matrix.os }}\n    env:\n      RUSTFLAGS: -Copt-level=0\n")
         self.assertRefused("ci.yml job 'release-targets-run' has a job `env`", ci)
 
@@ -7177,12 +7386,14 @@ class TestReleaseTargetParity(unittest.TestCase):
         ci = self.swap(_RT_CI, "      - uses: ./.github/actions/release-target-toolchain\n", fake + "      - uses: ./.github/actions/release-target-toolchain\n")
         self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", ci)
         self.assertRefused("ci.yml job 'release-targets-run' step 2 has keys", ci)
-        ci = _RT_CI + "      - shell: bash\n        run: echo after\n"
-        self.assertRefused("ci.yml job 'release-targets-freebsd' has 3 steps", ci)
+        manual = _RT_MANUAL + "      - shell: bash\n        run: echo after\n"
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' has 3 steps", manual=manual)
         vm = "      - run: echo '[build]' > .cargo/config.toml\n      - uses: vmactions/freebsd-vm@"
-        ci = self.swap(_RT_CI, "      - uses: vmactions/freebsd-vm@", vm)
-        self.assertRefused("ci.yml job 'release-targets-freebsd' has 3 steps", ci)
-        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2 has keys", ci)
+        manual = self.swap(_RT_MANUAL, "      - uses: vmactions/freebsd-vm@", vm)
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' has 3 steps", manual=manual)
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2 has keys", manual=manual)
+        ci = _RT_CI + "      - shell: bash\n        run: echo after\n"
+        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", ci)
         native = self.swap(_RT_CI, "      - name: Check ipe", "      - shell: bash\n        run: echo after\n      - name: Check ipe")
         self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", native)
 
@@ -7207,9 +7418,9 @@ class TestReleaseTargetParity(unittest.TestCase):
             with self.subTest(line=line):
                 native = self.swap(_RT_CI, self._CI_CARGO_RUN, f"        run: |\n          {line}\n          cargo check --release")
                 self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", native)
-                bsd = self.swap(_RT_CI, self._CI_VM_RUN, f"          run: |\n            {line}\n            cargo check")
-                self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with.run is", bsd)
-        native = self.swap(_RT_CI, "-p ipe -p ipe-ffi-inspector\n  release", "-p ipe -p ipe-ffi-inspector; true\n  release")
+                bsd = self.swap(_RT_MANUAL, self._CI_VM_RUN, f"          run: |\n            {line}\n            cargo check")
+                self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2.with.run is", manual=bsd)
+        native = self.swap(_RT_CI, "-p ipe -p ipe-ffi-inspector\n", "-p ipe -p ipe-ffi-inspector; true\n")
         self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", native)
 
     def test_cargo_step_env_beyond_release_refused(self) -> None:
@@ -7217,8 +7428,8 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("ci.yml job 'release-targets-run' step 3.env has keys", ci)
 
     def test_vm_input_drift_refused(self) -> None:
-        ci = self.swap(_RT_CI, "          prepare: pkg install -y rust\n", "          release: '13.2'\n          prepare: pkg install -y rust\n")
-        self.assertRefused("ci.yml job 'release-targets-freebsd' step 2.with has keys", ci)
+        manual = self.swap(_RT_MANUAL, "          prepare: pkg install -y rust\n", "          release: '13.2'\n          prepare: pkg install -y rust\n")
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2.with has keys", manual=manual)
 
     def test_job_key_drift_refused(self) -> None:
         for key in ("services:\n      cache:\n        image: x", "permissions:\n      contents: write", "defaults:\n      run:\n        shell: sh"):
@@ -7383,12 +7594,12 @@ class TestReleaseTargetParity(unittest.TestCase):
 
     def test_freebsd_strategy_refused(self) -> None:
         strategy = "    strategy:\n      matrix:\n        include:\n          - flags: x\n"
-        ci = _RT_CI.replace("  release-targets-freebsd:\n", "  release-targets-freebsd:\n" + strategy, 1)
+        manual = _RT_MANUAL.replace("  release-targets-freebsd:\n", "  release-targets-freebsd:\n" + strategy, 1)
         release = _RT_RELEASE.replace("  build-freebsd:\n", "  build-freebsd:\n" + strategy, 1)
-        self.assertNotEqual(ci, _RT_CI)
+        self.assertNotEqual(manual, _RT_MANUAL)
         self.assertNotEqual(release, _RT_RELEASE)
-        self.assertRefused("ci.yml job 'release-targets-freebsd' has a job `strategy`", ci, release)
-        self.assertRefused("release.yml job 'build-freebsd' has a job `strategy`", ci, release)
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' has a job `strategy`", release=release, manual=manual)
+        self.assertRefused("release.yml job 'build-freebsd' has a job `strategy`", release=release, manual=manual)
 
     # GitHub reads each scalar as YAML 1.2 does and hands a step its own text
     # of it; the checker compares the loaded value, so the type is part of it.
@@ -7479,7 +7690,7 @@ class TestReleaseTargetParity(unittest.TestCase):
                 native = self.swap(_RT_RELEASE, '          mkdir -p dist\n          cp "', f"          mkdir -p dist\n          {line}\n          cp \"")
                 self.assertRefused("release.yml job 'build' step 4 run: runs `cargo`", release=native)
         # A cargo step only ci.yml runs is a step its pins do not hold.
-        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", _RT_CI.replace("  release-targets-freebsd:\n", "      - shell: bash\n        run: cargo build\n  release-targets-freebsd:\n", 1))
+        self.assertRefused("ci.yml job 'release-targets-run' has 4 steps", _RT_CI + "      - shell: bash\n        run: cargo build\n")
 
     _CHECKOUT = "      - uses: actions/checkout@0000000000000000000000000000000000000000\n"
     _UPLOAD = "      - uses: actions/upload-artifact@0000000000000000000000000000000000000000\n"
@@ -7496,8 +7707,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("release.yml job 'build-freebsd' step 3 runs `actions/checkout@", release=release)
         release = self.swap(_RT_RELEASE, "      - name: Stage\n", self._CHECKOUT + "      - name: Stage\n")
         self.assertRefused("release.yml job 'build' step 4 runs `actions/checkout@", release=release)
-        ci = _RT_CI + self._CHECKOUT
-        self.assertRefused("ci.yml job 'release-targets-freebsd' step 3 runs `actions/checkout@", ci)
+        self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 3 runs `actions/checkout@", manual=_RT_MANUAL + self._CHECKOUT)
         # And in a local action a job step uses, at any depth.
         checkout = "    - uses: actions/checkout@0000000000000000000000000000000000000000\n"
         self.assertRefused(

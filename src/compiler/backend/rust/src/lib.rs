@@ -1539,6 +1539,10 @@ pub(crate) struct EmitCtx<'a> {
     /// recovers the same table an inline list carries. An id absent here is
     /// an opaque table, refused by the routed-app emit.
     pub(crate) route_tables: BTreeMap<FuncId, Vec<Expr>>,
+    /// The program's one `Web.pageLink` table and its renderer, decided once
+    /// over every page-link site and routed app before any emission. `None`
+    /// when the program holds no page link.
+    pub(crate) page_link_table: Option<crate::emit_web::PageLinkTable>,
     /// The transient, per-scope emit state (literal accumulator, transition-arm
     /// and subscriptions arming). Kept apart from the immutable config above so a
     /// scope field cannot leak into a config flag; reachable only through the
@@ -2417,6 +2421,7 @@ impl<'a> EmitCtx<'a> {
             hot_appearance: hot_appearance && (uses_web || uses_tui),
             ui_structural_wrappers,
             route_tables,
+            page_link_table: None,
             scope: ScopeState::default(),
             web_capabilities: program.imported_web_capabilities.clone(),
         };
@@ -2429,6 +2434,10 @@ impl<'a> EmitCtx<'a> {
         if wasm_hydrate_mode {
             ctx.hydration_state_rust_name = ctx.resolve_hydration_state_rust_name(program)?;
         }
+        // Every emission entry decides the page-link table here, so a link
+        // whose table no router could serve is refused whether or not
+        // emission reaches it.
+        ctx.page_link_table = emit_web::plan_page_link_table(&ctx, program)?;
         Ok(ctx)
     }
 
