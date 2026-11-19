@@ -24,7 +24,9 @@ pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
 /// The parsed `delivery.servers` origins a browser bundle may reach.
-pub use ipe_runtime_rust::encoding::{ServerOrigin, ServerOrigins};
+pub use ipe_runtime_rust::encoding::{
+    FrameOriginEntries, FrameOriginEntry, ServerOrigin, ServerOrigins,
+};
 pub mod crate_specs;
 pub mod golden_form;
 #[macro_use]
@@ -33,7 +35,8 @@ mod emit_console;
 mod emit_doc;
 mod emit_settings;
 pub use emit_settings::{
-    CrateName, EmitHost, EmitSettings, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME, TEST_RUN_KEY_ENV,
+    CrateName, EmitHost, EmitSettings, FrameListRefused, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
+    TEST_RUN_KEY_ENV, frame_origins_for,
 };
 mod emit_expr;
 mod emit_model_gate;
@@ -550,6 +553,7 @@ impl<'a> RustBackend<'a> {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -567,6 +571,7 @@ impl<'a> RustBackend<'a> {
                 wasm_public_env: wasm_public_env.clone(),
                 mount_base: mount_base.clone(),
                 server_origins: server_origins.clone(),
+                frame_origins: frame_origins.clone(),
                 wasm_hydrate_mode: *wasm_hydrate_mode,
                 runtime_dep: runtime_dep.clone(),
                 debugger: *debugger,
@@ -1417,6 +1422,10 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) mount_base: MountBase,
     /// The `delivery.servers` origins the browser shell's policy admits.
     pub(crate) server_origins: ServerOrigins,
+    /// The `delivery.frameOrigins` the program's pages trust to frame: the
+    /// browser shell's policy lists them, and a served program and the wasm
+    /// client register them.
+    pub(crate) frame_origins: ipe_runtime_rust::encoding::FrameOriginEntries,
     /// `true` when `[wasm] mode = "hydrate"` was set in `package.ipe`. When set,
     /// the emitted wasm epilogue includes a `#[wasm_bindgen] pub fn hydrate(…)`
     /// export in addition to the `#[wasm_bindgen(start)] ipe_start` entry —
@@ -1702,6 +1711,7 @@ impl<'a> EmitCtx<'a> {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -2378,6 +2388,7 @@ impl<'a> EmitCtx<'a> {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,

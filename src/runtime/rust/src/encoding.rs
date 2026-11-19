@@ -1135,16 +1135,31 @@ pub const FRAME_HEADER_BUDGET: usize = 6144;
 /// `frames.rs` asserts at build time that this equals the table's count.
 pub const FRAME_WIDENED_DIRECTIVES: usize = 24;
 
-/// The bytes a non-empty list adds whatever its origins: each undisclosed
-/// directive written as `, <feature>=(self)`. A granted capability-gated
-/// directive is already `(self)` without a list, so it adds only origins.
+/// The bytes the undisclosed directives a non-empty list writes add whatever
+/// its origins, each written as `, <feature>=(self)`.
 ///
-/// `frames.rs` asserts at build time that this equals the sum over the table.
-pub const FRAME_LIST_FIXED_COST: usize = 480;
+/// A granted capability-gated directive is already `(self)` without a list,
+/// so it adds only origins. `frames.rs` asserts at build time that this
+/// equals the sum over the table.
+pub const FRAME_UNDISCLOSED_FIXED_COST: usize = 480;
 
-/// The header bytes one listed origin adds, `len` being its written length:
+/// The source a non-empty list replaces in `frame-src` (`'self'`) and in
+/// `object-src` (`'none'`): both are six bytes.
+const FRAME_REPLACED_SOURCE_LEN: usize = "'self'".len();
+
+/// The bytes a non-empty list adds whatever its origins.
+///
+/// The undisclosed directives, less the replaced source and the one
+/// separator [`frame_origin_header_cost`] counts for every origin but the
+/// first, in `frame-src` and in `object-src`.
+pub const FRAME_LIST_FIXED_COST: usize =
+    FRAME_UNDISCLOSED_FIXED_COST - 2 * (FRAME_REPLACED_SOURCE_LEN + 1);
+
+/// The header bytes one listed origin adds, `len` being its written length.
+///
 /// ` <origin>` in `frame-src` and in `object-src`, and ` "<origin>"` in every
-/// widened directive.
+/// widened directive; [`FRAME_LIST_FIXED_COST`] takes back the replaced
+/// source and the first origin's separator.
 #[must_use]
 pub const fn frame_origin_header_cost(len: usize) -> usize {
     len.saturating_add(1).saturating_mul(2).saturating_add(

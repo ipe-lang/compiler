@@ -150,6 +150,9 @@ pub struct DeliveryConfig {
     /// The `https` origins the browser bundle may reach besides its own;
     /// empty for an offline bundle.
     pub servers: ipe_runtime_rust::encoding::ServerOrigins,
+    /// The origins a served page may frame with the trust of a declared
+    /// embed; empty when the page trusts no frame.
+    pub frame_origins: ipe_runtime_rust::encoding::FrameOriginEntries,
 }
 
 impl DeliveryConfig {
@@ -188,6 +191,7 @@ impl Default for DeliveryConfig {
             mobile: MobileDelivery::default(),
             browser: BrowserDelivery::default(),
             servers: ipe_runtime_rust::encoding::ServerOrigins::none(),
+            frame_origins: ipe_runtime_rust::encoding::FrameOriginEntries::none(),
         }
     }
 }

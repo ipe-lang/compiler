@@ -111,6 +111,7 @@ delivery =
     , mobile = { bundleId = "io.acme.myapp", orientation = Any }  -- Any (default) | Portrait | Landscape
     , browser = { basePath = "/" }
     , servers = [ "https://api.example.com" ]   -- default: [] (offline)
+    , frameOrigins = [ "https://player.example" ]   -- default: [] (no trusted frame)
     }
 ```
 
@@ -168,6 +169,60 @@ host and an optional `:port`:
 
 At most 16 origins are listed, each once; the manifest refuses any other
 value.
+
+`frameOrigins` lists the origins a served web page trusts to frame. A frame
+of a listed origin keeps that origin, so it can sign in, store data and run
+its own scripts; a frame of any other origin stays sandboxed with an opaque
+origin. Each entry is written like a `servers` entry, `https://` then a host
+and an optional `:port`. During development an entry may also be
+`http://localhost:PORT`, with the port required. A loopback entry is for
+served `ipe dev` only: `ipe release` and a browser-built client refuse it.
+At most 16 origins are listed, each once, and their bytes in the served
+headers must fit 6144 bytes, which holds about seven origins of 30 bytes;
+the manifest refuses any other value.
+
+List only origins you trust with the user's session. Never list the app's
+own origin, and never a host that serves content other people upload: a
+listed origin's frame runs with its own origin's full reach.
+
+Listing any origin changes the served page's policy:
+
+- `frame-src` and `object-src` become exactly the listed origins. `'self'` is
+  dropped, so the app can no longer frame its own pages.
+- Every page response carries `Cross-Origin-Opener-Policy: same-origin`. A
+  popup the app itself opens to another origin, such as an OAuth or payment
+  window, loses its `window.opener`; redirect-based flows are unaffected.
+- `Permissions-Policy` opens each feature the app's capabilities grant, and
+  each device or data feature no capability covers, to the listed origins as
+  well as the app. `payment` stays closed.
+
+A popup a trusted frame opens is the listed origin's own top-level page,
+opened by a click in the app. It has no handle on the app's tab.
+
+A listed origin delegated a device or data feature, such as USB, serial
+ports or clipboard reading, can show the browser's permission prompt for it
+inside the app's page. If that origin is compromised, the attacker holds the
+prompt while the user sees the app's address bar. Only the frame's `allow`
+attribute and the served `Permissions-Policy` stand between the origin and
+the prompt; no capability covers these features.
+
+`frameOrigins` is for served web pages only. The manifest refuses a
+non-empty list when `ships` names a desktop, Android or iOS shell, and each
+shell's packer refuses it again.
+
+`ipe dev build`, `ipe release build` and `ipe capabilities` print this notice
+for an app that lists frame origins, with `<origins>` replaced by the list:
+
+<!-- frame-reach-notice:begin -->
+This app lists trusted frame origins (`<origins>`). A page can give a trusted
+frame access to accelerometer, ambient light sensor, bluetooth devices,
+clipboard reading, compute pressure, screen capture, gyroscope, HID devices,
+federated sign-in, idle detection, local fonts, magnetometer, MIDI devices,
+one-time codes, passkey creation, passkey sign-in, serial ports, storage
+access, USB devices, window management, and XR spatial tracking. The
+capability list cannot show whether this program reaches them through a
+frame.
+<!-- frame-reach-notice:end -->
 
 A mobile app that accepts `JsPort Push` names its push identifiers under
 `delivery.mobile.push`:

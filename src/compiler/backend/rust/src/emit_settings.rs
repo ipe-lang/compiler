@@ -11,6 +11,7 @@ use crate::{
     BuildIntent, CargoPackageName, CrateIdentity, DbDriver, FfiEmit, MountBase, RuntimeDep,
     ServedInstall, ServerOrigins, WebViewWindow,
 };
+use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
 
 /// The emitted crate's `[package] name`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -84,6 +85,8 @@ pub struct EmitSettings {
     pub mount_base: MountBase,
     /// The `delivery.servers` origins the browser bundle may reach.
     pub server_origins: ServerOrigins,
+    /// The `delivery.frameOrigins` a page of the program trusts to frame.
+    pub frame_origins: FrameOriginEntries,
     /// `true` when the wasm bundle emits the hydrate export.
     pub wasm_hydrate_mode: bool,
     /// The dependency-model selector; `None` emits the vendored project.
@@ -112,6 +115,7 @@ impl EmitSettings {
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
             server_origins: ServerOrigins::none(),
+            frame_origins: FrameOriginEntries::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -135,6 +139,7 @@ impl EmitSettings {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -182,6 +187,16 @@ impl EmitSettings {
             push_framed(&mut payload, origin.authority().as_bytes());
         }
         emit_field(sink, FieldTag::ServerOrigins, &payload);
+
+        let mut payload = Vec::new();
+        push_len(&mut payload, frame_origins.len());
+        let mut written = String::new();
+        for entry in frame_origins.entries() {
+            written.clear();
+            entry.write(&mut written);
+            push_framed(&mut payload, written.as_bytes());
+        }
+        emit_field(sink, FieldTag::FrameOrigins, &payload);
 
         emit_field(
             sink,
@@ -231,6 +246,75 @@ impl EmitSettings {
     }
 }
 
+/// A frame-origin list a build of one intent and target cannot emit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameListRefused {
+    /// A release build lists a loopback entry, which only `ipe dev` trusts.
+    LoopbackAtRelease {
+        /// The refused loopback entry.
+        entry: FrameOriginEntry,
+    },
+    /// A browser-built development client lists a loopback entry, which its
+    /// runtime cannot represent.
+    LoopbackInBrowserClient {
+        /// The refused loopback entry.
+        entry: FrameOriginEntry,
+    },
+}
+
+impl std::fmt::Display for FrameListRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (entry, why) = match self {
+            Self::LoopbackAtRelease { entry } => (
+                entry,
+                "a loopback origin that is for served `ipe dev` only; a release build trusts \
+                 `https://` origins",
+            ),
+            Self::LoopbackInBrowserClient { entry } => (
+                entry,
+                "a loopback origin that is for served `ipe dev` only; a browser-built client \
+                 trusts `https://` origins",
+            ),
+        };
+        let mut written = String::with_capacity(entry.written_len());
+        entry.write(&mut written);
+        write!(f, "`delivery.frameOrigins` lists `{written}`, {why}")
+    }
+}
+
+/// The frame origins a build of `intent` for `target` may emit.
+///
+/// A development build for `Native` or `WasmWasi` emits every entry (both
+/// promote `dev-posture`, so their runtime represents a loopback origin);
+/// every other build only `https://` entries.
+///
+/// # Errors
+///
+/// [`FrameListRefused`] naming the first loopback entry a release build or a
+/// development browser client lists.
+pub fn frame_origins_for(
+    entries: &FrameOriginEntries,
+    intent: BuildIntent,
+    target: ipe_ir::Target,
+) -> Result<&FrameOriginEntries, FrameListRefused> {
+    let refusal: fn(FrameOriginEntry) -> FrameListRefused = match (intent, target) {
+        (BuildIntent::Development, ipe_ir::Target::Native | ipe_ir::Target::WasmWasi) => {
+            return Ok(entries);
+        }
+        (BuildIntent::Development, ipe_ir::Target::WasmClient) => {
+            |entry| FrameListRefused::LoopbackInBrowserClient { entry }
+        }
+        (
+            BuildIntent::Release,
+            ipe_ir::Target::Native | ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi,
+        ) => |entry| FrameListRefused::LoopbackAtRelease { entry },
+    };
+    entries
+        .entries()
+        .find(|entry| matches!(entry, FrameOriginEntry::Loopback(_)))
+        .map_or(Ok(entries), |entry| Err(refusal(entry.clone())))
+}
+
 /// The [`FieldTag::Host`] payload of `host`.
 fn host_payload(host: &EmitHost) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -276,6 +360,7 @@ enum FieldTag {
     Host = 11,
     Intent = 12,
     ServerOrigins = 13,
+    FrameOrigins = 14,
 }
 
 /// Write one field record: tag, payload length, payload.
@@ -379,6 +464,129 @@ mod tests {
             runtime_dep_payload(&linked(base)),
             Some(expected),
             "the dependency record is the presence byte and the framed digest alone",
+        );
+    }
+
+    /// The entries of `texts`, each a well-formed frame origin.
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn frames(texts: &[&str]) -> FrameOriginEntries {
+        FrameOriginEntries::new(
+            texts
+                .iter()
+                .map(|text| FrameOriginEntry::parse(text).expect("a frame origin")),
+        )
+        .expect("a frame list")
+    }
+
+    /// R28: a release build refuses a loopback frame origin and names it; a
+    /// development native build admits it; a release build admits `https://` entries.
+    #[test]
+    fn release_refuses_a_loopback_frame_origin() {
+        let loopback = frames(&["https://player.example", "http://localhost:3000"]);
+        let refused = frame_origins_for(&loopback, BuildIntent::Release, ipe_ir::Target::Native);
+        assert!(
+            matches!(&refused, Err(FrameListRefused::LoopbackAtRelease { entry }) if matches!(entry, FrameOriginEntry::Loopback(_))),
+            "{refused:?}"
+        );
+        let Err(refusal) = refused else { return };
+        let text = refusal.to_string();
+        assert!(text.contains("`http://localhost:3000`"), "{text}");
+        assert!(text.contains("served `ipe dev` only"), "{text}");
+        assert!(text.contains("a release build"), "{text}");
+        assert_eq!(
+            frame_origins_for(&loopback, BuildIntent::Development, ipe_ir::Target::Native),
+            Ok(&loopback)
+        );
+        let https = frames(&["https://player.example"]);
+        assert_eq!(
+            frame_origins_for(&https, BuildIntent::Release, ipe_ir::Target::Native),
+            Ok(&https)
+        );
+        let none = FrameOriginEntries::none();
+        assert_eq!(
+            frame_origins_for(&none, BuildIntent::Release, ipe_ir::Target::Native),
+            Ok(&none)
+        );
+    }
+
+    /// The verdict a refusal row expects.
+    #[derive(Clone, Copy, Debug)]
+    enum Row {
+        Admits,
+        AtRelease,
+        InBrowserClient,
+    }
+
+    /// R38: one row per `(BuildIntent, Target)`; a loopback entry is admitted
+    /// only by a development native or WASI build, and an `https://`-only list
+    /// by every build.
+    #[test]
+    fn frame_list_refusal_table() {
+        use ipe_ir::Target;
+        let loopback = frames(&["https://player.example", "http://localhost:3000"]);
+        let https = frames(&["https://player.example"]);
+        let table = [
+            (BuildIntent::Development, Target::Native, Row::Admits),
+            (BuildIntent::Development, Target::WasmWasi, Row::Admits),
+            (
+                BuildIntent::Development,
+                Target::WasmClient,
+                Row::InBrowserClient,
+            ),
+            (BuildIntent::Release, Target::Native, Row::AtRelease),
+            (BuildIntent::Release, Target::WasmClient, Row::AtRelease),
+            (BuildIntent::Release, Target::WasmWasi, Row::AtRelease),
+        ];
+        for (intent, target, row) in table {
+            let verdict = frame_origins_for(&loopback, intent, target);
+            let held = match row {
+                Row::Admits => verdict == Ok(&loopback),
+                Row::AtRelease => matches!(
+                    &verdict,
+                    Err(FrameListRefused::LoopbackAtRelease { entry })
+                        if matches!(entry, FrameOriginEntry::Loopback(_))
+                ),
+                Row::InBrowserClient => matches!(
+                    &verdict,
+                    Err(FrameListRefused::LoopbackInBrowserClient { entry })
+                        if matches!(entry, FrameOriginEntry::Loopback(_))
+                ),
+            };
+            assert!(held, "{intent:?} {target:?}: {verdict:?}, expected {row:?}");
+            if let Err(refusal) = &verdict {
+                let text = refusal.to_string();
+                assert!(text.contains("`http://localhost:3000`"), "{text}");
+            }
+            assert_eq!(
+                frame_origins_for(&https, intent, target),
+                Ok(&https),
+                "{intent:?} {target:?}"
+            );
+        }
+        let browser = frame_origins_for(&loopback, BuildIntent::Development, Target::WasmClient);
+        let Err(refusal) = browser else { return };
+        let text = refusal.to_string();
+        assert!(text.contains("a browser-built client"), "{text}");
+    }
+
+    /// The listed frame origins split the key, and an empty list keeps a
+    /// record of its own.
+    #[test]
+    fn the_frame_origins_split_the_key() {
+        let with = |entries| EmitSettings {
+            frame_origins: entries,
+            ..EmitSettings::unconfigured()
+        };
+        let none = records(&EmitSettings::unconfigured());
+        let one = records(&with(frames(&["https://a.example"])));
+        assert_ne!(none, one);
+        assert_ne!(one, records(&with(frames(&["https://b.example"]))));
+        assert_eq!(one, records(&with(frames(&["https://a.example"]))));
+        assert!(
+            none.chunks(3)
+                .any(|record| record.first().map(Vec::as_slice)
+                    == Some(&[FieldTag::FrameOrigins as u8])),
+            "the empty list writes its record"
         );
     }
 

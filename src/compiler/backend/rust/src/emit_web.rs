@@ -304,6 +304,54 @@ fn emit_web_route(
     )))
 }
 
+/// The one-time registration statements a NATIVE served web app emits.
+///
+/// Without a listed frame origin this is
+/// [`granted_web_features_register_stmt`] alone, byte for byte. With one, the
+/// granted suffixes are one emitted binding that feeds both the
+/// `Permissions-Policy` registry and `frames::register`, so the header and
+/// the frame sink read one grant set.
+fn served_register_stmts(ctx: &EmitCtx) -> String {
+    let origins = frame_origin_literals(&ctx.frame_origins);
+    if origins.is_empty() {
+        return granted_web_features_register_stmt(ctx);
+    }
+    format!(
+        "let __ipe_granted: &[&str] = &[{}]; \
+         ipe_runtime::telemetry::register_granted_web_features(__ipe_granted); \
+         ipe_runtime::frames::register(&[{}], __ipe_granted); ",
+        granted_suffix_literals(ctx).join(", "),
+        origins.join(", ")
+    )
+}
+
+/// The listed frame origins as Rust string literals, each its written form,
+/// in the list's sorted order.
+pub fn frame_origin_literals(
+    frames: &ipe_runtime_rust::encoding::FrameOriginEntries,
+) -> Vec<String> {
+    let mut written = String::new();
+    frames
+        .entries()
+        .map(|entry| {
+            written.clear();
+            entry.write(&mut written);
+            rust_str_lit(&written)
+        })
+        .collect()
+}
+
+/// The program's granted web-capability suffixes as Rust string literals, in
+/// sorted order.
+pub fn granted_suffix_literals(ctx: &EmitCtx) -> Vec<String> {
+    // Deterministic order (BTreeSet iteration is sorted); `rust_str_lit` renders
+    // each `&'static str` suffix as a valid Rust string literal.
+    ctx.web_capabilities
+        .iter()
+        .map(|c| rust_str_lit(c.as_str()))
+        .collect()
+}
+
 /// The one-time registration statement a NATIVE served web app emits so the
 /// runtime's `Permissions-Policy` opens exactly the GRANTED `Ipe.Browser.*`
 /// axes' directives (`geolocation` / `camera` / `microphone`) to `(self)` and
@@ -322,13 +370,7 @@ fn granted_web_features_register_stmt(ctx: &EmitCtx) -> String {
     if ctx.web_capabilities.is_empty() {
         return String::new();
     }
-    // Deterministic order (BTreeSet iteration is sorted); `rust_str_lit` renders
-    // each `&'static str` suffix as a valid Rust string literal.
-    let suffixes: Vec<String> = ctx
-        .web_capabilities
-        .iter()
-        .map(|c| rust_str_lit(c.as_str()))
-        .collect();
+    let suffixes = granted_suffix_literals(ctx);
     format!(
         "ipe_runtime::telemetry::register_granted_web_features(&[{}]); ",
         suffixes.join(", ")
@@ -573,7 +615,7 @@ fn emit_routed_web_leaf(
     let register = format!(
         "{}{}",
         crate::served_install::register_stmt(&ctx.served_install),
-        granted_web_features_register_stmt(ctx)
+        served_register_stmts(ctx)
     );
     let handler = &update.handler;
     let page_of = page_of_closure(&model_ty_s);
@@ -638,7 +680,7 @@ fn emit_single_page_web_leaf(
     let register = format!(
         "{}{}",
         crate::served_install::register_stmt(&ctx.served_install),
-        granted_web_features_register_stmt(ctx)
+        served_register_stmts(ctx)
     );
     format!("{{ {register}{tag_const} {msg_set_item}{handle} }}")
 }
@@ -4127,6 +4169,36 @@ mod hot_appearance_tests {
         assert!(
             out.is_none(),
             "flag-off: no wiring composition, the arm stays byte-identical"
+        );
+        Ok(())
+    }
+
+    /// R20: the frame registration is emitted only for a listed origin. An
+    /// empty list leaves the served statements byte-identical; a listed origin
+    /// feeds one granted binding to both the `Permissions-Policy` registry and
+    /// `frames::register`.
+    #[test]
+    #[allow(clippy::expect_used)] // the planted origin is well-formed
+    fn register_emitted_only_for_a_listed_origin() -> DResult<()> {
+        use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
+        let mut interner = Interner::new();
+        let (program, _) = one_view_program(&mut interner, Expr::Int(0))?;
+        let settings = crate::EmitSettings::unconfigured();
+        let mut ctx = RustBackend::configured(&interner, &settings).emit_ctx_for_tests(&program)?;
+        ctx.web_capabilities
+            .insert(ipe_kernels::WebCapability::Geolocation);
+        let empty = super::served_register_stmts(&ctx);
+        assert_eq!(empty, super::granted_web_features_register_stmt(&ctx));
+        assert!(!empty.contains("frames::register"), "{empty}");
+
+        let entry = FrameOriginEntry::parse("https://player.example").expect("a frame origin");
+        ctx.frame_origins = FrameOriginEntries::new([entry]).expect("a frame list");
+        let served = super::served_register_stmts(&ctx);
+        assert_eq!(
+            served,
+            "let __ipe_granted: &[&str] = &[\"geolocation\"]; \
+             ipe_runtime::telemetry::register_granted_web_features(__ipe_granted); \
+             ipe_runtime::frames::register(&[\"https://player.example\"], __ipe_granted); "
         );
         Ok(())
     }

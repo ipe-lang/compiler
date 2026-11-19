@@ -150,6 +150,7 @@ const fn settings(debugger: bool, host: EmitHost) -> EmitSettings {
         wasm_public_env: Vec::new(),
         mount_base: MountBase::root(),
         server_origins: ipe_backend_rust::ServerOrigins::none(),
+        frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
         wasm_hydrate_mode: false,
         runtime_dep: Some(RuntimeDep {
             content: ipe_backend_rust::RuntimeContentId::from_digest_bytes([0; 16]),
