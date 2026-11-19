@@ -386,7 +386,7 @@ fn registers_frame_list(program: &ipe_ir::Program, settings: &EmitSettings) -> b
 
 /// Who drives a web app-entry leaf (`Web.tea`, `Web.embed`, and their aliases).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LeafHost {
+pub enum LeafHost {
     /// The browser client: the leaf is the client sink, and the entry
     /// registers the frame list.
     Browser,
@@ -404,7 +404,7 @@ pub(crate) enum LeafHost {
 /// A mountable leaf is nested in a server's router, so a webview host never
 /// drives it. The emitter's leaf branch and the frame-list gate both read
 /// this one judge.
-pub(crate) const fn leaf_host(target: ipe_ir::Target, webview: bool, mountable: bool) -> LeafHost {
+pub const fn leaf_host(target: ipe_ir::Target, webview: bool, mountable: bool) -> LeafHost {
     match target {
         ipe_ir::Target::WasmClient => LeafHost::Browser,
         ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
@@ -418,7 +418,7 @@ pub(crate) const fn leaf_host(target: ipe_ir::Target, webview: bool, mountable: 
 }
 
 /// Whether web app-entry `kernel` builds a leaf a server mounts (`Web.embed`).
-pub(crate) const fn mounts_into_server(kernel: ipe_ir::KernelFn) -> bool {
+pub const fn mounts_into_server(kernel: ipe_ir::KernelFn) -> bool {
     matches!(kernel, ipe_ir::KernelFn::WebEmbed)
 }
 
