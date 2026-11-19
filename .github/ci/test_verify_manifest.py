@@ -25,9 +25,11 @@ verify-manifest.py itself already requires.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -5892,10 +5894,13 @@ class TestAptOnePath(unittest.TestCase):
 class TestAptInstallScript(unittest.TestCase):
     """The apt action's own `run` text, executed with `sudo` stubbed (an apt
     or dpkg command exits `rc`; the mirror edit runs for real on source files
-    under a scratch `/etc/apt`): it refuses every input it cannot pass to apt
-    as written, repoints each failed attempt to the next mirror and names each
-    file it repointed, warns when an attempt has nothing to repoint, kills a
-    command that ignores its cap's stop, and fails when every attempt fails."""
+    under a scratch `/etc/apt`; the signed listing prints `uris`): it refuses
+    every input it cannot pass to apt as written, repoints each failed attempt
+    to the next mirror and names each file it repointed, warns with the hosts
+    it found when an attempt has nothing to repoint, keeps a cached archive
+    only when its name, size and SHA-256 or SHA-512 match the signed listing,
+    kills a command that ignores its cap's stop, and fails when every attempt
+    fails."""
 
     _OPTS = "-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
     _CAP = "timeout -k 30 360"
@@ -5905,6 +5910,14 @@ class TestAptInstallScript(unittest.TestCase):
         "apt-mirrors.txt": "http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\n",
         "sources.list.d/ubuntu.sources": "Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\n",
     }
+    # The runner's `/etc/apt/apt-mirrors.txt` on the Azure-hosted image: the
+    # 144-byte `Mirrorlist` its apt update fetches, as the runner image's apt
+    # source setup writes it.
+    _AZURE_MIRRORS = (
+        "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n"
+        "https://archive.ubuntu.com/ubuntu/\tpriority:2\n"
+        "https://security.ubuntu.com/ubuntu/\tpriority:3\n"
+    )
 
     def run_script(
         self,
@@ -5916,18 +5929,36 @@ class TestAptInstallScript(unittest.TestCase):
         sources: dict[str, str] | None = None,
         hang: bool = False,
         script: str | None = None,
+        uris: str = "",
+        uris_rc: int = 0,
+        debs: dict[str, bytes | None] | None = None,
+        runner_temp: str = "{tmp}",
     ) -> tuple[int, list[str]]:
         """Exit status and recorded `sudo` argv lines; `{tmp}` in `archives`
-        is a writable scratch directory. `/etc/apt/` in the script reads a
-        scratch directory holding `sources`, so the host's own apt sources are
-        never read or edited. `hang` runs each capped command, its durations
-        cut to one second, as a process that ignores the stop signal."""
+        and `runner_temp` is a writable scratch directory. `/etc/apt/` in the
+        script reads a scratch directory holding `sources`, so the host's own
+        apt sources are never read or edited. `hang` runs each capped command,
+        its durations cut to one second, as a process that ignores the stop
+        signal. The signed listing (`--print-uris`) prints `uris` and exits
+        `uris_rc`. `debs` are planted in `archives` before the run (`None`
+        plants a directory); `self.left` names what is left there after."""
         if script is None:
             doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
             script = doc["runs"]["steps"][0]["run"]
         with tempfile.TemporaryDirectory() as tmp:
             etc = os.path.join(tmp, "etc", "apt")
             os.makedirs(os.path.join(etc, "sources.list.d"))
+            archives = archives.replace("{tmp}", tmp)
+            for name, content in (debs or {}).items():
+                os.makedirs(archives, exist_ok=True)
+                if content is None:
+                    os.makedirs(os.path.join(archives, name))
+                else:
+                    with open(os.path.join(archives, name), "wb") as f:
+                        f.write(content)
+            uris_file = os.path.join(tmp, "uris.txt")
+            with open(uris_file, "w", encoding="utf-8") as f:
+                f.write(uris)
             for name, text in (sources or {}).items():
                 with open(os.path.join(etc, name), "w", encoding="utf-8") as f:
                     f.write(text)
@@ -5941,6 +5972,7 @@ class TestAptInstallScript(unittest.TestCase):
                     'printf \'%s\\n\' "$*" >> "$SUDO_LOG"\n'
                     'if [ "$1" = sed ]; then exec "$@"; fi\n'
                     '[ "$1" = timeout ] || exit 0\n'
+                    'if [[ " $* " == *" --print-uris "* ]]; then cat "$SUDO_URIS"; exit "$SUDO_URIS_RC"; fi\n'
                     'if [ -n "$SUDO_HANG" ]; then\n'
                     "  shift\n"
                     "  pre=()\n"
@@ -5955,13 +5987,17 @@ class TestAptInstallScript(unittest.TestCase):
                 "SUDO_LOG": log,
                 "SUDO_RC": str(rc),
                 "SUDO_HANG": "1" if hang else "",
+                "SUDO_URIS": uris_file,
+                "SUDO_URIS_RC": str(uris_rc),
                 "LC_ALL": lc_all,
                 "APT_PACKAGES": packages,
-                "APT_ARCHIVES": archives.replace("{tmp}", tmp),
+                "APT_ARCHIVES": archives,
                 "APT_NO_RECOMMENDS": recommends,
+                "RUNNER_TEMP": runner_temp.replace("{tmp}", tmp),
             }
             done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
             self.stdout, self.stderr = done.stdout, done.stderr
+            self.left = sorted(os.listdir(archives)) if archives and os.path.isdir(archives) else []
             self.edited = {}
             for name in (sources or {}):
                 with open(os.path.join(etc, name), encoding="utf-8") as f:
@@ -5972,14 +6008,24 @@ class TestAptInstallScript(unittest.TestCase):
     def test_control_installs(self) -> None:
         with tempfile.TemporaryDirectory() as archives:
             code, calls = self.run_script("bubblewrap python3", archives=archives, recommends="true")
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(len(calls), 4, calls)
+        self.assertEqual(calls[:2], [f"{self._CAP} dpkg --configure -a", f"{self._CAP} apt-get {self._OPTS} update"])
+        # The listing asks for SHA-256 and lists into a fresh empty archive
+        # directory, so it names every archive the install needs, never only
+        # the ones the cache lacks.
+        self.assertRegex(
+            calls[2],
+            "^"
+            + re.escape(f"{self._CAP} apt-get {self._OPTS} -y --no-install-recommends -o Acquire::ForceHash=SHA256 -o Dir::Cache::archives=")
+            + r"/\S+/apt-listing\.[A-Za-z0-9]{6} "
+            + re.escape("--print-uris install bubblewrap python3")
+            + "$",
+        )
+        self.assertNotIn(archives, calls[2])
         self.assertEqual(
-            calls,
-            [
-                f"{self._CAP} dpkg --configure -a",
-                f"{self._CAP} apt-get {self._OPTS} update",
-                f"{self._CAP} apt-get {self._OPTS} -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
-            ],
+            calls[3],
+            f"{self._CAP} apt-get {self._OPTS} -y --no-install-recommends -o Dir::Cache::archives={archives} install bubblewrap python3",
         )
 
     def test_unpassable_input_refused(self) -> None:
@@ -6004,6 +6050,16 @@ class TestAptInstallScript(unittest.TestCase):
                 code, calls = self.run_script(packages, archives, recommends)
                 self.assertNotEqual(code, 0)
                 self.assertEqual(calls, [])
+
+    def test_unlistable_runner_temp_refused(self) -> None:
+        # A cached archive directory needs a place to list the signed index
+        # into; without one the install is refused before any apt command.
+        for runner_temp in ("", "relative", "{tmp}/absent", "{tmp}/a b"):
+            with self.subTest(runner_temp=runner_temp):
+                code, calls = self.run_script("x", archives="{tmp}/archives", runner_temp=runner_temp)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(calls, [])
+                self.assertIn("RUNNER_TEMP must be an existing absolute directory", self.stderr)
 
     def test_every_attempt_failing_fails(self) -> None:
         code, calls = self.run_script("bubblewrap", rc=1)
@@ -6036,9 +6092,12 @@ class TestAptInstallScript(unittest.TestCase):
 
     def test_attempt_with_nothing_to_repoint_warns(self) -> None:
         # An arm64 runner's sources name ports.ubuntu.com, which no fallback
-        # mirror serves: the attempt says so instead of claiming a repoint.
+        # mirror serves, and an unknown provider's host matches no Ubuntu
+        # archive role: the attempt says so, naming the hosts it found,
+        # instead of claiming a repoint.
         ports = {"sources.list.d/ubuntu.sources": "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"}
-        for sources in (None, ports):
+        unknown = {"apt-mirrors.txt": "http://mirror.example.net/ubuntu/\tpriority:1\n", **ports}
+        for sources, hosts in ((None, "none"), (ports, "ports.ubuntu.com"), (unknown, "mirror.example.net ports.ubuntu.com")):
             with self.subTest(sources=sources):
                 code, _calls = self.run_script("bubblewrap", rc=1, sources=sources)
                 self.assertNotEqual(code, 0)
@@ -6046,11 +6105,143 @@ class TestAptInstallScript(unittest.TestCase):
                 self.assertEqual(
                     [line for line in self.stdout.splitlines() if line.startswith("::warning::")],
                     [
-                        f"::warning::apt-install: attempt {n} found no Ubuntu archive or security source to repoint, so it retries the same mirrors"
+                        f"::warning::apt-install: attempt {n} found no Ubuntu archive or security source to repoint (source hosts: {hosts}), so it retries the same mirrors"
                         for n in (2, 3)
                     ],
                 )
                 self.assertEqual(self.edited, sources or {})
+
+    def test_runner_mirror_lists_are_repointed(self) -> None:
+        # The mirror host varies with the provider; each runner list is
+        # repointed whole, and no warning claims the fallback did nothing.
+        ec2 = self._SOURCES["apt-mirrors.txt"]
+        for mirrors in (self._AZURE_MIRRORS, ec2):
+            with self.subTest(mirrors=mirrors):
+                code, _calls = self.run_script("bubblewrap", rc=1, sources={"apt-mirrors.txt": mirrors})
+                self.assertNotEqual(code, 0)
+                self.assertEqual(
+                    [line for line in self.stdout.splitlines() if "repoints" in line],
+                    [f"apt attempt {n} repoints {self.etc}/apt-mirrors.txt to {m}" for n, m in ((2, "archive.ubuntu.com"), (3, "mirrors.edge.kernel.org"))],
+                )
+                self.assertNotIn("::warning::", self.stdout)
+                self.assertNotIn(".archive.ubuntu.com", self.edited["apt-mirrors.txt"])
+                self.assertNotIn("security.ubuntu.com", self.edited["apt-mirrors.txt"])
+
+    # A cached archive set: name -> content. The signed listing below names
+    # each with the size and hash the archive the index vouches for has.
+    _GOOD = b"good archive bytes"
+    _ARCHIVES = {
+        "gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb": _GOOD,
+        "vim-gui-common_2%3a8.2.3995-1ubuntu2.36_all.deb": b"epoch archive",
+        "rake_13.0.6-2_all.deb": b"sha512 archive",
+        "at_3.2.5-1ubuntu1_amd64.deb": b"tampered bytes!!!!",
+        "ruby3.0_3.0.2-7ubuntu2.13_amd64.deb": b"md5 listed",
+        "stale_1.0-1_amd64.deb": b"no longer listed",
+        "libruby3.0_3.0.2-7ubuntu2.13_amd64.deb": b"listed twice",
+    }
+
+    def _listing(self) -> str:
+        """`apt-get --print-uris` output with `-o Acquire::ForceHash=SHA256`
+        in the shape apt prints it (its progress lines, then one
+        `'<uri>' <file> <size> <TYPE>:<hex>` line per archive), with sizes
+        and hashes computed over `_ARCHIVES`."""
+        good = self._GOOD
+        tampered_source = b"original bytes!!!!"
+        self.assertEqual(len(tampered_source), len(self._ARCHIVES["at_3.2.5-1ubuntu1_amd64.deb"]))
+        epoch = self._ARCHIVES["vim-gui-common_2%3a8.2.3995-1ubuntu2.36_all.deb"]
+        sha512 = self._ARCHIVES["rake_13.0.6-2_all.deb"]
+        md5 = self._ARCHIVES["ruby3.0_3.0.2-7ubuntu2.13_amd64.deb"]
+        twice = self._ARCHIVES["libruby3.0_3.0.2-7ubuntu2.13_amd64.deb"]
+        pool = "http://azure.archive.ubuntu.com/ubuntu/pool/main"
+        return (
+            "Reading package lists...\n"
+            "Building dependency tree...\n"
+            "Reading state information...\n"
+            "0 upgraded, 7 newly installed, 0 to remove and 32 not upgraded.\n"
+            "Need to get 63.2 MB of archives.\n"
+            f"'{pool}/a/atk1.0/gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb' gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb {len(good)} SHA256:{hashlib.sha256(good).hexdigest()}\n"
+            f"'{pool}/v/vim/vim-gui-common_8.2.3995-1ubuntu2.36_all.deb' vim-gui-common_2%3a8.2.3995-1ubuntu2.36_all.deb {len(epoch)} SHA256:{hashlib.sha256(epoch).hexdigest()}\n"
+            f"'{pool}/r/rake/rake_13.0.6-2_all.deb' rake_13.0.6-2_all.deb {len(sha512)} SHA512:{hashlib.sha512(sha512).hexdigest()}\n"
+            f"'{pool}/a/at/at_3.2.5-1ubuntu1_amd64.deb' at_3.2.5-1ubuntu1_amd64.deb {len(tampered_source)} SHA256:{hashlib.sha256(tampered_source).hexdigest()}\n"
+            f"'{pool}/r/ruby3.0/ruby3.0_3.0.2-7ubuntu2.13_amd64.deb' ruby3.0_3.0.2-7ubuntu2.13_amd64.deb {len(md5)} MD5Sum:{hashlib.md5(md5).hexdigest()}\n"
+            f"'{pool}/r/ruby3.0/libruby3.0_3.0.2-7ubuntu2.13_amd64.deb' libruby3.0_3.0.2-7ubuntu2.13_amd64.deb {len(twice)} SHA256:{hashlib.sha256(twice).hexdigest()}\n"
+            f"'{pool}/r/ruby3.0/libruby3.0_3.0.2-7ubuntu2.13_amd64.deb' libruby3.0_3.0.2-7ubuntu2.13_amd64.deb {len(twice)} SHA256:{hashlib.sha256(b'other').hexdigest()}\n"
+            f"'{pool}/u/unparsed/unparsed_1_amd64.deb' unparsed_1_amd64.deb\n"
+        )
+
+    def test_cached_archives_kept_only_when_the_signed_listing_vouches(self) -> None:
+        code, calls = self.run_script("libwebkit2gtk-4.1-dev", archives="{tmp}/archives", uris=self._listing(), debs=self._ARCHIVES)
+        self.assertEqual(code, 0, self.stderr)
+        # Kept: a variant-named archive, an epoch (`%3a`) name and a SHA-512
+        # entry, each matching. Removed: a same-size tampered archive, an
+        # MD5-only entry (a hash type it does not trust), an unlisted one and
+        # one listed twice with two hashes.
+        self.assertEqual(
+            self.left,
+            ["gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb", "partial", "rake_13.0.6-2_all.deb", "vim-gui-common_2%3a8.2.3995-1ubuntu2.36_all.deb"],
+        )
+        warnings = [line for line in self.stdout.splitlines() if line.startswith("::warning::")]
+        self.assertEqual(
+            warnings,
+            [
+                "::warning::apt-install: 1 archive lines of the signed listing did not parse, so no cached copy of them is kept",
+                *(
+                    f"::warning::apt-install: cached {n} does not match the signed index, so it is removed and fetched again"
+                    for n in ("at_3.2.5-1ubuntu1_amd64.deb", "libruby3.0_3.0.2-7ubuntu2.13_amd64.deb", "ruby3.0_3.0.2-7ubuntu2.13_amd64.deb")
+                ),
+            ],
+        )
+        self.assertIn("apt attempt 1 keeps 3 cached archives the signed index lists and removes 4", self.stdout)
+        self.assertTrue(calls[-1].endswith("install libwebkit2gtk-4.1-dev"), calls)
+
+    def test_skipped_hash_comparison_keeps_the_tampered_archive(self) -> None:
+        # Mutation check: with the hash comparison removed, the same-size
+        # tampered archive survives, so the test above discriminates.
+        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
+        script = doc["runs"]["steps"][0]["run"]
+        compare = '"${actual%% *}" == "$digest"'
+        self.assertEqual(script.count(compare), 1)
+        code, _calls = self.run_script(
+            "x", archives="{tmp}/archives", uris=self._listing(), debs=self._ARCHIVES, script=script.replace(compare, "-n $digest")
+        )
+        self.assertEqual(code, 0, self.stderr)
+        self.assertIn("at_3.2.5-1ubuntu1_amd64.deb", self.left)
+
+    def test_symlinked_cached_archive_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as outside:
+            target = os.path.join(outside, "real.deb")
+            with open(target, "wb") as f:
+                f.write(self._GOOD)
+            name = "gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb"
+            listing = self._listing()
+            with tempfile.TemporaryDirectory() as tmp:
+                archives = os.path.join(tmp, "archives")
+                os.makedirs(archives)
+                os.symlink(target, os.path.join(archives, name))
+                code, _calls = self.run_script("x", archives=archives, uris=listing)
+            self.assertEqual(code, 0, self.stderr)
+            self.assertEqual(self.left, ["partial"])
+            self.assertTrue(os.path.isfile(target))
+
+    def test_directory_named_as_archive_refused(self) -> None:
+        code, calls = self.run_script("x", archives="{tmp}/archives", uris=self._listing(), debs={"odd_1_amd64.deb": None})
+        self.assertNotEqual(code, 0)
+        self.assertIn("a cached archive is a directory", self.stderr)
+        self.assertFalse(any(c.endswith("install x") and "--print-uris" not in c for c in calls), calls)
+
+    def test_failed_listing_never_reaches_the_install(self) -> None:
+        code, calls = self.run_script("x", archives="{tmp}/archives", uris=self._listing(), uris_rc=1, debs=self._ARCHIVES)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(len([c for c in calls if "--print-uris" in c]), 3)
+        self.assertFalse(any(c.endswith("install x") and "--print-uris" not in c for c in calls), calls)
+        self.assertIn("failed at verify", self.stdout)
+
+    def test_empty_listing_removes_every_cached_archive(self) -> None:
+        # Nothing to fetch (every package already installed) or a listing
+        # with no archive line: no cached archive is vouched for.
+        code, _calls = self.run_script("x", archives="{tmp}/archives", uris="Reading package lists...\n", debs=self._ARCHIVES)
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(self.left, ["partial"])
 
     def test_command_ignoring_its_stop_is_killed(self) -> None:
         # Each capped command ignores SIGTERM for 20 s; the kill grace ends it
@@ -6099,6 +6290,137 @@ class TestAptInstallScript(unittest.TestCase):
                         "URIs: http://ports.ubuntu.com/ubuntu-ports/",
                     ],
                 )
+
+
+class TestWebviewLinkDepsScript(unittest.TestCase):
+    """The webview link deps action's own `run` texts, executed: the image
+    identity keeps only key-safe values, and the archive check prunes every
+    archive no installed package names and fails the job on an archive the
+    save could not read."""
+
+    # `dpkg-query -W -f='${db:Status-Abbrev}\t${Package}_${Version}\n'` rows
+    # as dpkg prints them: a three-character status, a tab, then the
+    # package and version (an epoch spelled with `:`).
+    _INSTALLED = (
+        "ii \tgir1.2-atk-1.0_2.60.4-0ubuntu0.1\n"
+        "ii \tacpid_1:2.0.33-1ubuntu1\n"
+        "rc \told-pkg_1.0-1\n"
+    )
+
+    def step_run(self, step_id: str) -> str:
+        doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "webview-link-deps", "action.yml"))
+        step = next(st for st in doc["runs"]["steps"] if st.get("id") == step_id)
+        return step["run"]
+
+    def run_step(self, step_id: str, env: dict[str, str], tmp: str, installed: str | None = None) -> tuple[int, dict[str, str]]:
+        """Exit status and the `GITHUB_OUTPUT` pairs; `installed` stubs
+        `dpkg-query` on `PATH`."""
+        bin_dir = os.path.join(tmp, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        if installed is not None:
+            rows = os.path.join(tmp, "rows")
+            with open(rows, "w", encoding="utf-8") as f:
+                f.write(installed)
+            stub = os.path.join(bin_dir, "dpkg-query")
+            with open(stub, "w", encoding="utf-8") as f:
+                f.write(f"#!/bin/bash\ncat {rows}\n")
+            os.chmod(stub, 0o755)
+        out = os.path.join(tmp, "output")
+        open(out, "w").close()
+        full = {"PATH": bin_dir + os.pathsep + os.environ.get("PATH", ""), "GITHUB_OUTPUT": out, **env}
+        done = subprocess.run(["bash", "-c", self.step_run(step_id)], env=full, capture_output=True, text=True, timeout=60, check=False)
+        self.stdout, self.stderr = done.stdout, done.stderr
+        with open(out, encoding="utf-8") as f:
+            pairs = dict(line.split("=", 1) for line in f.read().splitlines())
+        return done.returncode, pairs
+
+    def test_image_identity_keeps_only_key_safe_values(self) -> None:
+        for image_os, image, want_os, want_image in (
+            ("ubuntu26", "20261111.196.1", "ubuntu26", "20261111.196.1"),
+            ("ubuntu 26", "2026$(id)", "unknown", "unknown"),
+            ("", "", "unknown", "unknown"),
+            ("ubuntu26-x", "a/b", "unknown", "unknown"),
+        ):
+            with self.subTest(image_os=image_os, image=image), tempfile.TemporaryDirectory() as tmp:
+                code, out = self.run_step("apt-image", {"ImageOS": image_os, "ImageVersion": image}, tmp)
+                self.assertEqual(code, 0, self.stderr)
+                self.assertEqual(out["os"], want_os)
+                self.assertEqual(out["image"], want_image)
+                self.assertRegex(out["variant"], r"^[0-9a-f]{16}$")
+
+    def archives_case(self, debs: dict[str, bytes], installed: str | None = None) -> tuple[int, dict[str, str], list[str]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            archives = os.path.join(tmp, "apt-archives")
+            os.makedirs(archives)
+            for name, content in debs.items():
+                with open(os.path.join(archives, name), "wb") as f:
+                    f.write(content)
+            code, out = self.run_step("apt-archives", {"ARCHIVES_DIR": archives}, tmp, self._INSTALLED if installed is None else installed)
+            return code, out, sorted(os.listdir(archives))
+
+    def test_prunes_archives_no_installed_package_names(self) -> None:
+        code, out, left = self.archives_case(
+            {
+                "gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb": b"a",
+                "acpid_1%3a2.0.33-1ubuntu1_amd64.deb": b"b",
+                "old-pkg_1.0-1_amd64.deb": b"c",
+                "gir1.2-atk-1.0_2.60.3-0ubuntu1_amd64v3.deb": b"d",
+                "not an archive name.deb": b"e",
+            }
+        )
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(left, ["acpid_1%3a2.0.33-1ubuntu1_amd64.deb", "gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb"])
+        self.assertEqual(out, {"debs": "2"})
+
+    def test_empty_install_listing_refused(self) -> None:
+        code, out, _left = self.archives_case({"acpid_1%3a2.0.33-1ubuntu1_amd64.deb": b"b"}, installed="")
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, {})
+        self.assertIn("listed no installed package", self.stderr)
+
+    def test_symlinked_archive_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archives = os.path.join(tmp, "apt-archives")
+            os.makedirs(archives)
+            target = os.path.join(tmp, "real")
+            open(target, "wb").close()
+            os.symlink(target, os.path.join(archives, "acpid_1%3a2.0.33-1ubuntu1_amd64.deb"))
+            code, out = self.run_step("apt-archives", {"ARCHIVES_DIR": archives}, tmp, self._INSTALLED)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, {})
+        self.assertIn("is not a regular file", self.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 file")
+    def test_unreadable_archive_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archives = os.path.join(tmp, "apt-archives")
+            os.makedirs(archives)
+            path = os.path.join(archives, "acpid_1%3a2.0.33-1ubuntu1_amd64.deb")
+            open(path, "wb").close()
+            os.chmod(path, 0)
+            code, out = self.run_step("apt-archives", {"ARCHIVES_DIR": archives}, tmp, self._INSTALLED)
+            os.chmod(path, 0o644)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, {})
+        self.assertIn("is not readable by the runner user", self.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root lists a mode-000 directory")
+    def test_unlistable_archive_directory_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            archives = os.path.join(tmp, "apt-archives")
+            os.makedirs(archives)
+            os.chmod(archives, 0o300)
+            code, out = self.run_step("apt-archives", {"ARCHIVES_DIR": archives}, tmp, self._INSTALLED)
+            os.chmod(archives, 0o755)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, {})
+        self.assertIn("not listable by the runner user", self.stderr)
+
+    def test_missing_archive_directory_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self.run_step("apt-archives", {"ARCHIVES_DIR": os.path.join(tmp, "absent")}, tmp, self._INSTALLED)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(out, {})
 
 
 _DU_WF = """\
@@ -7280,7 +7602,9 @@ class TestReleaseTargetParity(unittest.TestCase):
             ('update) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" update', 'update) sudo apt-get "${apt_opts[@]}" update'),
             ('install) sudo timeout -k 30 "$left" apt-get', 'install) sudo timeout "$left" apt-get'),
             ("            if ((repointed == 0)); then\n", "            if false; then\n"),
-            ("for stage in configure update install; do", "for stage in update install; do"),
+            ("for stage in configure update verify install; do", "for stage in configure update install; do"),
+            ('-o Acquire::ForceHash=SHA256 ', ''),
+            ('"${actual%% *}" == "$digest"', '-n "$actual"'),
             ('    exit 1\n            fi\n            if ((left > 360))', '    break\n            fi\n            if ((left > 360))'),
             ("for attempt in 1 2 3; do", "for attempt in 1; do"),
             ('mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)', 'mirrors=("" mirror.invalid mirrors.edge.kernel.org)'),
