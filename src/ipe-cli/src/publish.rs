@@ -2920,6 +2920,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// A publish draft records only an `https://` or `ssh://` source: a local
+    /// `--source` and a local `origin` remote are both refused as not network.
+    #[test]
+    fn a_publish_draft_with_a_local_source_is_refused() {
+        let repo = make_git_repo("pub-local-source", "module Lib\n");
+        let manifest = publishable_manifest(&repo);
+        let origin = crate::remote_ingest::fixture_git(&repo)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .expect("git remote get-url");
+        let origin = String::from_utf8_lossy(&origin.stdout).trim().to_owned();
+        for (source, raw) in [(Some("/srv/repo"), "/srv/repo"), (None, origin.as_str())] {
+            let not_network = SourceUrl::parse(&pn("lib"), raw)
+                .expect_err("a local source is not an index source");
+            let expected = text::msg::publish_source_refused(&not_network);
+            let err = compute_entry_draft(&manifest, source, Some("HEAD"))
+                .expect_err("a local source is refused");
+            assert!(
+                matches!(&err, CliError::Usage(got) if *got == expected),
+                "{source:?}: {err:?}"
+            );
+        }
+        let draft =
+            compute_entry_draft(&manifest, Some("https://example.invalid/lib"), Some("HEAD"))
+                .expect("a network source drafts");
+        assert_eq!(draft.source.as_str(), "https://example.invalid/lib");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
     // --- Test H: render_entry_version round-trips a PinnedRev entry ---
 
     #[test]

@@ -2,7 +2,8 @@
 //! source git repo — no network, no real GitHub.
 //!
 //! A fixture index is a local git checkout with `packages/<name>.toml`; a
-//! fixture source is a local git repo whose HEAD is the pinned revision. The
+//! fixture source is a git repo served over a loopback HTTPS fixture, its HEAD
+//! the pinned revision, its `https://` URL the entry's `source`. The
 //! index entry's `sha256` is the real content hash of the source tree (computed
 //! via `ipe::resolve::hash_source_tree`), so the resolver's verify-before-trust
 //! check passes for a faithful fixture and fails for a tampered one.
@@ -14,7 +15,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use git_https_fixture::GitHttpsFixture;
 use ipe::lockfile::Lockfile;
+use ipe::remote_ingest::{FixtureTrust, trust_fixture};
 use ipe::resolve::{self, hash_source_tree};
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -64,9 +67,19 @@ fn fixture_source(tag: &str) -> PathBuf {
     repo
 }
 
-/// Build a fixture index with one package version pointing at `source`, pinned
-/// to its HEAD, with the given capabilities and the *given* sha256 (a faithful
-/// hash for a real fixture, a wrong one to exercise the mismatch path).
+/// `repo` served over a loopback HTTPS fixture this process's isolated git
+/// trusts, with its source URL; the server lives as long as the fixture.
+fn served(repo: &Path) -> (GitHttpsFixture, String) {
+    let (fixture, urls) = GitHttpsFixture::start(&[repo]).expect("fixture server starts");
+    trust_fixture(FixtureTrust::new(fixture.client_env())).expect("one trust per process");
+    let url = urls.first().expect("one served repository").to_string();
+    (fixture, url)
+}
+
+/// Build a fixture index with one package version pointing at served `source`,
+/// pinned to its HEAD, with the given capabilities and the *given* sha256 (a
+/// faithful hash for a real fixture, a wrong one to exercise the mismatch
+/// path); the server must outlive every fetch.
 fn fixture_index(
     tag: &str,
     name: &str,
@@ -74,18 +87,18 @@ fn fixture_index(
     source: &Path,
     sha256: &str,
     capabilities: &str,
-) -> PathBuf {
+) -> (PathBuf, GitHttpsFixture) {
+    let (fixture, url) = served(source);
     let index = temp_dir(&format!("index-{tag}"));
     let packages = index.join("packages");
     std::fs::create_dir_all(&packages).expect("packages dir");
     let entry = format!(
         "name = \"{name}\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"{version}\"\n\
-         source = \"{}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = {capabilities}\n",
-        source.display(),
+         source = \"{url}\"\nrev = \"{}\"\nsha256 = \"{sha256}\"\ncapabilities = {capabilities}\n",
         head_rev(source),
     );
     std::fs::write(packages.join(format!("{name}.toml")), entry).expect("write entry");
-    index
+    (index, fixture)
 }
 
 /// A minimal `package.ipe` for a freshly-scaffolded project: a single-field
@@ -112,7 +125,7 @@ fn read_manifest(proj: &Path) -> String {
 fn add_resolves_verifies_and_locks() {
     let source = fixture_source("ok");
     let sha = hash_source_tree(&source).expect("hash source");
-    let index = fixture_index(
+    let (index, _server) = fixture_index(
         "ok",
         "http-extras",
         "1.2.0",
@@ -171,13 +184,13 @@ fn add_resolves_a_rev_held_alive_only_by_a_tag() {
     git(&source, &["commit", "--quiet", "-m", "advance"]);
 
     // An index entry pinned to C1 (the tagged, non-tip rev) with C1's tree hash.
+    let (_server, url) = served(&source);
     let index = temp_dir("index-tagged");
     let packages = index.join("packages");
     std::fs::create_dir_all(&packages).expect("packages dir");
     let entry = format!(
         "name = \"http-extras\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"1.2.0\"\n\
-         source = \"{}\"\nrev = \"{pinned}\"\nsha256 = \"{sha}\"\ncapabilities = [\"network\"]\n",
-        source.display(),
+         source = \"{url}\"\nrev = \"{pinned}\"\nsha256 = \"{sha}\"\ncapabilities = [\"network\"]\n",
     );
     std::fs::write(packages.join("http-extras.toml"), entry).expect("write entry");
     let proj = scaffold_project("tagged");
@@ -207,7 +220,7 @@ fn add_rejects_a_hash_mismatch() {
     // The index pins a hash the fetched source does not match: verify-before-
     // trust must reject it, and write nothing.
     let source = fixture_source("bad");
-    let index = fixture_index(
+    let (index, _server) = fixture_index(
         "bad",
         "http-extras",
         "1.2.0",
@@ -235,11 +248,65 @@ fn add_rejects_a_hash_mismatch() {
     let _ = std::fs::remove_dir_all(&proj);
 }
 
+/// An index entry whose `source` names a local repository — a bare path or a
+/// `file://` URL — is refused at the index parse: nothing is fetched, locked
+/// or recorded.
+#[test]
+fn an_index_with_a_local_source_adds_nothing() {
+    let source = fixture_source("local");
+    let sha = hash_source_tree(&source).expect("hash source");
+    let plain = source.display().to_string();
+    let file_url = if cfg!(windows) {
+        format!("file:///{plain}")
+    } else {
+        format!("file://{plain}")
+    };
+    for (tag, raw) in [("plain", plain.as_str()), ("file", file_url.as_str())] {
+        let index = temp_dir(&format!("index-local-{tag}"));
+        let packages = index.join("packages");
+        std::fs::create_dir_all(&packages).expect("packages dir");
+        let recorded = raw.replace('\\', "\\\\");
+        let entry = format!(
+            "name = \"http-extras\"\npublisher = \"tester\"\n\n[[version]]\nversion = \"1.2.0\"\n\
+             source = \"{recorded}\"\nrev = \"{}\"\nsha256 = \"{sha}\"\ncapabilities = []\n",
+            head_rev(&source),
+        );
+        std::fs::write(packages.join("http-extras.toml"), entry).expect("write entry");
+        let proj = scaffold_project(&format!("local-{tag}"));
+        let manifest_before = read_manifest(&proj);
+
+        let req = "^1".parse().expect("valid req");
+        let err = resolve::resolve_and_add(&proj, "http-extras", &req, &index).unwrap_err();
+        let pkg = ipe::package_name::PackageName::parse("http-extras").expect("package name");
+        let shown = ipe::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+        let expected = ipe::text::msg::index_source_url_not_network(&pkg, &shown);
+        assert!(
+            matches!(&err, ipe::CliError::Resolve(msg) if *msg == expected),
+            "{tag}: {err:?}"
+        );
+        assert!(
+            !proj.join("ipe.lock").exists(),
+            "{tag}: a refusal writes no lock"
+        );
+        let lock = Lockfile::read(&proj).expect("lock");
+        assert!(lock.packages().is_empty(), "{tag}: a refusal locks nothing");
+        assert_eq!(
+            read_manifest(&proj),
+            manifest_before,
+            "{tag}: a refusal records nothing"
+        );
+        let _ = std::fs::remove_dir_all(&index);
+        let _ = std::fs::remove_dir_all(&proj);
+    }
+    let _ = std::fs::remove_dir_all(&source);
+}
+
 #[test]
 fn add_then_remove_leaves_both_files_clean() {
     let source = fixture_source("cycle");
     let sha = hash_source_tree(&source).expect("hash");
-    let index = fixture_index("cycle", "json-tools", "0.4.0", &source, sha.as_str(), "[]");
+    let (index, _server) =
+        fixture_index("cycle", "json-tools", "0.4.0", &source, sha.as_str(), "[]");
     let proj = scaffold_project("cycle");
 
     let req = "^0.4".parse().expect("valid req");
@@ -275,7 +342,7 @@ fn add_then_remove_leaves_both_files_clean() {
 fn add_appends_updates_and_never_overwrites_an_escape() {
     let source = fixture_source("block");
     let sha = hash_source_tree(&source).expect("hash");
-    let index = fixture_index(
+    let (index, _server) = fixture_index(
         "block",
         "http-extras",
         "1.2.0",
@@ -336,7 +403,8 @@ fn add_appends_updates_and_never_overwrites_an_escape() {
 
     // An index add that COLLIDES with the author-written escape is refused —
     // the escape is never converted to / overwritten by an index entry.
-    let esc_index = fixture_index("esc", "locallib", "0.1.0", &source, sha.as_str(), "[]");
+    let (esc_index, _esc_server) =
+        fixture_index("esc", "locallib", "0.1.0", &source, sha.as_str(), "[]");
     let req3 = "^0.1".parse().expect("req3");
     let err = resolve::resolve_and_add(&proj, "locallib", &req3, &esc_index)
         .expect_err("adding an index dep over an escape name must be refused");
