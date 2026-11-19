@@ -5391,6 +5391,30 @@ mod tests {
         );
     }
 
+    /// The fixture trust is set once: the same pairs again are a no-op, other
+    /// pairs are refused, and the trust in force is unchanged.
+    ///
+    /// Every fixture in one process yields the same pairs (one CA file per
+    /// process, constant proxy bypass), so this test leaves the trust exactly
+    /// as any other fixture test of the process would set it.
+    #[cfg(unix)] // the fixture's runtime tests run on Unix hosts only
+    #[test]
+    #[allow(clippy::expect_used)] // a fixture that cannot start is a failed test
+    fn a_conflicting_fixture_trust_is_refused() {
+        use super::{FIXTURE_TRUST, FixtureTrust, FixtureTrustConflict, trust_fixture};
+        let (fixture, _urls) =
+            git_https_fixture::GitHttpsFixture::start(&[]).expect("fixture starts");
+        let trust = || FixtureTrust::new(fixture.client_env());
+        assert_eq!(trust_fixture(trust()), Ok(()));
+        assert_eq!(trust_fixture(trust()), Ok(()), "the same pairs again");
+        let other = FixtureTrust::new([(
+            "GIT_SSL_CAINFO",
+            std::ffi::OsString::from("/elsewhere/ca.pem"),
+        )]);
+        assert_eq!(trust_fixture(other), Err(FixtureTrustConflict));
+        assert_eq!(FIXTURE_TRUST.get(), Some(&trust()), "the first trust stays");
+    }
+
     /// The user git allows only HTTPS and never prompts.
     #[test]
     fn user_git_allows_only_https() {

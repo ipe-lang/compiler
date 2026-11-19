@@ -178,6 +178,15 @@ impl GitHttpsFixture {
             .map(|repo| git_dir(repo))
             .collect::<Result<Vec<_>, _>>()?;
         let backend = Backend::probe()?;
+        Self::serve(git_dirs, backend, CgiCeilings::SERVED)
+    }
+
+    /// Serve the resolved `git_dirs` through `backend` under `ceilings`.
+    fn serve(
+        git_dirs: Vec<PathBuf>,
+        backend: Backend,
+        ceilings: CgiCeilings,
+    ) -> Result<(Self, Vec<RepoUrl>), FixtureError> {
         let config = Arc::new(server_config()?);
         let ca_file = ca_file()?;
         let listener = TcpListener::bind(("127.0.0.1", 0)).map_err(FixtureError::Bind)?;
@@ -188,6 +197,7 @@ impl GitHttpsFixture {
         let served = Arc::new(Served {
             git_dirs,
             backend,
+            ceilings,
             config,
         });
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -240,7 +250,23 @@ impl Drop for GitHttpsFixture {
 struct Served {
     git_dirs: Vec<PathBuf>,
     backend: Backend,
+    ceilings: CgiCeilings,
     config: Arc<ServerConfig>,
+}
+
+/// The output and wall-time ceilings every CGI child runs under.
+#[derive(Clone, Copy, Debug)]
+struct CgiCeilings {
+    stdout: u64,
+    wall: Duration,
+}
+
+impl CgiCeilings {
+    /// The ceilings a started fixture serves under.
+    const SERVED: Self = Self {
+        stdout: MAX_CGI_STDOUT,
+        wall: CGI_WALL_TIME,
+    };
 }
 
 /// The `git http-backend` program and the one directory its children search.
@@ -654,11 +680,11 @@ fn run_cgi(served: &Served, request: Request) -> Response {
     if request.gzip {
         command.env("HTTP_CONTENT_ENCODING", "gzip");
     }
-    let deadline = Instant::now() + CGI_WALL_TIME;
+    let deadline = Instant::now() + served.ceilings.wall;
     let Ok(mut child) = command.spawn() else {
         return Response::refused(Refused::BadGateway);
     };
-    let output = bounded_output(&mut child, request.body, deadline);
+    let output = bounded_output(&mut child, request.body, served.ceilings.stdout, deadline);
     let status = match &output {
         Ok(_) => wait_until(&mut child, deadline).ok().flatten(),
         Err(_) => None,
@@ -674,11 +700,16 @@ fn run_cgi(served: &Served, request: Request) -> Response {
     }
 }
 
-/// Feed `body` to the child and read its output under [`MAX_CGI_STDOUT`] by `deadline`.
+/// Feed `body` to the child and read at most `ceiling` bytes of its output by `deadline`.
 ///
 /// On a refusal the feeding and reading threads are left to end on their own:
 /// once the caller kills the child, its pipes close and both threads return.
-fn bounded_output(child: &mut Child, body: Vec<u8>, deadline: Instant) -> Result<Vec<u8>, Refused> {
+fn bounded_output(
+    child: &mut Child,
+    body: Vec<u8>,
+    ceiling: u64,
+    deadline: Instant,
+) -> Result<Vec<u8>, Refused> {
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(Refused::BadGateway);
     };
@@ -694,7 +725,7 @@ fn bounded_output(child: &mut Child, body: Vec<u8>, deadline: Instant) -> Result
         .spawn(move || {
             let mut out = Vec::new();
             let read = stdout
-                .take(MAX_CGI_STDOUT.saturating_add(1))
+                .take(ceiling.saturating_add(1))
                 .read_to_end(&mut out)
                 .map(|_| out);
             let _sent = sender.send(read);
@@ -706,7 +737,7 @@ fn bounded_output(child: &mut Child, body: Vec<u8>, deadline: Instant) -> Result
         Ok(Err(_)) => return Err(Refused::BadGateway),
         Err(_) => return Err(Refused::GatewayTimeout),
     };
-    if u64::try_from(out.len()).map_or(true, |len| len > MAX_CGI_STDOUT) {
+    if u64::try_from(out.len()).map_or(true, |len| len > ceiling) {
         return Err(Refused::BadGateway);
     }
     let _fed = feeder.join();
@@ -800,8 +831,8 @@ fn write_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        CA_PEM, GitHttpsFixture, MAX_BODY_BYTES, MAX_CONCURRENT, MAX_CONNECTIONS, MAX_HEAD_BYTES,
-        RepoUrl,
+        Backend, CA_PEM, CgiCeilings, GitHttpsFixture, MAX_BODY_BYTES, MAX_CONCURRENT,
+        MAX_CONNECTIONS, MAX_HEAD_BYTES, RepoUrl,
     };
     use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
     use rustls_pki_types::pem::PemObject;
@@ -1074,5 +1105,90 @@ mod tests {
         }
         settle(&fixture);
         assert!(exchange(addr(&url), INFO_REFS.as_bytes()).is_empty());
+    }
+
+    /// A fixture whose CGI child is the shell `script`, under `ceilings`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a fixture that cannot start is a failed test
+    fn serve_script(
+        script: &str,
+        ceilings: CgiCeilings,
+    ) -> (tempfile::TempDir, GitHttpsFixture, RepoUrl) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = repo();
+        let program = dir.path().join("cgi.sh");
+        std::fs::write(&program, script).expect("write the CGI script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("make the CGI script executable");
+        let git_dir = super::git_dir(dir.path()).expect("served repository");
+        let backend = Backend {
+            program,
+            exec_path: std::ffi::OsString::from("/nonexistent"),
+        };
+        let (fixture, urls) =
+            GitHttpsFixture::serve(vec![git_dir], backend, ceilings).expect("fixture starts");
+        let url = urls.into_iter().next().expect("one url");
+        (dir, fixture, url)
+    }
+
+    /// Small ceilings, so each crossing is reached in well under a second.
+    const SMALL: CgiCeilings = CgiCeilings {
+        stdout: 64 * 1024,
+        wall: Duration::from_secs(5),
+    };
+
+    /// A CGI child writing past the output ceiling is killed and answered 502.
+    #[cfg(unix)]
+    #[test]
+    fn cgi_output_past_its_ceiling_is_refused() {
+        let flood = "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\n\
+             while :; do printf '%s' 0123456789abcdef0123456789abcdef0123456789abcdef; done\n";
+        let (_dir, fixture, url) = serve_script(flood, SMALL);
+        assert_eq!(
+            status(&exchange(addr(&url), INFO_REFS.as_bytes())),
+            Some(502)
+        );
+        settle(&fixture);
+        // Control twin: the same backend under the same ceilings, with output within it.
+        let small = "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nserved'\n";
+        let (_dir, _fixture, url) = serve_script(small, SMALL);
+        let response = exchange(addr(&url), INFO_REFS.as_bytes());
+        assert_eq!(status(&response), Some(200));
+        assert!(response.ends_with(b"served"), "{response:?}");
+    }
+
+    /// A CGI child running past the wall-time ceiling is killed and answered 504,
+    /// whether it holds its output open or closes it and keeps running.
+    #[cfg(unix)]
+    #[test]
+    fn cgi_past_its_wall_time_is_refused() {
+        let ceilings = CgiCeilings {
+            stdout: SMALL.stdout,
+            wall: Duration::from_millis(300),
+        };
+        for script in [
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\nwhile :; do :; done\n",
+            "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\nexec >&-\nwhile :; do :; done\n",
+        ] {
+            let (_dir, fixture, url) = serve_script(script, ceilings);
+            let started = std::time::Instant::now();
+            assert_eq!(
+                status(&exchange(addr(&url), INFO_REFS.as_bytes())),
+                Some(504),
+                "{script:?}"
+            );
+            assert!(
+                started.elapsed() < SMALL.wall,
+                "the served ceiling, not a wider one, ends {script:?}"
+            );
+            settle(&fixture);
+        }
+        // Control twin: a child that ends within the same wall time is answered.
+        let prompt = "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\nserved'\n";
+        let (_dir, _fixture, url) = serve_script(prompt, ceilings);
+        assert_eq!(
+            status(&exchange(addr(&url), INFO_REFS.as_bytes())),
+            Some(200)
+        );
     }
 }
