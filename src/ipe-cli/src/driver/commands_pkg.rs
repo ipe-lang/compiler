@@ -681,15 +681,17 @@ impl<'a> BundleAssembler<'a> {
         // A `release web desktop` bundle carries an optimised binary and its
         // consented floor; the `build` dev bundle carries a plain debug one and
         // the development marker.
+        let finish = self.finish.native();
         let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
             cargo_bin.path(),
+            finish.build_posture(),
             crate_dir.path(),
             None,
         )?;
         let build = FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
-            finish: self.finish.native(),
+            finish,
             target: CargoTarget::Host,
             target_dir: &target_dir,
             output: CargoOutput::Human(Verbosity::Progress),
@@ -869,15 +871,17 @@ impl<'a> BundleAssembler<'a> {
         let layout = pack::desktop::layout(os, &identity, pin.accepts(), icon)?;
 
         let cargo_bin = toolchain::require_cargo(toolchain::ToolIntent::Build)?;
+        let finish = self.finish.native();
         let target_dir = crate::target_dir::LinkableTargetDir::for_crate(
             cargo_bin.path(),
+            finish.build_posture(),
             crate_dir.path(),
             None,
         )?;
         let build = FlooredBuild {
             cargo: &cargo_bin,
             crate_dir: &crate_dir,
-            finish: self.finish.native(),
+            finish,
             target: CargoTarget::Host,
             target_dir: &target_dir,
             output: CargoOutput::Human(Verbosity::Progress),

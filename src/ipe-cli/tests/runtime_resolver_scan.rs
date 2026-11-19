@@ -57,15 +57,41 @@ const RETIRED: &[&str] = &[
 ];
 
 /// The harness locator: walks up from an anchor to the checkout's runtime
-/// tree, so only the harness's `require_runtime` may reach it.
+/// tree, so it is defined only in the harness and only the harness's
+/// `require_runtime` may reach it.
 const HARNESS_LOCATOR: &str = "in_repo_runtime_src";
 
-/// The harness module that anchors the [`HARNESS_LOCATOR`] walk.
+/// The label of a [`HARNESS_LOCATOR`] definition.
+const LOCATOR_DEF: &str = "fn in_repo_runtime_src";
+
+/// The dev-only harness module that defines and anchors the [`HARNESS_LOCATOR`] walk.
 const HARNESS: &str = "tools/e2e-support/src/bin.rs";
 
 /// The gate's runtime admission: the compile core hands its emit only the
 /// runtime the options' origin admits, so a gate never carries an override.
 const ADMISSION: &str = "admitted_runtime";
+
+/// The name the compile core's runtime is bound under, before and after admission.
+const RUNTIME_BINDING: &str = "runtime";
+
+/// The label of the admission's result rebinding the core's runtime as the
+/// core's first statement, so no use in the core can reach the unadmitted one.
+const ADMISSION_BOUND: &str = "let runtime = options.runtime_origin.admitted_runtime(runtime)";
+
+/// The compile core's options parameter, whose origin alone may admit its runtime.
+const OPTIONS_BINDING: &str = "options";
+
+/// The options field naming the origin that admits a runtime.
+const ORIGIN_FIELD: &str = "runtime_origin";
+
+/// The compile core: the one function whose runtime the gate admission rebinds.
+const CORE: &str = "compile_source_set_here";
+
+/// The label of any binding named [`RUNTIME_BINDING`] in [`CORE`]: its
+/// parameter and the admitted rebinding, so no later rebinding can shadow
+/// the admitted runtime with another. A macro body in [`CORE`] naming
+/// [`RUNTIME_BINDING`] counts too, since its expansion may bind it.
+const CORE_BINDING: &str = "a `runtime` binding in the compile core";
 
 /// The label of a zero-argument `ancestors()` walk in a runtime locator.
 const ANCESTORS: &str = "ancestors() in a runtime locator";
@@ -130,9 +156,12 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
     ("RUNTIME_VENDORED_VAR", EMBED_MODULE, "from_env", 1),
     ("RUNTIME_VENDORED_VAR", EMBED_MODULE, "parse", 1),
     (ANCESTORS, EMBED_MODULE, "ancestors", 1),
-    (HARNESS_LOCATOR, HARNESS, "<file>", 1),
+    (ANCESTORS, HARNESS, HARNESS_LOCATOR, 1),
+    (LOCATOR_DEF, HARNESS, "<file>", 1),
     (HARNESS_LOCATOR, HARNESS, "require_runtime", 1),
-    (ADMISSION, PIPELINE, "compile_source_set_here", 1),
+    (ADMISSION, PIPELINE, CORE, 1),
+    (ADMISSION_BOUND, PIPELINE, CORE, 1),
+    (CORE_BINDING, PIPELINE, CORE, 2),
 ];
 
 /// Whether `meta` holds only under `cfg(test)`.
@@ -190,6 +219,45 @@ fn item_attrs(item: &syn::Item) -> &[Attribute] {
         syn::Item::TraitAlias(item) => &item.attrs,
         _ => &[],
     }
+}
+
+/// Whether `stmt` is `let runtime = options.runtime_origin.admitted_runtime(runtime);`.
+///
+/// Only that shape rebinds the compile core's runtime to the one its own
+/// options admit; a discarded call, another binding name, a `mut` or `ref`
+/// binding, another receiver, or another argument leaves the unadmitted
+/// runtime reachable.
+fn binds_admission(stmt: &syn::Stmt) -> bool {
+    let syn::Stmt::Local(local) = stmt else {
+        return false;
+    };
+    let syn::Pat::Ident(pat) = &local.pat else {
+        return false;
+    };
+    let Some(init) = &local.init else {
+        return false;
+    };
+    let syn::Expr::MethodCall(call) = &*init.expr else {
+        return false;
+    };
+    let syn::Expr::Field(origin) = &*call.receiver else {
+        return false;
+    };
+    let syn::Member::Named(field) = &origin.member else {
+        return false;
+    };
+    let of_the_options = matches!(&*origin.base, syn::Expr::Path(base) if base.path.is_ident(OPTIONS_BINDING))
+        && field == ORIGIN_FIELD;
+    let takes_the_runtime = call.args.len() == 1
+        && matches!(call.args.first(), Some(syn::Expr::Path(arg)) if arg.path.is_ident(RUNTIME_BINDING));
+    pat.ident == RUNTIME_BINDING
+        && pat.subpat.is_none()
+        && pat.mutability.is_none()
+        && pat.by_ref.is_none()
+        && init.diverge.is_none()
+        && of_the_options
+        && call.method == ADMISSION
+        && takes_the_runtime
 }
 
 /// What the scan found in one source.
@@ -298,6 +366,9 @@ impl Scan {
                     }
                     colons = 0;
                     let name = ident.to_string();
+                    if name == RUNTIME_BINDING && self.fns.last().is_some_and(|f| f == CORE) {
+                        self.met(CORE_BINDING.to_owned());
+                    }
                     if dot {
                         self.method(&name, 0);
                     }
@@ -334,6 +405,9 @@ impl Scan {
         if RETIRED.contains(&name.as_str()) {
             self.met(format!("fn {name}"));
         }
+        if name == HARNESS_LOCATOR {
+            self.met(LOCATOR_DEF.to_owned());
+        }
         self.fns.push(name);
         walk(self);
         self.fns.pop();
@@ -360,6 +434,9 @@ impl<'ast> Visit<'ast> for Scan {
 
     fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
         self.within(item.sig.ident.to_string(), |scan| {
+            if item.sig.ident == CORE && item.block.stmts.first().is_some_and(binds_admission) {
+                scan.met(ADMISSION_BOUND.to_owned());
+            }
             visit::visit_item_fn(scan, item);
         });
     }
@@ -397,6 +474,13 @@ impl<'ast> Visit<'ast> for Scan {
     fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
         self.method(&call.method.to_string(), call.args.len());
         visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+        if pat.ident == RUNTIME_BINDING && self.fns.last().is_some_and(|name| name == CORE) {
+            self.met(CORE_BINDING.to_owned());
+        }
+        visit::visit_pat_ident(self, pat);
     }
 
     fn visit_lit_str(&mut self, lit: &'ast syn::LitStr) {
@@ -525,8 +609,9 @@ fn scan_trees() -> Result<BTreeMap<String, Scan>, String> {
 
 /// The `src/` tree of every workspace member the root manifest lists.
 ///
-/// The harness locator is defined in `ipe_env`, a dependency of crates beyond
-/// [`TREES`], so its pin reads every member rather than a hand-kept list.
+/// A [`HARNESS_LOCATOR`] definition or call in any member beyond [`TREES`]
+/// would put the walk back in reach, so its pin reads every member rather
+/// than a hand-kept list.
 fn member_trees(root: &Path) -> Result<Vec<PathBuf>, String> {
     let manifest_path = root.join("Cargo.toml");
     let text = std::fs::read_to_string(&manifest_path)
@@ -551,13 +636,13 @@ fn member_trees(root: &Path) -> Result<Vec<PathBuf>, String> {
         .collect()
 }
 
-/// Each [`HARNESS_LOCATOR`] spelling, or second name for it, `found` holds
-/// outside [`HARNESS`], one line each.
+/// Each [`HARNESS_LOCATOR`] definition, spelling, or second name for it,
+/// `found` holds outside [`HARNESS`], one line each.
 fn locator_refusals(found: &BTreeMap<String, Scan>) -> Vec<String> {
     let mut out = Vec::new();
     for (rel, scan) in found.iter().filter(|(rel, _)| rel.as_str() != HARNESS) {
         for ((site, what), count) in &scan.sites {
-            if what == HARNESS_LOCATOR {
+            if what == HARNESS_LOCATOR || what == LOCATOR_DEF {
                 out.push(format!(
                     "{rel}: `{what}` {count}x in `{site}`: only the harness walks to the checkout's runtime"
                 ));
@@ -624,11 +709,11 @@ fn baseline(rel: &str) -> &'static str {
              fn build_loose_file_into() { RuntimeSource::resolve(o, e, r); }\n\
              fn build_test_into() { RuntimeSource::resolve(o, None, r); }\n\
              fn build_project_into() { RuntimeSource::resolve(o, e, r); }\n\
-             fn compile_source_set_here() { let r = o.runtime_origin.admitted_runtime(r); }\n"
+             fn compile_source_set_here(runtime: &RuntimeSource, options: &BuildOptions) { let runtime = options.runtime_origin.admitted_runtime(runtime); }\n"
         }
         HEALTH => "fn check_runtime() { runtime_check(RuntimeSource::resolve(o, None, r)); }\n",
         HARNESS => {
-            "use ipe_env::artifact::{ProvenRuntime, in_repo_runtime_src};\n\
+            "pub fn in_repo_runtime_src(anchor: &Path) { for d in anchor.ancestors().take(64) {} }\n\
              fn require_runtime() { in_repo_runtime_src(&anchor); }\n"
         }
         EMBED_MODULE => {
@@ -745,20 +830,22 @@ fn a_planted_runtime_read_is_refused() -> Result<(), String> {
             PIPELINE,
             "fn compile_source_set_here() { m!(o.runtime_origin.admitted_runtime(r)); }\n",
         ),
-        // The harness locator reached outside the harness anchor.
+        // The harness locator reached outside the harness anchor, or defined twice.
         (
             cli,
-            "fn locate() { ipe_env::artifact::in_repo_runtime_src(&cwd); }\n",
+            "fn locate() { e2e_support::bin::in_repo_runtime_src(&cwd); }\n",
         ),
-        (cli, "use ipe_env::artifact::in_repo_runtime_src;\n"),
+        (cli, "use e2e_support::bin::in_repo_runtime_src;\n"),
         (
             harness,
-            "fn other() { m!(ipe_env::artifact::in_repo_runtime_src(&cwd)); }\n",
+            "fn other() { m!(e2e_support::bin::in_repo_runtime_src(&cwd)); }\n",
         ),
         (
             regen,
-            "use ipe_env::artifact::in_repo_runtime_src as locate;\n",
+            "use e2e_support::bin::in_repo_runtime_src as locate;\n",
         ),
+        (cli, "fn in_repo_runtime_src(anchor: &Path) {}\n"),
+        (harness, "mod again { fn in_repo_runtime_src() {} }\n"),
         // Second names.
         (cli, "use crate::runtime_embed as embedded;\n"),
         (cli, "use crate::runtime_embed::{self as embedded};\n"),
@@ -773,8 +860,8 @@ fn a_planted_runtime_read_is_refused() -> Result<(), String> {
     Ok(())
 }
 
-/// The harness locator is named in no workspace member's non-test source but
-/// the harness's own, so no crate depending on `ipe_env` walks to the
+/// The harness locator is defined and named in no workspace member's non-test
+/// source but the dev-only harness's own, so no production crate walks to the
 /// checkout's runtime tree.
 #[test]
 fn the_harness_locator_is_reached_only_from_the_harness() -> Result<(), String> {
@@ -796,6 +883,10 @@ fn the_harness_locator_is_reached_only_from_the_harness() -> Result<(), String> 
 fn a_planted_harness_locator_in_any_member_is_refused() -> Result<(), String> {
     let backend = "src/compiler/backend/rust/src/lib.rs";
     let cases = [
+        (
+            "src/compiler/env/src/artifact.rs",
+            "pub fn in_repo_runtime_src(anchor: &Path) -> Result<P, E> { walk(anchor) }\n",
+        ),
         (
             backend,
             "fn locate() { ipe_env::artifact::in_repo_runtime_src(&anchor); }\n",
@@ -824,27 +915,69 @@ fn a_planted_harness_locator_in_any_member_is_refused() -> Result<(), String> {
     Ok(())
 }
 
-/// The compile core without its gate admission is refused.
+/// The compile core whose gate admission is dropped, or whose result does not
+/// rebind the core's runtime, is refused.
 #[test]
-fn a_compile_core_without_the_admission_is_refused() -> Result<(), String> {
-    let admission = "let r = o.runtime_origin.admitted_runtime(r); ";
+fn a_compile_core_without_the_bound_admission_is_refused() -> Result<(), String> {
+    let admission = "let runtime = options.runtime_origin.admitted_runtime(runtime); ";
     let baseline = baseline(PIPELINE);
     if !baseline.contains(admission) {
         return Err(format!("{PIPELINE}: the baseline lost its admission line"));
     }
-    let mut found = BTreeMap::new();
-    found.insert(
-        PIPELINE.to_owned(),
-        scan(PIPELINE, &baseline.replace(admission, ""))?,
-    );
-    let refused = refusals(&found);
-    assert!(
-        refused
-            .iter()
-            .any(|line| line.contains(ADMISSION) && line.contains("never met")),
-        "the dropped admission must be refused; got:\n{}",
-        refused.join("\n")
-    );
+    for unbound in [
+        "",
+        "options.runtime_origin.admitted_runtime(runtime); ",
+        "let _ = options.runtime_origin.admitted_runtime(runtime); ",
+        "let r = options.runtime_origin.admitted_runtime(runtime); ",
+        "let runtime = options.runtime_origin.admitted_runtime(other); ",
+        "let runtime = options.runtime_origin.admitted_runtime(runtime) else { return }; ",
+        "let mut runtime = options.runtime_origin.admitted_runtime(runtime); runtime = other; ",
+        "let ref runtime = options.runtime_origin.admitted_runtime(runtime); ",
+        "let runtime = RuntimeOrigin::Developer.admitted_runtime(runtime); ",
+        "let runtime = developer.runtime_origin.admitted_runtime(runtime); ",
+        "let runtime = options.other_origin.admitted_runtime(runtime); ",
+        "emit(runtime); let runtime = options.runtime_origin.admitted_runtime(runtime); ",
+        "let early = runtime; let runtime = options.runtime_origin.admitted_runtime(runtime); ",
+    ] {
+        let mut found = BTreeMap::new();
+        found.insert(
+            PIPELINE.to_owned(),
+            scan(PIPELINE, &baseline.replace(admission, unbound))?,
+        );
+        let refused = refusals(&found);
+        assert!(
+            refused
+                .iter()
+                .any(|line| line.contains(ADMISSION_BOUND) && line.contains("never met")),
+            "`{unbound}` must be refused as an unbound admission; got:\n{}",
+            refused.join("\n")
+        );
+    }
+    for shadow in [
+        "let runtime = other; ",
+        "let (runtime, _) = (other, 1); ",
+        "if let Some(runtime) = other { use_it(runtime); } ",
+        "let f = |runtime: &RuntimeSource| emit(runtime); ",
+        "for runtime in others { emit(runtime); } ",
+        "match other { runtime => emit(runtime) } ",
+        "let Bundle { runtime } = other; ",
+        "rebind!(runtime, other); ",
+    ] {
+        let mut found = BTreeMap::new();
+        found.insert(
+            PIPELINE.to_owned(),
+            scan(
+                PIPELINE,
+                &baseline.replace(admission, &format!("{admission}{shadow}")),
+            )?,
+        );
+        let refused = refusals(&found);
+        assert!(
+            refused.iter().any(|line| line.contains(CORE_BINDING)),
+            "`{shadow}` must be refused as a rebinding past the admission; got:\n{}",
+            refused.join("\n")
+        );
+    }
     Ok(())
 }
 

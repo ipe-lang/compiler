@@ -6,7 +6,7 @@ mod registry_phase_c_tests {
     };
     use ipe_diagnostics::Span;
     use ipe_intern::Interner;
-    use ipe_kernels::StdlibKernel;
+    use ipe_kernels::{FieldTag, StdlibKernel};
 
     /// Kernels RELOCATED into `stdlib_scheme` from the legacy `kernel_ty` table
     /// (String / List / Math plus the remaining backed families). Each carries
@@ -1351,6 +1351,10 @@ mod registry_phase_c_tests {
             // `Web.embed : WebConfig -> WebApp` — Ipê-new (no legacy oracle);
             // a mountable web-app handle sharing `Web.tea`'s cfg scheme.
             K::WebEmbed,
+            // `Web.pageLink : List (WebRoute page) -> List (Attribute msg) ->
+            // { to : page, current : page, label : Element msg } -> Element msg`
+            // — Ipê-new (no legacy oracle); its scheme lives in `stdlib_scheme`.
+            K::WebPageLink,
             // ── Ipe.App runtime-config front door (8, Ipê-new) ──────────────
             K::WebAppWith,
             K::AppFromEnv,
@@ -1580,10 +1584,10 @@ mod registry_phase_c_tests {
         let mut interner = Interner::new();
         let builtins = make_builder(&mut interner);
         let mut field_names: Vec<&str> = [
-            builtins.retry_f_base_ms,
-            builtins.retry_f_max_attempts,
-            builtins.retry_f_should_retry,
-            builtins.retry_f_strategy,
+            builtins.field_symbol(FieldTag::RetryBaseMs),
+            builtins.field_symbol(FieldTag::RetryMaxAttempts),
+            builtins.field_symbol(FieldTag::RetryShouldRetry),
+            builtins.field_symbol(FieldTag::RetryStrategy),
         ]
         .into_iter()
         .filter_map(|s| interner.resolve(s))

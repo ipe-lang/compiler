@@ -91,7 +91,6 @@ const ALLOWED: &[(&str, &str)] = &[
         "lower/src/lower.rs",
         r#"("Server", "any") => Ok(Callee::Kernel(KernelFn::ServerAny)),"#,
     ),
-    ("canon/src/env.rs", r#""any","#),
     (
         "ipe-cli/src/package_manifest.rs",
         r#""Any" => Ok(ScreenOrientation::Any),"#,

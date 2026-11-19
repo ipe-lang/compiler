@@ -66,7 +66,7 @@ url = { version = "2", optional = true }
 # runtime gets a working `tinyvec`. Optional so it is absent from dep graphs that
 # do not activate `url`.
 tinyvec = { version = "1", features = ["std"], optional = true }
-lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls"], optional = true }
+lettre = { version = "0.11.24", default-features = false, features = ["builder", "hostname", "smtp-transport", "pool", "tokio1", "tokio1-rustls-tls"], optional = true }
 # Handshake only: the runtime owns the `wss://` TLS (`tokio-rustls` over the
 # `ring` provider, trusting `webpki-roots`), so tungstenite carries no TLS or
 # root-store feature of its own, and no native-tls dependency enters.

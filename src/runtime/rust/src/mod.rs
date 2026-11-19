@@ -684,6 +684,10 @@ pub mod telemetry;
 // security headers are assembled from.
 pub mod csp;
 
+// The frame origins a program trusts and what a trusted frame may be
+// delegated: the delegation table, the `allow` parser, the registered policy.
+pub mod frames;
+
 // The runtime's one OS entropy source: every random mint draws through
 // `entropy::fill_entropy`, which refuses instead of panicking.
 pub mod entropy;
@@ -893,6 +897,8 @@ const _WASI_EFFECT_FLOOR_SEAL: () = {
     // single-thread executor (no tokio, no spawn) is the LIVE arm on WASI.
     let _ = crate::task::task_run::<E, ()>;
     let _ = crate::task::block_on::<E, i64>;
+    // The entry `fn main` calls: it builds the entry task inside the catch.
+    let _ = crate::task::block_on_entry::<E, i64, fn() -> crate::core::IpeTask<E, i64>>;
     let _ = crate::task::task_parallel::<E, i64>;
 };
 

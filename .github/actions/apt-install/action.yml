@@ -1,12 +1,18 @@
 name: Install apt packages
 description: >-
   The one apt package install every CI job runs (ci/verify-manifest.py check
-  27 refuses any other). Each of two attempts first completes an install an
+  27 refuses any other). Each of three attempts first completes an install an
   earlier cap interrupted mid-unpack, then updates and installs with apt's own
-  download retries, each command capped at six minutes; a failed attempt
-  repoints the runner from the Azure Ubuntu mirror to archive.ubuntu.com
-  before the next.
-
+  download retries; every command is capped at six minutes and at what is left
+  of one fifteen-minute budget for the whole install, and is killed thirty
+  seconds after its cap if it ignores the stop. The first attempt uses the
+  runner's own Ubuntu mirror; each failed attempt repoints every Ubuntu archive
+  and security source to the next independent mirror (archive.ubuntu.com, then
+  mirrors.edge.kernel.org) before the next, names each source file it
+  repointed, and warns when it found none to repoint. Archives
+  an attempt finished downloading stay in the archive directory, so a later
+  attempt fetches only what is still missing. When every attempt fails the
+  step fails, and so does a spent budget.
 inputs:
   packages:
     description: Space-separated Debian package names on one line (lower-case ASCII letters, digits and `.+:-`, never a leading `-`).
@@ -67,17 +73,48 @@ runs:
           mkdir -p "$APT_ARCHIVES/partial"
           install_flags+=(-o "Dir::Cache::archives=$APT_ARCHIVES")
         fi
-        for attempt in 1 2; do
-          if sudo timeout 360 dpkg --configure -a \
-            && sudo timeout 360 apt-get -o Acquire::Retries=3 update \
-            && sudo timeout 360 apt-get -o Acquire::Retries=3 "${install_flags[@]}" install "${packages[@]}"; then
-            exit 0
+        apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)
+        source_host='://([A-Za-z0-9.-]*\.)?(archive|security)\.ubuntu\.com/'
+        deadline=$((SECONDS + 900))
+        for attempt in 1 2 3; do
+          mirror="${mirrors[attempt - 1]}"
+          if [[ -n "$mirror" ]]; then
+            repointed=0
+            for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+              if [[ -f "$list" ]] && grep -qE "$source_host" "$list"; then
+                sudo sed -i -E "s#${source_host}#://${mirror}/#g" "$list"
+                echo "apt attempt $attempt repoints $list to $mirror"
+                repointed=$((repointed + 1))
+              fi
+            done
+            if ((repointed == 0)); then
+              echo "::warning::apt-install: attempt $attempt found no Ubuntu archive or security source to repoint, so it retries the same mirrors"
+            fi
           fi
-          echo "apt attempt $attempt failed or did not finish within its 6 minute cap"
-          for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
-            if [[ -f "$list" ]]; then
-              sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' "$list"
+          failed=""
+          for stage in configure update install; do
+            left=$((deadline - SECONDS))
+            if ((left <= 0)); then
+              echo "::error::apt-install: the 15 minute install budget is spent" >&2
+              exit 1
+            fi
+            if ((left > 360)); then
+              left=360
+            fi
+            case "$stage" in
+              configure) sudo timeout -k 30 "$left" dpkg --configure -a || failed="$stage" ;;
+              update) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" update || failed="$stage" ;;
+              install) sudo timeout -k 30 "$left" apt-get "${apt_opts[@]}" "${install_flags[@]}" install "${packages[@]}" || failed="$stage" ;;
+            esac
+            if [[ -n "$failed" ]]; then
+              break
             fi
           done
+          if [[ -z "$failed" ]]; then
+            exit 0
+          fi
+          echo "apt attempt $attempt failed at $failed or did not finish within its cap"
         done
+        echo "::error::apt-install: every mirror failed within the install budget" >&2
         exit 1

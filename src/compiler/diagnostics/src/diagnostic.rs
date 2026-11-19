@@ -20,20 +20,20 @@ use crate::code::{
     IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
     IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
     IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
-    IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002,
-    IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020,
-    IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028,
-    IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036,
-    IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045,
-    IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053,
-    IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014,
-    IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031,
-    IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064,
-    IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072,
-    IPE_P0073, IPE_P0074, IPE_P0075, IPE_P0076, IPE_P0077, IPE_S0001, IPE_S0002, IPE_S0003,
-    IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012,
-    IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020,
-    IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
+    IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0165, IPE_L0166, IPE_L0200, IPE_L0201,
+    IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012,
+    IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026,
+    IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034,
+    IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043,
+    IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051,
+    IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012,
+    IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021,
+    IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062,
+    IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070,
+    IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074, IPE_P0075, IPE_P0076, IPE_P0077, IPE_S0001,
+    IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
+    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
+    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -2115,6 +2115,18 @@ pub enum LowerError {
         /// A bounded, escaped excerpt of the refused name.
         name: Box<str>,
     },
+    /// The route table a `Web.pageLink` names is not a reference to one
+    /// top-level binding whose body is a literal list of `Web.route` calls, so
+    /// no page renderer can be derived from it. [IPE-L0165]
+    PageLinkTableOpaque,
+    /// The route table a `Web.pageLink` names is a top-level binding whose
+    /// page type is not one closed custom type: an empty table, whose type
+    /// stays open, or a table over another type. [IPE-L0165]
+    PageLinkTableOpenPage,
+    /// A `Web.pageLink` table is not the program's one table: a routed app's
+    /// `routes` is not that binding, or two page links name different
+    /// bindings. [IPE-L0166]
+    PageLinkTableNotAppRoutes,
     /// A function's compiled code needs a capability of a value that the
     /// value's type does not have: `List.repeat` copies its element, so a
     /// `Task` element cannot build. [IPE-L0164]
@@ -3390,6 +3402,8 @@ const fn lower_code(msg: &LowerError) -> Code {
         LowerError::OnNavigateWithoutPage => IPE_L0162,
         LowerError::ReservedAttributeName { .. } => IPE_L0163,
         LowerError::CalleeBoundUnmet { .. } => IPE_L0164,
+        LowerError::PageLinkTableOpaque | LowerError::PageLinkTableOpenPage => IPE_L0165,
+        LowerError::PageLinkTableNotAppRoutes => IPE_L0166,
         LowerError::DevOnlyKernelInProduction { .. } => IPE_L0140,
         LowerError::UiCellsInWebShape(_) => IPE_L0132,
         LowerError::UiCellsInCliShape(_) => IPE_L0153,
@@ -3969,6 +3983,17 @@ fn lower_help(msg: &LowerError) -> Vec<HelpLine> {
             "rename the attribute out of the `ipe-` and `data-ipe-` namespaces and away \
              from `nonce`. A routed app's URL already follows `model.page`, so set the page in `update` instead \
              of naming a path; attach events with the `Ui.on*` attributes."
+                .into(),
+        )],
+        LowerError::PageLinkTableOpaque | LowerError::PageLinkTableOpenPage => vec![HelpLine::Note(
+            "bind the routes to one top-level name annotated with the page type, e.g. \
+             `routes : List (WebRoute Page)`, list a `Web.route` for every page \
+             constructor, and pass that name to `Web.pageLink`."
+                .into(),
+        )],
+        LowerError::PageLinkTableNotAppRoutes => vec![HelpLine::Note(
+            "name the app's routes once as a top-level value, set `routes` to that name, \
+             and pass the same name to every `Web.pageLink`."
                 .into(),
         )],
         LowerError::CalleeBoundUnmet { leaf, .. } => vec![HelpLine::Note(

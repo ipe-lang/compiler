@@ -10,9 +10,15 @@
  *      - Back and Forward restore the page each entry names;
  *      - a deep link enters its page through the route table;
  *      - an element a page script plants with a `data-ipe-path` attribute
- *        names no location: the URL follows the committed page only.
+ *        names no location: the URL follows the committed page only;
+ *      - a `Web.pageLink` click moves to its page in place, as one history
+ *        entry, and `aria-current` follows the page on screen;
+ *      - a page link a patch inserts is followed in place too;
+ *      - a page link with `target="_blank"` or `download` is the browser's.
  *   2. Browser bundle (`web client`): the same button's `update` is one new
- *      history entry at the page's route, and Back restores the page before.
+ *      history entry at the page's route, and Back restores the page before;
+ *      a page-link click, and one on a link a patch inserts, moves in place as
+ *      one history entry.
  *
  * Prerequisites (satisfied by the CI `browser-e2e` job setup):
  *   - the page-navigation server listening on IPE_PAGE_NAVIGATION_PORT
@@ -51,6 +57,18 @@ const CONTENT_TYPES = {
 async function openLive(page, route = "/") {
   await page.goto(`${BASE}${route}`);
   await page.waitForSelector('html[data-ipe-live="1"]', { timeout: 15000 });
+}
+
+/**
+ * The current history entry's index and the number of entries, through the
+ * Navigation API: unlike `history.length`, the index tells a pushed entry
+ * from a rewritten one when entries lie ahead.
+ */
+function entryPosition(page) {
+  return page.evaluate(() => ({
+    index: navigation.currentEntry.index,
+    count: navigation.entries().length,
+  }));
 }
 
 /** The text of the page heading. */
@@ -121,6 +139,60 @@ test("served: a planted data-ipe-path names no location", async ({ page }) => {
   expect(await page.evaluate(() => history.length)).toBe(before + 2);
 });
 
+test("served: a page-link click moves in place, and aria-current follows the page", async ({
+  page,
+}) => {
+  await openLive(page);
+  await expect(page.locator("#link-home")).toHaveAttribute("aria-current", "page");
+  await expect(page.locator("#link-entry")).not.toHaveAttribute("aria-current", /.*/);
+  const before = await page.evaluate(() => history.length);
+  // A full load would drop this marker; an in-place move keeps it.
+  await page.evaluate(() => {
+    window.__e2eSameDocument = true;
+  });
+  await page.locator("#link-entry").click();
+  await expect(heading(page)).toHaveText("entry 2", { timeout: 10000 });
+  await expect(page).toHaveURL(`${BASE}/entry/2`);
+  expect(await page.evaluate(() => history.length)).toBe(before + 1);
+  expect(await page.evaluate(() => window.__e2eSameDocument === true)).toBe(true);
+  await expect(page.locator("#link-entry")).toHaveAttribute("aria-current", "page");
+  await expect(page.locator("#link-home")).not.toHaveAttribute("aria-current", /.*/);
+});
+
+test("served: a page link a patch inserts moves in place", async ({ page }) => {
+  await openLive(page);
+  await expect(page.locator("#link-about")).toHaveCount(0);
+  await page.locator("#open-entry").click();
+  await expect(heading(page)).toHaveText("entry 1", { timeout: 10000 });
+  const before = await page.evaluate(() => history.length);
+  await page.evaluate(() => {
+    window.__e2eSameDocument = true;
+  });
+  await page.locator("#link-about").click();
+  await expect(heading(page)).toHaveText("about", { timeout: 10000 });
+  await expect(page).toHaveURL(`${BASE}/about`);
+  expect(await page.evaluate(() => history.length)).toBe(before + 1);
+  expect(await page.evaluate(() => window.__e2eSameDocument === true)).toBe(true);
+});
+
+test("served: a new-tab or download page link is the browser's", async ({ page, context }) => {
+  await openLive(page);
+  const before = await page.evaluate(() => history.length);
+  const [opened] = await Promise.all([
+    context.waitForEvent("page"),
+    page.locator("#link-about-tab").click(),
+  ]);
+  await opened.close();
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    page.locator("#link-about-download").click(),
+  ]);
+  await download.cancel();
+  await expect(heading(page)).toHaveText("home");
+  await expect(page).toHaveURL(`${BASE}/`);
+  expect(await page.evaluate(() => history.length)).toBe(before);
+});
+
 /**
  * The bundle file a request path names: a file under the bundle, or the shell
  * for any other path, as a static host serving a routed app answers a deep
@@ -162,6 +234,35 @@ test("web client: a button's page change is one history entry, and Back restores
     await page.locator("#leave-soon").click();
     await expect(heading(page)).toHaveText("about", { timeout: 10000 });
     await expect(page).toHaveURL(`${CLIENT}/about`);
+
+    // A page-link click moves in place as one entry; so does one on a link
+    // the patch that shows the entry inserts. Back left the entry-1 entry
+    // ahead of the about entry, so `history.length` cannot tell a push from a
+    // rewrite here: a push moves one entry on and drops every entry ahead.
+    await page.evaluate(() => {
+      window.__e2eSameDocument = true;
+    });
+    const atLinks = await entryPosition(page);
+    expect(atLinks.count).toBe(atLinks.index + 2);
+    await page.locator("#link-entry").click();
+    await expect(heading(page)).toHaveText("entry 2", { timeout: 10000 });
+    await expect(page).toHaveURL(`${CLIENT}/entry/2`);
+    await expect(page.locator("#link-entry")).toHaveAttribute("aria-current", "page");
+    expect(await entryPosition(page)).toEqual({
+      index: atLinks.index + 1,
+      count: atLinks.index + 2,
+    });
+    await page.locator("#link-about").click();
+    await expect(heading(page)).toHaveText("about", { timeout: 10000 });
+    await expect(page).toHaveURL(`${CLIENT}/about`);
+    expect(await entryPosition(page)).toEqual({
+      index: atLinks.index + 2,
+      count: atLinks.index + 3,
+    });
+    expect(await page.evaluate(() => window.__e2eSameDocument === true)).toBe(true);
+    await page.goBack();
+    await expect(heading(page)).toHaveText("entry 2", { timeout: 10000 });
+    await expect(page).toHaveURL(`${CLIENT}/entry/2`);
   } finally {
     await ctx.close();
   }
