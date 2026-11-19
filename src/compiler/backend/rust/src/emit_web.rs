@@ -311,7 +311,7 @@ fn emit_web_route(
 /// granted suffixes are one emitted binding that feeds both the
 /// `Permissions-Policy` registry and `frames::register`, so the header and
 /// the frame sink read one grant set.
-pub(crate) fn served_register_stmts(ctx: &EmitCtx) -> String {
+fn served_register_stmts(ctx: &EmitCtx) -> String {
     let origins = frame_origin_literals(&ctx.frame_origins);
     if origins.is_empty() {
         return granted_web_features_register_stmt(ctx);
