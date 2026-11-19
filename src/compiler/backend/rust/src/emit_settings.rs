@@ -364,8 +364,8 @@ pub fn dropped_frame_origin<'s>(
 /// Whether `program` built under `settings` emits a frame-list registration.
 ///
 /// A browser client registers the list at its entry. A served build
-/// registers it at each `Web.tea` or `Web.embed` leaf, except a non-mounted
-/// leaf a webview host drives, which serves no page.
+/// registers it at each web leaf [`leaf_host`] delivers as
+/// [`LeafHost::Served`].
 fn registers_frame_list(program: &ipe_ir::Program, settings: &EmitSettings) -> bool {
     if settings.target == ipe_ir::Target::WasmClient {
         return true;
@@ -375,7 +375,7 @@ fn registers_frame_list(program: &ipe_ir::Program, settings: &EmitSettings) -> b
     let walked = crate::kernel_walk::each_kernel_site(program, &mut |site| {
         if let crate::kernel_walk::KernelSite::Call { kernel, .. } = site
             && kernel.app_entry_surface() == Some(ipe_ir::AppSurface::Web)
-            && (!webview || kernel == ipe_ir::KernelFn::WebEmbed)
+            && leaf_host(settings.target, webview, mounts_into_server(kernel)) == LeafHost::Served
         {
             registers = true;
         }
@@ -384,12 +384,54 @@ fn registers_frame_list(program: &ipe_ir::Program, settings: &EmitSettings) -> b
     walked.is_ok() && registers
 }
 
+/// Who drives a web app-entry leaf (`Web.tea`, `Web.embed`, and their aliases).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeafHost {
+    /// The browser client: the leaf is the client sink, and the entry
+    /// registers the frame list.
+    Browser,
+    /// The webview-native executor: the leaf serves no page and registers
+    /// nothing.
+    WebView,
+    /// The served runtime: the leaf registers the frame list where it is
+    /// evaluated.
+    Served,
+}
+
+/// Who drives a web leaf built for `target`, under a webview driver when
+/// `webview`, that a server mounts when `mountable`.
+///
+/// A mountable leaf is nested in a server's router, so a webview host never
+/// drives it. The emitter's leaf branch and the frame-list gate both read
+/// this one judge.
+pub(crate) const fn leaf_host(target: ipe_ir::Target, webview: bool, mountable: bool) -> LeafHost {
+    match target {
+        ipe_ir::Target::WasmClient => LeafHost::Browser,
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
+            if webview && !mountable {
+                LeafHost::WebView
+            } else {
+                LeafHost::Served
+            }
+        }
+    }
+}
+
+/// Whether web app-entry `kernel` builds a leaf a server mounts (`Web.embed`).
+pub(crate) const fn mounts_into_server(kernel: ipe_ir::KernelFn) -> bool {
+    matches!(kernel, ipe_ir::KernelFn::WebEmbed)
+}
+
 /// Whether `program` built for `host` is driven by the webview-native executor.
 ///
 /// The `web desktop` host drives it, and so does a source module that carries
 /// the webview leaf.
 pub fn drives_webview(program: &ipe_ir::Program, host: &EmitHost) -> bool {
-    matches!(host, EmitHost::WebView(_)) || program.modules.iter().any(|m| m.uses_webview)
+    let host_drives = match host {
+        EmitHost::WebView(_) => true,
+        EmitHost::Served(_) => false,
+    };
+    host_drives || program.modules.iter().any(|m| m.uses_webview)
 }
 
 /// The [`FieldTag::Host`] payload of `host`.
@@ -911,6 +953,52 @@ mod tests {
                 frame_origins_of(&program(mounted_embed(), true), &listed),
                 Ok(&listed.frame_origins)
             );
+        }
+
+        /// T16: the frame-list gate and the emitter's leaf branch read one
+        /// judge. Every web app-entry kernel, on every target, under a
+        /// webview driver or not, registers a list exactly when the judge
+        /// delivers its leaf as served, and only `Web.embed` mounts.
+        #[test]
+        fn the_frame_gate_reads_the_leaf_judge() {
+            use super::super::{LeafHost, leaf_host, mounts_into_server};
+            let web: Vec<KernelFn> = KernelFn::ALL
+                .iter()
+                .copied()
+                .filter(|k| k.app_entry_surface() == Some(ipe_ir::AppSurface::Web))
+                .collect();
+            assert!(web.contains(&KernelFn::WebEmbed) && web.contains(&KernelFn::WebApp));
+            for kernel in web {
+                assert_eq!(mounts_into_server(kernel), kernel == KernelFn::WebEmbed);
+                for target in [
+                    ipe_ir::Target::Native,
+                    ipe_ir::Target::WasmWasi,
+                    ipe_ir::Target::WasmClient,
+                ] {
+                    for webview in [false, true] {
+                        let host = leaf_host(target, webview, mounts_into_server(kernel));
+                        let expected = match target {
+                            ipe_ir::Target::WasmClient => LeafHost::Browser,
+                            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
+                                if webview && kernel != KernelFn::WebEmbed =>
+                            {
+                                LeafHost::WebView
+                            }
+                            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => LeafHost::Served,
+                        };
+                        assert_eq!(host, expected, "{kernel:?} {target:?} webview={webview}");
+                        let leaf = program(call(kernel, vec![Expr::Unit]), webview);
+                        let admitted =
+                            frame_origins_of(&leaf, &settings(listed().frame_origins, target))
+                                .is_ok();
+                        assert_eq!(
+                            admitted,
+                            host != LeafHost::WebView,
+                            "{kernel:?} {target:?} webview={webview}"
+                        );
+                    }
+                }
+            }
         }
 
         /// The loopback refusal of the intent and target precedes the shape.

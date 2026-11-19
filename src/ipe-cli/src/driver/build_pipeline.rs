@@ -340,7 +340,11 @@ fn manifest_emit_settings(
         },
         mount_base: manifest.delivery.browser.base.clone(),
         server_origins: manifest.delivery.servers.clone(),
-        frame_origins: manifest.delivery.frame_origins.clone(),
+        // The test runner serves no page, so it trusts no frame origin.
+        frame_origins: match role {
+            runtime_embed::BundleRole::Out => manifest.delivery.frame_origins.clone(),
+            runtime_embed::BundleRole::Scratch => ipe_backend_rust::FrameOriginEntries::none(),
+        },
         wasm_hydrate_mode: matches!(
             &manifest.wasm,
             project::WasmConfig::On(bundle) if bundle.mode == project::WasmMode::Hydrate
@@ -385,6 +389,36 @@ fn frame_site_step(
     ipe_backend_rust::frame_origins_of(program, settings)
         .map(|_| ())
         .map_err(|refusal| frame_refusal(&refusal))
+}
+
+/// Refuse a frame list the served native development build of `program`, an
+/// entry of `root`, would drop: the judge `ipe dev build` applies, for a
+/// command that reports the list without building.
+///
+/// # Errors
+///
+/// [`CliError::ProjectRefused`] naming the first listed origin when the
+/// program registers no frame list.
+pub(super) fn served_frame_site_step(
+    root: &ProjectRoot,
+    program: &ipe_ir::Program,
+) -> Result<(), CliError> {
+    let manifest_path = root.path().join(crate::package_manifest::PACKAGE_IPE);
+    let options = BuildOptions {
+        target: ipe_ir::Target::Native,
+        intent: ipe_backend_rust::BuildIntent::Development,
+        ..BuildOptions::default()
+    };
+    let settings = emit_settings(
+        &SettingsSource::Manifest {
+            manifest: root.manifest(),
+            manifest_path: &manifest_path,
+            host: crate::delivery::HostIntent::Served,
+        },
+        &options,
+        runtime_embed::BundleRole::Out,
+    );
+    frame_site_step(program, &settings)
 }
 
 /// The CLI error of a frame-list refusal.
@@ -4717,6 +4751,36 @@ main =
             renamed, project,
             "a manifest setting is dropped on the test path"
         );
+    }
+
+    /// T16: the test runner serves no page, so a test build of a project
+    /// listing frame origins trusts none and its entry is admitted, while the
+    /// project build keeps the list.
+    #[test]
+    fn a_test_build_trusts_no_frame_origin() {
+        let tree =
+            crate::project_root::SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+                .field(r#"delivery = { frameOrigins = [ "https://player.example" ] }"#);
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let source = served_manifest(&manifest, &manifest_path);
+        let options = test_runner_options();
+        let test = emit_settings(&source, &options, runtime_embed::BundleRole::Scratch);
+        let project = emit_settings(&source, &options, runtime_embed::BundleRole::Out);
+        assert!(test.frame_origins.is_empty());
+        assert_eq!(project.frame_origins, manifest.delivery.frame_origins);
+        assert!(!project.frame_origins.is_empty());
+        let runner = ipe_ir::Program {
+            modules: Vec::new(),
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+        };
+        assert!(matches!(frame_site_step(&runner, &test), Ok(())));
+        assert!(matches!(
+            frame_site_step(&runner, &project),
+            Err(CliError::ProjectRefused(_))
+        ));
     }
 
     /// A build without a manifest links the undeclared driver, and its test

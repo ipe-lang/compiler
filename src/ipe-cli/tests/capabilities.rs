@@ -1866,35 +1866,75 @@ fn a_gamepad_app_without_the_grant_is_rejected_ipe_s0002() -> TestResult {
 
 // ── trusted frame origins ───────────────────────────────────────────────────
 
+/// A `Web.tea` page: a web leaf that registers the project's frame list.
+const WEB_TEA_PAGE: &str = r#"module Main exposing (main)
+
+import Ipe.Tea.Web as Web
+import Ipe.Ui as Ui
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.String as String
+
+type Msg = Noop
+
+type alias Model = { count : Int }
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { count = 0 }, Cmd.none )
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Noop ->
+            ( model, Cmd.none )
+
+view : Model -> Element Msg
+view model =
+    Ui.column [] [ Ui.text (String.fromInt model.count) ]
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+main =
+    Web.tea
+        { init = init, update = update, view = view, subscriptions = subscriptions
+        , routes = [], notFound = Noop
+        }
+"#;
+
+/// A project named `tag` whose `src/Main.ipe` is `source`, its manifest
+/// carrying `delivery`. The caller removes the returned dir.
+fn frame_project(tag: &str, delivery: &str, source: &str) -> Result<PathBuf, Box<dyn Error>> {
+    let dir = crate::support::scratch_root().join(format!(
+        "ipe-cap-frames-{tag}-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    e2e_support::scratch::fresh(&dir);
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(
+        dir.join("package.ipe"),
+        format!(
+            "module Package exposing (package)\n\n\npackage =\n    {{ name = \"framepkg\", version = \"0.1.0\"{delivery} }}\n"
+        ),
+    )?;
+    std::fs::write(dir.join("src/Main.ipe"), source)?;
+    Ok(dir)
+}
+
+/// The manifest field listing one trusted frame origin.
+const LISTED: &str = ", delivery = { frameOrigins = [ \"https://player.example\" ] }";
+
 /// R31: `ipe capabilities` reads the manifest's `delivery.frameOrigins`.
 ///
-/// A pure program listing a trusted frame origin is reported with the frame
-/// notice and the origin, never as pure; without the list the report is the
-/// pure one and names no frame.
+/// A `Web.tea` page listing a trusted frame origin is reported with the frame
+/// notice and the origin; without the list the report names no frame.
 #[test]
 fn capabilities_command_reads_frame_origins() -> TestResult {
-    let source = std::fs::read_to_string(fixture("pure_string.ipe"))?;
-    for (tag, delivery) in [
-        (
-            "listed",
-            ", delivery = { frameOrigins = [ \"https://player.example\" ] }",
-        ),
-        ("absent", ""),
-    ] {
-        let dir = crate::support::scratch_root().join(format!(
-            "ipe-cap-frames-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        e2e_support::scratch::fresh(&dir);
-        std::fs::create_dir_all(dir.join("src"))?;
-        std::fs::write(
-            dir.join("package.ipe"),
-            format!(
-                "module Package exposing (package)\n\n\npackage =\n    {{ name = \"framepkg\", version = \"0.1.0\"{delivery} }}\n"
-            ),
-        )?;
-        std::fs::write(dir.join("src/Main.ipe"), &source)?;
+    for (tag, delivery) in [("listed", LISTED), ("absent", "")] {
+        let dir = frame_project(tag, delivery, WEB_TEA_PAGE)?;
         let human = run_ipe_in(&dir, &["capabilities"]);
         let plain = run_ipe_in(&dir, &["capabilities", "--plain"]);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1905,7 +1945,6 @@ fn capabilities_command_reads_frame_origins() -> TestResult {
             "{tag}: `ipe capabilities` succeeds:\n{human}"
         );
         if delivery.is_empty() {
-            assert!(human.contains("pure"), "{tag}: {human}");
             assert!(!human.contains("frame"), "{tag}: {human}");
             assert!(!plain.contains("frame:"), "{tag}: {plain}");
         } else {
@@ -1913,10 +1952,45 @@ fn capabilities_command_reads_frame_origins() -> TestResult {
             assert!(human.contains("https://player.example"), "{tag}: {human}");
             assert!(!human.contains("pure"), "{tag}: {human}");
             assert_eq!(
-                plain.trim(),
-                "frame:https://player.example",
+                plain
+                    .lines()
+                    .filter(|line| line.starts_with("frame:"))
+                    .collect::<Vec<_>>(),
+                ["frame:https://player.example"],
                 "{tag}: {plain}"
             );
+        }
+    }
+    Ok(())
+}
+
+/// T16: `ipe capabilities` refuses a listed frame origin on a program that
+/// serves no page, as its build does, and so never reports trust for it.
+/// Without the list the same pure program is reported pure.
+#[test]
+fn capabilities_command_refuses_a_frame_list_without_a_web_leaf() -> TestResult {
+    let source = std::fs::read_to_string(fixture("pure_string.ipe"))?;
+    for (tag, delivery) in [("noleaf-listed", LISTED), ("noleaf-absent", "")] {
+        let dir = frame_project(tag, delivery, &source)?;
+        let human = run_ipe_in(&dir, &["capabilities"]);
+        let plain = run_ipe_in(&dir, &["capabilities", "--plain"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ok, human) = human?;
+        let (plain_ok, plain) = plain?;
+        if delivery.is_empty() {
+            assert!(
+                ok && plain_ok,
+                "{tag}: `ipe capabilities` succeeds:\n{human}"
+            );
+            assert!(human.contains("pure"), "{tag}: {human}");
+            assert!(!plain.contains("frame:"), "{tag}: {plain}");
+        } else {
+            assert!(
+                !ok && !plain_ok,
+                "{tag}: `ipe capabilities` must refuse:\n{human}"
+            );
+            assert!(!human.contains("trusted frame origins"), "{tag}: {human}");
+            assert!(!plain.contains("frame:"), "{tag}: {plain}");
         }
     }
     Ok(())

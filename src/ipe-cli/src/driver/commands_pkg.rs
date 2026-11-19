@@ -2388,12 +2388,14 @@ pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
 /// project, their sets unioned. A file argument must name one of the
 /// project's entries: a capability set is a program's, and any other module
 /// is not one. The frame reach is the project's `delivery.frameOrigins`,
-/// `None` when the list is empty.
+/// `None` when the list is empty; a listed origin an analyzed entry would drop
+/// is refused, as its build refuses it, so no trust is claimed for it.
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`] and [`analysis_target`];
 /// [`CliError::Usage`] for a file naming no entry; [`CliError::Pipeline`] when
-/// an entry does not lower.
+/// an entry does not lower; [`CliError::ProjectRefused`] when an entry serves
+/// no page that registers the listed frame origins.
 pub fn capabilities_in(
     cwd: &Path,
     arg: Option<&str>,
@@ -2419,8 +2421,23 @@ pub fn capabilities_in(
             )));
         }
     }
-    let frames = crate::frame_reach::FrameReach::of(&root.manifest().delivery.frame_origins);
-    Ok((target_capabilities(&target)?, frames))
+    let frame_origins = &root.manifest().delivery.frame_origins;
+    let judge = if frame_origins.is_empty() {
+        FrameJudge::Unlisted
+    } else {
+        FrameJudge::Served(&root)
+    };
+    let caps = target_capabilities(&target, judge)?;
+    Ok((caps, crate::frame_reach::FrameReach::of(frame_origins)))
+}
+
+/// Whether a capability analysis judges each entry's frame list.
+#[derive(Clone, Copy)]
+enum FrameJudge<'a> {
+    /// No frame origin is listed, or the caller reports none.
+    Unlisted,
+    /// Refuse an entry the served build of `root` would drop the list of.
+    Served(&'a ProjectRoot),
 }
 
 /// The union of the capabilities every entry `target` names exercises.
@@ -2430,6 +2447,7 @@ pub fn capabilities_in(
 /// [`analysis_graphs`].
 fn target_capabilities(
     target: &AnalysisTarget<'_>,
+    judge: FrameJudge<'_>,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
     crate::threads::run_compile(|| {
         let mut caps = std::collections::BTreeSet::new();
@@ -2437,6 +2455,15 @@ fn target_capabilities(
             let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
                 ipe_db::lower_program(db, root, file).clone()
             })?;
+            match judge {
+                FrameJudge::Unlisted => {}
+                FrameJudge::Served(project) => {
+                    let folded = graph.run_attributed(graph.entry_path(), |db, root, file| {
+                        ipe_db::folded_program(db, root, file).clone()
+                    })?;
+                    super::build_pipeline::served_frame_site_step(project, &folded)?;
+                }
+            }
             caps.extend(capabilities_including_served_widgets(
                 &graph.db,
                 graph.source_root,
@@ -3366,7 +3393,7 @@ pub fn verify_capabilities(
     root: &ProjectRoot,
     declared: &std::collections::BTreeSet<ipe_ir::Capability>,
 ) -> Result<(), CliError> {
-    let inferred = target_capabilities(&AnalysisTarget::Project(root))?;
+    let inferred = target_capabilities(&AnalysisTarget::Project(root), FrameJudge::Unlisted)?;
     if *declared == inferred {
         return Ok(());
     }
