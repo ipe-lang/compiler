@@ -1,5 +1,6 @@
 # cargo-audit configuration — the documented, justified advisory ignore-list
-# (mirror of deny.toml [advisories].ignore; keep the two in sync).
+# (the same id set as deny.toml [advisories].ignore; verify-manifest.py check
+# 29 refuses a difference either way).
 
 [advisories]
 ignore = [

@@ -44,7 +44,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo check --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
 
   # FreeBSD has no native GitHub runner, so its release leg runs in a VM; this is
   # that leg's check: release.yml's VM step, its cargo line pinned by check 23.
@@ -60,4 +60,4 @@ jobs:
           # neither saves nor restores (verify-manifest check 6).
           disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
-          run: cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
+          run: cargo check --release --locked --features wasi_run -p ipe -p ipe-ffi-inspector

@@ -182,8 +182,8 @@ pki_types = { package = "rustls-pki-types", version = "1", optional = true }
 # JIT default backend is kept (the module is executed once per `ipe dev run`, not a
 # cold-start-sensitive path). Optional so the default build never links the
 # engine's graph.
-wasmtime = { version = "45", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
-wasmtime-wasi = { version = "45", default-features = false, features = ["p1"], optional = true }
+wasmtime = { version = "48.0.8", default-features = false, features = ["cranelift", "runtime", "std"], optional = true }
+wasmtime-wasi = { version = "48.0.8", default-features = false, features = ["p1"], optional = true }
 
 # `ipe health`'s free-disk check reads the filesystem's available blocks via
 # `statvfs(2)`. rustix exposes the syscall directly — no libc binding in our own
@@ -209,7 +209,9 @@ cap-primitives = "4.0.3"
 win32job = "2"
 
 [dev-dependencies]
-# Turns on `test-fixtures` for this package's own test targets.
+# Turns on `test-fixtures` for this package's own test targets. Its key `ipe`
+# makes a `--features ipe/<f>` spelling name this dev edge's feature, so the
+# release build spells its feature bare (`.github/ci/release_build.py`).
 ipe = { path = ".", features = ["test-fixtures"] }
 ipe-test-temp = { path = "../../tools/test-temp" }
 # The nesting shapes at the parser's ceiling, shared with the in-browser test.
@@ -227,6 +229,8 @@ ipe_sandbox = { path = "../compiler/sandbox", features = ["assumed-tool-path"] }
 # this crate's graph, so no new package compiles.
 proc-macro2 = "1"
 syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
+# Assembles the WAT guests the WASI preopen confinement tests run.
+wat = "1"
 
 [lints]
 workspace = true
