@@ -10,7 +10,9 @@
 
 use std::sync::OnceLock;
 
-use crate::inbound_authority::{Authority, AuthorityHost};
+use crate::inbound_authority::Authority;
+#[cfg(feature = "encoding")]
+use crate::inbound_authority::AuthorityHost;
 
 #[cfg(feature = "encoding")]
 pub use crate::encoding::FRAME_HEADER_BUDGET;
