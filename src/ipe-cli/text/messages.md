@@ -3065,7 +3065,15 @@ error[IPE-P0001]: the packaged {platform} manifest declares OS permission(s) the
 
 ## index-source-url-invalid
 
-package `{pkg}`: `source` must be an https://, ssh://, or file:// URL (or a bare absolute path), got: {raw}
+package `{pkg}`: `source` must be an https:// or ssh:// URL with no option-shaped or transport-helper text, got: {raw}
+
+## index-source-url-not-network
+
+package `{pkg}`: an index `source` must be the repository's https:// or ssh:// URL — a local path or `file://` URL is never an index source, got: {raw}
+
+## lock-escape-source-invalid
+
+package `{pkg}`: an escape `source` must be an https://, ssh://, or file:// URL (or a bare absolute path), got: {raw}
 
 ## index-source-url-remote
 

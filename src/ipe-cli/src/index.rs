@@ -33,24 +33,21 @@ use crate::published_version::{PublishedVersion, require_successor};
 use crate::publisher::{AttestedActor, BlessedPublisher, SelfDeclaredPublisher};
 use crate::signing::SignatureBundle;
 
-/// A git transport the package index accepts for a source repository.
+/// A git transport a remote-authored source can name.
 ///
-/// Every accepted transport authenticates the server (`https`, `ssh`) or is
-/// local (`file`). The plaintext `git://` transport, which neither encrypts
-/// nor authenticates, has no variant, so no source URL can carry it.
+/// Every transport authenticates the server. The plaintext `git://` transport
+/// and a local directory have no variant, so no index source can name either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transport {
     /// `https://` — TLS-authenticated HTTP.
     Https,
     /// `ssh://` — SSH with host-key checking.
     Ssh,
-    /// A local directory — a `file://` URL or a bare absolute path.
-    File,
 }
 
 impl Transport {
     /// Every accepted transport.
-    pub const ALL: [Self; 3] = [Self::Https, Self::Ssh, Self::File];
+    pub const ALL: [Self; 2] = [Self::Https, Self::Ssh];
 
     /// The transport's name as `GIT_ALLOW_PROTOCOL` spells it.
     #[must_use]
@@ -58,7 +55,6 @@ impl Transport {
         match self {
             Self::Https => "https",
             Self::Ssh => "ssh",
-            Self::File => "file",
         }
     }
 }
@@ -173,6 +169,8 @@ pub enum LocalRefusal {
     LossyVerbatim,
     /// A `%` in a `file://` URL, which git would decode into a text nobody judged.
     PercentInFileUrl,
+    /// A character outside [`is_recordable_path_char`].
+    Unrecordable,
 }
 
 /// A local repository location, in the plain spelling git receives.
@@ -182,6 +180,13 @@ pub enum LocalRefusal {
 /// a non-local `file://` host, under either host regime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalRepo {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "an escape origin records its local source and never opens it"
+        )
+    )]
     plain: String,
 }
 
@@ -268,10 +273,10 @@ impl LocalRepo {
         Self::parse(path, regime)
     }
 
-    /// The location as a filesystem path.
-    #[must_use]
-    pub fn as_path(&self) -> &Path {
-        Path::new(&self.plain)
+    /// The plain spelling of the location.
+    #[cfg(test)]
+    fn plain(&self) -> &str {
+        &self.plain
     }
 }
 
@@ -288,17 +293,6 @@ fn file_url_path(after_scheme: &str) -> Result<&str, LocalRefusal> {
         return Err(LocalRefusal::PercentInFileUrl);
     }
     remote_path(path).map_or(Ok(path), |kind| Err(LocalRefusal::Remote(kind)))
-}
-
-/// Where a source repository lives, by transport.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SourceKind {
-    /// `https://` — TLS-authenticated HTTP.
-    Https,
-    /// `ssh://` — SSH with host-key checking.
-    Ssh,
-    /// A local directory, from a bare absolute path or a `file://` URL.
-    Local(LocalRepo),
 }
 
 /// Whether `c` may appear in a network source URL.
@@ -344,31 +338,39 @@ pub fn is_recordable_path_char(c: char) -> bool {
     c != '"' && !is_display_hazard(c)
 }
 
-/// Why a raw `source` value was refused.
+/// Why a text is not a network source URL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SourceRefusal {
+pub enum NetworkRefusal {
     /// The plaintext, unauthenticated `git://` transport.
     Plaintext,
-    /// An injection-shaped value: a leading `-`, a `::`, or a character outside
-    /// the location's alphabet ([`is_url_char`] or [`is_recordable_path_char`]).
+    /// An injection-shaped value: a leading `-`, a `::`, or an `https://` /
+    /// `ssh://` URL holding a character outside [`is_url_char`].
     Invalid,
-    /// A network share or a device.
-    Remote(RemotePath),
-    /// A local location this host cannot admit.
-    Local(LocalRefusal),
 }
 
-impl From<LocalRefusal> for SourceRefusal {
-    fn from(refusal: LocalRefusal) -> Self {
-        match refusal {
-            LocalRefusal::Remote(kind) => Self::Remote(kind),
-            LocalRefusal::NotAnchored
-            | LocalRefusal::ForeignDrive
-            | LocalRefusal::DeviceElement
-            | LocalRefusal::LossyVerbatim
-            | LocalRefusal::PercentInFileUrl => Self::Local(refusal),
+impl NetworkRefusal {
+    /// The refusal's message for package `pkg`'s already-sanitized `shown` source.
+    fn message(
+        self,
+        pkg: &PackageName,
+        shown: &crate::style::TerminalSafe,
+    ) -> crate::text::Message {
+        match self {
+            Self::Plaintext => crate::text::msg::index_source_url_plaintext(pkg, shown),
+            Self::Invalid => crate::text::msg::index_source_url_invalid(pkg, shown),
         }
     }
+}
+
+/// Why a remote-authored `source` value was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceRefusal {
+    /// A `git://`, option-shaped, transport-helper or off-alphabet value.
+    Network(NetworkRefusal),
+    /// Anything that is not an `https://` or `ssh://` URL: a bare path, a
+    /// `file://` URL, a UNC or device spelling, an upper-case scheme, a
+    /// relative path.
+    NotNetwork,
 }
 
 impl SourceRefusal {
@@ -377,150 +379,239 @@ impl SourceRefusal {
     pub fn into_cli(self, pkg: &PackageName, raw: &str) -> CliError {
         let shown = crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
         CliError::Resolve(match self {
-            Self::Plaintext => crate::text::msg::index_source_url_plaintext(pkg, &shown),
-            Self::Remote(kind) | Self::Local(LocalRefusal::Remote(kind)) => {
-                crate::text::msg::index_source_url_remote(pkg, &kind.describe(), &shown)
-            }
-            Self::Invalid
-            | Self::Local(
-                LocalRefusal::NotAnchored
-                | LocalRefusal::ForeignDrive
-                | LocalRefusal::DeviceElement
-                | LocalRefusal::LossyVerbatim
-                | LocalRefusal::PercentInFileUrl,
-            ) => crate::text::msg::index_source_url_invalid(pkg, &shown),
+            Self::Network(refusal) => refusal.message(pkg, &shown),
+            Self::NotNetwork => crate::text::msg::index_source_url_not_network(pkg, &shown),
         })
     }
 }
 
-/// A validated source-repository location accepted by the package index.
+/// A source location a remote party authored: an `https://` or `ssh://` URL.
 ///
-/// The accept set is the [`Transport`] set: `https://`, `ssh://`, and a local
-/// directory, named by a `file://` URL whose host is empty or `localhost` or
-/// by a bare path absolute on this host (`/x` on Unix; `X:\x` or `\\?\X:\x` on
-/// Windows). A `git://` URL is refused with a diagnostic naming its `https://`
-/// fix. Any value that begins with `-` (option injection) or contains `::`
-/// (git transport helpers such as `ext::` or `fd::`, the real RCE vector) is
-/// rejected at parse time so a malicious index entry can never reach the `git`
-/// subprocess. A network URL admits only [`is_url_char`] (RFC 3986, ASCII) and a
-/// local location only [`is_recordable_path_char`], so a source can neither
-/// break out of the quoted, line-oriented files (`ipe.lock`, index entries) it
-/// is recorded in nor display differently from what `git` is handed. A location naming a network share or a device (`//host/share`,
-/// `\\?\UNC\…`, `\\.\…`, `\??\…`, `file://host/…`) has no representation on any
-/// host, so opening a source never contacts a host the transport did not name.
+/// An index entry, an index lockfile origin and a publish draft parse their
+/// `source` into this type, and it has no local-path representation, so text a
+/// remote party writes can never make the reader's git open a path on the
+/// reading host. A `git://` URL is refused with a diagnostic naming its
+/// `https://` fix. Any value that begins with `-` (option injection) or
+/// contains `::` (git transport helpers such as `ext::` or `fd::`) is rejected
+/// at parse time, so a malicious index entry can never reach the `git`
+/// subprocess. A URL admits only [`is_url_char`] (RFC 3986, ASCII), so a source
+/// can neither break out of the quoted, line-oriented files (`ipe.lock`, index
+/// entries) it is recorded in nor display differently from what `git` is
+/// handed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceUrl {
     recorded: String,
-    kind: SourceKind,
+    transport: Transport,
 }
 
 impl SourceUrl {
-    /// Parse a raw string from the index into a [`SourceUrl`] under the host's
-    /// path regime.
+    /// Parse a raw string from the index into a network [`SourceUrl`].
     ///
     /// Rejected: `git://` (plaintext, unauthenticated), a leading `-` (git flag
-    /// injection), `::` anywhere (transport-helper execution, the RCE vector),
-    /// a network URL character outside [`is_url_char`] or a local character
-    /// outside [`is_recordable_path_char`], a network share or device location,
-    /// and any local location that is not absolute on this host.
+    /// injection), `::` anywhere (transport-helper execution), a URL character
+    /// outside [`is_url_char`], and anything that is not an `https://` or
+    /// `ssh://` URL — a local path or a `file://` URL among them.
     ///
     /// # Errors
     /// [`CliError::Resolve`] when the value is not an accepted source form.
     pub fn parse(pkg: &PackageName, raw: &str) -> Result<Self, CliError> {
-        Self::parse_in(raw, ipe_path_core::HOST).map_err(|refusal| refusal.into_cli(pkg, raw))
+        Self::parse_in(raw).map_err(|refusal| refusal.into_cli(pkg, raw))
     }
 
-    /// [`Self::parse`] under an explicit path `regime`.
-    fn parse_in(raw: &str, regime: Regime) -> Result<Self, SourceRefusal> {
+    /// [`Self::parse`] as a typed refusal.
+    fn parse_in(raw: &str) -> Result<Self, SourceRefusal> {
+        Self::parse_network(raw)
+            .map_err(SourceRefusal::Network)?
+            .ok_or(SourceRefusal::NotNetwork)
+    }
+
+    /// The one network parser, shared with [`EscapeSource`].
+    ///
+    /// The steps run in this order: `git://` is plaintext; a leading `-` or a
+    /// `::` anywhere is invalid; an `https://` or `ssh://` URL is admitted when
+    /// every character is [`is_url_char`] and is invalid otherwise; anything
+    /// else is not a network URL (`Ok(None)`).
+    fn parse_network(raw: &str) -> Result<Option<Self>, NetworkRefusal> {
         if raw.starts_with("git://") {
-            return Err(SourceRefusal::Plaintext);
+            return Err(NetworkRefusal::Plaintext);
         }
-        // Fail closed: absent proof the transport is safe, reject.
-        // `-`-leading values would be parsed as git flags; `::` introduces
-        // transport helpers (e.g. `ext::`) that execute arbitrary commands.
-        let network = raw.starts_with("https://") || raw.starts_with("ssh://");
-        let alphabet: fn(char) -> bool = if network {
-            is_url_char
-        } else {
-            is_recordable_path_char
-        };
-        if raw.starts_with('-') || raw.contains("::") || !raw.chars().all(alphabet) {
-            return Err(SourceRefusal::Invalid);
+        if raw.starts_with('-') || raw.contains("::") {
+            return Err(NetworkRefusal::Invalid);
         }
-        let kind = if raw.starts_with("https://") {
-            SourceKind::Https
+        let transport = if raw.starts_with("https://") {
+            Transport::Https
         } else if raw.starts_with("ssh://") {
-            SourceKind::Ssh
-        } else if let Some(after_scheme) = raw.strip_prefix("file://") {
-            SourceKind::Local(LocalRepo::from_file_url(after_scheme, regime)?)
+            Transport::Ssh
         } else {
-            SourceKind::Local(LocalRepo::parse(raw, regime)?)
+            return Ok(None);
         };
-        Ok(Self {
+        if !raw.chars().all(is_url_char) {
+            return Err(NetworkRefusal::Invalid);
+        }
+        Ok(Some(Self {
             recorded: raw.to_owned(),
-            kind,
-        })
+            transport,
+        }))
     }
 
     /// The recorded spelling, as the lockfile, an index entry and publisher
-    /// inference hold it — never a git argument (that is [`Self::git_remote`]).
+    /// inference hold it.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.recorded
     }
 
-    /// Where the repository lives.
-    #[must_use]
-    pub const fn kind(&self) -> &SourceKind {
-        &self.kind
-    }
-
-    /// The `git remote add` argument: the recorded URL for `https`/`ssh`, the
-    /// plain path for a local repository.
+    /// The `git remote add` argument: the recorded `https`/`ssh` URL.
     ///
     /// The exact text returned is judged again here, so a value built by any
-    /// path is refused at the sink when it names a network share or a device.
+    /// path is refused at the sink unless it is an injection-free network URL.
     ///
     /// # Errors
-    /// [`SourceRefusal::Remote`] when the argument names a network share or a
-    /// device; [`SourceRefusal::Invalid`] when it is injection-shaped.
+    /// [`SourceRefusal::NotNetwork`] when the argument is not an `https://` or
+    /// `ssh://` URL or names a network share or device;
+    /// [`SourceRefusal::Network`] when it is injection-shaped.
     pub fn git_remote(&self) -> Result<&str, SourceRefusal> {
-        let arg = match &self.kind {
-            SourceKind::Https | SourceKind::Ssh => self.recorded.as_str(),
-            SourceKind::Local(repo) => repo.plain.as_str(),
-        };
-        sink_check(arg)?;
-        Ok(arg)
+        sink_check(&self.recorded)?;
+        Ok(&self.recorded)
     }
 
     /// The transport the location uses.
     #[must_use]
     pub const fn transport(&self) -> Transport {
-        match self.kind {
-            SourceKind::Https => Transport::Https,
-            SourceKind::Ssh => Transport::Ssh,
-            SourceKind::Local(_) => Transport::File,
-        }
+        self.transport
     }
 }
 
-/// The git-sink refusal: `arg` names no network share or device (spelled bare
-/// or as a `file://` URL) and is not injection-shaped.
+/// The git-sink refusal: `arg` is an `https://` or `ssh://` URL, names no
+/// network share or device (spelled bare or as a `file://` URL), and is not
+/// injection-shaped.
 fn sink_check(arg: &str) -> Result<(), SourceRefusal> {
+    if !(arg.starts_with("https://") || arg.starts_with("ssh://")) {
+        return Err(SourceRefusal::NotNetwork);
+    }
     if let Some(after_scheme) = arg
         .get(..7)
         .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
         .and_then(|_| arg.get(7..))
     {
-        file_url_path(after_scheme)?;
+        file_url_path(after_scheme).map_err(|_| SourceRefusal::NotNetwork)?;
     }
-    if let Some(kind) = remote_path(arg) {
-        return Err(SourceRefusal::Remote(kind));
+    if remote_path(arg).is_some() {
+        return Err(SourceRefusal::NotNetwork);
     }
     if arg.starts_with('-') || arg.contains("::") {
-        return Err(SourceRefusal::Invalid);
+        return Err(SourceRefusal::Network(NetworkRefusal::Invalid));
     }
     Ok(())
+}
+
+/// Why a lockfile escape origin's `source` was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EscapeRefusal {
+    /// A `git://`, option-shaped, transport-helper or off-alphabet network value.
+    Network(NetworkRefusal),
+    /// A network share or a device.
+    Remote(RemotePath),
+    /// A local location this host cannot admit.
+    Local(LocalRefusal),
+}
+
+impl From<LocalRefusal> for EscapeRefusal {
+    fn from(refusal: LocalRefusal) -> Self {
+        match refusal {
+            LocalRefusal::Remote(kind) => Self::Remote(kind),
+            LocalRefusal::NotAnchored
+            | LocalRefusal::ForeignDrive
+            | LocalRefusal::DeviceElement
+            | LocalRefusal::LossyVerbatim
+            | LocalRefusal::PercentInFileUrl
+            | LocalRefusal::Unrecordable => Self::Local(refusal),
+        }
+    }
+}
+
+impl EscapeRefusal {
+    /// The refusal as the CLI reports it for package `pkg`'s `raw` source.
+    #[must_use]
+    pub fn into_cli(self, pkg: &PackageName, raw: &str) -> CliError {
+        let shown = crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+        CliError::Resolve(match self {
+            Self::Network(refusal) => refusal.message(pkg, &shown),
+            Self::Remote(kind) | Self::Local(LocalRefusal::Remote(kind)) => {
+                crate::text::msg::index_source_url_remote(pkg, &kind.describe(), &shown)
+            }
+            Self::Local(
+                LocalRefusal::NotAnchored
+                | LocalRefusal::ForeignDrive
+                | LocalRefusal::DeviceElement
+                | LocalRefusal::LossyVerbatim
+                | LocalRefusal::PercentInFileUrl
+                | LocalRefusal::Unrecordable,
+            ) => crate::text::msg::lock_escape_source_invalid(pkg, &shown),
+        })
+    }
+}
+
+/// The source of a lockfile `{git=}` escape origin: a network URL or a local repository.
+///
+/// Only a lockfile origin that declares itself an escape parses into this
+/// type. Its value is recorded and never fetched, so a local repository it
+/// names is never opened. A local location is a `file://` URL whose host is
+/// empty or `localhost`, or a bare path absolute on this host (`/x` on Unix;
+/// `X:\x` or `\\?\X:\x` on Windows), and admits only
+/// [`is_recordable_path_char`]. A location naming a network share or a device
+/// (`//host/share`, `\\?\UNC\…`, `\\.\…`, `\??\…`, `file://host/…`)
+/// has no representation on any host.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EscapeSource {
+    /// An `https://` or `ssh://` URL.
+    Network(SourceUrl),
+    /// A local repository.
+    Local {
+        /// The recorded spelling.
+        recorded: String,
+        /// The location, read under the host's path regime.
+        repo: LocalRepo,
+    },
+}
+
+impl EscapeSource {
+    /// Parse a lockfile escape origin's raw `source` under the host's path regime.
+    ///
+    /// # Errors
+    /// [`CliError::Resolve`] when the value is neither an accepted network URL
+    /// nor an absolute local location on this host.
+    pub fn parse(pkg: &PackageName, raw: &str) -> Result<Self, CliError> {
+        Self::parse_in(raw, ipe_path_core::HOST).map_err(|refusal| refusal.into_cli(pkg, raw))
+    }
+
+    /// [`Self::parse`] under an explicit path `regime`.
+    fn parse_in(raw: &str, regime: Regime) -> Result<Self, EscapeRefusal> {
+        if let Some(url) = SourceUrl::parse_network(raw).map_err(EscapeRefusal::Network)? {
+            return Ok(Self::Network(url));
+        }
+        if !raw.chars().all(is_recordable_path_char) {
+            return Err(EscapeRefusal::Local(LocalRefusal::Unrecordable));
+        }
+        let repo = if let Some(after_scheme) = raw.strip_prefix("file://") {
+            LocalRepo::from_file_url(after_scheme, regime)?
+        } else {
+            LocalRepo::parse(raw, regime)?
+        };
+        Ok(Self::Local {
+            recorded: raw.to_owned(),
+            repo,
+        })
+    }
+
+    /// The recorded spelling, as the lockfile holds it.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Network(url) => url.as_str(),
+            Self::Local { recorded, .. } => recorded,
+        }
+    }
 }
 
 impl std::fmt::Display for SourceUrl {
@@ -2339,8 +2430,6 @@ mod tests {
         let cases = [
             ("https://github.com/user/repo", Transport::Https),
             ("ssh://git@github.com/user/repo", Transport::Ssh),
-            ("file:///home/user/repo", Transport::File),
-            ("/home/user/repo", Transport::File),
         ];
         for (raw, transport) in cases {
             assert_eq!(
@@ -2364,15 +2453,96 @@ mod tests {
         assert!(format!("{err}").contains("https://"), "{err}");
     }
 
+    /// An index-route source is an `https://` or `ssh://` URL; every other spelling is refused by kind.
     #[test]
-    fn source_url_accepts_file_scheme() {
-        // `file://` is on the allow-list so local and test-fixture repos work.
-        assert!(SourceUrl::parse(&pn("p"), "file:///home/user/repo").is_ok());
+    fn an_index_source_must_be_a_network_url() {
+        use super::{NetworkRefusal, SourceRefusal};
+        let not_network = [
+            "/home/u/r",
+            "file:///home/u/r",
+            "file://localhost/r",
+            r"C:\r",
+            r"\\?\C:\r",
+            "//h/s/r",
+            r"\\h\s\r",
+            "HTTPS://h/r",
+            "relative/r",
+        ];
+        let refused = not_network
+            .iter()
+            .map(|raw| (*raw, SourceRefusal::NotNetwork))
+            .chain([
+                (
+                    "git://h/r",
+                    SourceRefusal::Network(NetworkRefusal::Plaintext),
+                ),
+                ("-uhack", SourceRefusal::Network(NetworkRefusal::Invalid)),
+                ("ext::sh", SourceRefusal::Network(NetworkRefusal::Invalid)),
+                (
+                    "https://h/r ",
+                    SourceRefusal::Network(NetworkRefusal::Invalid),
+                ),
+            ]);
+        // The network grammar reads no path regime: one table holds under Unix and Windows alike.
+        for (raw, refusal) in refused {
+            assert_eq!(SourceUrl::parse_in(raw), Err(refusal), "{raw:?}");
+            let network = SourceUrl::parse_network(raw);
+            match refusal {
+                SourceRefusal::NotNetwork => assert_eq!(network, Ok(None), "{raw:?}"),
+                SourceRefusal::Network(kind) => assert_eq!(network, Err(kind), "{raw:?}"),
+            }
+            let err = SourceUrl::parse(&pn("p"), raw).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                refusal.into_cli(&pn("p"), raw).to_string(),
+                "{raw:?}"
+            );
+        }
+        for (raw, transport) in [
+            ("https://h/r", Transport::Https),
+            ("ssh://git@h/r", Transport::Ssh),
+        ] {
+            let url =
+                SourceUrl::parse_in(raw).map(|url| (url.transport(), url.as_str().to_owned()));
+            assert_eq!(url, Ok((transport, raw.to_owned())), "{raw:?}");
+        }
     }
 
+    /// The production entry points refuse a local source in an index entry, TOML and JSON alike.
     #[test]
-    fn source_url_accepts_bare_absolute_path() {
-        assert!(SourceUrl::parse(&pn("p"), "/home/user/repo").is_ok());
+    fn an_index_entry_naming_a_local_source_is_refused() {
+        let toml = |source: &str| {
+            format!(
+                "publisher = \"tester\"\n\n[[version]]\nversion = \"1.0.0\"\n\
+                 source = \"{source}\"\nrev = \"{FIXTURE_REV}\"\nsha256 = \"{}\"\n",
+                "0".repeat(64)
+            )
+        };
+        let json = |source: &str| {
+            format!(
+                "{{\"name\":\"p\",\"publisher\":\"tester\",\"versions\":[{{\"version\":\"1.0.0\",\
+                 \"source\":\"{source}\",\"rev\":\"{FIXTURE_REV}\",\"sha256\":\"{}\"}}]}}",
+                "0".repeat(64)
+            )
+        };
+        for raw in ["/srv/repo", "file:///srv/repo"] {
+            let shown = crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+            let expected = crate::text::msg::index_source_url_not_network(&pn("p"), &shown);
+            let from_toml = super::parse_entry(&pn("p"), &toml(raw));
+            assert!(
+                matches!(&from_toml, Err(crate::CliError::Resolve(msg)) if *msg == expected),
+                "{raw:?}: {from_toml:?}"
+            );
+            let from_json = super::parse_entry_json("p", &json(raw));
+            assert!(
+                matches!(&from_json, Err(crate::CliError::Resolve(msg)) if *msg == expected),
+                "{raw:?}: {from_json:?}"
+            );
+        }
+        let control = "https://example.invalid/r";
+        assert!(super::parse_entry(&pn("p"), &toml(control)).is_ok());
+        let json_control = super::parse_entry_json("p", &json(control));
+        assert!(json_control.is_ok(), "{json_control:?}");
     }
 
     #[test]
@@ -3180,10 +3350,13 @@ mod tests {
         }
     }
 
-    /// Source locations: the network-share and device refusals, under both regimes.
+    /// Escape-origin source locations: the network-share and device refusals, under both regimes.
     mod source_location {
-        use super::super::{LocalRefusal, RemotePath, SourceKind, SourceRefusal, sink_check};
-        use super::{SourceUrl, pn};
+        use super::super::{
+            EscapeRefusal, EscapeSource, LocalRefusal, NetworkRefusal, RemotePath, SourceRefusal,
+            sink_check,
+        };
+        use super::pn;
         use ipe_path_core::Regime;
 
         /// Every network-share and device spelling, with the kind it names.
@@ -3218,17 +3391,16 @@ mod tests {
         const FOREIGN_DRIVE_ROWS: [&str; 3] = [r"C:\r", "C:/r", r"\\?\C:\r"];
 
         /// The refusal `raw` meets under `regime`, or `None` when admitted.
-        fn refusal(raw: &str, regime: Regime) -> Option<SourceRefusal> {
-            SourceUrl::parse_in(raw, regime).err()
+        fn refusal(raw: &str, regime: Regime) -> Option<EscapeRefusal> {
+            EscapeSource::parse_in(raw, regime).err()
         }
 
-        /// The `git remote add` argument `raw` yields under `regime`.
-        #[allow(clippy::expect_used)] // every caller passes an admitted control
-        fn git_arg(raw: &str, regime: Regime) -> String {
-            let url = SourceUrl::parse_in(raw, regime).expect("control source is admitted");
-            url.git_remote()
-                .expect("admitted source reaches git")
-                .to_owned()
+        /// The plain spelling `raw` yields under `regime` as an escape-origin local repository.
+        fn local_plain(raw: &str, regime: Regime) -> Option<String> {
+            match EscapeSource::parse_in(raw, regime) {
+                Ok(EscapeSource::Local { repo, .. }) => Some(repo.plain().to_owned()),
+                Ok(EscapeSource::Network(_)) | Err(_) => None,
+            }
         }
 
         #[test]
@@ -3237,7 +3409,7 @@ mod tests {
                 for (raw, kind) in REMOTE_ROWS {
                     assert_eq!(
                         refusal(raw, regime),
-                        Some(SourceRefusal::Remote(kind)),
+                        Some(EscapeRefusal::Remote(kind)),
                         "{raw:?} under {regime:?}"
                     );
                 }
@@ -3251,7 +3423,7 @@ mod tests {
             for raw in PERCENT_ROWS {
                 assert_eq!(
                     refusal(raw, Regime::Unix),
-                    Some(SourceRefusal::Local(LocalRefusal::PercentInFileUrl)),
+                    Some(EscapeRefusal::Local(LocalRefusal::PercentInFileUrl)),
                     "{raw:?}"
                 );
             }
@@ -3263,7 +3435,7 @@ mod tests {
             for raw in WINDOWS_UNANCHORED_ROWS {
                 assert_eq!(
                     refusal(raw, Regime::Windows),
-                    Some(SourceRefusal::Local(LocalRefusal::NotAnchored)),
+                    Some(EscapeRefusal::Local(LocalRefusal::NotAnchored)),
                     "{raw:?}"
                 );
             }
@@ -3277,7 +3449,7 @@ mod tests {
             for raw in DEVICE_ROWS {
                 assert_eq!(
                     refusal(raw, Regime::Windows),
-                    Some(SourceRefusal::Local(LocalRefusal::DeviceElement)),
+                    Some(EscapeRefusal::Local(LocalRefusal::DeviceElement)),
                     "{raw:?}"
                 );
             }
@@ -3290,7 +3462,7 @@ mod tests {
             for raw in LOSSY_ROWS {
                 assert_eq!(
                     refusal(raw, Regime::Windows),
-                    Some(SourceRefusal::Local(LocalRefusal::LossyVerbatim)),
+                    Some(EscapeRefusal::Local(LocalRefusal::LossyVerbatim)),
                     "{raw:?}"
                 );
             }
@@ -3302,7 +3474,7 @@ mod tests {
             for raw in FOREIGN_DRIVE_ROWS {
                 assert_eq!(
                     refusal(raw, Regime::Unix),
-                    Some(SourceRefusal::Local(LocalRefusal::ForeignDrive)),
+                    Some(EscapeRefusal::Local(LocalRefusal::ForeignDrive)),
                     "{raw:?}"
                 );
             }
@@ -3310,42 +3482,101 @@ mod tests {
         }
 
         #[test]
-        fn a_local_source_reaches_git_in_plain_spelling() {
-            assert_eq!(git_arg(r"\\?\C:\a\b", Regime::Windows), r"C:\a\b");
-            assert_eq!(git_arg("file:///C:/a", Regime::Windows), "C:/a");
-            assert_eq!(git_arg("file://LOCALHOST/C:/a", Regime::Windows), "C:/a");
-            assert_eq!(git_arg("file:///home/u/r", Regime::Unix), "/home/u/r");
-            for remote in ["https://h/r", "ssh://git@h/r"] {
-                assert_eq!(git_arg(remote, Regime::Unix), remote);
+        fn an_escape_source_runs_the_network_grammar_first() {
+            for regime in [Regime::Unix, Regime::Windows] {
+                for (raw, kind) in [
+                    ("git://h/r", NetworkRefusal::Plaintext),
+                    ("-uhack", NetworkRefusal::Invalid),
+                    ("ext::sh", NetworkRefusal::Invalid),
+                    ("https://h/r ", NetworkRefusal::Invalid),
+                ] {
+                    assert_eq!(
+                        refusal(raw, regime),
+                        Some(EscapeRefusal::Network(kind)),
+                        "{raw:?}"
+                    );
+                }
+                for raw in ["/srv/r\"", "/srv/r\u{1b}[2J"] {
+                    assert_eq!(
+                        refusal(raw, regime),
+                        Some(EscapeRefusal::Local(LocalRefusal::Unrecordable)),
+                        "{raw:?}"
+                    );
+                }
+                for remote in ["https://h/r", "ssh://git@h/r"] {
+                    assert!(
+                        matches!(
+                            EscapeSource::parse_in(remote, regime),
+                            Ok(EscapeSource::Network(_))
+                        ),
+                        "{remote:?}"
+                    );
+                }
             }
-            let local = SourceUrl::parse_in("file:///home/u/r", Regime::Unix);
-            assert!(
-                matches!(
-                    local.as_ref().map(SourceUrl::kind),
-                    Ok(SourceKind::Local(_))
-                ),
-                "{local:?}"
+            assert_eq!(
+                local_plain("/srv/r\u{e9}po with space", Regime::Unix),
+                Some("/srv/r\u{e9}po with space".to_owned())
+            );
+        }
+
+        #[test]
+        fn an_escape_local_source_keeps_its_plain_spelling() {
+            assert_eq!(
+                local_plain(r"\\?\C:\a\b", Regime::Windows).as_deref(),
+                Some(r"C:\a\b")
             );
             assert_eq!(
-                local.map(|url| url.as_str().to_owned()),
+                local_plain("file:///C:/a", Regime::Windows).as_deref(),
+                Some("C:/a")
+            );
+            assert_eq!(
+                local_plain("file://LOCALHOST/C:/a", Regime::Windows).as_deref(),
+                Some("C:/a")
+            );
+            assert_eq!(
+                local_plain("file:///home/u/r", Regime::Unix).as_deref(),
+                Some("/home/u/r")
+            );
+            let local = EscapeSource::parse_in("file:///home/u/r", Regime::Unix);
+            assert_eq!(
+                local.map(|source| source.as_str().to_owned()),
                 Ok("file:///home/u/r".to_owned()),
                 "the recorded spelling is kept for the lockfile"
             );
         }
 
+        /// The git sink admits only an injection-free `https://` or `ssh://` URL.
         #[test]
-        fn the_git_sink_refuses_a_remote_spelling() {
-            for (raw, kind) in REMOTE_ROWS {
-                assert_eq!(sink_check(raw), Err(SourceRefusal::Remote(kind)), "{raw:?}");
+        fn the_git_sink_refuses_a_local_remote() {
+            for local in [
+                "/srv/r",
+                "file:///srv/r",
+                r"C:\r",
+                r"C:\a\b",
+                "C:/a",
+                "/home/u/r",
+            ] {
+                assert_eq!(
+                    sink_check(local),
+                    Err(SourceRefusal::NotNetwork),
+                    "{local:?}"
+                );
+            }
+            for (raw, _) in REMOTE_ROWS {
+                assert_eq!(sink_check(raw), Err(SourceRefusal::NotNetwork), "{raw:?}");
             }
             for injected in ["-uhack", "ext::sh"] {
                 assert_eq!(
                     sink_check(injected),
-                    Err(SourceRefusal::Invalid),
+                    Err(SourceRefusal::NotNetwork),
                     "{injected:?}"
                 );
             }
-            for control in [r"C:\a\b", "C:/a", "/home/u/r", "https://h/r"] {
+            assert_eq!(
+                sink_check("https://h/r::x"),
+                Err(SourceRefusal::Network(NetworkRefusal::Invalid))
+            );
+            for control in ["https://h/r", "ssh://git@h/r"] {
                 assert_eq!(sink_check(control), Ok(()), "{control:?}");
             }
         }
@@ -3373,13 +3604,13 @@ mod tests {
                 ]);
             for raw in rows {
                 assert_eq!(
-                    SourceUrl::parse(&pn("p"), raw).is_ok(),
-                    SourceUrl::parse_in(raw, ipe_path_core::HOST).is_ok(),
+                    EscapeSource::parse(&pn("p"), raw).is_ok(),
+                    EscapeSource::parse_in(raw, ipe_path_core::HOST).is_ok(),
                     "{raw:?}"
                 );
             }
             assert!(
-                SourceUrl::parse(&pn("p"), "//h/s/r").is_err(),
+                EscapeSource::parse(&pn("p"), "//h/s/r").is_err(),
                 "the production entry point refuses a UNC share on this host"
             );
         }

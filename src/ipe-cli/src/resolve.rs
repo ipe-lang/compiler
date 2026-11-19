@@ -1061,7 +1061,9 @@ mod tests {
         verify_locked_hashes, verify_lockfile_hashes,
     };
     use crate::CliError;
-    use crate::index::{self, CommitId, EntryVersion, PinnedRev, Sha256Hex, SourceUrl};
+    use crate::index::{
+        self, CommitId, EntryVersion, EscapeSource, PinnedRev, Sha256Hex, SourceUrl,
+    };
     use crate::lockfile::{LockedDep, LockedOrigin, Lockfile};
     use crate::package_name::PackageName;
     use crate::published_version::PublishedVersion;
@@ -1228,7 +1230,9 @@ mod tests {
             name: name.clone(),
             version: PublishedVersion::new(0, 0, 0),
             origin: LockedOrigin::Git {
-                source: SourceUrl::parse(name, "https://example.invalid/lib").expect("valid url"),
+                source: EscapeSource::Network(
+                    SourceUrl::parse(name, "https://example.invalid/lib").expect("valid url"),
+                ),
                 rev,
             },
             sha256: Sha256Hex::of_tree(&cache).expect("hash"),
@@ -1294,8 +1298,10 @@ mod tests {
             name: PackageName::parse("myescape").expect("valid name"),
             version: PublishedVersion::new(0, 0, 0),
             origin: LockedOrigin::Git {
-                source: SourceUrl::parse(&pn("myescape"), "https://example.invalid/myescape")
-                    .expect("valid url"),
+                source: EscapeSource::Network(
+                    SourceUrl::parse(&pn("myescape"), "https://example.invalid/myescape")
+                        .expect("valid url"),
+                ),
                 rev: pinned_sha.clone(),
             },
             sha256: digest.clone(),

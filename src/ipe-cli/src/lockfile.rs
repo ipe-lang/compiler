@@ -25,7 +25,7 @@ use ipe_diagnostics::terminal::DisplayHazard;
 use ipe_fs_open::FileId;
 
 use crate::CliError;
-use crate::index::{PinnedRev, RemotePath, RevSite, Sha256Hex, SourceUrl};
+use crate::index::{EscapeSource, PinnedRev, RemotePath, RevSite, Sha256Hex, SourceUrl};
 use crate::line_grammar::{LineFault, LineKey, LineShape, TextLine};
 use crate::output_dir::held::{self, Created, Durability, HeldDir, ReadMiss, Replaced};
 use crate::package_name::PackageName;
@@ -378,9 +378,12 @@ pub enum LockedOrigin {
         rev: PinnedRev,
     },
     /// A `{git=}` escape, bypassing the index, pinned to its resolved commit.
+    ///
+    /// Its source is recorded, never fetched, so a local repository it names
+    /// is never opened.
     Git {
-        /// The repository the author named.
-        source: SourceUrl,
+        /// The repository the author named: a network URL or a local repository.
+        source: EscapeSource,
         /// The immutable commit the requested ref resolved to.
         rev: PinnedRev,
     },
@@ -446,11 +449,16 @@ impl LockedOrigin {
         }
         // Fail closed: a non-SHA rev (a legacy "HEAD" or branch) is refused.
         let rev = PinnedRev::from_full_sha(pkg, rev, RevSite::Lockfile)?;
-        let source = SourceUrl::parse(pkg, source)?;
         Ok(if escape {
-            Self::Git { source, rev }
+            Self::Git {
+                source: EscapeSource::parse(pkg, source)?,
+                rev,
+            }
         } else {
-            Self::Index { source, rev }
+            Self::Index {
+                source: SourceUrl::parse(pkg, source)?,
+                rev,
+            }
         })
     }
 }
@@ -790,7 +798,7 @@ mod tests {
         LockedOrigin, Lockfile, MAX_LOCAL_SOURCE_LEN, TextLine,
     };
     use crate::CliError;
-    use crate::index::{PinnedRev, RemotePath, Sha256Hex, SourceUrl};
+    use crate::index::{EscapeSource, PinnedRev, RemotePath, Sha256Hex, SourceUrl};
     use crate::line_grammar::MAX_KEY_ECHO;
     use crate::package_name::PackageName;
     use crate::published_version::{PublishedVersion, VersionRefusal};
@@ -834,7 +842,10 @@ mod tests {
         LockedDep {
             name: name(raw),
             version: PublishedVersion::new(0, 0, 0),
-            origin: LockedOrigin::Git { source, rev },
+            origin: LockedOrigin::Git {
+                source: EscapeSource::Network(source),
+                rev,
+            },
             sha256: sha256(),
         }
     }
@@ -1253,6 +1264,56 @@ mod tests {
         );
     }
 
+    /// A lockfile spells a local source only by declaring the origin an escape.
+    #[test]
+    fn an_index_lock_origin_naming_a_local_source_is_refused() {
+        let pkg = name("mypkg");
+        let shown = crate::style::TerminalSafe::sanitize(&format!("{:?}", "/abs/mypkg"));
+        let expected = crate::text::msg::index_source_url_not_network(&pkg, &shown);
+        for (version, kind) in [("1.0.0", "kind = \"index\"\n"), ("1.0.0", "")] {
+            let text = one_package("mypkg", version, "/abs/mypkg", FIXTURE_SHA, kind);
+            let err = read_text("local-index-origin", &text).unwrap_err();
+            assert!(
+                matches!(&err, CliError::Resolve(msg) if *msg == expected),
+                "{kind:?}: {err:?}"
+            );
+        }
+        let escape = read_one(
+            "local-escape-origin",
+            &one_package(
+                "mypkg",
+                "1.0.0",
+                "/abs/mypkg",
+                FIXTURE_SHA,
+                "kind = \"escape\"\n",
+            ),
+        );
+        assert!(
+            matches!(
+                escape.origin,
+                LockedOrigin::Git {
+                    source: EscapeSource::Local { .. },
+                    ..
+                }
+            ),
+            "{escape:?}"
+        );
+        let index = read_one(
+            "network-index-origin",
+            &one_package(
+                "mypkg",
+                "1.0.0",
+                "https://example.invalid/mypkg",
+                FIXTURE_SHA,
+                "kind = \"index\"\n",
+            ),
+        );
+        assert!(
+            matches!(index.origin, LockedOrigin::Index { .. }),
+            "{index:?}"
+        );
+    }
+
     #[test]
     fn local_source_refuses_a_line_break() {
         // A newline could forge a following lockfile field; it never becomes a
@@ -1498,8 +1559,7 @@ mod tests {
         let indexed = one_package("mylib", "1.0.0", "//h/s", FIXTURE_SHA, "");
         let err = Lockfile::from_text(&indexed).unwrap_err();
         let shown = crate::style::TerminalSafe::sanitize(&format!("{:?}", "//h/s"));
-        let expected =
-            crate::text::msg::index_source_url_remote(&pkg, &RemotePath::Unc.describe(), &shown);
+        let expected = crate::text::msg::index_source_url_not_network(&pkg, &shown);
         assert!(
             matches!(&err, CliError::Resolve(msg) if *msg == expected),
             "{err:?}"

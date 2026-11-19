@@ -3623,7 +3623,7 @@ pub struct Git {
 
 /// The `GIT_ALLOW_PROTOCOL` list of an isolated git: exactly the
 /// [`Transport`](crate::index::Transport) set a source URL can parse to.
-const ISOLATED_GIT_PROTOCOLS: &str = "https:ssh:file";
+const ISOLATED_GIT_PROTOCOLS: &str = "https:ssh";
 
 // The isolated protocol list is exactly the source-URL transports, in order,
 // so a transport added or dropped on either side breaks the build.
@@ -3696,6 +3696,8 @@ const GIT_INJECTION_VARS: [&str; 7] = [
 
 impl Git {
     /// The shared hardening of both flavours, run in `cwd`.
+    ///
+    /// TLS certificate verification is never disabled from the environment.
     fn base(cwd: &Path) -> Command {
         let mut command = Command::new("git");
         command.current_dir(cwd);
@@ -3703,6 +3705,7 @@ impl Git {
             command.env_remove(var);
         }
         command
+            .env_remove("GIT_SSL_NO_VERIFY")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_LFS_SKIP_SMUDGE", "1")
             .args(["-c", "core.hooksPath=/dev/null"])
@@ -3742,6 +3745,10 @@ impl Git {
             .args(["-c", "core.sshCommand=ssh -o BatchMode=yes"])
             .args(["-c", "fetch.recurseSubmodules=false"])
             .args(["-c", "transfer.unpackLimit=1"]);
+        #[cfg(any(test, feature = "test-fixtures"))]
+        if let Some(trust) = FIXTURE_TRUST.get() {
+            command.envs(trust.pairs.iter().map(|(key, value)| (*key, value)));
+        }
         Self { command }
     }
 
@@ -3880,6 +3887,51 @@ impl Curl {
     #[cfg(test)]
     pub fn get_args(&self) -> std::process::CommandArgs<'_> {
         self.command.get_args()
+    }
+}
+
+/// The client environment that makes an isolated git trust a test HTTPS fixture.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FixtureTrust {
+    pairs: Vec<(&'static str, std::ffi::OsString)>,
+}
+
+#[cfg(any(test, feature = "test-fixtures"))]
+impl FixtureTrust {
+    /// Trust built from a fixture's client environment pairs.
+    #[must_use]
+    pub fn new(pairs: impl IntoIterator<Item = (&'static str, std::ffi::OsString)>) -> Self {
+        Self {
+            pairs: pairs.into_iter().collect(),
+        }
+    }
+}
+
+/// A second fixture trust that names other pairs than the one already in force.
+#[cfg(any(test, feature = "test-fixtures"))]
+#[derive(Debug, PartialEq, Eq)]
+pub struct FixtureTrustConflict;
+
+/// The fixture trust every isolated git in this process applies, set once.
+#[cfg(any(test, feature = "test-fixtures"))]
+static FIXTURE_TRUST: std::sync::OnceLock<FixtureTrust> = std::sync::OnceLock::new();
+
+/// Make every isolated git started in this process trust a test fixture.
+///
+/// The first call wins; a later call with the same pairs is a no-op, and one
+/// with other pairs is refused.
+///
+/// # Errors
+///
+/// [`FixtureTrustConflict`] when another trust is already in force.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn trust_fixture(trust: FixtureTrust) -> Result<(), FixtureTrustConflict> {
+    let held = FIXTURE_TRUST.get_or_init(|| trust.clone());
+    if *held == trust {
+        Ok(())
+    } else {
+        Err(FixtureTrustConflict)
     }
 }
 
@@ -5206,7 +5258,7 @@ mod tests {
         assert!(set("GIT_CONFIG_NOSYSTEM", "1"));
         assert!(set("GIT_CONFIG_GLOBAL", "/dev/null"));
         assert!(set("GIT_TERMINAL_PROMPT", "0"));
-        assert!(set("GIT_ALLOW_PROTOCOL", "https:ssh:file"));
+        assert!(set("GIT_ALLOW_PROTOCOL", "https:ssh"));
         assert!(set("GIT_NO_REPLACE_OBJECTS", "1"));
         assert!(set(
             "GIT_ALLOC_LIMIT",
@@ -5251,15 +5303,16 @@ mod tests {
     /// is refused.
     #[test]
     fn transport_list_check_refuses_every_drift() {
-        assert!(super::names_every_transport("https:ssh:file"));
+        assert!(super::names_every_transport("https:ssh"));
         for drifted in [
-            "https:ssh:file:git",
-            "git:https:ssh:file",
-            "https:ssh",
-            "ssh:https:file",
-            "https:ssh:files",
-            "https:ssh:file:",
-            "https::ssh:file",
+            "https:ssh:file",
+            "https:ssh:git",
+            "git:https:ssh",
+            "https",
+            "ssh:https",
+            "https:sshx",
+            "https:ssh:",
+            "https::ssh",
             "",
         ] {
             assert!(
@@ -5267,6 +5320,76 @@ mod tests {
                 "{drifted:?} accepted"
             );
         }
+    }
+
+    /// A real isolated git refuses a local repository, spelled as a `file://` URL or a bare path.
+    #[test]
+    fn isolated_git_refuses_the_file_transport() {
+        let repo = scratch();
+        let git = |args: &[&str]| {
+            super::fixture_git(repo.path())
+                .args(args)
+                .output()
+                .map(|out| out.status.success())
+        };
+        assert!(matches!(git(&["init", "--quiet"]), Ok(true)));
+        assert!(matches!(
+            git(&["commit", "--quiet", "--allow-empty", "-m", "seed"]),
+            Ok(true)
+        ));
+        let plain = repo.path().display().to_string();
+        let file_url = if cfg!(windows) {
+            format!("file:///{plain}")
+        } else {
+            format!("file://{plain}")
+        };
+        let cwd = scratch();
+        for remote in [file_url.as_str(), plain.as_str()] {
+            let out = Git::isolated(cwd.path())
+                .args(["ls-remote", "--", remote])
+                .command
+                .output();
+            assert!(
+                matches!(&out, Ok(out) if !out.status.success() && out.stdout.is_empty()),
+                "{remote:?}: {out:?}"
+            );
+        }
+        let control = super::fixture_git(cwd.path())
+            .args(["ls-remote", "--", plain.as_str()])
+            .output();
+        assert!(
+            matches!(&control, Ok(out) if out.status.success()
+                && String::from_utf8_lossy(&out.stdout).contains("HEAD")),
+            "{control:?}"
+        );
+    }
+
+    /// Neither git flavour inherits a request to skip TLS certificate verification.
+    #[test]
+    fn isolated_git_never_disables_tls_verification() {
+        let dir = scratch();
+        let removed = |git: Git| {
+            git.command
+                .get_envs()
+                .any(|(k, v)| k == "GIT_SSL_NO_VERIFY" && v.is_none())
+        };
+        assert!(removed(Git::isolated(dir.path())), "isolated git");
+        assert!(removed(Git::user(dir.path())), "user git");
+        let isolated = Git::isolated(dir.path());
+        assert!(
+            !isolated
+                .command
+                .get_envs()
+                .any(|(k, v)| k == "GIT_SSL_NO_VERIFY" && v.is_some()),
+            "no flavour sets it"
+        );
+        assert!(
+            !isolated
+                .command
+                .get_envs()
+                .any(|(k, v)| k == "GIT_SSL_CAINFO" && v.is_none()),
+            "an operator trust anchor is kept"
+        );
     }
 
     /// The user git allows only HTTPS and never prompts.
