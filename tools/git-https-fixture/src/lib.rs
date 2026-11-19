@@ -401,9 +401,12 @@ enum Route {
 struct RepoId(u8);
 
 impl RepoId {
-    /// The id `raw` spells, when it is a plain decimal below `served`.
+    /// The id `raw` spells, when it is a canonical decimal (no leading zero) below `served`.
     fn parse(raw: &str, served: usize) -> Option<Self> {
         if raw.is_empty() || raw.len() > 2 || !raw.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        if raw.len() > 1 && raw.starts_with('0') {
             return None;
         }
         let id = raw.parse::<u8>().ok()?;

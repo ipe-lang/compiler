@@ -2880,7 +2880,10 @@ mod tests {
         for remedy in ["https://", "ssh://"] {
             assert!(not_network.as_str().contains(remedy), "{not_network:?}");
         }
-        assert!(!not_network.as_str().contains("file://"), "{not_network:?}");
+        assert!(
+            not_network.as_str().contains("is never an index source"),
+            "{not_network:?}"
+        );
         let invalid = msg::index_source_url_invalid(&pkg, &raw);
         assert!(!invalid.as_str().contains("file://"), "{invalid:?}");
         assert!(
