@@ -2148,7 +2148,7 @@ mod group {
     use std::process::{Child, Command};
     use std::sync::{Mutex, PoisonError};
 
-    use rustix::process::{Pid, Signal, WaitId, WaitidOptions};
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
     /// A live group's ID: its leader's process ID.
     pub type GroupId = Pid;
@@ -2240,7 +2240,7 @@ mod group {
     pub fn exited(id: Pid) -> std::io::Result<bool> {
         match rustix::process::waitid(
             WaitId::Pid(id),
-            WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT,
+            WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
         ) {
             Ok(status) => Ok(status.is_some()),
             Err(rustix::io::Errno::INTR) => Ok(false),
@@ -2251,7 +2251,7 @@ mod group {
     /// Kill every process in group `id`.
     pub fn kill(id: Pid) {
         // A group whose members have all exited is already gone.
-        let _ = rustix::process::kill_process_group(id, Signal::Kill);
+        let _ = rustix::process::kill_process_group(id, Signal::KILL);
     }
 
     /// Deregister group `id` from the relay.
@@ -2276,10 +2276,10 @@ mod group {
         let mut registry = REGISTRY.lock().unwrap_or_else(PoisonError::into_inner);
         registry.ended = true;
         for id in &registry.live {
-            let _ = rustix::process::kill_process_group(*id, Signal::Kill);
+            let _ = rustix::process::kill_process_group(*id, Signal::KILL);
         }
         for id in &registry.attached {
-            let _ = rustix::process::kill_process(*id, Signal::Kill);
+            let _ = rustix::process::kill_process(*id, Signal::KILL);
         }
     }
 
@@ -2985,8 +2985,8 @@ mod relay {
     fn dispatch(step: Step) {
         match step.effect {
             Effect::Ends => super::group::end_all(),
-            Effect::Stops => super::group::signal_all(Signal::Stop),
-            Effect::Continues => super::group::signal_all(Signal::Cont),
+            Effect::Stops => super::group::signal_all(Signal::STOP),
+            Effect::Continues => super::group::signal_all(Signal::CONT),
         }
         match step.handling {
             Handling::RelayThenDefault => {
@@ -4787,7 +4787,7 @@ mod tests {
             .and_then(|text| text.trim().parse::<i32>().ok())
             .and_then(rustix::process::Pid::from_raw)
             .expect("the child wrote the escaped process's ID");
-        let _ = rustix::process::kill_process(pid, rustix::process::Signal::Kill);
+        let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
     }
 
     /// A process that left the transfer's group and holds its output pipes

@@ -738,8 +738,8 @@ fn zombie_cpu_time(pid: u32) -> Option<CpuTime> {
 fn poll_exit(
     child: &mut std::process::Child,
 ) -> std::io::Result<Option<(std::process::ExitStatus, Option<CpuTime>)>> {
-    use rustix::process::{Pid, WaitId, WaitidOptions, waitid};
-    let options = WaitidOptions::EXITED | WaitidOptions::NOHANG | WaitidOptions::NOWAIT;
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
     if waitid(WaitId::Pid(Pid::from_child(child)), options)?.is_none() {
         return Ok(None);
     }
