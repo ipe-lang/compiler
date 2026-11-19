@@ -2,10 +2,11 @@ name: Release-target toolchain
 description: >-
   The one copy of what a release target's cargo command runs under: the
   pinned toolchain with the target installed, the dependency cache, and the
-  musl tools on a musl target. release.yml's `build` and ci.yml's
-  `release-targets-run` each run it straight after their checkout and right
-  before their cargo command; ci/verify-manifest.py check 23 pins all three
-  steps and this action's body.
+  musl tools on a musl target. release.yml's `build`, ci.yml's
+  `release-targets-run` and release-targets.yml's `release-targets-native`
+  each run it straight after their checkout and right before their cargo
+  command; ci/verify-manifest.py check 23 pins all three steps and this
+  action's body.
 
 inputs:
   target:
