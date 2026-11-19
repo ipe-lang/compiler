@@ -114,17 +114,20 @@ function __ipeListedOrigin(url) {
 }
 // Whether the listed `origin` may be the page's own on a page at `pageHost`
 // (`location.host`), so its frame is untrusted (`frames.rs` `served_on`): an
-// `https` origin on the page's host at any port, a loopback `http` origin on
-// the page's `localhost` port, and every origin when the host does not read
-// as a name. An IP-literal page host is never a listed origin's.
+// `https` origin on the page's host at any port, an `https` loopback-name
+// origin (last label `localhost`) on any loopback-name page, a loopback
+// `http` origin on a loopback-name page at its port, and every origin when the
+// host does not read as a name. An IP-literal page host is never a listed
+// origin's.
 function __ipeServedOn(origin, pageHost) {
   if (typeof pageHost !== "string") return true;
   if (pageHost.charAt(0) === "[") return false;
   var page = /^([a-z0-9-]+(?:\.[a-z0-9-]+)*)(?::([0-9]+))?$/.exec(__ipeAsciiLower(pageHost));
   var o = /^(https?):\/\/([a-z0-9.-]+)(?::([0-9]+))?$/.exec(origin);
   if (!page || !o) return true;
-  if (o[1] === "https") return o[2] === page[1];
-  return page[1] === "localhost" && o[3] === page[2];
+  var loopback = function(name) { return /(^|\.)localhost$/.test(name); };
+  if (o[1] === "https") return o[2] === page[1] || (loopback(o[2]) && loopback(page[1]));
+  return loopback(page[1]) && o[3] === page[2];
 }
 // The listed origin a frame element `tag` whose attribute reader is `get`
 // (a value, or null when absent) loads from, on a page at `pageHost`; null

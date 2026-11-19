@@ -697,7 +697,8 @@ impl EscapedPopups {
 /// Whether `origin` may be the page's own origin, so its frame is untrusted.
 ///
 /// True for an `Unknown` page; for an `https` origin whose host is the
-/// page's name, at any port (cookies ignore the port); for a dev loopback
+/// page's name, at any port (cookies ignore the port); for an `https`
+/// loopback-name origin on any loopback-name page; for a dev loopback
 /// origin on a loopback page at its port; and for an origin whose host does
 /// not parse as an authority. An IP-literal page never matches a listed
 /// origin, since no listed origin names an IP literal.
@@ -716,6 +717,8 @@ fn origin_served_on(origin: &ListedOrigin, page: &Authority) -> bool {
         FrameOrigin::Https(server) => Authority::parse(server.authority()).map_or(true, |listed| {
             match (listed.host(), page.host()) {
                 (AuthorityHost::Name(listed), AuthorityHost::Name(page)) => listed == page,
+                // A loopback name keeps no spelling, so any two may be one.
+                (AuthorityHost::LoopbackName, AuthorityHost::LoopbackName) => true,
                 (
                     AuthorityHost::Name(_) | AuthorityHost::Ip(_) | AuthorityHost::LoopbackName,
                     _,
@@ -1007,6 +1010,21 @@ mod tests {
         }
         assert!(served_on(&ported, &page("app.example")));
         assert!(!served_on(&ported, &page("other.example:8443")));
+        let local = FrameOrigin::parse("https://localhost:8443").expect("origin");
+        let sub = FrameOrigin::parse("https://a.localhost").expect("origin");
+        for origin in [&local, &sub] {
+            for host in [
+                "localhost:8443",
+                "localhost",
+                "a.localhost:3000",
+                "b.localhost",
+            ] {
+                assert!(served_on(origin, &page(host)), "{host}");
+            }
+            for host in ["app.example", "127.0.0.1:8443", "[::1]:8443"] {
+                assert!(!served_on(origin, &page(host)), "{host}");
+            }
+        }
         for origin in [&app, &ported] {
             assert!(served_on(origin, &PageAuthority::Unknown));
         }
@@ -1035,16 +1053,13 @@ mod tests {
     /// A page authority narrows only to the authority it was admitted under.
     #[cfg(feature = "encoding")]
     #[test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
     fn page_authority_admits_only_its_own_authority() {
         let minted = page("app.example:8080");
-        let Ok(same) = Authority::parse("app.example:8080") else {
-            return;
-        };
+        let same = Authority::parse("app.example:8080").expect("a well-formed vector");
         assert!(minted.is_admitted(Some(&same)));
         for other in ["app.example:8081", "other.example:8080", "app.example"] {
-            let Ok(other) = Authority::parse(other) else {
-                return;
-            };
+            let other = Authority::parse(other).expect("a well-formed vector");
             assert!(!minted.is_admitted(Some(&other)));
         }
         assert!(!minted.is_admitted(None));

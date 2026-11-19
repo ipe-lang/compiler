@@ -19919,10 +19919,9 @@ mod frame_mark_tests {
     /// the origin check is on; with it off, or with no admission, the page
     /// authority is `Unknown`.
     #[test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
     fn served_page_authority_follows_the_origin_check() {
-        let Ok(authority) = Authority::parse("app.example") else {
-            return;
-        };
+        let authority = Authority::parse("app.example").expect("a well-formed vector");
         assert_eq!(
             served_page_authority(Some(&authority), EnvFlag::On),
             Some(&authority)

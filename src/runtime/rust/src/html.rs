@@ -1205,6 +1205,7 @@ pub(crate) mod frame_patch {
     /// toward a trusted target and is removed otherwise. So a patch that moves a
     /// frame off a trusted origin withdraws its grant before it navigates, and a
     /// grant on an untrusted frame is the opaque one, whatever was asked.
+    /// An element that is no frame plans no write.
     pub(crate) fn plan_frame_patch<'a>(
         tag: &str,
         delta: &[(&'a str, Option<&'a str>)],
@@ -1214,6 +1215,9 @@ pub(crate) mod frame_patch {
         popups: EscapedPopups,
     ) -> Vec<FrameWrite> {
         let keys = frame_patch_keys(tag);
+        if keys.is_empty() {
+            return Vec::new();
+        }
         let asked = |name: &str| {
             delta
                 .iter()
@@ -3205,6 +3209,7 @@ mod tests {
     /// not parse, or an unstamped render, trusts no frame.
     #[cfg(feature = "encoding")]
     #[test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
     fn client_context_withdraws_own_origin() {
         register_listed();
         let frame = || {
@@ -3231,9 +3236,7 @@ mod tests {
         let session = SessionMarks::new(StyleNonce::from_random_bytes([7; 16]));
         let out = render_html_in(&frame(), &RenderCtx::Session(&session));
         assert!(out.contains(" sandbox=\"\""), "unknown session page: {out}");
-        let Ok(other) = Authority::parse("other.example") else {
-            return;
-        };
+        let other = Authority::parse("other.example").expect("a well-formed vector");
         let served = session.serving(PageAuthority::Known(other), EscapedPopups::Dropped);
         let out = render_html_in(&frame(), &RenderCtx::Session(&served));
         assert!(out.contains(trusted), "{out}");
@@ -3392,6 +3395,18 @@ mod tests {
             &page,
             EscapedPopups::Held,
         )
+    }
+
+    /// An element that is no frame plans no write, whatever its patch names,
+    /// as `client.js`'s `__ipeFramePlan` does.
+    #[cfg(feature = "encoding")]
+    #[test]
+    fn a_patch_of_no_frame_plans_nothing() {
+        let live: &[(&str, &str)] = &[("allow", "camera"), ("sandbox", "allow-scripts")];
+        for tag in ["div", "a", "img", "iframes", ""] {
+            let writes = planned(tag, live, &[("src", Some("https://app.example"))]);
+            assert!(writes.is_empty(), "{tag}: {writes:?}");
+        }
     }
 
     /// R13: every planned grant write precedes every navigation write, in

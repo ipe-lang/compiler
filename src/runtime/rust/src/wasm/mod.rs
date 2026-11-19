@@ -2720,10 +2720,10 @@ mod tests {
     /// R10g: the client's marks read its location's host, and a page with no
     /// window or an unparsable host trusts no frame.
     #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
     fn wasm_client_marks_read_the_location() {
-        let Ok(page) = crate::inbound_authority::Authority::parse("app.example:8443") else {
-            return;
-        };
+        let page = crate::inbound_authority::Authority::parse("app.example:8443")
+            .expect("a well-formed vector");
         assert_eq!(
             client_marks_of(Some("app.example:8443".to_owned())).page,
             PageAuthority::Known(page)
@@ -2739,10 +2739,10 @@ mod tests {
     /// R13, client half: under a listed policy every grant write precedes the
     /// navigation, and leaving the listed origin withdraws the grant first.
     #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
     fn a_wasm_patch_writes_grants_before_navigation() {
-        let Ok(policy) = crate::frames::policy_of(&["https://frames.example"], &[]) else {
-            return;
-        };
+        let policy = crate::frames::policy_of(&["https://frames.example"], &[])
+            .expect("a well-formed vector");
         let live = [
             ("src", "https://frames.example/a"),
             ("sandbox", "allow-same-origin allow-scripts"),
@@ -2775,14 +2775,14 @@ mod tests {
     /// R27, client half: a browser-built page never holds escaped popups, so
     /// a trusted frame's escape token is dropped.
     #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
     fn wasm_popups_are_always_dropped() {
         for host in [None, Some("other.example".to_owned())] {
             assert_eq!(client_marks_of(host).popups, EscapedPopups::Dropped);
         }
         assert_eq!(client_marks().popups, EscapedPopups::Dropped);
-        let Ok(policy) = crate::frames::policy_of(&["https://frames.example"], &[]) else {
-            return;
-        };
+        let policy = crate::frames::policy_of(&["https://frames.example"], &[])
+            .expect("a well-formed vector");
         let escape = Some("allow-popups allow-popups-to-escape-sandbox");
         let writes = plan(
             "iframe",
@@ -2791,6 +2791,308 @@ mod tests {
             &policy,
         );
         assert_eq!(written(&writes, "sandbox"), Some(Some("allow-popups")));
+    }
+
+    /// The browser client's script, whose frame rules R14 runs here.
+    const CLIENT_JS: &str = include_str!("../web/client.js");
+
+    /// The one top-level item of `client.js` that starts with `head` and ends
+    /// at the first `tail` after it, `tail` included.
+    #[allow(clippy::expect_used)] // the script holds each named item once
+    fn client_js_item(head: &str, tail: &str) -> &'static str {
+        assert_eq!(CLIENT_JS.matches(head).count(), 1, "one {head}");
+        let start = CLIENT_JS.find(head).expect("the item");
+        let rest = CLIENT_JS.get(start..).expect("the item");
+        let len = rest.find(tail).expect("the item's end") + tail.len();
+        rest.get(..len).expect("the item")
+    }
+
+    /// The `client.js` frame rules as one function of the boot block, the
+    /// page's host and a frame's live and patched attributes, returning the
+    /// JSON of `__ipeFramePlan`'s writes. The DOM reads it makes go through a
+    /// stand-in node.
+    fn client_js_frame_plan() -> js_sys::Function {
+        let mut body = String::from(
+            "var __ipeBoot = JSON.parse(boot);\n\
+             var window = { top: 1, self: 1 };\n\
+             var location = { host: host };\n\
+             var __ipeNode = {\n\
+               local: function(el) { return el.tag; },\n\
+               attr: function(el, k) {\n\
+                 return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null;\n\
+               }\n\
+             };\n",
+        );
+        for table in [
+            "__IPE_SANDBOX_TOKENS",
+            "__IPE_FRAME_LOADERS",
+            "__IPE_TRUSTED_SANDBOX_TOKENS",
+            "__IPE_FRAME_PERMISSIONS",
+            "__IPE_DELEGATION_FEATURES",
+        ] {
+            body.push_str(client_js_item(&format!("var {table} = "), ";\n"));
+        }
+        for function in [
+            "__ipeAsciiLower",
+            "__ipeSandbox",
+            "__ipeFrameLoaderKey",
+            "__ipeFrameList",
+            "__ipeEscapePopups",
+            "__ipeListedOrigin",
+            "__ipeServedOn",
+            "__ipeFrameTarget",
+            "__ipeTrustedSandbox",
+            "__ipeAllow",
+            "__ipeFrameGrant",
+            "__ipeFramePatchKeys",
+            "__ipeFramePlan",
+        ] {
+            body.push_str(client_js_item(&format!("\nfunction {function}("), "\n}\n"));
+        }
+        body.push_str("return JSON.stringify(__ipeFramePlan(JSON.parse(el), JSON.parse(attrs)));");
+        js_sys::Function::new_with_args("boot, host, el, attrs", &body)
+    }
+
+    /// `pairs` as a JSON object, in order; `None` is `null`.
+    #[allow(clippy::expect_used)] // a string always serializes
+    fn json_object(pairs: &[(&str, Option<&str>)]) -> String {
+        let fields: Vec<String> = pairs
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(key).expect("a key"),
+                    serde_json::to_string(value).expect("a value")
+                )
+            })
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    }
+
+    /// The frame origins R14 lists, two loopback names among them.
+    const R14_ORIGINS: [&str; 4] = [
+        "https://app.example",
+        "https://frames.example:8443",
+        "https://localhost:8443",
+        "https://a.localhost",
+    ];
+
+    /// Every sandbox token a trusted frame may keep.
+    const R14_WIDE: &str =
+        "allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox";
+
+    /// An `allow` naming a gated, a granted, a never, a cross-origin and an
+    /// undisclosed feature.
+    const R14_ALLOW: &str =
+        "camera; geolocation 'src'; payment; fullscreen https://frames.example:8443; usb";
+
+    /// One R14 vector: a frame's tag, its live attributes and a patch.
+    type R14Vector = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        &'static [(&'static str, Option<&'static str>)],
+    );
+
+    /// The frames and patches R14 runs on every page.
+    const R14_VECTORS: &[R14Vector] = &[
+        (
+            "iframe",
+            &[],
+            &[
+                ("src", Some("https://frames.example:8443/x")),
+                ("sandbox", Some(R14_WIDE)),
+                ("allow", Some(R14_ALLOW)),
+            ],
+        ),
+        (
+            "iframe",
+            &[
+                ("src", "https://frames.example:8443/a"),
+                ("sandbox", "allow-same-origin allow-scripts"),
+                ("allow", "camera"),
+            ],
+            &[("src", Some("/b"))],
+        ),
+        (
+            "iframe",
+            &[
+                ("src", "https://frames.example:8443"),
+                ("sandbox", R14_WIDE),
+            ],
+            &[("srcdoc", Some("<p>"))],
+        ),
+        (
+            "iframe",
+            &[("srcdoc", "<p>"), ("sandbox", R14_WIDE)],
+            &[("srcdoc", None), ("src", Some("https://app.example/"))],
+        ),
+        (
+            "IFRAME",
+            &[],
+            &[
+                ("SRC", Some("https://localhost:8443")),
+                ("Sandbox", Some("ALLOW-SAME-ORIGIN allow-scripts")),
+                ("AllowFullScreen", Some("")),
+            ],
+        ),
+        (
+            "iframe",
+            &[("sandbox", R14_WIDE)],
+            &[
+                ("src", Some("https://evil.example")),
+                ("SRC", Some("https://a.localhost/p?q#f")),
+            ],
+        ),
+        (
+            "iframe",
+            &[
+                ("src", "https://frames.example:8443"),
+                ("sandbox", R14_WIDE),
+            ],
+            &[("sandbox", None), ("allowpaymentrequest", Some(""))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("https://frames.example:8443.evil/"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("https://frames.example:84430"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("https://frames.example:8443\\@evil"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some(" https://frames.example:8443"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("HTTPS://frames.example:8443"))],
+        ),
+        (
+            "embed",
+            &[],
+            &[
+                ("src", Some("https://a.localhost/x")),
+                ("allowfullscreen", Some("")),
+            ],
+        ),
+        (
+            "embed",
+            &[("src", "https://frames.example:8443")],
+            &[("src", Some("/"))],
+        ),
+        (
+            "object",
+            &[],
+            &[("data", Some("https://frames.example:8443?q"))],
+        ),
+        ("OBJECT", &[], &[("DATA", Some("https://evil.example"))]),
+        (
+            "frame",
+            &[],
+            &[("src", Some("https://frames.example:8443"))],
+        ),
+        ("div", &[], &[("src", Some("https://frames.example:8443"))]),
+    ];
+
+    /// The page hosts R14 runs every vector on: the listed hosts at and off
+    /// their ports, loopback names, IP literals, and hosts that do not parse.
+    const R14_HOSTS: [&str; 13] = [
+        "app.example",
+        "app.example:8443",
+        "frames.example",
+        "frames.example:8443",
+        "localhost:8443",
+        "localhost",
+        "a.localhost:3000",
+        "b.localhost",
+        "other.example",
+        "127.0.0.1:3000",
+        "[::1]:3000",
+        "app.example.",
+        "",
+    ];
+
+    /// The JSON of `client.js`'s frame plan for `vector` on a page at `host`
+    /// under the boot block `boot`.
+    #[allow(clippy::expect_used)] // the client plan returns its JSON string
+    fn client_js_plan(
+        client: &js_sys::Function,
+        boot: &str,
+        host: &str,
+        (tag, live, delta): &R14Vector,
+    ) -> String {
+        let live: Vec<(&str, Option<&str>)> = live.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let el = format!(
+            "{{\"tag\":{},\"attrs\":{}}}",
+            serde_json::to_string(tag).expect("a tag"),
+            json_object(&live)
+        );
+        let args = js_sys::Array::of4(
+            &boot.into(),
+            &host.into(),
+            &el.as_str().into(),
+            &json_object(delta).as_str().into(),
+        );
+        client
+            .apply(&wasm_bindgen::JsValue::NULL, &args)
+            .expect("the client plan runs")
+            .as_string()
+            .expect("the client plan's JSON")
+    }
+
+    /// R14, executed: on every page host, popup mark, frame and patch of the
+    /// vector table, `client.js`'s `__ipeFramePlan` writes exactly what the
+    /// runtime's `plan_frame_patch` writes, in the same order.
+    #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // the vector table is well-formed
+    fn client_js_frame_plan_matches_the_runtime() {
+        let policy = crate::frames::policy_of(&R14_ORIGINS, &["camera"]).expect("the policy");
+        let grants: Vec<&str> = policy
+            .grants()
+            .suffixes()
+            .map(crate::frames::GrantSuffix::as_str)
+            .collect();
+        let client = client_js_frame_plan();
+        for popups in [EscapedPopups::Held, EscapedPopups::Dropped] {
+            let boot = serde_json::json!({
+                "frameOrigins": R14_ORIGINS,
+                "frameGrants": grants,
+                "escapePopups": popups.is_held(),
+            })
+            .to_string();
+            for host in R14_HOSTS {
+                let page = PageAuthority::of_location_host(host);
+                for vector in R14_VECTORS {
+                    let (tag, live, delta) = vector;
+                    let runtime = plan_frame_patch(
+                        tag,
+                        delta,
+                        |key| {
+                            live.iter()
+                                .find(|(k, _)| *k == key)
+                                .map(|(_, v)| (*v).to_owned())
+                        },
+                        &policy,
+                        &page,
+                        popups,
+                    );
+                    assert_eq!(
+                        client_js_plan(&client, &boot, host, vector),
+                        serde_json::to_string(&runtime).expect("the runtime plan's JSON"),
+                        "{popups:?} on {host:?}: {tag} {live:?} {delta:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A `Decode.index` past the 32-bit `usize` is out of range here, never
