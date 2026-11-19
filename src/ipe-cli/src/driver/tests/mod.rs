@@ -4058,10 +4058,9 @@ fn audit_entry_rejects_on_hash_mismatch() {
     std::fs::create_dir_all(&pkgs).expect("packages dir");
     let entry_text = format!(
         "name = \"testlib\"\npublisher = \"tester\"\n\n[[version]]\n\
-         version = \"1.0.0\"\nsource = \"{}\"\nrev = \"{rev}\"\n\
+         version = \"1.0.0\"\nsource = \"{url}\"\nrev = \"{rev}\"\n\
          sha256 = \"0000000000000000000000000000000000000000000000000000000000000000\"\n\
-         capabilities = []\n",
-        url
+         capabilities = []\n"
     );
     std::fs::write(pkgs.join("testlib.toml"), entry_text).expect("write entry");
 
