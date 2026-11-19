@@ -103,7 +103,7 @@ mod engine {
     use crate::{CliError, Path};
     use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
     use wasmtime_wasi::p1::{self, WasiP1Ctx};
-    use wasmtime_wasi::{DirPerms, FilePerms, I32Exit, WasiCtxBuilder};
+    use wasmtime_wasi::{FsPerms, I32Exit, WasiCtxBuilder};
 
     /// The store's host data: the WASI context PLUS the address-space limiter.
     /// Both live in the store so the resource bound is enforced by the same
@@ -206,7 +206,7 @@ mod engine {
         }
         builder.inherit_env();
         builder
-            .preopened_dir(working_tree, ".", DirPerms::all(), FilePerms::all())
+            .preopened_dir(working_tree, ".", FsPerms::ReadWrite)
             .map_err(|e| CliError::WasiRunFailed {
                 detail: crate::style::TerminalSafe::sanitize(&format!(
                     "could not preopen the working tree: {e}"

@@ -149,6 +149,126 @@ const WIDGET_JS: &str = "export function mount(host, emit) { return {}; }\n";
 /// Shared error type for E2E helpers.
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+/// Reads the exit status a virtual-display run recorded for the program it
+/// launched, never `xvfb-run`'s own wrapper status.
+///
+/// Absent, empty, or non-numeric content means the program's status was never
+/// recorded — refused, not read as a stand-in zero or pass.
+fn read_recorded_exit_status(status_file: &std::path::Path) -> Result<i32, String> {
+    let contents = std::fs::read_to_string(status_file).map_err(|e| {
+        format!(
+            "no exit status was recorded at {}: {e}",
+            status_file.display()
+        )
+    })?;
+    contents.trim().parse::<i32>().map_err(|e| {
+        format!(
+            "the recorded exit status at {} is not a number ({contents:?}): {e}",
+            status_file.display()
+        )
+    })
+}
+
+/// Runs `binary` for `secs` seconds inside `xvfb-run`, judging `binary`'s own
+/// exit status rather than `xvfb-run`'s: the wrapper's housekeeping (its own
+/// temp-directory cleanup) can fail independently of the program it ran, and
+/// that failure must never stand in for the program's verdict.
+///
+/// The inner shell records `binary`'s status to a private file inside
+/// `status_dir` before `xvfb-run` can overwrite it with its own exit code.
+/// `configure` adjusts the command (env vars, working directory) before it
+/// runs. Returns the recorded status and `xvfb-run`'s stderr; a run whose
+/// status was never recorded errors with that stderr attached.
+fn run_under_virtual_display(
+    binary: &std::path::Path,
+    secs: u64,
+    status_dir: &std::path::Path,
+    configure: impl FnOnce(&mut std::process::Command),
+) -> Result<(i32, String), BoxError> {
+    let status_file = status_dir.join(format!("xvfb_status_{}", std::process::id()));
+    let _ = std::fs::remove_file(&status_file);
+    let mut command = std::process::Command::new("xvfb-run");
+    command.arg("-a").arg("sh").arg("-c").arg(
+        r#"timeout "$1" "$2"
+printf %s "$?" >"$3""#,
+    );
+    command
+        .arg("sh")
+        .arg(secs.to_string())
+        .arg(binary)
+        .arg(&status_file);
+    configure(&mut command);
+    let output = command
+        .output()
+        .map_err(|e| -> BoxError { format!("failed to spawn xvfb-run: {e}").into() })?;
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    match read_recorded_exit_status(&status_file) {
+        Ok(code) => {
+            let _ = std::fs::remove_file(&status_file);
+            Ok((code, stderr))
+        }
+        Err(e) => Err(format!(
+            "the program's exit status was never recorded under xvfb-run: {e}\n\
+             --- xvfb-run stderr ---\n{stderr}"
+        )
+        .into()),
+    }
+}
+
+mod virtual_display_status {
+    use super::read_recorded_exit_status;
+
+    /// A status file xvfb-run's inner shell never wrote — the program never
+    /// ran under the display — is refused, not read as a pass.
+    #[test]
+    fn missing_status_file_is_refused() {
+        let dir = ipe_test_temp::temp_root().join("ipe_webview_e2e_status_missing_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let path = dir.join("absent");
+        assert!(read_recorded_exit_status(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A status file written but left empty — the inner shell's `printf`
+    /// never completed — is refused.
+    #[test]
+    fn empty_status_file_is_refused() {
+        let dir = ipe_test_temp::temp_root().join("ipe_webview_e2e_status_empty_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let path = dir.join("status");
+        std::fs::write(&path, "").expect("write empty status file");
+        assert!(read_recorded_exit_status(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A status file holding non-numeric content is refused rather than
+    /// parsed as some fallback code.
+    #[test]
+    fn non_numeric_status_file_is_refused() {
+        let dir = ipe_test_temp::temp_root().join("ipe_webview_e2e_status_nan_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let path = dir.join("status");
+        std::fs::write(&path, "xvfb-run: error: cleanup failed").expect("write status file");
+        assert!(read_recorded_exit_status(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A status file holding a plain recorded exit code is accepted.
+    #[test]
+    fn numeric_status_file_is_accepted() {
+        let dir = ipe_test_temp::temp_root().join("ipe_webview_e2e_status_ok_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        let path = dir.join("status");
+        std::fs::write(&path, "124").expect("write status file");
+        assert_eq!(read_recorded_exit_status(&path), Ok(124));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// The manifest field that sizes and titles the desktop window.
 const DESKTOP_WINDOW: &str =
     "delivery = { desktop = { title = \"Counter\", width = 400, height = 300 } }";
@@ -328,7 +448,8 @@ fn webview_ui_widget_seal_builds() -> Result<(), BoxError> {
 }
 
 /// Tier-B: launch the compiled binary under `xvfb-run` to exercise the
-/// native-window-open path. A timeout (exit 124) means the window stayed alive
+/// native-window-open path. A timeout recorded for the binary itself (exit
+/// 124, never `xvfb-run`'s own wrapper status) means the window stayed alive
 /// long enough — that is the success condition.
 ///
 /// LOUD-SKIP conditions (prints a clear message, returns `Ok(())`):
@@ -369,29 +490,22 @@ fn webview_counter_tier_b() -> Result<(), BoxError> {
         Err(e) => return Err(e),
     };
 
-    // `timeout 5 <binary>` wrapped by `xvfb-run -a` (a virtual display). Exit 124
-    // = timeout killed the process = the window stayed open = pass. Any other
-    // non-zero exit is a failure.
-    let result = std::process::Command::new("xvfb-run")
-        .arg("-a")
-        .arg("timeout")
-        .arg("5")
-        .arg(&exe)
-        .output()
-        .map_err(|e| -> BoxError { format!("Tier-B: failed to spawn xvfb-run: {e}").into() })?;
-
-    let exit_code = result.status.code().unwrap_or(-1);
+    // `timeout 5 <binary>` under `xvfb-run -a` (a virtual display), judged by
+    // the binary's own recorded status, never `xvfb-run`'s wrapper status.
+    // Exit 124 = timeout killed the process = the window stayed open = pass.
+    let status_dir =
+        ipe_test_temp::temp_root().join(format!("ipe_webview_e2e_tier_b_{}", std::process::id()));
+    std::fs::create_dir_all(&status_dir)?;
+    let (exit_code, stderr) = run_under_virtual_display(&exe, 5, &status_dir, |_command| {})
+        .map_err(|e| format!("Tier-B: {e}"))?;
+    let _ = std::fs::remove_dir_all(&status_dir);
 
     if exit_code == 124 || exit_code == 0 {
         println!("Tier-B webview paint smoke: exit={exit_code} (pass — window stayed alive)");
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&result.stderr);
-        let stdout = String::from_utf8_lossy(&result.stdout);
         Err(format!(
-            "Tier-B webview paint smoke FAILED: exit={exit_code}\n\
-             --- stdout ---\n{stdout}\n\
-             --- stderr ---\n{stderr}"
+            "Tier-B webview paint smoke FAILED: exit={exit_code}\n--- stderr ---\n{stderr}"
         )
         .into())
     }
@@ -637,7 +751,8 @@ fn run_shell_with_xdg(
 /// and exits only by the timeout; its webview data lives in the storage key's
 /// private directory under the `XDG_DATA_HOME` it was given.
 ///
-/// Exit 124 is the only pass: an exit by the shell's own error is 1, and a
+/// Exit 124, recorded for the shell itself (never `xvfb-run`'s own wrapper
+/// status), is the only pass: an exit by the shell's own error is 1, and a
 /// shell that closed on its own is 0. Afterwards `<xdg>/<key>/webview` exists,
 /// is mode 0o700 like `<xdg>/<key>`, and holds the engine's data.
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -649,15 +764,11 @@ fn client_desktop_shell_boots_and_loads_wasm() -> Result<(), BoxError> {
     let test_name = "client_desktop_shell_boots";
     let (_fixture, binary) = built_client_desktop(test_name)?;
     let xdg = private_scratch(test_name)?;
-    let result = std::process::Command::new("xvfb-run")
-        .args(["-a", "timeout", "10"])
-        .arg(&binary)
-        .env("XDG_DATA_HOME", &xdg)
-        .output()?;
-    let stderr = String::from_utf8_lossy(&result.stderr);
+    let (exit_code, stderr) = run_under_virtual_display(&binary, 10, &xdg, |command| {
+        command.env("XDG_DATA_HOME", &xdg);
+    })?;
     assert_eq!(
-        result.status.code(),
-        Some(124),
+        exit_code, 124,
         "the shell exits only by the timeout:\n{stderr}"
     );
 

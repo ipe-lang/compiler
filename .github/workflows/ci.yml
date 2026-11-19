@@ -210,6 +210,8 @@ jobs:
         run: python3 .github/ci/test_ipe_fmt_check.py -v
       - name: Prove the static cache-prune refusals (unit tests)
         run: python3 .github/ci/test_cache_prune.py -v
+      - name: Prove the release supply-chain scope refusals (unit tests)
+        run: python3 .github/ci/test_supply_chain_scope.py -v
       - name: The derived required-set is in sync with the manifest
         run: python3 .github/ci/check_required_set.py
 
@@ -525,7 +527,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo check --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
 
   # Required context for the release-target jobs: the phase verdict (see the header).
   release-targets:
@@ -946,6 +948,28 @@ jobs:
           IPE_ORACLE_SHARED_TARGET: ${{ github.workspace }}/.cache/oracle-shared-target
         run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal
 
+  # The WASI preopen confines a guest to the working tree it is handed. Linux
+  # resolves every guest path beneath the preopen in the kernel (`openat2`), so
+  # `wasi-run` cannot see a gap in the engine's userspace resolver; macOS takes
+  # that resolver, so the preopen confinement tests of `wasi_target_seal` run
+  # here as well. `--no-tests=fail` refuses a filter that selects nothing.
+  wasi-confinement-macos:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    needs: [changes, quick-check]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+        with:
+          tool: nextest@0.9.146
+      - name: Run the WASI preopen confinement tests on macOS
+        run: cargo nextest run --locked -p ipe --features wasi_run --profile ci --test wasi_target_seal --no-tests=fail -E 'test(/^preopen_confinement_/)'
+
   # A Git or Curl transfer on Windows runs in its own kill-on-close job object
   # inside the CLI's own job, and a transfer that cannot be contained is refused
   # with its child killed and reaped. Those refusals and the job teardown of a
@@ -975,13 +999,13 @@ jobs:
         run: cargo nextest run --locked -p ipe --lib --profile ci -E 'test(remote_ingest::) | test(target_dir::) | test(driver_error::link_failure) | test(compile_stack::) | test(agents_guide::) | test(output_dir::held::) | test(init::tests::managed_write_)'
 
   # Required aggregation gate for `test`: green only when every shard, the
-  # doctest job (in test-prep), the feature job `wasi-run` and the Windows job
-  # `windows-test` passed. Branch protection lists this job, so a
+  # doctest job (in test-prep), the feature job `wasi-run`, the macOS job
+  # `wasi-confinement-macos` and the Windows job `windows-test` passed. Branch protection lists this job, so a
   # matrix expansion never silently drops a required check. The `always()` guard
   # makes a skipped/failed dependency a FAILURE here, never a false green.
   test:
     runs-on: ubuntu-latest
-    needs: [changes, test-prep, test-run, wasi-run, windows-test]
+    needs: [changes, test-prep, test-run, wasi-run, wasi-confinement-macos, windows-test]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -996,6 +1020,7 @@ jobs:
             test-prep=${{ needs.test-prep.result }}
             test-run=${{ needs.test-run.result }}
             wasi-run=${{ needs.wasi-run.result }}
+            wasi-confinement-macos=${{ needs.wasi-confinement-macos.result }}
             windows-test=${{ needs.windows-test.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}

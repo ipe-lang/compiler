@@ -6940,7 +6940,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo check --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
 """
 _RT_MANUAL = """\
 on: workflow_dispatch
@@ -6962,7 +6962,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo check --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo check --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
   release-targets-freebsd:
     runs-on: ubuntu-latest
     steps:
@@ -6972,7 +6972,7 @@ jobs:
           disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
           run: |
-            cargo check --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
+            cargo check --release --locked --features wasi_run -p ipe -p ipe-ffi-inspector
 """
 _RT_RELEASE = """\
 on: workflow_dispatch
@@ -7007,7 +7007,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
-        run: cargo build --release --locked --features ipe/wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
+        run: cargo build --release --locked --features wasi_run --target "$TARGET" -p ipe -p ipe-ffi-inspector
       - name: Stage
         shell: bash
         env:
@@ -7028,7 +7028,7 @@ jobs:
           disable-cache: ${{ github.ref != 'refs/heads/main' }}
           prepare: pkg install -y rust
           run: |
-            cargo build --release --locked --features ipe/wasi_run -p ipe -p ipe-ffi-inspector
+            cargo build --release --locked --features wasi_run -p ipe -p ipe-ffi-inspector
             mkdir -p dist
             cp target/release/ipe dist/ipe
       - uses: actions/upload-artifact@0000000000000000000000000000000000000000
@@ -7197,7 +7197,7 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("release-targets.yml has no job 'release-targets-native'", manual=head)
 
     def test_manual_native_job_pinned_like_ci(self) -> None:
-        manual = _RT_MANUAL.replace("cargo check --release --locked --features ipe/wasi_run --target", "cargo build --release --locked --features ipe/wasi_run --target", 1)
+        manual = _RT_MANUAL.replace("cargo check --release --locked --features wasi_run --target", "cargo build --release --locked --features wasi_run --target", 1)
         self.assertNotEqual(manual, _RT_MANUAL)
         self.assertRefused("release-targets.yml job 'release-targets-native' step 3.run is", manual=manual)
         manual = self.swap(_RT_MANUAL, "on: workflow_dispatch\n", "on: workflow_dispatch\nenv:\n  RUSTFLAGS: --cfg broken\n")
@@ -7225,7 +7225,9 @@ class TestReleaseTargetParity(unittest.TestCase):
             ("--release --locked", "--locked"),
             ("--release --locked", "--release"),
             ("--release --locked", "--release --locked --features wasi_run"),
-            (" --features ipe/wasi_run", " --features ipe/signing"),
+            (" --features wasi_run", " --features signing"),
+            # The package-qualified spelling cargo binds to `ipe`'s dev edge.
+            (" --features wasi_run", " --features ipe/wasi_run"),
             (" -p ipe -p ipe-ffi-inspector", " -p ipe"),
             ("--release --locked --features", "--release --locked --offline --features"),
             ("cargo check --release", "cargo  check --release"),
@@ -7241,14 +7243,22 @@ class TestReleaseTargetParity(unittest.TestCase):
 
     def test_release_builds_must_ship_the_feature(self) -> None:
         # Dropped from both workflows alike: still equal, still refused.
-        ci = _RT_CI.replace(" --features ipe/wasi_run", "")
-        release = _RT_RELEASE.replace(" --features ipe/wasi_run", "")
+        ci = _RT_CI.replace(" --features wasi_run", "")
+        release = _RT_RELEASE.replace(" --features wasi_run", "")
         self.assertRefused("release.yml job 'build' step 3.run is", ci, release)
         self.assertRefused("release.yml job 'build-freebsd' step 2.with.run is", ci, release)
         # The `=` spelling is another line than the pinned one.
-        ci = _RT_CI.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
-        release = _RT_RELEASE.replace(" --features ipe/wasi_run", " --features=ipe/wasi_run")
+        ci = _RT_CI.replace(" --features wasi_run", " --features=wasi_run")
+        release = _RT_RELEASE.replace(" --features wasi_run", " --features=wasi_run")
         self.assertRefused("release.yml job 'build' step 3.run is", ci, release)
+
+    def test_the_pinned_feature_and_packages_are_release_build_s(self) -> None:
+        # Check 23 reads the one copy check 28 and the scope proof read too.
+        import release_build
+
+        self.assertIs(verify_manifest.RELEASE_FEATURE, release_build.RELEASE_FEATURE)
+        self.assertEqual(verify_manifest._RELEASE_PACKAGES, "-p ipe -p ipe-ffi-inspector")
+        self.assertEqual(release_build.package_args(), "-p ipe -p ipe-ffi-inspector")
 
     def test_ci_must_check_not_build(self) -> None:
         ci = self.swap(_RT_CI, "cargo check --release --locked --features", "cargo build --release --locked --features")
@@ -9842,6 +9852,312 @@ class TestRuntimeClippyAllTargets(unittest.TestCase):
         entries = manifest.get("checks") if isinstance(manifest, dict) else None
         check_runtime_clippy_all_targets(wfs, entries, errors)
         self.assertEqual(errors, [])
+
+
+_DG_GRAPH = """\
+[graph]
+all-features = false
+no-default-features = false
+features = ["full", "wasi_run"]
+"""
+
+
+class TestDenyGraphCoversRelease(unittest.TestCase):
+    """Check 28: `deny.toml [graph]` names `full` and every release feature,
+    explicitly, all-target and unpruned."""
+
+    def errors(self, deny: str | None) -> list[str]:
+        with tempfile.TemporaryDirectory() as repo:
+            if deny is not None:
+                _write(os.path.join(repo, "deny.toml"), deny)
+            errors: list[str] = []
+            verify_manifest.check_deny_graph_covers_release(errors, root=os.path.join(repo, ".github"))
+            return errors
+
+    def assertRefused(self, deny: str | None, needle: str) -> None:
+        errors = self.errors(deny)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_valid_passes(self) -> None:
+        self.assertEqual(self.errors(_DG_GRAPH), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_deny_graph_covers_release(errors)
+        self.assertEqual(errors, [])
+
+    def test_missing_release_feature_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace(', "wasi_run"', ""), "lacks 'wasi_run'")
+
+    def test_missing_full_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace('"full", ', ""), "lacks 'full'")
+
+    def test_every_release_feature_is_required(self) -> None:
+        with mock.patch.object(verify_manifest.release_build, "RELEASE_FEATURE", "wasi_run,extra"):
+            self.assertRefused(_DG_GRAPH, "lacks 'extra'")
+
+    def test_all_features_true_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace("all-features = false", "all-features = true"), "`[graph].all-features`")
+
+    def test_all_features_absent_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace("all-features = false\n", ""), "`[graph].all-features`")
+
+    def test_no_default_features_true_refused(self) -> None:
+        self.assertRefused(
+            _DG_GRAPH.replace("no-default-features = false", "no-default-features = true"),
+            "`[graph].no-default-features`",
+        )
+
+    def test_targets_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH + 'targets = ["x86_64-unknown-linux-gnu"]\n', "`[graph].targets` narrows")
+
+    def test_exclude_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH + 'exclude = ["wasmtime"]\n', "`[graph].exclude` narrows")
+
+    def test_no_graph_refused(self) -> None:
+        self.assertRefused("[advisories]\nignore = []\n", "no `[graph]` table")
+
+    def test_top_level_graph_scope_refused(self) -> None:
+        for key in ('exclude = ["wasmtime"]', 'targets = ["x86_64-unknown-linux-gnu"]', 'features = ["full"]'):
+            with self.subTest(key=key):
+                self.assertRefused(key + "\n" + _DG_GRAPH, f"top-level `{key.split()[0]}` is outside")
+
+    def test_graph_key_outside_the_closed_set_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH + "exclude-unpublished = true\n", "`[graph].exclude-unpublished` is outside")
+
+    def test_policy_tables_and_exclude_dev_pass(self) -> None:
+        text = _DG_GRAPH + "exclude-dev = true\n[advisories]\n[licenses]\n[bans]\n[sources]\n[output]\n"
+        self.assertEqual(self.errors(text), [])
+
+    def test_non_list_features_refused(self) -> None:
+        self.assertRefused(_DG_GRAPH.replace('["full", "wasi_run"]', '"full"'), "must be a list of strings")
+
+    def test_missing_or_unreadable_deny_toml_refused(self) -> None:
+        self.assertRefused(None, "deny.toml is missing")
+        self.assertRefused("[graph\n", "deny.toml is unreadable")
+
+
+class TestAuditIgnoresEqual(unittest.TestCase):
+    """Check 29: deny.toml and .cargo/audit.toml ignore one RUSTSEC id set."""
+
+    def errors(self, deny: str, audit: str) -> list[str]:
+        with tempfile.TemporaryDirectory() as repo:
+            _write(os.path.join(repo, "deny.toml"), deny)
+            _write(os.path.join(repo, ".cargo", "audit.toml"), audit)
+            errors: list[str] = []
+            verify_manifest.check_audit_ignores_equal(errors, root=os.path.join(repo, ".github"))
+            return errors
+
+    @staticmethod
+    def ignores(*entries: str) -> str:
+        return "[advisories]\nignore = [\n" + "".join(f"    {e},\n" for e in entries) + "]\n"
+
+    def assertRefused(self, deny: str, audit: str, needle: str) -> None:
+        errors = self.errors(deny, audit)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_equal_sets_pass(self) -> None:
+        a, b = '"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0543"'
+        self.assertEqual(self.errors(self.ignores(a, b), self.ignores(b, a)), [])
+
+    def test_table_form_counts_as_its_id(self) -> None:
+        deny = self.ignores('{ id = "RUSTSEC-2023-0071", reason = "no fix" }')
+        self.assertEqual(self.errors(deny, self.ignores('"RUSTSEC-2023-0071"')), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_audit_ignores_equal(errors)
+        self.assertEqual(errors, [])
+
+    def test_id_only_in_deny_refused(self) -> None:
+        deny = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2025-0141"')
+        self.assertRefused(deny, self.ignores('"RUSTSEC-2023-0071"'), "deny.toml ignores ['RUSTSEC-2025-0141']")
+
+    def test_id_only_in_audit_refused(self) -> None:
+        audit = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0459"')
+        self.assertRefused(
+            self.ignores('"RUSTSEC-2023-0071"'), audit, ".cargo/audit.toml ignores ['RUSTSEC-2026-0459']"
+        )
+
+    def test_unparseable_entry_refused_never_skipped(self) -> None:
+        for entry in ('"GHSA-xxxx-yyyy-zzzz"', '"RUSTSEC-23-71"', "{ reason = \"no id\" }", "7"):
+            with self.subTest(entry=entry):
+                self.assertRefused(
+                    self.ignores(entry), self.ignores(), "is not a RUSTSEC id"
+                )
+                self.assertRefused(
+                    self.ignores(), self.ignores(entry), "is not a RUSTSEC id"
+                )
+
+    def test_non_list_ignore_refused(self) -> None:
+        self.assertRefused('[advisories]\nignore = "RUSTSEC-2023-0071"\n', self.ignores(), "must be a list")
+
+    def test_unreadable_side_refused(self) -> None:
+        self.assertRefused("[advisories\n", self.ignores(), "deny.toml is unreadable")
+
+
+_REAL_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_INSTALL = "taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29"
+_TOOLCHAIN_STEP = "- uses: ./.github/actions/rust-toolchain-pinned\n"
+_TOOLCHAIN_TOML = '[toolchain]\nchannel = "1.98.1"\ncomponents = ["clippy"]\ntargets = ["wasm32-wasip1"]\n'
+
+
+def _install_step(with_: str = "tool: cargo-deny@0.20.2\nfallback: none\n", uses: str = _INSTALL) -> str:
+    return f"- uses: {uses}\n  with:\n" + textwrap.indent(with_, "    ")
+
+
+class TestToolchainAndInstallPreToolShapes(unittest.TestCase):
+    """A `.github/ci` tool may follow the pinned Rust toolchain action (no
+    `with:`, its body pinned, a closed `rust-toolchain.toml`) and the pinned
+    tool installer (an exact `name@X.Y.Z`, `fallback: none`); every other
+    spelling of either is outside the closed shapes."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.fx = WorkflowFixture(self._tmpdir.name)
+        with open(os.path.join(_REAL_REPO, ".github", "actions", "rust-toolchain-pinned", "action.yml"), encoding="utf-8") as f:
+            self.action = f.read()
+        self.fx.composite("rust-toolchain-pinned", self.action)
+        self.toml(_TOOLCHAIN_TOML)
+
+    def toml(self, text: str, name: str = "rust-toolchain.toml") -> None:
+        _write(os.path.join(self.fx.repo, name), text)
+
+    def errors(self, pre: str) -> list[str]:
+        self.fx.workflow("t.yml", _job(f"- uses: {_CHECKOUT}\n" + pre + _run("Verify", _TOOL)))
+        return self.fx.errors()
+
+    def assertAccepted(self, pre: str) -> None:
+        self.assertEqual(self.errors(pre), [])
+
+    def assertRefused(self, pre: str) -> None:
+        errors = self.errors(pre)
+        self.assertTrue(
+            any("step 'Verify'" in e and "outside the closed pre-tool shapes" in e for e in errors), errors
+        )
+
+    def test_toolchain_and_installer_then_the_tool_pass(self) -> None:
+        self.assertAccepted(_TOOLCHAIN_STEP + _install_step())
+
+    def test_the_live_toolchain_file_is_closed(self) -> None:
+        self.assertIsNone(verify_manifest.toolchain_file_refusal(_REAL_REPO))
+
+    def test_toolchain_with_inputs_or_env_is_refused(self) -> None:
+        for extra in ("  with:\n    targets: x86_64-unknown-linux-musl\n", "  env:\n    RUSTUP_HOME: /tmp\n"):
+            with self.subTest(extra=extra):
+                self.assertRefused(_TOOLCHAIN_STEP + extra)
+
+    def test_toolchain_file_outside_the_closed_shape_is_refused(self) -> None:
+        for text in (
+            '[toolchain]\nchannel = "1.98.1"\npath = "./evil"\n',
+            '[toolchain]\nchannel = "stable"\n',
+            '[toolchain]\nchannel = "1.98"\n',
+            '[toolchain]\nchannel = "1.98.1"\nprofile = "minimal"\n',
+            '[toolchain]\nchannel = "1.98.1"\ntargets = ["--evil"]\n',
+            '[toolchain]\nchannel = "1.98.1"\n[other]\nx = 1\n',
+            "[toolchain\n",
+        ):
+            with self.subTest(text=text):
+                self.toml(text)
+                self.assertRefused(_TOOLCHAIN_STEP)
+
+    def test_missing_or_legacy_toolchain_file_is_refused(self) -> None:
+        os.remove(os.path.join(self.fx.repo, "rust-toolchain.toml"))
+        self.assertRefused(_TOOLCHAIN_STEP)
+        self.toml(_TOOLCHAIN_TOML)
+        self.toml('[toolchain]\nchannel = "1.98.1"\n', name="rust-toolchain")
+        self.assertRefused(_TOOLCHAIN_STEP)
+
+    def test_toolchain_action_off_its_pinned_body_is_refused(self) -> None:
+        self.fx.composite(
+            "rust-toolchain-pinned",
+            self.action + "\n    - shell: bash\n      run: cp /tmp/e .github/ci/verify-manifest.py\n",
+        )
+        self.assertRefused(_TOOLCHAIN_STEP)
+
+    def test_installer_outside_its_closed_with_is_refused(self) -> None:
+        for step in (
+            _install_step("tool: cargo-deny@0.20.2\n"),
+            _install_step("tool: cargo-deny@0.20.2\nfallback: cargo-install\n"),
+            _install_step("tool: cargo-deny@0.20.2\nfallback: cargo-binstall\n"),
+            _install_step("tool: cargo-deny\nfallback: none\n"),
+            _install_step("tool: cargo-deny@0.20\nfallback: none\n"),
+            _install_step("tool: cargo-deny@0.20.2,evil@1.0.0\nfallback: none\n"),
+            _install_step("tool: cargo-deny@0.20.2\nfallback: none\nchecksum: false\n"),
+            _install_step("tool: coreutils@0.2.2\nfallback: none\n"),
+            _install_step("tool: uv@0.9.0\nfallback: none\n"),
+            _install_step("tool: ${{ github.head_ref }}\nfallback: none\n"),
+            _install_step(uses="taiki-e/install-action@v2"),
+            _install_step(uses="taiki-e/install-action@" + "0" * 40),
+            _install_step() + "  env:\n    PATH: /tmp\n",
+            _install_step() + "  if: always()\n",
+        ):
+            with self.subTest(step=step):
+                self.assertRefused(step)
+
+
+_RF_WS = '[workspace]\nmembers = ["cli", "inspector"]\n'
+_RF_CLI = (
+    '[package]\nname = "ipe"\n[features]\nwasi_run = []\ntest-fixtures = []\n'
+    '[dev-dependencies]\nipe-test-fixtures = { package = "ipe", path = ".", features = ["test-fixtures"] }\n'
+)
+_RF_INSPECTOR = '[package]\nname = "ipe-ffi-inspector"\n'
+
+
+class TestReleaseFeatureLive(unittest.TestCase):
+    """Check 30: each release feature is a bare name exactly one release
+    package declares (cargo binds `ipe/<f>` to the dev edge keyed `ipe`)."""
+
+    def errors(
+        self, cli: str = _RF_CLI, ws: str = _RF_WS, feature: str | None = None, inspector: str = _RF_INSPECTOR
+    ) -> list[str]:
+        with tempfile.TemporaryDirectory() as repo:
+            _write(os.path.join(repo, "Cargo.toml"), ws)
+            _write(os.path.join(repo, "cli", "Cargo.toml"), cli)
+            _write(os.path.join(repo, "inspector", "Cargo.toml"), inspector)
+            errors: list[str] = []
+            with mock.patch.object(
+                verify_manifest.release_build,
+                "RELEASE_FEATURE",
+                verify_manifest.release_build.RELEASE_FEATURE if feature is None else feature,
+            ):
+                verify_manifest.check_release_feature_live(errors, root=os.path.join(repo, ".github"))
+            return errors
+
+    def assertRefused(self, needle: str, **kw: str) -> None:
+        errors = self.errors(**kw)
+        self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    def test_valid_passes(self) -> None:
+        self.assertEqual(self.errors(), [])
+        self.assertEqual(self.errors(feature="wasi_run,test-fixtures"), [])
+
+    def test_repo_passes(self) -> None:
+        errors: list[str] = []
+        verify_manifest.check_release_feature_live(errors)
+        self.assertEqual(errors, [])
+
+    def test_package_qualified_spelling_is_refused(self) -> None:
+        for feature in ("ipe/wasi_run", "ipe-ffi-inspector/wasi_run", "dep:wasmtime", "wasmtime?/std", "wasi_run,ipe/x"):
+            with self.subTest(feature=feature):
+                self.assertRefused("is not a bare feature name", feature=feature)
+
+    def test_undeclared_feature_is_refused(self) -> None:
+        self.assertRefused("declared by no release package", cli=_RF_CLI.replace("wasi_run = []\n", ""))
+
+    def test_feature_two_release_packages_declare_is_refused(self) -> None:
+        inspector = _RF_INSPECTOR + "[features]\nwasi_run = []\n"
+        self.assertRefused("declared by ['ipe', 'ipe-ffi-inspector']", inspector=inspector)
+
+    def test_empty_feature_set_is_refused(self) -> None:
+        self.assertRefused("names no feature", feature="")
+
+    def test_unreadable_or_glob_workspace_is_refused(self) -> None:
+        self.assertRefused("is unreadable", ws="[workspace\n")
+        self.assertRefused("is a glob", ws='[workspace]\nmembers = ["cli/*"]\n')
+        self.assertRefused("no list of", ws="[workspace]\n")
+        self.assertRefused("is no workspace member", ws='[workspace]\nmembers = ["inspector"]\n')
 
 
 if __name__ == "__main__":

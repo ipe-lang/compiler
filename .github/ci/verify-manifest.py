@@ -158,7 +158,10 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
      (`shell_lex`). The integrity of `.github/ci/**` itself rests on an
      ordering rule: a step naming the tree is itself a closed pre-tool shape
      and runs only after steps of one (a content-pinned checkout or
-     setup-python with a closed literal `with:` and no `env:`, the canonical
+     setup-python with a closed literal `with:` and no `env:`, the pinned
+     Rust toolchain action with no `with:` over its pinned body and a closed
+     `rust-toolchain.toml`, the pinned tool installer with an exact
+     `name@X.Y.Z` of a named tool and `fallback: none`, the canonical
      pip install with no `env:`, a typed `ToolRun` of a file that exists
      under `.github/ci` in an invocation `TOOL_INVOCATIONS` lists, its words split only on bash's blanks
      `shell_lex.BLANKS`; any `timeout-minutes` a positive integer literal).
@@ -466,7 +469,7 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       ./.github/actions/release-target-toolchain` with `target: ${{
       matrix.target }}`; and a `shell: bash` step whose `env` is exactly
       `TARGET: ${{ matrix.target }}` and whose `run` is exactly the one
-      cargo line, `cargo <verb> --release --locked --features ipe/wasi_run
+      cargo line, `cargo <verb> --release --locked --features wasi_run
       --target "$TARGET" -p ipe -p ipe-ffi-inspector` (`check` in the
       checking workflows, `build` in release.yml).  A FreeBSD job's first
       two steps are exactly its checkout and the FreeBSD VM step (`prepare:
@@ -501,7 +504,7 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `c""argo`, an `sh -c` body, `cargo-zigbuild`) is refused.
       release.yml's completeness `expected` list is exactly the artifacts
       its jobs publish.  Both release builds carry `--features
-      ipe/wasi_run`, so the shipped `ipe` has the embedded WASI run its
+      wasi_run`, so the shipped `ipe` has the embedded WASI run its
       refusal text promises.
       LIMIT: `cargo check` does not link, so a link-time failure of a target
       is not seen; the FreeBSD toolchain is the VM's unpinned `pkg install
@@ -588,6 +591,36 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       position (a comment line included).  A file it cannot read is
       refused.  LIMIT: an apt reached through a variable, a script or a
       third-party action is not read.
+  28. The dependency scan covers the release feature set: `deny.toml
+      [graph]` names `full` and every feature of `release_build.
+      RELEASE_FEATURE` in `features`, with `all-features` and
+      `no-default-features` both literally `false`, and neither `targets`
+      nor `exclude` (the judged graph is all-target and unpruned).  An
+      unreadable `deny.toml`, an absent `[graph]` or a non-list `features`
+      is refused, as is a top-level key outside `graph`, `advisories`,
+      `licenses`, `bans`, `sources` and `output` (cargo-deny reads a
+      top-level `targets`, `exclude` or `features` as graph scope) and a
+      `[graph]` key outside `all-features`, `no-default-features`,
+      `features` and `exclude-dev`.  The graph-level proof that every crate the release links
+      is judged is `supply_chain_scope.py`.
+  29. One advisory ignore set: the `RUSTSEC-` ids of `deny.toml
+      [advisories].ignore` (each a string or a `{ id = .. }` table) equal
+      those of `.cargo/audit.toml [advisories].ignore`, compared both ways
+      and each side's extra ids named.  An entry of either list that is not
+      a `RUSTSEC-YYYY-NNNN` id is refused, never skipped.
+  30. The release feature spelling is live: every feature of
+      `release_build.RELEASE_FEATURE` is a bare feature name (cargo's
+      `[A-Za-z0-9_][A-Za-z0-9_+.-]*`, no `/`, `dep:` or `?`) that exactly
+      one of `RELEASE_PACKAGES` declares in its `[features]`.  A
+      `<pkg>/<feature>` spelling is refused because cargo binds it to a
+      dependency keyed `<pkg>` when the package has one (`ipe`'s self
+      dev-dependency is keyed `ipe`), and that edge is not in the release
+      graph, so the shipped binary would lack the feature; a name two
+      release packages declare would enable both.  The workspace members
+      are read from `[workspace].members`; an unreadable manifest, a glob
+      member or a release package that is no member is refused.  The
+      graph-level proof is `supply_chain_scope.py`'s sentinel: `cargo tree
+      -e normal,build` with the release features must list the engine.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -641,6 +674,7 @@ import check_required_set  # noqa: E402  # owns the admin-read environment's nam
 import claims_table  # noqa: E402  # the one reader of test-claims.yml, check 20
 import action_metadata  # noqa: E402  # proven declared inputs of every pinned action, check 24
 import rerun_policy  # noqa: E402  # the job-name leg rule the merge-group test watchers apply
+import release_build  # noqa: E402  # the release feature set and packages, checks 23 and 28
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -5968,6 +6002,30 @@ PINNED_CHECKOUT_USES = frozenset({
 CHECKOUT_WITH_KEYS = frozenset({"fetch-depth", "persist-credentials", "sparse-checkout", "sparse-checkout-cone-mode"})
 PINNED_SETUP_PYTHON_USES = frozenset({"actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0"})
 SETUP_PYTHON_WITH_KEYS = frozenset({"python-version"})
+# The pinned Rust toolchain action with no `with:`: its body is the
+# `_LOCAL_ACTION_PINS` entry (re-read at each use, not only by check 23), and
+# `rust-toolchain.toml` is a `ToolchainFile`, so the step installs one rustup
+# release toolchain and runs nothing the tree supplies.
+# The pinned tool installer with a closed literal `with:` — an exact
+# `name@X.Y.Z` and `fallback: none` — fetches the checksum-verified prebuilt
+# binary its manifest lists and never compiles a crate (a build script is
+# arbitrary code that could rewrite the tree).
+# The tools it may install are named: a tool's binaries land on `PATH` ahead of
+# the runner's, so an unnamed tool could shadow an interpreter or a command a
+# later step runs.
+PINNED_INSTALL_ACTION_USES = frozenset({"taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29"})
+INSTALL_TOOL_RE = re.compile(r"(?P<name>[a-z0-9][a-z0-9-]*)@[0-9]+\.[0-9]+\.[0-9]+")
+PRE_TOOL_INSTALL_NAMES = frozenset({"cargo-deny"})
+INSTALL_FALLBACK_NONE = "none"
+# A `rust-toolchain.toml` the toolchain shape trusts: one `[toolchain]` table
+# naming an exact release channel and plain component/target names. `path`
+# (a toolchain binary from the tree) and every other key are outside it, as is
+# a legacy `rust-toolchain` file rustup would read instead.
+TOOLCHAIN_FILE = "rust-toolchain.toml"
+LEGACY_TOOLCHAIN_FILE = "rust-toolchain"
+TOOLCHAIN_FILE_KEYS = frozenset({"channel", "components", "targets"})
+RELEASE_CHANNEL_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
+TOOLCHAIN_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
 # The keys that can turn a red step or job green: a skipped step or job, and a
 # failure-ignored one, both report success (GitHub counts a skipped required
 # check as passing). On a setup step a skip or an ignored failure leaves the
@@ -6047,6 +6105,8 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "test_check_required_set.py": _SELF_TEST,
     "test_ipe_fmt_check.py": _SELF_TEST,
     "test_cache_prune.py": _SELF_TEST,
+    "test_supply_chain_scope.py": _SELF_TEST,
+    "supply_chain_scope.py": {(): _V},
     "rerun_policy.py": {("--lint",): _V, ("--decide",): _O, ("--proven-test-red",): _O},
     "nightly_green.py": {("--lint",): _V, ("--verdict",): _V},
     "check_required_set.py": {(): _V, ("--fetch",): _V, ("--fetch-admin",): _V},
@@ -6397,6 +6457,8 @@ class PreToolKind(enum.Enum):
     CHECKOUT = "pinned checkout"
     SETUP_PYTHON = "pinned setup-python"
     PIP_INSTALL = "canonical pip install"
+    RUST_TOOLCHAIN = "pinned Rust toolchain"
+    TOOL_INSTALL = "pinned prebuilt tool install"
 
 
 @dataclass(frozen=True)
@@ -6446,6 +6508,10 @@ def parse_closed_step(st: Step, root: str) -> ClosedStep | None:
             return PreToolStep(PreToolKind.CHECKOUT, timeout)
         if uses in PINNED_SETUP_PYTHON_USES and set(with_) <= SETUP_PYTHON_WITH_KEYS:
             return PreToolStep(PreToolKind.SETUP_PYTHON, timeout)
+        if uses == _TOOLCHAIN_ACTION and "with" not in raw and _toolchain_closed(os.path.dirname(root)):
+            return PreToolStep(PreToolKind.RUST_TOOLCHAIN, timeout)
+        if uses in PINNED_INSTALL_ACTION_USES and _install_with_closed(with_):
+            return PreToolStep(PreToolKind.TOOL_INSTALL, timeout)
         return None
     if isinstance(run, str) and uses is None and "with" not in raw:
         if shell_lex.trim(run) == CANONICAL_PIP_INSTALL:
@@ -6461,6 +6527,56 @@ def parse_closed_step(st: Step, root: str) -> ClosedStep | None:
             return None
         return ToolStep(tool, role, timeout, masking)
     return None
+
+
+def _install_with_closed(with_: dict) -> bool:
+    """Whether a tool installer's `with:` is exactly one `name@X.Y.Z` of a
+    `PRE_TOOL_INSTALL_NAMES` tool and `fallback: none`
+    (`PINNED_INSTALL_ACTION_USES`)."""
+    tool = with_.get("tool")
+    m = INSTALL_TOOL_RE.fullmatch(tool) if isinstance(tool, str) else None
+    return (
+        set(with_) == {"tool", "fallback"}
+        and with_.get("fallback") == INSTALL_FALLBACK_NONE
+        and m is not None
+        and m.group("name") in PRE_TOOL_INSTALL_NAMES
+    )
+
+
+def toolchain_file_refusal(repo: str) -> str | None:
+    """Why `repo`'s toolchain files are outside the closed toolchain shape, or None."""
+    if os.path.lexists(os.path.join(repo, LEGACY_TOOLCHAIN_FILE)):
+        return f"a legacy `{LEGACY_TOOLCHAIN_FILE}` file exists"
+    path = os.path.join(repo, TOOLCHAIN_FILE)
+    if os.path.islink(path) or not os.path.isfile(path):
+        return f"`{TOOLCHAIN_FILE}` is not a regular file"
+    try:
+        with open(path, "rb") as f:
+            doc = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return f"`{TOOLCHAIN_FILE}` does not parse ({e})"
+    table = doc.get("toolchain")
+    if set(doc) != {"toolchain"} or not isinstance(table, dict):
+        return f"`{TOOLCHAIN_FILE}` holds more than one `[toolchain]` table"
+    extra = sorted(set(table) - TOOLCHAIN_FILE_KEYS)
+    if extra:
+        return f"`{TOOLCHAIN_FILE}` [toolchain] has {extra}, outside {sorted(TOOLCHAIN_FILE_KEYS)}"
+    channel = table.get("channel")
+    if not isinstance(channel, str) or RELEASE_CHANNEL_RE.fullmatch(channel) is None:
+        return f"`{TOOLCHAIN_FILE}` channel {channel!r} is not an exact release version"
+    for key in ("components", "targets"):
+        names = table.get(key, [])
+        if not isinstance(names, list) or not all(isinstance(n, str) and TOOLCHAIN_NAME_RE.fullmatch(n) for n in names):
+            return f"`{TOOLCHAIN_FILE}` {key} is not a list of plain names"
+    return None
+
+
+def _toolchain_closed(repo: str) -> bool:
+    """Whether the pinned toolchain action is its pinned body and `repo`'s
+    toolchain file is closed (`toolchain_file_refusal`)."""
+    scratch: list[str] = []
+    _check_local_action_pin(_TOOLCHAIN_ACTION, repo, scratch)
+    return not scratch and toolchain_file_refusal(repo) is None
 
 
 # The one expression a closed `with:` admits: a checkout `fetch-depth` chosen
@@ -6510,7 +6626,9 @@ def _tree_reference(node: object, run: str | None, loc: str) -> str | None:
 
 CLOSED_SHAPES_NOTE = (
     "the closed pre-tool shapes (pinned checkout or setup-python with a literal with: and "
-    "no env, the canonical pip install with no env, a pure .github/ci tool run with "
+    "no env, the pinned Rust toolchain action with no with: over a closed rust-toolchain.toml, "
+    "the pinned tool installer with an exact name@X.Y.Z and fallback: none, "
+    "the canonical pip install with no env, a pure .github/ci tool run with "
     "allowlisted env; any timeout-minutes: a positive integer literal; no if:, and "
     "continue-on-error: true only on an advisory tool)"
 )
@@ -7892,14 +8010,13 @@ RELEASE_TARGET_ACTION = "./.github/actions/release-target-toolchain"
 # The one action every CI apt package install runs (check 27).
 APT_INSTALL_ACTION = "./.github/actions/apt-install"
 _RELEASE_EXPECTED = re.compile(r'expected="([^"]*)"')
-# The feature release binaries ship: `ipe dev run --target wasi` needs it, and
-# its refusal text promises it "in release packaging".
-RELEASE_FEATURE = "ipe/wasi_run"
-# The cargo command's argv, the one copy every pinned cargo line is built
-# from; only the verb (`check` in ci.yml, `build` in release.yml) and the
-# native jobs' `--target` differ.
+# The release feature and packages live in `release_build` (check 28 and
+# `supply_chain_scope.py` read the same names). The cargo command's argv is
+# the one copy every pinned cargo line is built from; only the verb (`check`
+# in ci.yml, `build` in release.yml) and the native jobs' `--target` differ.
+RELEASE_FEATURE = release_build.RELEASE_FEATURE
 _RELEASE_CARGO_FLAGS = f"--release --locked --features {RELEASE_FEATURE}"
-_RELEASE_PACKAGES = "-p ipe -p ipe-ffi-inspector"
+_RELEASE_PACKAGES = release_build.package_args()
 # The job that parses the release tag, and the one `ref` a release build
 # checks out: the tag it parsed. ci.yml checks the tree under test instead.
 RELEASE_TAG_JOB = "resolve-tag"
@@ -8440,11 +8557,16 @@ def _check_local_action_pins(repo: str, errors: list[str]) -> None:
     """Every local action a pinned step runs is exactly its
     `_LOCAL_ACTION_PINS` body: the toolchain, cache and musl steps, and
     nothing else, before any release-target cargo command."""
-    for uses, (inputs_pin, steps_pin) in _LOCAL_ACTION_PINS.items():
-        where = f"local action {uses!r}"
-        got = _local_composite(uses, repo, where, 0, errors)
-        if got is None:
-            continue
+    for uses in _LOCAL_ACTION_PINS:
+        _check_local_action_pin(uses, repo, errors)
+
+
+def _check_local_action_pin(uses: str, repo: str, errors: list[str]) -> None:
+    """The local action `uses` is exactly its `_LOCAL_ACTION_PINS` body."""
+    inputs_pin, steps_pin = _LOCAL_ACTION_PINS[uses]
+    where = f"local action {uses!r}"
+    got = _local_composite(uses, repo, where, 0, errors)
+    if got is not None:
         doc, steps = got
         for key in sorted(set(doc) - _ACTION_TOP_KEYS, key=str):
             errors.append(f"check 23: {where} has a top-level `{key}`, which no pin names; refused")
@@ -8912,6 +9034,169 @@ def load_manifest() -> dict:
     return doc
 
 
+# Check 28: the `deny.toml [graph]` feature every graph must carry besides the
+# release features (the runtime's shipped surface), and the `[graph]` keys
+# that would narrow the judged graph.
+DENY_GRAPH_BASE_FEATURE = "full"
+_DENY_GRAPH_NARROWING_KEYS = ("targets", "exclude")
+# The keys deny.toml may hold. cargo-deny still reads a top-level `targets`,
+# `exclude` or `features` as graph scope, and `[graph].exclude-unpublished`
+# drops roots, so every key outside these sets is refused, never read past.
+_DENY_TOP_LEVEL_KEYS = frozenset({"graph", "advisories", "licenses", "bans", "sources", "output"})
+_DENY_GRAPH_KEYS = frozenset({"all-features", "no-default-features", "features", "exclude-dev"})
+
+
+def check_deny_graph_covers_release(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 28 (see the module docstring)."""
+    doc = _load_toml(os.path.join(os.path.dirname(root), "deny.toml"))
+    if isinstance(doc, str):
+        errors.append(f"check 28: deny.toml {doc}; refused")
+        return
+    for key in sorted(set(doc) - _DENY_TOP_LEVEL_KEYS):
+        errors.append(
+            f"check 28: deny.toml top-level `{key}` is outside {sorted(_DENY_TOP_LEVEL_KEYS)}; cargo-deny "
+            "reads a top-level `targets`, `exclude` or `features` as the judged graph's scope; refused"
+        )
+    graph = doc.get("graph")
+    if not isinstance(graph, dict):
+        errors.append("check 28: deny.toml has no `[graph]` table, so the scan judges the default features only; refused")
+        return
+    for key in sorted(set(graph) - _DENY_GRAPH_KEYS - set(_DENY_GRAPH_NARROWING_KEYS)):
+        errors.append(f"check 28: deny.toml `[graph].{key}` is outside {sorted(_DENY_GRAPH_KEYS)}; refused")
+    features = graph.get("features")
+    if not isinstance(features, list) or not all(isinstance(f, str) for f in features):
+        errors.append(f"check 28: deny.toml `[graph].features` must be a list of strings, not {features!r}; refused")
+        return
+    for want in (DENY_GRAPH_BASE_FEATURE, *release_build.release_features()):
+        if want not in features:
+            errors.append(
+                f"check 28: deny.toml `[graph].features` lacks {want!r}, so crates the release build links "
+                f"(`--features {release_build.RELEASE_FEATURE}`) are never judged; refused"
+            )
+    for key in ("all-features", "no-default-features"):
+        if graph.get(key) is not False:
+            errors.append(
+                f"check 28: deny.toml `[graph].{key}` must be `false`, not {graph.get(key)!r} — the feature "
+                "list is the scanned set, stated explicitly; refused"
+            )
+    for key in _DENY_GRAPH_NARROWING_KEYS:
+        if key in graph:
+            errors.append(f"check 28: deny.toml `[graph].{key}` narrows the judged graph; refused")
+
+
+# Check 30: cargo's feature-name grammar, a bare name with no dependency part.
+_BARE_FEATURE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_+.-]*")
+
+
+def _member_manifests(repo: str, errors: list[str]) -> dict[str, dict] | None:
+    """Each workspace member's parsed manifest by package name, or None (refused)."""
+    ws = _load_toml(os.path.join(repo, "Cargo.toml"))
+    if isinstance(ws, str):
+        errors.append(f"check 30: the workspace Cargo.toml {ws}; refused")
+        return None
+    workspace = ws.get("workspace")
+    members = workspace.get("members") if isinstance(workspace, dict) else None
+    if not isinstance(members, list) or not all(isinstance(m, str) for m in members):
+        errors.append("check 30: the workspace Cargo.toml has no list of `[workspace].members`; refused")
+        return None
+    out: dict[str, dict] = {}
+    for member in members:
+        if any(c in member for c in "*?["):
+            errors.append(f"check 30: workspace member {member!r} is a glob, which this check does not expand; refused")
+            return None
+        doc = _load_toml(os.path.join(repo, member, "Cargo.toml"))
+        if isinstance(doc, str):
+            errors.append(f"check 30: {member}/Cargo.toml {doc}; refused")
+            return None
+        package = doc.get("package")
+        name = package.get("name") if isinstance(package, dict) else None
+        if isinstance(name, str):
+            out[name] = doc
+    return out
+
+
+def check_release_feature_live(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 30 (see the module docstring)."""
+    manifests = _member_manifests(os.path.dirname(root), errors)
+    if manifests is None:
+        return
+    declared: dict[str, set[str]] = {}
+    for pkg in release_build.RELEASE_PACKAGES:
+        doc = manifests.get(pkg)
+        if doc is None:
+            errors.append(f"check 30: release package {pkg!r} is no workspace member; refused")
+            return
+        features = doc.get("features")
+        declared[pkg] = set(features) if isinstance(features, dict) else set()
+    features = release_build.release_features()
+    if not features:
+        errors.append("check 30: `release_build.RELEASE_FEATURE` names no feature; refused")
+    for feature in features:
+        if not _BARE_FEATURE_RE.fullmatch(feature):
+            errors.append(
+                f"check 30: release feature {feature!r} is not a bare feature name; cargo binds "
+                f"`<pkg>/<feature>` to a dependency keyed `<pkg>` (a dev edge the release graph "
+                f"lacks) when there is one, so spell it bare; refused"
+            )
+            continue
+        owners = [pkg for pkg in release_build.RELEASE_PACKAGES if feature in declared[pkg]]
+        if len(owners) != 1:
+            errors.append(
+                f"check 30: release feature {feature!r} is declared by {owners or 'no release package'}, "
+                f"not exactly one of {list(release_build.RELEASE_PACKAGES)}; refused"
+            )
+
+
+# Check 29: the one advisory id grammar both ignore lists hold.
+_RUSTSEC_ID_RE = re.compile(r"RUSTSEC-[0-9]{4}-[0-9]{4}")
+
+
+def _advisory_ignores(doc: dict[str, object], name: str, errors: list[str]) -> set[str] | None:
+    """The `RUSTSEC-` ids of `doc`'s `[advisories].ignore`, or None (with each
+    refusal appended) when an entry is not one."""
+    adv = doc.get("advisories")
+    ignore = adv.get("ignore", []) if isinstance(adv, dict) else None
+    if not isinstance(ignore, list):
+        errors.append(f"check 29: {name} `[advisories].ignore` must be a list, not {ignore!r}; refused")
+        return None
+    ids: set[str] = set()
+    ok = True
+    for entry in ignore:
+        rid = entry.get("id") if isinstance(entry, dict) else entry
+        if not isinstance(rid, str) or not _RUSTSEC_ID_RE.fullmatch(rid):
+            errors.append(f"check 29: {name} `[advisories].ignore` entry {entry!r} is not a RUSTSEC id; refused")
+            ok = False
+            continue
+        ids.add(rid)
+    return ids if ok else None
+
+
+def check_audit_ignores_equal(errors: list[str], root: str = REPO_ROOT) -> None:
+    """Check 29 (see the module docstring)."""
+    repo = os.path.dirname(root)
+    sides: list[set[str]] = []
+    for name in ("deny.toml", ".cargo/audit.toml"):
+        doc = _load_toml(os.path.join(repo, name))
+        if isinstance(doc, str):
+            errors.append(f"check 29: {name} {doc}; refused")
+            return
+        ids = _advisory_ignores(doc, name, errors)
+        if ids is None:
+            return
+        sides.append(ids)
+    deny, audit = sides
+    if deny - audit:
+        errors.append(
+            f"check 29: deny.toml ignores {sorted(deny - audit)} that .cargo/audit.toml does not; "
+            "the two ignore lists must be one set; refused"
+        )
+    if audit - deny:
+        errors.append(
+            f"check 29: .cargo/audit.toml ignores {sorted(audit - deny)} that deny.toml does not; "
+            "the two ignore lists must be one set; refused"
+        )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.parse_args()
@@ -9079,6 +9364,15 @@ def main() -> int:
 
     # ---- 27. every apt package install runs the one apt action ----
     check_apt_one_path(workflows, errors)
+
+    # ---- 28. the dependency scan's graph covers the release feature set ----
+    check_deny_graph_covers_release(errors)
+
+    # ---- 29. deny.toml and .cargo/audit.toml ignore one advisory set ----
+    check_audit_ignores_equal(errors)
+
+    # ---- 30. the release feature spelling reaches the release graph ----
+    check_release_feature_live(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

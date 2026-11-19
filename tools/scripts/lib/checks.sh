@@ -227,7 +227,9 @@ exercise_tui() {
   return 0
 }
 
-# exercise_webview <bin> <logfile>  (OS-aware headless smoke)
+# exercise_webview <bin> <logfile>  (OS-aware headless smoke; under xvfb-run,
+# the verdict is the program's own recorded exit status, never xvfb-run's own
+# wrapper status, and a run whose status was never recorded is refused)
 exercise_webview() {
   local bin="$1" log="$2" abin run_dir
   abin="$(_abs_bin "$bin")"
@@ -243,7 +245,13 @@ exercise_webview() {
       if ! command -v xvfb-run >/dev/null 2>&1; then
         printf 'SKIP (linux: xvfb-run not installed)\n' >"$log"; rm -rf "$run_dir" 2>/dev/null; return "$EXERCISE_SKIP_RC"
       fi
-      ( cd "$run_dir" && xvfb-run -a timeout 8 "$abin" ) >"$log" 2>&1 </dev/null
+      local status_file="$run_dir/xvfb-exit-status"
+      ( cd "$run_dir" && xvfb-run -a sh -c 'timeout "$1" "$2"; printf %s "$?" >"$3"' sh 8 "$abin" "$status_file" ) >"$log" 2>&1 </dev/null
+      if ! grep -qE '^[0-9]+$' "$status_file" 2>/dev/null; then
+        printf '\nthe program'"'"'s exit status was never recorded under xvfb-run\n' >>"$log"
+        rm -rf "$run_dir" 2>/dev/null
+        return 1
+      fi
       ;;
   esac
   rm -rf "$run_dir" 2>/dev/null

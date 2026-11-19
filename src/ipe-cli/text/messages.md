@@ -1181,6 +1181,18 @@ package.ipe was updated but ipe.lock was not; run the command again to bring ipe
 
 {path} was written, but syncing its directory failed ({kind}); a crash before the system flushes it may still lose the change
 
+## build-dir-prune-skipped
+
+unused build directories under the ipe cache could not be removed ({count} in all; first: {path}: {kind}); the build goes on. Remove them by hand to reclaim the space.
+
+## build-dir-prune-crowded
+
+{root} holds more than {cap} entries, so no unused build directory was removed; the build goes on. Remove entries you no longer need to let ipe clean it again.
+
+## build-dir-prune-unlisted
+
+{root} could not be listed ({kind}), so no unused build directory was removed; the build goes on.
+
 # Version refusals
 
 ## version-refused-malformed

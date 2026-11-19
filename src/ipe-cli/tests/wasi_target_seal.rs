@@ -620,3 +620,308 @@ fn ipe_run_target_wasi_server_feature_off_is_typed_refusal() {
         "the feature-off server run refusal must fire before any emit (no wasted build)",
     );
 }
+
+// ── preopen confinement (the embedded engine's filesystem boundary) ─────────────
+
+/// The bytes the fixture keeps outside the preopened working tree.
+#[cfg(all(unix, feature = "wasi_run"))]
+const OUTSIDE_SECRET: &[u8] = b"outside-the-preopen";
+
+/// The guest's exit code when its first filesystem call is refused.
+#[cfg(all(unix, feature = "wasi_run"))]
+const REFUSED_AT_OPEN: i32 = 20;
+
+/// The guest's exit code when the bytes it read reached `leak`.
+#[cfg(all(unix, feature = "wasi_run"))]
+const LEAK_WRITTEN: i32 = 12;
+
+/// What a confinement guest asks of the preopen, through one path.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[derive(Clone, Copy)]
+enum GuestAct {
+    /// Open `path` as a directory, open `secret` under it, read it, and write
+    /// the bytes to `leak` in the preopen.
+    OpenDirThenSecret { path: &'static str },
+    /// Open `path` as a file, read it, and write the bytes to `leak` in the
+    /// preopen.
+    OpenFile { path: &'static str },
+    /// Rename `path` to `moved`, both under the preopen.
+    Rename { path: &'static str },
+}
+
+/// The WAT text of the guest that performs `act` against preopen fd 3.
+///
+/// Exit codes, one per stage reached: `20` refused at the first call, `10`
+/// opened but not read, `11` read but not written, `12` the bytes written to
+/// `leak`, `13` renamed. Every open of `path` follows symlinks, the guest
+/// libc's default.
+#[cfg(all(unix, feature = "wasi_run"))]
+fn confinement_guest(act: GuestAct) -> String {
+    let (path, body) = match act {
+        GuestAct::OpenDirThenSecret { path } => (path, open_read_leak_body(path, 2, Some(704))),
+        GuestAct::OpenFile { path } => (path, open_read_leak_body(path, 0, None)),
+        GuestAct::Rename { path } => (path, rename_body(path)),
+    };
+    format!(
+        r#"(module
+  (import "wasi_snapshot_preview1" "path_open"
+    (func $path_open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_read"
+    (func $fd_read (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "path_rename"
+    (func $path_rename (param i32 i32 i32 i32 i32 i32) (result i32)))
+  (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "{path}")
+  (data (i32.const 64) "secret")
+  (data (i32.const 128) "leak")
+  (data (i32.const 192) "moved")
+  (func $exit (param i32) (call $proc_exit (local.get 0)) unreachable)
+  (func (export "_start")
+{body}))"#
+    )
+}
+
+/// The open, read and write-to-`leak` body.
+///
+/// `oflags` is the first open's flags; `secret_fd_at` names where a nested
+/// `secret` open stores its fd, and with none the first open's fd is read.
+#[cfg(all(unix, feature = "wasi_run"))]
+fn open_read_leak_body(path: &str, oflags: u8, secret_fd_at: Option<u32>) -> String {
+    let path_len = path.len();
+    let open_secret = secret_fd_at.map_or_else(String::new, |at| {
+        format!(
+            "    (if (call $path_open (i32.load (i32.const 700)) (i32.const 1) (i32.const 64) (i32.const 6)
+          (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 0) (i32.const {at}))
+      (then (call $exit (i32.const 10))))\n"
+        )
+    });
+    let read_fd_at = secret_fd_at.unwrap_or(700);
+    format!(
+        "    (if (call $path_open (i32.const 3) (i32.const 1) (i32.const 0) (i32.const {path_len})
+          (i32.const {oflags}) (i64.const 2) (i64.const 0) (i32.const 0) (i32.const 700))
+      (then (call $exit (i32.const {REFUSED_AT_OPEN}))))
+{open_secret}    (i32.store (i32.const 512) (i32.const 1024))
+    (i32.store (i32.const 516) (i32.const 256))
+    (if (call $fd_read (i32.load (i32.const {read_fd_at})) (i32.const 512) (i32.const 1) (i32.const 600))
+      (then (call $exit (i32.const 10))))
+    (if (call $path_open (i32.const 3) (i32.const 0) (i32.const 128) (i32.const 4)
+          (i32.const 9) (i64.const 64) (i64.const 0) (i32.const 0) (i32.const 708))
+      (then (call $exit (i32.const 11))))
+    (i32.store (i32.const 520) (i32.const 1024))
+    (i32.store (i32.const 524) (i32.load (i32.const 600)))
+    (if (call $fd_write (i32.load (i32.const 708)) (i32.const 520) (i32.const 1) (i32.const 604))
+      (then (call $exit (i32.const 11))))
+    (call $exit (i32.const 12))"
+    )
+}
+
+/// The rename body: `path` to `moved`, both under the preopen.
+#[cfg(all(unix, feature = "wasi_run"))]
+fn rename_body(path: &str) -> String {
+    let path_len = path.len();
+    format!(
+        "    (if (call $path_rename (i32.const 3) (i32.const 0) (i32.const {path_len})
+          (i32.const 3) (i32.const 192) (i32.const 5))
+      (then (call $exit (i32.const {REFUSED_AT_OPEN}))))
+    (call $exit (i32.const 13))"
+    )
+}
+
+/// The host side of one confinement case.
+///
+/// It holds the fixture root, its preopened working tree and the sibling
+/// directory holding the secret.
+#[cfg(all(unix, feature = "wasi_run"))]
+struct ConfinementFixture {
+    root: PathBuf,
+    sandbox: PathBuf,
+    outside: PathBuf,
+}
+
+#[cfg(all(unix, feature = "wasi_run"))]
+impl ConfinementFixture {
+    /// The working tree `sandbox/` beside `outside/secret`, under the test temp root.
+    ///
+    /// `sandbox/up -> ../outside` and `sandbox/f -> ../outside/secret` are
+    /// proven to resolve on the host first, so a refusal the guest sees is the
+    /// preopen's, never a broken fixture's. `sandbox/inside/secret` and
+    /// `sandbox/g` hold the same bytes inside the preopen, for the controls
+    /// that prove the guest reads and leaks when the preopen allows it.
+    #[allow(clippy::expect_used)] // test helper: a failed fixture setup IS the failure
+    fn new(name: &str) -> Self {
+        let root = ipe_test_temp::temp_root().join(format!(
+            "ipe_preopen_confinement_{name}_{}",
+            std::process::id()
+        ));
+        if root.exists() {
+            std::fs::remove_dir_all(&root).expect("clear a stale fixture");
+        }
+        let sandbox = root.join("sandbox");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&sandbox).expect("create the working tree");
+        std::fs::create_dir_all(&outside).expect("create the outside directory");
+        std::fs::write(outside.join("secret"), OUTSIDE_SECRET).expect("write the secret");
+        std::fs::create_dir_all(sandbox.join("inside")).expect("create the inside directory");
+        std::fs::write(sandbox.join("inside").join("secret"), OUTSIDE_SECRET)
+            .expect("write the inside secret");
+        std::fs::write(sandbox.join("g"), OUTSIDE_SECRET).expect("write the inside file");
+        std::os::unix::fs::symlink("../outside", sandbox.join("up")).expect("link up");
+        std::os::unix::fs::symlink("../outside/secret", sandbox.join("f")).expect("link f");
+        assert_eq!(
+            std::fs::read(sandbox.join("up").join("secret")).expect("read through up"),
+            OUTSIDE_SECRET,
+            "the directory link must resolve on the host",
+        );
+        assert_eq!(
+            std::fs::read(sandbox.join("f")).expect("read through f"),
+            OUTSIDE_SECRET,
+            "the file link must resolve on the host",
+        );
+        Self {
+            root,
+            sandbox,
+            outside,
+        }
+    }
+
+    /// Run the guest for `act` with the working tree preopened as `.`.
+    #[allow(clippy::expect_used)] // test helper: an unassemblable guest IS the failure
+    fn run(&self, act: GuestAct) -> Result<(), CliError> {
+        let wasm = wat::parse_str(confinement_guest(act)).expect("assemble the guest");
+        let module = self.root.join("guest.wasm");
+        std::fs::write(&module, wasm).expect("write the guest module");
+        ipe::wasi_run::run_wasi_module(
+            &module,
+            &ipe::wasi_run::WasiCtx::dev_ambient(),
+            &self.sandbox,
+            &[],
+        )
+    }
+
+    /// Whether the working tree's `leak` holds the outside secret.
+    fn leaked(&self) -> bool {
+        std::fs::read(self.sandbox.join("leak")).is_ok_and(|bytes| bytes == OUTSIDE_SECRET)
+    }
+}
+
+/// Assert `result` is the guest's refusal exit at its first call, no other outcome.
+#[cfg(all(unix, feature = "wasi_run"))]
+fn assert_refused_at_open(result: &Result<(), CliError>) {
+    assert!(
+        matches!(
+            result,
+            Err(CliError::WasiRunExited {
+                code: REFUSED_AT_OPEN
+            })
+        ),
+        "the preopen must refuse the first call (guest exit {REFUSED_AT_OPEN}); got {result:?}",
+    );
+}
+
+/// A directory link opened with a trailing slash stays inside the preopen.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_dir_link_trailing_slash() {
+    let fixture = ConfinementFixture::new("dir_slash");
+    let result = fixture.run(GuestAct::OpenDirThenSecret { path: "up/" });
+    assert!(
+        !fixture.leaked(),
+        "the outside secret reached the working tree"
+    );
+    assert_refused_at_open(&result);
+}
+
+/// A file link opened with a trailing slash stays inside the preopen.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_file_link_trailing_slash() {
+    let fixture = ConfinementFixture::new("file_slash");
+    let result = fixture.run(GuestAct::OpenFile { path: "f/" });
+    assert!(
+        !fixture.leaked(),
+        "the outside secret reached the working tree"
+    );
+    assert_refused_at_open(&result);
+}
+
+/// A directory link renamed with a trailing slash never moves its target.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_rename_dir_link() {
+    let fixture = ConfinementFixture::new("rename_slash");
+    let result = fixture.run(GuestAct::Rename { path: "up/" });
+    assert!(
+        std::fs::read(fixture.outside.join("secret")).is_ok_and(|bytes| bytes == OUTSIDE_SECRET),
+        "the outside directory must stay at its path with its secret",
+    );
+    assert!(
+        !std::fs::symlink_metadata(fixture.sandbox.join("moved")).is_ok_and(|m| m.is_dir()),
+        "the outside directory must not be moved into the working tree",
+    );
+    assert_refused_at_open(&result);
+}
+
+/// A directory link with no trailing slash is refused on every engine version.
+///
+/// The control: it proves the fixture and the oracle can observe a refusal, so
+/// the trailing-slash cases are not vacuous.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_plain_link() {
+    let fixture = ConfinementFixture::new("control");
+    let result = fixture.run(GuestAct::OpenDirThenSecret { path: "up" });
+    assert!(
+        !fixture.leaked(),
+        "the outside secret reached the working tree"
+    );
+    assert_refused_at_open(&result);
+}
+
+/// An in-tree directory opened with a trailing slash is read and leaked.
+///
+/// The positive control: the same guest the refusals run reaches its last
+/// stage when the preopen allows the path, so a refusal at the first call is
+/// the preopen's, never a guest that cannot open anything.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_inside_dir_is_read() {
+    let fixture = ConfinementFixture::new("inside_dir");
+    let result = fixture.run(GuestAct::OpenDirThenSecret { path: "inside/" });
+    assert!(
+        matches!(result, Err(CliError::WasiRunExited { code: LEAK_WRITTEN })),
+        "the guest must open, read and write in-tree (exit {LEAK_WRITTEN}); got {result:?}",
+    );
+    assert!(fixture.leaked(), "the in-tree secret must reach `leak`");
+}
+
+/// An in-tree file opened by name is read and leaked: the file guest's control.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_inside_file_is_read() {
+    let fixture = ConfinementFixture::new("inside_file");
+    let result = fixture.run(GuestAct::OpenFile { path: "g" });
+    assert!(
+        matches!(result, Err(CliError::WasiRunExited { code: LEAK_WRITTEN })),
+        "the guest must open, read and write in-tree (exit {LEAK_WRITTEN}); got {result:?}",
+    );
+    assert!(fixture.leaked(), "the in-tree secret must reach `leak`");
+}
+
+/// An in-tree directory renamed with a trailing slash moves: the rename control.
+#[cfg(all(unix, feature = "wasi_run"))]
+#[test]
+fn preopen_confinement_control_inside_rename() {
+    let fixture = ConfinementFixture::new("inside_rename");
+    let result = fixture.run(GuestAct::Rename { path: "inside/" });
+    assert!(
+        matches!(result, Err(CliError::WasiRunExited { code: 13 })),
+        "the guest must rename in-tree (exit 13); got {result:?}",
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.sandbox.join("moved")).is_ok_and(|m| m.is_dir()),
+        "the in-tree directory must move to `moved`",
+    );
+}
