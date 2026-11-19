@@ -6467,7 +6467,7 @@ mod tests {
         for (_, meta) in framed.served_policies() {
             assert!(meta.contains("frame-src https://player.example"), "{meta}");
             assert!(meta.contains("object-src https://player.example"), "{meta}");
-            assert!(!meta.contains("frame-src 'self'"), "{meta}");
+            assert!(!meta.contains("frame-src &#39;self&#39;"), "{meta}");
             assert!(
                 swaps.contains(&PolicySwap::new(meta.clone(), meta.clone())),
                 "{meta}"
@@ -6482,12 +6482,20 @@ mod tests {
             .expect("an Android reach");
         let shell_swaps = plain.policy_swaps(&android);
         for (_, meta) in plain.served_policies() {
-            assert!(meta.contains("frame-src 'self'"), "{meta}");
+            assert!(meta.contains("frame-src &#39;self&#39;"), "{meta}");
             let page = format!("<html><head>{meta}</head></html>");
             let shown = swapped_policy(Path::new("index.html"), page.into_bytes(), &shell_swaps)
                 .expect("the served meta swaps");
-            assert_eq!(shown.matches("frame-src 'self'").count(), 1, "{shown}");
-            assert_eq!(shown.matches("object-src 'none'").count(), 1, "{shown}");
+            assert_eq!(
+                shown.matches("frame-src &#39;self&#39;").count(),
+                1,
+                "{shown}"
+            );
+            assert_eq!(
+                shown.matches("object-src &#39;none&#39;").count(),
+                1,
+                "{shown}"
+            );
             assert!(!shown.contains("player.example"), "{shown}");
         }
     }
