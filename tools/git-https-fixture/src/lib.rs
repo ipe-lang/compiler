@@ -252,7 +252,10 @@ struct Backend {
 impl Backend {
     /// Locate `git http-backend` and prove it starts and exits.
     fn probe() -> Result<Self, FixtureError> {
-        let out = Command::new("git")
+        let git = ipe_sandbox::host_tool::resolve(ipe_sandbox::HostTool::Git)
+            .map_err(|refusal| FixtureError::Backend(io::Error::other(refusal)))?;
+        let out = git
+            .command()
             .arg("--exec-path")
             .stdin(Stdio::null())
             .stderr(Stdio::null())

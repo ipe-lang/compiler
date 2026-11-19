@@ -3077,6 +3077,7 @@ version = "0.7.4"
 dependencies = [
  "httparse",
  "ipe-test-temp",
+ "ipe_sandbox",
  "rustls",
  "rustls-pki-types",
  "tempfile",
