@@ -3464,6 +3464,29 @@ mod tests {
     use super::*;
     use crate::output_dir::OutputRefusal;
 
+    /// A bare served emit under `intent` trusting `frame_origins` to frame.
+    fn frame_settings(
+        frame_origins: ipe_backend_rust::FrameOriginEntries,
+        intent: ipe_backend_rust::BuildIntent,
+    ) -> ipe_backend_rust::EmitSettings {
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target: ipe_ir::Target::Native,
+            wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
+            server_origins: ipe_backend_rust::ServerOrigins::none(),
+            frame_origins,
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
+            intent,
+        }
+    }
+
     /// The build step of a release refuses a loopback frame origin and names
     /// it; a development build of the same list reports its reach.
     #[test]
@@ -3472,11 +3495,7 @@ mod tests {
         let entry = ipe_backend_rust::FrameOriginEntry::parse("http://localhost:3000")
             .expect("a frame origin");
         let frames = ipe_backend_rust::FrameOriginEntries::new([entry]).expect("a frame list");
-        let at = |intent| ipe_backend_rust::EmitSettings {
-            frame_origins: frames.clone(),
-            intent,
-            ..ipe_backend_rust::EmitSettings::unconfigured()
-        };
+        let at = |intent| frame_settings(frames.clone(), intent);
         let refused = frame_step(&at(ipe_backend_rust::BuildIntent::Release));
         assert!(
             matches!(&refused, Err(CliError::ProjectRefused(text))
@@ -3502,20 +3521,13 @@ mod tests {
             ipe_backend_rust::BuildIntent::Development,
             ipe_backend_rust::BuildIntent::Release,
         ] {
-            let listed = ipe_backend_rust::EmitSettings {
-                frame_origins: frames.clone(),
-                intent,
-                ..ipe_backend_rust::EmitSettings::unconfigured()
-            };
+            let listed = frame_settings(frames.clone(), intent);
             let reach = frame_step(&listed);
             assert!(
                 matches!(&reach, Ok(Some(reach)) if reach.origins() == ["https://player.example"]),
                 "{reach:?}"
             );
-            let empty = ipe_backend_rust::EmitSettings {
-                intent,
-                ..ipe_backend_rust::EmitSettings::unconfigured()
-            };
+            let empty = frame_settings(ipe_backend_rust::FrameOriginEntries::none(), intent);
             assert!(matches!(frame_step(&empty), Ok(None)));
         }
 
