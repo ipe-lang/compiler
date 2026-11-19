@@ -1047,7 +1047,7 @@ decodeTask t raw =
         Ok _ ->
             1
 
-        _ ->
+        Err _ ->
             0
 
 
