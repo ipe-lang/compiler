@@ -3004,20 +3004,35 @@ mod tests {
     ];
 
     /// The page hosts R14 runs every vector on: the listed hosts at and off
-    /// their ports, loopback names, IP literals, and hosts that do not parse.
-    const R14_HOSTS: [&str; 13] = [
+    /// their ports and in another case, a subdomain, loopback names, IP
+    /// literals and a numeric last label, and hosts `Authority::parse`
+    /// refuses (a trailing dot, an edge hyphen, a 64-byte label, a 254-byte
+    /// name, a non-canonical or out-of-range port, an empty host).
+    const R14_HOSTS: [&str; 25] = [
         "app.example",
         "app.example:8443",
+        "APP.Example:8443",
+        "sub.app.example",
         "frames.example",
         "frames.example:8443",
         "localhost:8443",
         "localhost",
         "a.localhost:3000",
         "b.localhost",
+        "B.LocalHost",
         "other.example",
         "127.0.0.1:3000",
+        "203.0.113.7",
+        "a.123",
         "[::1]:3000",
         "app.example.",
+        "localhost.",
+        "-a.example",
+        "a-.localhost",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "app.example:0443",
+        "app.example:65536",
         "",
     ];
 

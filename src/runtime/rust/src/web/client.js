@@ -117,14 +117,17 @@ function __ipeListedOrigin(url) {
 // `https` origin on the page's host at any port, an `https` loopback-name
 // origin (last label `localhost`) on any loopback-name page, a loopback
 // `http` origin on a loopback-name page at its port, and every origin when the
-// host does not read as a name. An IP-literal page host is never a listed
-// origin's.
+// host does not read as `Authority::parse` reads one (labels of at most 63
+// bytes with no edge `-`, at most 253 bytes, a port in `1..=65535` with no
+// leading zero). An IP-literal page host is never a listed origin's.
 function __ipeServedOn(origin, pageHost) {
   if (typeof pageHost !== "string") return true;
   if (pageHost.charAt(0) === "[") return false;
-  var page = /^([a-z0-9-]+(?:\.[a-z0-9-]+)*)(?::([0-9]+))?$/.exec(__ipeAsciiLower(pageHost));
+  var page = /^([a-z0-9-]+(?:\.[a-z0-9-]+)*)(?::([1-9][0-9]{0,4}))?$/.exec(__ipeAsciiLower(pageHost));
   var o = /^(https?):\/\/([a-z0-9.-]+)(?::([0-9]+))?$/.exec(origin);
-  if (!page || !o) return true;
+  if (!page || !o || page[1].length > 253 || +page[2] > 65535) return true;
+  var odd = function(l) { return l.length > 63 || l.charAt(0) === "-" || l.charAt(l.length - 1) === "-"; };
+  if (page[1].split(".").some(odd)) return true;
   var loopback = function(name) { return /(^|\.)localhost$/.test(name); };
   if (o[1] === "https") return o[2] === page[1] || (loopback(o[2]) && loopback(page[1]));
   return loopback(page[1]) && o[3] === page[2];

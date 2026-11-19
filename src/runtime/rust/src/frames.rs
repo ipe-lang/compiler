@@ -714,22 +714,34 @@ pub fn served_on(origin: &ListedOrigin, page: &PageAuthority) -> bool {
 #[cfg(feature = "encoding")]
 fn origin_served_on(origin: &ListedOrigin, page: &Authority) -> bool {
     match origin {
-        FrameOrigin::Https(server) => Authority::parse(server.authority()).map_or(true, |listed| {
-            match (listed.host(), page.host()) {
-                (AuthorityHost::Name(listed), AuthorityHost::Name(page)) => listed == page,
-                // A loopback name keeps no spelling, so any two may be one.
-                (AuthorityHost::LoopbackName, AuthorityHost::LoopbackName) => true,
-                (
-                    AuthorityHost::Name(_) | AuthorityHost::Ip(_) | AuthorityHost::LoopbackName,
-                    _,
-                ) => false,
-            }
-        }),
+        FrameOrigin::Https(server) => Authority::parse(server.authority())
+            .map_or(true, |listed| hosts_may_be_one(listed.host(), page.host())),
         #[cfg(feature = "dev-posture")]
         FrameOrigin::DevLoopback(port) => {
             matches!(page.host(), AuthorityHost::LoopbackName)
                 && page.port().map(std::num::NonZeroU16::get) == Some(port.get())
         }
+    }
+}
+
+/// Whether a listed origin's host `listed` may be the page's host `page`.
+///
+/// Every pair is named, so a new host kind is a build error here rather than
+/// a silent "different". Two names are one only when equal. A loopback name
+/// keeps no spelling, so any two may be one. A listed IP literal (which
+/// `FrameOrigin` refuses) may be any page's host. A name and a loopback name,
+/// and a name or a loopback name beside an IP literal, are distinct origins.
+#[cfg(feature = "encoding")]
+fn hosts_may_be_one(listed: &AuthorityHost, page: &AuthorityHost) -> bool {
+    match (listed, page) {
+        (AuthorityHost::Name(listed), AuthorityHost::Name(page)) => listed == page,
+        (AuthorityHost::LoopbackName, AuthorityHost::LoopbackName)
+        | (
+            AuthorityHost::Ip(_),
+            AuthorityHost::Ip(_) | AuthorityHost::LoopbackName | AuthorityHost::Name(_),
+        ) => true,
+        (AuthorityHost::Name(_), AuthorityHost::LoopbackName | AuthorityHost::Ip(_))
+        | (AuthorityHost::LoopbackName, AuthorityHost::Name(_) | AuthorityHost::Ip(_)) => false,
     }
 }
 
@@ -1048,6 +1060,39 @@ mod tests {
         assert!(!served_on(&dev, &page("localhost:3001")));
         assert!(!served_on(&dev, &page("app.example")));
         assert!(served_on(&dev, &PageAuthority::Unknown));
+    }
+
+    /// The host judge answers "may be one" for every pair whose
+    /// representation cannot prove two hosts apart: two loopback names, and a
+    /// listed IP literal beside any page host.
+    #[cfg(feature = "encoding")]
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed authority
+    fn host_pairs_without_proof_may_be_one() {
+        let host = |raw: &str| Authority::parse(raw).expect("authority").host().clone();
+        let (name, other) = (host("app.example"), host("other.example"));
+        let (local, sub) = (host("localhost"), host("a.localhost"));
+        let (v4, v6) = (host("127.0.0.1"), host("[::1]"));
+        for (listed, page) in [
+            (&name, &name),
+            (&local, &sub),
+            (&sub, &local),
+            (&v4, &v4),
+            (&v4, &v6),
+            (&v4, &local),
+            (&v4, &name),
+        ] {
+            assert!(hosts_may_be_one(listed, page), "{listed:?} on {page:?}");
+        }
+        for (listed, page) in [
+            (&name, &other),
+            (&name, &local),
+            (&name, &v4),
+            (&local, &name),
+            (&local, &v6),
+        ] {
+            assert!(!hosts_may_be_one(listed, page), "{listed:?} on {page:?}");
+        }
     }
 
     /// A page authority narrows only to the authority it was admitted under.
