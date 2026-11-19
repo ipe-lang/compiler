@@ -1107,19 +1107,26 @@ fn decode_succeed_of_a_task_is_refused() {
     );
 }
 
-/// cargo-0 and run-correct for a `Clone` `Decode.succeed` payload: gated on
-/// `IPE_E2E=1` (THE SEAL).
+/// A `Clone` `Decode.succeed` payload passes ipe.
 #[test]
-fn decode_succeed_of_a_string_builds_and_runs() {
-    let (built, out) = build_source("decode_succeed_string", DECODE_SUCCEED_STRING);
+fn decode_succeed_of_a_string_passes_ipe() {
+    let (built, _) = build_source("decode_succeed_string", DECODE_SUCCEED_STRING);
     assert!(
         built.is_ok(),
         "a `String` payload of `Decode.succeed` must pass ipe: {:?}",
         built.err()
     );
+}
+
+/// cargo-0 and run-correct for a `Clone` `Decode.succeed` payload: gated on
+/// `IPE_E2E=1` (THE SEAL).
+#[test]
+fn decode_succeed_of_a_string_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
+    let (built, out) = build_source("decode_succeed_string_e2e", DECODE_SUCCEED_STRING);
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
     let outcome = crate::support::build_and_run_emitted("decode_succeed_string", &out);
     assert_eq!(
         outcome.exit_code,

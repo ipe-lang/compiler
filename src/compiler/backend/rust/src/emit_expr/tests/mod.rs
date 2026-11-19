@@ -215,7 +215,7 @@ fn cmd_wiring_effect_binds_before_its_thunk() -> DResult<()> {
     let bind = out.find("let __ipe_eff = ");
     let thunk = out.find("Box::new(move || __ipe_eff) }");
     assert!(
-        matches!((bind, thunk), (Some(b), Some(h)) if b < h),
+        matches!((bind, thunk), (Some(bind_at), Some(head_at)) if bind_at < head_at),
         "the effect is bound before its thunk, got:\n{out}"
     );
     assert_eq!(

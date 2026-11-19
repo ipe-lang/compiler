@@ -208,11 +208,6 @@ fn splices_first(text: &str) -> bool {
     text.starts_with('{') && !text.starts_with("{{")
 }
 
-/// How many closure heads `text` prints.
-fn closure_heads(text: &str) -> usize {
-    head_tails(text).len()
-}
-
 /// The names of the format placeholders in `text`, in order.
 ///
 /// A positional `{}` is `""`; a format spec after `:` is dropped; the escapes
@@ -601,6 +596,7 @@ fn a_positional_placeholder_after_an_adapter_head_is_refused() -> Result<(), Str
 /// A listed type placeholder passes, with a format spec too, and an escaped
 /// brace is text.
 #[test]
+#[allow(clippy::literal_string_with_formatting_args)] // the literal is scanned source text
 fn a_listed_placeholder_after_an_adapter_head_passes() -> Result<(), String> {
     let row = [(
         "emit_web.rs",
