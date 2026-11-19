@@ -888,7 +888,7 @@ mod tests {
                     "{kernel:?}"
                 );
             }
-            let client = settings(listed.frame_origins.clone(), ipe_ir::Target::WasmClient);
+            let client = settings(listed.frame_origins, ipe_ir::Target::WasmClient);
             for body in [Expr::Unit, served_html()] {
                 assert_eq!(
                     frame_origins_of(&program(body, false), &client),
