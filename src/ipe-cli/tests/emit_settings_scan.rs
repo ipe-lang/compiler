@@ -1175,7 +1175,8 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
         (
             "src/ipe-cli/src/pack/mobile.rs",
             "fn of() { Self { base: m.delivery.browser.base.clone(), \
-             servers: m.delivery\n.servers\n.clone(), push: m.delivery.mobile.push.clone(), \
+             servers: m.delivery\n.servers\n.clone(), frames: m.delivery.frame_origins.clone(), \
+             push: m.delivery.mobile.push.clone(), \
              accepts: m.capabilities_accept.clone() } }\n",
         ),
         (
@@ -1192,7 +1193,7 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
              go(HostIntent::Served); }\n\
              fn front_check() { go(HostIntent::Served); }\n\
              fn serve_client_bundle() { let b = manifest.delivery.browser.base.clone(); \
-             let s = &manifest.delivery.servers; }\n",
+             let s = &manifest.delivery.servers; let f = &manifest.delivery.frame_origins; }\n",
         ),
         (
             "src/ipe-cli/src/run_sandbox.rs",
@@ -1212,7 +1213,8 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
              fn assemble_mobile() { let pin = ManifestPin::of(manifest); \
              layout(pin.accepts(), pin.base()); }\n\
              fn build_under_pinned_manifest() { let after = ManifestPin::of(&parse(p)?); }\n\
-             fn run_project_tests_with() { go(HostIntent::Served); }\n",
+             fn run_project_tests_with() { go(HostIntent::Served); }\n\
+             fn capabilities_in() { let f = FrameReach::of(&root.manifest().delivery.frame_origins); }\n",
         ),
     ]
 }

@@ -209,8 +209,8 @@ the prompt; no capability covers these features.
 non-empty list when `ships` names a desktop, Android or iOS shell, and each
 shell's packer refuses it again.
 
-`ipe build`, `ipe release` and `ipe capabilities` print this notice for an
-app that lists frame origins, with `<origins>` replaced by the list:
+`ipe dev build`, `ipe release build` and `ipe capabilities` print this notice
+for an app that lists frame origins, with `<origins>` replaced by the list:
 
 <!-- frame-reach-notice:begin -->
 This app lists trusted frame origins (`<origins>`). A page can give a trusted
