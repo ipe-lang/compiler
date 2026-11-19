@@ -2289,7 +2289,7 @@ class ScriptAction:
 # A row whose `uses:` is not pinned, whose `why` is empty, or that no
 # inline decider runs is refused.
 SCRIPT_ACTIONS: dict[str, ScriptAction] = {
-    "vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc": ScriptAction(
+    "vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b": ScriptAction(
         inputs=frozenset({"sync-time", "disable-cache", "prepare", "run"}),
         why=(
             "the pinned `index.js` runs `with.run` through `execSSH(runCmd, sshConfig)` with `ignoreReturn` "
