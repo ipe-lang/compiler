@@ -868,8 +868,17 @@ fn a_lookup_outside_a_package_never_reads_the_cwd_as_a_project() -> io::Result<(
             !ok,
             "`ipe doc {key}` outside a package must miss:\n{stdout}"
         );
+        assert!(stdout.is_empty(), "{stdout}");
+        let project_terms = ["Shapes", "Shapes.shapeMarker", "Broken", "Broken.x"];
         assert!(
-            stderr.contains(&format!("no documentation entry is named `{key}`")),
+            stderr
+                .lines()
+                .filter_map(|line| line.split('\t').next())
+                .all(|term| !project_terms.contains(&term)),
+            "no candidate comes from the cwd tree:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("A marker unique to this project"),
             "{stderr}"
         );
     }
