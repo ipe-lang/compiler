@@ -54,10 +54,10 @@ mod user_pins;
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
 use clone_class::{
-    CloneClass, CloneEnv, HandlerCapture, alias_rebuild_refusal, classify_capture_clone,
-    classify_handler_capture, clone_class, enum_is_opaque_ffi_handle, param_is_multiuse_clonable,
-    reject_nonclone_value_reuse, rewrite_captured_clones, rewrite_multiuse_clones,
-    slice_element_alias_refusal, slice_ownership,
+    CloneClass, CloneEnv, HandlerCapture, alias_rebuild_refusal, bounded_nonclone,
+    classify_capture_clone, classify_handler_capture, clone_class, enum_is_opaque_ffi_handle,
+    param_is_multiuse_clonable, reject_nonclone_value_reuse, rewrite_captured_clones,
+    rewrite_multiuse_clones, slice_element_alias_refusal, slice_ownership,
 };
 use generic_syms::{default_generics_to_unit, signature_generics};
 #[cfg(test)]
@@ -27630,7 +27630,14 @@ impl<'a> Lowerer<'a> {
     /// leaf is rewritten to a plain `Var` so it is not clone-forwarded) and
     /// called by shared reference — and an `Arc<dyn Fn>` value IS `Clone`, so
     /// the emit `succeed` path wraps it in `curry{n}` soundly. A non-function
-    /// leaf, or one whose solved type is not a direct arrow, is left unchanged.
+    /// leaf, or one whose solved type is not a direct arrow, is left unchanged,
+    /// unless its emitted type is not `Clone`.
+    ///
+    /// # Errors
+    /// IPE-L0135 ([`Feature::NonCloneValueReuse`]) at the payload when the
+    /// unchanged leaf's emitted type is not `Clone` (a `Task`, a `Cmd`, a boxed
+    /// function inside a composite): the factory reproduces the payload by
+    /// `.clone()` on every run, which such a value cannot do.
     fn eta_expand_succeed_fn_value(&self, canon_arg: &canon::Expr, value: Expr) -> DResult<Expr> {
         // The literal leaves that already curry soundly at emit stay untouched.
         if matches!(
@@ -27649,15 +27656,15 @@ impl<'a> Lowerer<'a> {
         }
         // Only a DIRECT function arrow needs the fn-payload carrier flip; a
         // non-function value (or a still-generic / collection-carried slot) is a
-        // plain payload and stays on its own carrier.
+        // plain payload and stays on its own carrier, which must be `Clone`.
         let Some(solved @ Ty::Fun(_, _)) = self.region_ty(canon_arg.span) else {
-            return Ok(value);
+            return self.clone_reproduced_succeed_payload(canon_arg.span, value);
         };
         let IrType::Fun(params, ret) = self.ir_type_from_ty(solved, canon_arg.span)? else {
-            return Ok(value);
+            return self.clone_reproduced_succeed_payload(canon_arg.span, value);
         };
         if params.is_empty() {
-            return Ok(value);
+            return self.clone_reproduced_succeed_payload(canon_arg.span, value);
         }
         // A `Var`/`CloneVar` leaf is MOVED into the `Arc` (a `Box<dyn Fn>` is not
         // `Clone`, so a clone-forward would be an E0599 inside the `Fn`
@@ -27682,6 +27689,26 @@ impl<'a> Lowerer<'a> {
                 args: call_args,
             }),
         })
+    }
+
+    /// A `succeed` payload the factory reproduces by `.clone()`, refused when its
+    /// emitted type is not `Clone`.
+    ///
+    /// A payload with no solved type, or one whose type does not lower here,
+    /// is passed through: its carrier is judged where it is lowered.
+    ///
+    /// # Errors
+    /// IPE-L0135 ([`Feature::NonCloneValueReuse`]) at `span` when the emitted
+    /// type holds a non-`Clone` leaf under its generic bounds.
+    fn clone_reproduced_succeed_payload(&self, span: Span, value: Expr) -> DResult<Expr> {
+        let refused = self.region_ty(span).is_some_and(|solved| {
+            self.ir_type_from_ty(solved, span)
+                .is_ok_and(|ty| bounded_nonclone(self.clone_env(), &ty))
+        });
+        if refused {
+            return Err(unsupported(span, Feature::NonCloneValueReuse));
+        }
+        Ok(value)
     }
 
     /// The parameter types and return type of the `arity`-arrow callee at `span`.

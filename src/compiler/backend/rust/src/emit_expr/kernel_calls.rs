@@ -949,6 +949,10 @@ pub fn emit_task_retry_call(
         KernelFn::TaskRetryWith => {
             // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
             const _: () = assert!(all_adapt(&[KernelFn::TaskRetryWith], AdaptedSlot::Thunk(1)));
+            // The predicate bridge captures only the fresh `__ipe_sr`; it is its
+            // own literal so no emitted text follows its `move` head.
+            const SHOULD_RETRY_BRIDGE: &str =
+                "move |__ipe_e: &IpeError| (__ipe_sr)(__ipe_e.clone())";
             // `retryWith policy task` — decompose policy, call runtime.
             // The `shouldRetry` field is `Arc<dyn Fn(IpeError) -> bool>` (directly
             // callable) but `task_retry_with` expects `impl Fn(&IpeError) -> bool`;
@@ -980,7 +984,7 @@ pub fn emit_task_retry_call(
                  __ipe_p.maxAttempts, \
                  __ipe_p.baseMs, \
                  __ipe_p.strategy, \
-                 move |__ipe_e: &IpeError| (__ipe_sr)(__ipe_e.clone()), \
+                 {SHOULD_RETRY_BRIDGE}, \
                  {task_s}\
                  ) }}"
             )))
@@ -4453,10 +4457,10 @@ pub fn emit_json_decoder_call(
                     param_names.push(name);
                 }
                 let ret_s = render_type(ctx, ret, generics)?;
+                let params = param_decls.join(", ");
+                let args = param_names.join(", ");
                 let wrapper = format!(
-                    "{{ let __ipe_succeed = {arc}; move |{}| -> {ret_s} {{ (__ipe_succeed)({}) }} }}",
-                    param_decls.join(", "),
-                    param_names.join(", ")
+                    "{{ let __ipe_succeed = {arc}; move |{params}| -> {ret_s} {{ (__ipe_succeed)({args}) }} }}"
                 );
                 return Ok(Some(decode_succeed_curried(n, &wrapper)));
             }

@@ -1197,12 +1197,15 @@ pub fn emit_init_datum(
 ///
 /// Emits the whole arm body as
 /// `(<compiled model>, ipe_runtime::web::fire_cmd_wiring("<baked wiring JSON>",
-/// vec![Box::new(move || <compiled effect 0>)]))`: the model half is the arm's
-/// OWN compiled model (unchanged), and the Cmd half is the wiring dispatch. The
-/// effect thunk builds the arm's sole compiled effect; the runtime selector
-/// picks WHICH id fires (dev overlay under the dev gate, the baked id otherwise —
-/// dev == prod) and runs only that thunk. The effect BODIES are compiled exactly as
-/// written — only the WIRING (which id fires) is data.
+/// vec![{ let __ipe_eff = <compiled effect 0>; Box::new(move || __ipe_eff) }]))`:
+/// the model half is the arm's OWN compiled model (unchanged), and the Cmd half is
+/// the wiring dispatch. The effect value is built at the arm's position, after its
+/// model and in the plain path's order, and bound to a fresh name; the thunk
+/// captures only that name, never a source local, so the thunk moves nothing out
+/// of an enclosing closure and leaves every arm binding readable after the `case`.
+/// The runtime selector picks WHICH id fires (dev overlay under the dev gate, the
+/// baked id otherwise — dev == prod) and runs only that thunk. The effect BODIES
+/// are compiled exactly as written — only the WIRING (which id fires) is data.
 ///
 /// The baked JSON is
 /// [`crate::transition_classify::CompileCmdWiring::to_json`], byte-identical to the
@@ -1258,12 +1261,11 @@ pub fn emit_cmd_wiring_arm(
     };
     let child = depth + 1;
     let model_s = emit_expr_at(ctx, model_expr, indent + 1, child, generics)?;
-    // The one-entry compiled-effect table: the sole effect wrapped in a `move`
-    // thunk, built and fired only when the wiring selects it. A `move` closure
-    // lets the effect capture the arm's bindings by value, sound because only one
-    // match arm runs and the arm has one effect, emitted after its model.
+    // The one-entry compiled-effect table: the sole effect value bound to a fresh
+    // name, and a thunk that captures only that name. Building a `Cmd` runs no
+    // effect, so binding it eagerly is the plain path's evaluation.
     let effect_s = emit_expr_at(ctx, effect, indent + 1, child, generics)?;
-    let table = format!("Box::new(move || {effect_s})");
+    let table = format!("{{ let __ipe_eff = {effect_s}; Box::new(move || __ipe_eff) }}");
     let json = arm.wiring.to_json();
     let json_lit = rust_str_lit(&json);
     Ok(Some(format!(

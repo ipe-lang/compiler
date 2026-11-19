@@ -357,18 +357,29 @@ pub fn emit_lambda_unboxed(
         ));
     }
     let ret_s = render_type(ctx, ret, generics)?;
-    // This is a `move` closure: it captures `__ipe_lit` by move, so a style
-    // literal inside its body must NOT hoist into the enclosing view's table
-    // (it would contend with the binding's other uses). Fence hoisting off for
-    // the closure body; literals within emit directly, unchanged.
-    ctx.enter_closure();
-    let body_result = emit_expr_at(ctx, body, indent, child, generics);
-    ctx.exit_closure();
-    let body_s = body_result?;
+    let body_s = in_closure_body(ctx, || emit_expr_at(ctx, body, indent, child, generics))?;
     Ok(format!(
         "move |{}| -> {ret_s} {{ {body_s} }}",
         parts.join(", ")
     ))
+}
+
+/// Run `emit` as the body of a printed `move` closure.
+///
+/// Two emit states never reach a closure body. Style-literal hoisting is fenced
+/// off, because the closure captures `__ipe_lit` by move. The `update`-arm
+/// transition and Cmd-wiring rewrites are disarmed, because only the top `case`
+/// of an armed `update` is an overlay arm: a `case` inside a nested lambda is
+/// compiled as written. Both states are restored when `emit` returns. The string
+/// path ([`emit_lambda_unboxed`]) and the Doc path
+/// (`crate::emit_doc::build_closure`) share this one entry.
+pub fn in_closure_body<T>(ctx: &EmitCtx, emit: impl FnOnce() -> T) -> T {
+    ctx.enter_closure();
+    let saved_transition = ctx.begin_transition_update(None);
+    let out = emit();
+    ctx.end_transition_update(saved_transition);
+    ctx.exit_closure();
+    out
 }
 
 /// The compiler-bug refusal for an [`Expr::OnceLambda`] at an unadmitted position.

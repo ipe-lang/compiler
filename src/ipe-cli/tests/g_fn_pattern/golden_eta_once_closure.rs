@@ -1029,3 +1029,107 @@ fn adapted_handler_shapes_build_and_run() {
         outcome.stdout
     );
 }
+
+/// `Decode.succeed` over a `Task` parameter: the factory reproduces its payload
+/// by `.clone()` on every run, which a task cannot do.
+const DECODE_SUCCEED_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.String
+import Ipe.Task as Task
+
+
+decodeTask : Task Error Int -> String -> Int
+decodeTask t raw =
+    case JsonDec.decodeString (JsonDec.succeed t) raw of
+        Ok _ ->
+            1
+
+        _ ->
+            0
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (decodeTask (Task.succeed 1) "1"))
+"#;
+
+/// `Decode.succeed` over a `String` parameter, decoded twice.
+const DECODE_SUCCEED_STRING: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.Task as Task
+
+
+decodeName : String -> String -> String
+decodeName s raw =
+    let
+        d =
+            JsonDec.succeed s
+    in
+    case ( JsonDec.decodeString d raw, JsonDec.decodeString d raw ) of
+        ( Ok a, Ok b ) ->
+            a ++ "," ++ b
+
+        _ ->
+            "err"
+
+
+main : Task Error ()
+main =
+    Io.println (decodeName "hi" "1")
+"#;
+
+/// A non-`Clone` `Decode.succeed` payload is refused at ipe time with IPE-L0135
+/// at the payload, before cargo can fail on its `.clone()`.
+#[test]
+fn decode_succeed_of_a_task_is_refused() {
+    let (built, _) = build_source("decode_succeed_task", DECODE_SUCCEED_TASK);
+    let want = source_capture_span(DECODE_SUCCEED_TASK, "t) raw");
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::NonCloneValueReuse),
+                    } if *span == want
+                )
+        ),
+        "a `Task` payload of `Decode.succeed` must fail closed with IPE-L0135 at the \
+         payload ({want:?}), got {built:?}"
+    );
+}
+
+/// cargo-0 and run-correct for a `Clone` `Decode.succeed` payload: gated on
+/// `IPE_E2E=1` (THE SEAL).
+#[test]
+fn decode_succeed_of_a_string_builds_and_runs() {
+    let (built, out) = build_source("decode_succeed_string", DECODE_SUCCEED_STRING);
+    assert!(
+        built.is_ok(),
+        "a `String` payload of `Decode.succeed` must pass ipe: {:?}",
+        built.err()
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let outcome = crate::support::build_and_run_emitted("decode_succeed_string", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "a `String` payload of `Decode.succeed` must build and exit 0; stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("hi,hi\n"),
+        "must decode the payload twice; got: {:?}",
+        outcome.stdout
+    );
+}

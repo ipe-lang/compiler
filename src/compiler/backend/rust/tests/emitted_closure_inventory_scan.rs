@@ -11,6 +11,12 @@
 //! in), and holds the count per
 //! `(file, fn)` against [`INVENTORY`]. A new producer without a row fails, and
 //! so does a row whose count no longer matches.
+//!
+//! An adapter closure must capture no source local, so its literal is checked
+//! too: the text after an [`Producer::Adapter`] head may splice in only the
+//! format placeholders its row allowlists (fresh names, type text, runtime
+//! text), and its `|` may not be spliced in at all. Emitted IR text after an
+//! adapter head (`move || {effect_s}`) is refused.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -38,8 +44,10 @@ enum Producer {
     /// An IR closure node, whose kind is `boundary_kind` of that node.
     Boundary(Form),
     /// A kernel or wiring adapter closure no IR node marks, so the capture
-    /// verdict does not see it; the reason proves it wraps no source local.
-    Adapter(AdapterReason),
+    /// verdict does not see it; the reason proves it wraps no source local, and
+    /// the list names every format placeholder its literals may splice in after
+    /// the `move` head (`""` is a positional `{}`).
+    Adapter(AdapterReason, &'static [&'static str]),
     /// A layout check that matches a printed closure head and prints none.
     Recognizer,
 }
@@ -57,10 +65,6 @@ enum AdapterReason {
     /// value is bound by a `let` before the `move`, so the value is evaluated
     /// once outside the closure and no source local is captured.
     RuntimeValue,
-    /// The closure is the single `FnOnce` effect thunk of a `Cmd.perform` arm:
-    /// `ArmWiring.effect` holds at most one effect, emitted after the
-    /// arm's model, so the plain path's clone verdict for the arm holds.
-    SoleEffectThunk,
 }
 
 /// Where a producer sits: the file relative to `src`, and the innermost named
@@ -76,7 +80,7 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
         "emit_console.rs",
         "line_handler_bridge",
         1,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
     ),
     (
         "emit_doc.rs",
@@ -94,7 +98,7 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
         "emit_expr/expr.rs",
         "emit_cmd_wiring_arm",
         1,
-        Producer::Adapter(AdapterReason::SoleEffectThunk),
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
     ),
     (
         "emit_expr/expr.rs",
@@ -112,49 +116,49 @@ const INVENTORY: &[(&str, &str, usize, Producer)] = &[
         "emit_expr/kernel_calls.rs",
         "emit_json_decoder_call",
         2,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &["params", "ret_s", "args"]),
     ),
     (
         "emit_expr/kernel_calls.rs",
         "emit_task_retry_call",
         1,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
     ),
     (
         "emit_tui.rs",
         "key_event_bridge",
         1,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &["struct_name"]),
     ),
     (
         "emit_web.rs",
         "emit_route_render",
         1,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &["page_ty_s", "arms"]),
     ),
     (
         "emit_web.rs",
         "emit_web_route",
         2,
-        Producer::Adapter(AdapterReason::TopLevelFn),
+        Producer::Adapter(AdapterReason::TopLevelFn, &["ctor_s", ""]),
     ),
     (
         "emit_web.rs",
         "new",
         1,
-        Producer::Adapter(AdapterReason::TopLevelFn),
+        Producer::Adapter(AdapterReason::TopLevelFn, &[]),
     ),
     (
         "emit_web.rs",
         "set_page_closure",
         2,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &["page_ty_s", "model_ty_s"]),
     ),
     (
         "emit_web.rs",
         "wrap_view",
         1,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
     ),
     ("render.rs", "is_closure_head", 1, Producer::Recognizer),
     (
@@ -176,24 +180,78 @@ fn str_value(tok: &TokenTree) -> Option<String> {
     }
 }
 
-/// How many `move |` / `move ||` closure heads `text` prints. A trailing
-/// `move` keyword, or one followed by a format placeholder, counts as one: its
-/// `|` may sit in the next literal or the spliced text.
-fn closure_heads(text: &str) -> usize {
+/// The text after each `move |` / `move ||` closure head `text` prints.
+///
+/// A trailing `move` keyword, or one followed by a format placeholder, is a
+/// head too: its `|` may sit in the next literal or the spliced text.
+fn head_tails(text: &str) -> Vec<&str> {
     text.match_indices("move")
-        .filter(|&(at, word)| {
+        .filter_map(|(at, word)| {
             let starts_word = text
                 .get(..at)
                 .and_then(|before| before.chars().next_back())
                 .is_none_or(|c| !(c.is_alphanumeric() || c == '_'));
-            let opens_params = text.get(at + word.len()..).is_some_and(|after| {
-                let after = after.trim_start();
-                let placeholder = after.starts_with('{') && !after.starts_with("{{");
-                after.is_empty() || after.starts_with('|') || placeholder
-            });
-            starts_word && opens_params
+            let tail = text.get(at + word.len()..)?;
+            (starts_word && opens_params(tail)).then_some(tail)
         })
-        .count()
+        .collect()
+}
+
+/// Whether the text after a `move` keyword opens a closure parameter list.
+fn opens_params(tail: &str) -> bool {
+    let rest = tail.trim_start();
+    rest.is_empty() || rest.starts_with('|') || splices_first(rest)
+}
+
+/// Whether `text` starts with a format placeholder (not an escaped `{{`).
+fn splices_first(text: &str) -> bool {
+    text.starts_with('{') && !text.starts_with("{{")
+}
+
+/// How many closure heads `text` prints.
+fn closure_heads(text: &str) -> usize {
+    head_tails(text).len()
+}
+
+/// The names of the format placeholders in `text`, in order.
+///
+/// A positional `{}` is `""`; a format spec after `:` is dropped; the escapes
+/// `{{` and `}}` are text.
+fn placeholders(text: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        let escaped = chars.peek() == Some(&c);
+        if escaped && (c == '{' || c == '}') {
+            chars.next();
+        } else if c == '{' {
+            let body: String = chars.by_ref().take_while(|&b| b != '}').collect();
+            let name = body.split_once(':').map_or(body.as_str(), |(name, _)| name);
+            names.push(name.trim().to_owned());
+        }
+    }
+    names
+}
+
+/// One printed closure head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Head {
+    /// The format placeholders after the `move` keyword in its literal.
+    placeholders: Vec<String>,
+    /// Whether its `|` is spliced in or sits in another literal, so the
+    /// parameter list is not fixed text.
+    split: bool,
+}
+
+impl Head {
+    /// The head whose literal continues with `tail` after the `move` keyword.
+    fn of_tail(tail: &str) -> Self {
+        let rest = tail.trim_start();
+        Self {
+            placeholders: placeholders(tail),
+            split: rest.is_empty() || splices_first(rest),
+        }
+    }
 }
 
 /// Whether `tok` is the punctuation `ch`.
@@ -214,19 +272,37 @@ fn is_test_attr(body: &TokenStream) -> bool {
     }
 }
 
+/// The closure heads found, per site: their count and each head's shape.
+#[derive(Debug, Default)]
+struct Found {
+    hits: BTreeMap<Site, usize>,
+    heads: BTreeMap<Site, Vec<Head>>,
+}
+
+impl Found {
+    /// Fold `other` into this result.
+    fn absorb(&mut self, other: Self) {
+        self.hits.extend(other.hits);
+        self.heads.extend(other.heads);
+    }
+}
+
 /// The producer counter over one file's token tree.
 struct Scan<'a> {
     file: &'a str,
-    hits: BTreeMap<Site, usize>,
+    found: Found,
 }
 
 impl Scan<'_> {
-    /// Count `heads` closure heads in `func`.
-    fn hit(&mut self, func: &str, heads: usize) {
-        *self
-            .hits
-            .entry((self.file.to_owned(), func.to_owned()))
-            .or_insert(0) += heads;
+    /// Record the closure heads whose literal continues with `tails` in `func`.
+    fn hit(&mut self, func: &str, tails: &[&str]) {
+        let site = (self.file.to_owned(), func.to_owned());
+        *self.found.hits.entry(site.clone()).or_insert(0) += tails.len();
+        self.found
+            .heads
+            .entry(site)
+            .or_default()
+            .extend(tails.iter().copied().map(Head::of_tail));
     }
 
     /// Scan one token sequence inside the innermost named fn `func`, skipping
@@ -288,9 +364,9 @@ impl Scan<'_> {
                 }
             }
             if let Some(text) = str_value(tok) {
-                let heads = closure_heads(&text);
-                if heads > 0 {
-                    self.hit(func, heads);
+                let tails = head_tails(&text);
+                if !tails.is_empty() {
+                    self.hit(func, &tails);
                 }
             }
             if let TokenTree::Group(g) = tok {
@@ -311,16 +387,16 @@ impl Scan<'_> {
 }
 
 /// The closure producers in one source file, keyed by `(file, fn)`.
-fn scan_source(file: &str, src: &str) -> Result<BTreeMap<Site, usize>, String> {
+fn scan_source(file: &str, src: &str) -> Result<Found, String> {
     let stream: TokenStream = src
         .parse()
         .map_err(|e| format!("{file} does not lex: {e}"))?;
     let mut scan = Scan {
         file,
-        hits: BTreeMap::new(),
+        found: Found::default(),
     };
     scan.stream(&stream, "<file>");
-    Ok(scan.hits)
+    Ok(scan.found)
 }
 
 /// The `/`-joined path of `path` relative to `root`.
@@ -335,16 +411,16 @@ fn relative(root: &Path, path: &Path) -> Result<String, String> {
 }
 
 /// Scan one `.rs` file, naming it by its path relative to `root`.
-fn scan_file(root: &Path, path: &Path, hits: &mut BTreeMap<Site, usize>) -> Result<(), String> {
+fn scan_file(root: &Path, path: &Path, found: &mut Found) -> Result<(), String> {
     let rel = relative(root, path)?;
     let src = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    hits.extend(scan_source(&rel, &src)?);
+    found.absorb(scan_source(&rel, &src)?);
     Ok(())
 }
 
 /// Scan every non-test `.rs` file under `dir` (a `tests` directory is test
 /// code).
-fn scan_dir(root: &Path, dir: &Path, hits: &mut BTreeMap<Site, usize>) -> Result<(), String> {
+fn scan_dir(root: &Path, dir: &Path, found: &mut Found) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let mut paths = Vec::new();
     for entry in entries {
@@ -356,9 +432,9 @@ fn scan_dir(root: &Path, dir: &Path, hits: &mut BTreeMap<Site, usize>) -> Result
             if path.file_name().is_some_and(|n| n == "tests") {
                 continue;
             }
-            scan_dir(root, &path, hits)?;
+            scan_dir(root, &path, found)?;
         } else if path.extension().is_some_and(|e| e == "rs") {
-            scan_file(root, &path, hits)?;
+            scan_file(root, &path, found)?;
         }
     }
     Ok(())
@@ -386,14 +462,214 @@ fn drift(
     (unexpected, stale)
 }
 
+/// The placeholders an [`AdapterReason`] admits after its rows' heads.
+///
+/// No reason admits emitted IR text: each admits only the names its row lists,
+/// which are fresh `__`-prefixed bindings, type text or runtime text.
+const fn admitted(
+    reason: AdapterReason,
+    allow: &'static [&'static str],
+) -> &'static [&'static str] {
+    match reason {
+        AdapterReason::TopLevelFn | AdapterReason::RuntimeValue => allow,
+    }
+}
+
+/// Every way the [`Producer::Adapter`] rows' heads in `heads` break their row.
+///
+/// A split head, a placeholder its row does not list, and a listed name no
+/// head uses each give one line naming the site.
+fn adapter_violations(
+    heads: &BTreeMap<Site, Vec<Head>>,
+    inventory: &[(&str, &str, usize, Producer)],
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for &(file, func, _, producer) in inventory {
+        let Producer::Adapter(reason, allow) = producer else {
+            continue;
+        };
+        let allowed = admitted(reason, allow);
+        let site = (file.to_owned(), func.to_owned());
+        let row_heads = heads.get(&site).map_or(&[][..], Vec::as_slice);
+        for head in row_heads {
+            if head.split {
+                out.push(format!("{file}::{func}: a split `move` head"));
+            }
+            for name in &head.placeholders {
+                if !allowed.contains(&name.as_str()) {
+                    out.push(format!("{file}::{func}: `{{{name}}}` after a `move` head"));
+                }
+            }
+        }
+        for name in allowed {
+            let used = row_heads
+                .iter()
+                .any(|head| head.placeholders.iter().any(|p| p == name));
+            if !used {
+                out.push(format!(
+                    "{file}::{func}: allowlisted `{{{name}}}` is unused"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Every adapter closure the backend prints splices in only its row's listed
+/// placeholders after its `move` head, and never its `|`.
+#[test]
+fn each_adapter_head_splices_only_its_listed_placeholders() -> Result<(), String> {
+    let root = e2e_support::manifest_dir!().join("src");
+    let mut found = Found::default();
+    scan_dir(&root, &root, &mut found)?;
+    let violations = adapter_violations(&found.heads, INVENTORY);
+    assert!(
+        violations.is_empty(),
+        "an adapter closure may capture no source local: bind emitted text to a \
+         fresh `__` name before the `move` head, or list a fresh-name/type \
+         placeholder on its INVENTORY row.\n{violations:#?}"
+    );
+    Ok(())
+}
+
+/// The adapter-head violations of a synthetic source against `inventory`.
+fn synthetic_violations(
+    file: &str,
+    src: &str,
+    inventory: &[(&str, &str, usize, Producer)],
+) -> Result<Vec<String>, String> {
+    Ok(adapter_violations(
+        &scan_source(file, src)?.heads,
+        inventory,
+    ))
+}
+
+/// The real cmd-wiring row: one runtime-value adapter head, nothing listed.
+const CMD_WIRING_ROW: [(&str, &str, usize, Producer); 1] = [(
+    "emit_expr/expr.rs",
+    "emit_cmd_wiring_arm",
+    1,
+    Producer::Adapter(AdapterReason::RuntimeValue, &[]),
+)];
+
+/// An effect spliced into the cmd-wiring thunk is refused; bound to a fresh
+/// name before the head, it passes.
+#[test]
+fn an_effect_spliced_after_the_cmd_wiring_head_is_refused() -> Result<(), String> {
+    let spliced = synthetic_violations(
+        "emit_expr/expr.rs",
+        r#"fn emit_cmd_wiring_arm(effect_s: &str) -> String { format!("Box::new(move || {effect_s})") }"#,
+        &CMD_WIRING_ROW,
+    )?;
+    assert_eq!(
+        spliced,
+        vec!["emit_expr/expr.rs::emit_cmd_wiring_arm: `{effect_s}` after a `move` head".to_owned()]
+    );
+    let bound = synthetic_violations(
+        "emit_expr/expr.rs",
+        r#"fn emit_cmd_wiring_arm(effect_s: &str) -> String { format!("{{ let __ipe_eff = {effect_s}; Box::new(move || __ipe_eff) }}") }"#,
+        &CMD_WIRING_ROW,
+    )?;
+    assert_eq!(bound, Vec::<String>::new());
+    Ok(())
+}
+
+/// A positional placeholder after an adapter head is refused unless listed.
+#[test]
+fn a_positional_placeholder_after_an_adapter_head_is_refused() -> Result<(), String> {
+    let row = [(
+        "emit_expr/kernel_calls.rs",
+        "emit_wrap",
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
+    )];
+    let got = synthetic_violations(
+        "emit_expr/kernel_calls.rs",
+        r#"fn emit_wrap(a: &str, b: &str) -> String { format!("move |{}| (x)({})", a, b) }"#,
+        &row,
+    )?;
+    assert_eq!(
+        got,
+        vec![
+            "emit_expr/kernel_calls.rs::emit_wrap: `{}` after a `move` head".to_owned(),
+            "emit_expr/kernel_calls.rs::emit_wrap: `{}` after a `move` head".to_owned(),
+        ]
+    );
+    Ok(())
+}
+
+/// A listed type placeholder passes, with a format spec too, and an escaped
+/// brace is text.
+#[test]
+fn a_listed_placeholder_after_an_adapter_head_passes() -> Result<(), String> {
+    let row = [(
+        "emit_web.rs",
+        "page_closure",
+        1,
+        Producer::Adapter(AdapterReason::RuntimeValue, &["page_ty_s"]),
+    )];
+    let got = synthetic_violations(
+        "emit_web.rs",
+        r#"fn page_closure(page_ty_s: &str) -> String { format!("move |__page: &{page_ty_s:>0}| {{ __page }}") }"#,
+        &row,
+    )?;
+    assert_eq!(got, Vec::<String>::new());
+    Ok(())
+}
+
+/// A head whose `|` is spliced in or sits in another literal is refused in an
+/// adapter row, and a listed name no head uses is stale.
+#[test]
+fn a_split_adapter_head_and_an_unused_listed_name_are_refused() -> Result<(), String> {
+    let row = [(
+        "emit_tui.rs",
+        "bridge",
+        2,
+        Producer::Adapter(AdapterReason::TopLevelFn, &["p", "gone"]),
+    )];
+    let got = synthetic_violations(
+        "emit_tui.rs",
+        r#"fn bridge(o: &mut String, p: &str) { o.push_str(&format!("Box::new(move {p} x)")); o.push_str("Box::new(move "); }"#,
+        &row,
+    )?;
+    assert_eq!(
+        got,
+        vec![
+            "emit_tui.rs::bridge: a split `move` head".to_owned(),
+            "emit_tui.rs::bridge: a split `move` head".to_owned(),
+            "emit_tui.rs::bridge: allowlisted `{gone}` is unused".to_owned(),
+        ]
+    );
+    Ok(())
+}
+
+/// A boundary row's head is held by the IR closure verdict, so its spliced body
+/// is not an adapter violation.
+#[test]
+fn a_boundary_head_is_not_held_to_an_allowlist() -> Result<(), String> {
+    let row = [(
+        "emit_expr/func.rs",
+        "emit_lambda_unboxed",
+        1,
+        Producer::Boundary(Form::Closure),
+    )];
+    let got = synthetic_violations(
+        "emit_expr/func.rs",
+        r#"fn emit_lambda_unboxed(b: &str) -> String { format!("move |x| -> R {{ {b} }}") }"#,
+        &row,
+    )?;
+    assert_eq!(got, Vec::<String>::new());
+    Ok(())
+}
+
 /// The backend prints exactly the inventoried `move` closures: a new
 /// producer fails, and so does a row gone stale.
 #[test]
 fn every_emitted_move_closure_has_an_inventory_row() -> Result<(), String> {
     let root = e2e_support::manifest_dir!().join("src");
-    let mut found = BTreeMap::new();
+    let mut found = Found::default();
     scan_dir(&root, &root, &mut found)?;
-    let (unexpected, stale) = drift(&found, INVENTORY);
+    let (unexpected, stale) = drift(&found.hits, INVENTORY);
     assert!(
         unexpected.is_empty() && stale.is_empty(),
         "a `move` closure printed by the backend needs an INVENTORY row: \
@@ -493,6 +769,7 @@ fn a_task_seq_continuation_slot_takes_a_capture_moving_closure() {
 /// The producers of a synthetic source, as `(fn, count)`.
 fn synthetic(src: &str) -> Result<Vec<(String, usize)>, String> {
     Ok(scan_source("synthetic.rs", src)?
+        .hits
         .into_iter()
         .map(|((_, func), count)| (func, count))
         .collect())
@@ -568,9 +845,9 @@ fn a_producer_without_a_row_and_a_row_without_a_producer_both_drift() -> Result<
         "emit_expr/old.rs",
         "emit_old",
         1,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
     )];
-    let (unexpected, stale) = drift(&found, &gone);
+    let (unexpected, stale) = drift(&found.hits, &gone);
     let new_site = ("emit_expr/new.rs".to_owned(), "emit_new".to_owned());
     let old_site = ("emit_expr/old.rs".to_owned(), "emit_old".to_owned());
     assert_eq!(unexpected, vec![(new_site.clone(), 1)]);
@@ -579,9 +856,9 @@ fn a_producer_without_a_row_and_a_row_without_a_producer_both_drift() -> Result<
         "emit_expr/new.rs",
         "emit_new",
         2,
-        Producer::Adapter(AdapterReason::RuntimeValue),
+        Producer::Adapter(AdapterReason::RuntimeValue, &[]),
     )];
-    let (unexpected, stale) = drift(&found, &recount);
+    let (unexpected, stale) = drift(&found.hits, &recount);
     assert_eq!(unexpected, vec![(new_site.clone(), 1)]);
     assert_eq!(stale, vec![(new_site, 2)]);
     Ok(())
@@ -594,7 +871,7 @@ fn a_kernel_call_rewrap_of_emitted_handler_text_drifts() -> Result<(), String> {
         "emit_expr/kernel_calls.rs",
         r#"fn emit_ui_plan(h: &str) -> String { format!("ui_on_key_down_(::std::sync::Arc::new(move |_x| ({h})(_x)))") }"#,
     )?;
-    let (unexpected, stale) = drift(&found, INVENTORY);
+    let (unexpected, stale) = drift(&found.hits, INVENTORY);
     let site = (
         "emit_expr/kernel_calls.rs".to_owned(),
         "emit_ui_plan".to_owned(),

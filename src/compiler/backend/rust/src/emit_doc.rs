@@ -1759,16 +1759,8 @@ fn build_closure(
     }
     let ret_s = render_type(ctx, ret, generics)?;
     let head = format!("move |{}| -> {ret_s} ", parts.join(", "));
-    // This is a `move` closure: it captures `__ipe_lit` by move, so an
-    // appearance style literal inside its body must NOT hoist into the enclosing
-    // view's `LiteralTable` (the table is bound in the outer scope; a hoist here
-    // would read a slot the closure did not introduce). Fence hoisting off for
-    // the whole closure body, mirroring the string path's
-    // [`crate::emit_expr::emit_lambda_unboxed`]; literals within emit directly.
-    ctx.enter_closure();
-    let body_doc = build_doc(ctx, body, indent, child, generics);
-    ctx.exit_closure();
-    let body_doc = body_doc?;
+    let body_doc =
+        crate::emit_expr::in_closure_body(ctx, || build_doc(ctx, body, indent, child, generics))?;
     Ok(Doc::concat(vec![Doc::owned(head)?, braced_block(body_doc)]))
 }
 
