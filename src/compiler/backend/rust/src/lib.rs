@@ -35,8 +35,8 @@ mod emit_console;
 mod emit_doc;
 mod emit_settings;
 pub use emit_settings::{
-    CrateName, EmitHost, EmitSettings, LoopbackAtRelease, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
-    TEST_RUN_KEY_ENV, frame_origins_for_intent,
+    CrateName, EmitHost, EmitSettings, FrameListRefused, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
+    TEST_RUN_KEY_ENV, frame_origins_for,
 };
 mod emit_expr;
 mod emit_model_gate;

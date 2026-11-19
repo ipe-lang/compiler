@@ -105,14 +105,35 @@ pub fn console_warn(detail: &str) {
 /// entry never judged the environment, and the program does not start.
 static STARTUP_ACCEPTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Install `console_error_panic_hook` so a residual trap (e.g. stack
-/// exhaustion from a non-TCO fold — the documented reachable residual)
-/// dies with a classified `console.error`, never a silent white screen.
-/// Then judge the environment and fix the values read once per process,
-/// before the program's first line, as a native `main` does.
-pub fn install_panic_hook() {
-    console_error_panic_hook::set_once();
-    let accepted = match crate::env_registry::startup_check() {
+/// What the entry's frame-origin registration came to.
+///
+/// `Registered` and `Refused` are reachable only through
+/// [`install_panic_hook_trusting_frames`]; an entry with no list judges `NoList`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameAdmission {
+    /// The program declares no frame origins.
+    NoList,
+    /// The declared origins re-parsed and are the program's frame policy.
+    Registered,
+    /// The declared origins did not re-parse; the program must not start.
+    Refused,
+}
+
+/// Whether the program may start, from the environment verdict and the frame admission.
+const fn startup_accepted(env_clean: bool, frames: FrameAdmission) -> bool {
+    match frames {
+        FrameAdmission::NoList | FrameAdmission::Registered => env_clean,
+        FrameAdmission::Refused => false,
+    }
+}
+
+/// The one startup judge every entry form calls, setting [`STARTUP_ACCEPTED`] once.
+///
+/// It judges the environment and fixes the values read once per process,
+/// before the program's first line, as a native `main` does, then folds in
+/// `frames`.
+fn judge_startup(frames: FrameAdmission) {
+    let env_clean = match crate::env_registry::startup_check() {
         Ok(()) => true,
         Err(refusals) => {
             for refusal in &refusals {
@@ -121,7 +142,36 @@ pub fn install_panic_hook() {
             false
         }
     };
+    let accepted = startup_accepted(env_clean, frames);
     let _ = STARTUP_ACCEPTED.set(accepted);
+}
+
+/// Install the panic hook, then judge startup for a program with no frame origins.
+///
+/// `console_error_panic_hook` makes a residual trap (e.g. stack exhaustion
+/// from a non-TCO fold — the documented reachable residual) die with a
+/// classified `console.error`, never a silent white screen.
+pub fn install_panic_hook() {
+    console_error_panic_hook::set_once();
+    judge_startup(FrameAdmission::NoList);
+}
+
+/// [`install_panic_hook`] for a program that declares trusted frame origins.
+///
+/// `origins` are re-parsed and registered with the granted web-capability
+/// suffixes `granted` as the program's frame policy. A list that does not
+/// re-parse is a classified `console.error`, and the program never starts.
+#[cfg(feature = "encoding")]
+pub fn install_panic_hook_trusting_frames(origins: &[&str], granted: &[&str]) {
+    console_error_panic_hook::set_once();
+    let frames = match crate::frames::try_register(origins, granted) {
+        Ok(()) => FrameAdmission::Registered,
+        Err(refusal) => {
+            console_fatal("StartupRefused", &refusal.to_string());
+            FrameAdmission::Refused
+        }
+    };
+    judge_startup(frames);
 }
 
 /// Drive the program's entry task on the browser microtask queue.
@@ -2470,6 +2520,39 @@ fn clear_dom_property(el: &web_sys::Element, key: &str) {
 mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn startup_accepted_folds_the_frame_admission() {
+        let table = [
+            (true, FrameAdmission::NoList, true),
+            (true, FrameAdmission::Registered, true),
+            (true, FrameAdmission::Refused, false),
+            (false, FrameAdmission::NoList, false),
+            (false, FrameAdmission::Registered, false),
+            (false, FrameAdmission::Refused, false),
+        ];
+        for (env_clean, frames, accepted) in table {
+            assert_eq!(
+                startup_accepted(env_clean, frames),
+                accepted,
+                "({env_clean}, {frames:?})"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_runtime_refuses_a_loopback_frame_origin() {
+        let loopback = crate::frames::policy_of(&["http://localhost:3000"], &[]);
+        assert!(
+            matches!(
+                loopback,
+                Err(crate::frames::FrameRegisterRefusal::Origin { index: 0, .. })
+            ),
+            "{loopback:?}"
+        );
+        let listed = crate::frames::policy_of(&["https://player.example"], &["camera"]);
+        assert!(listed.is_ok(), "{listed:?}");
+    }
 
     const TRUSTED: Arrival = Arrival {
         trusted: true,

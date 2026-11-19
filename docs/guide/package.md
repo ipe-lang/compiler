@@ -175,7 +175,8 @@ of a listed origin keeps that origin, so it can sign in, store data and run
 its own scripts; a frame of any other origin stays sandboxed with an opaque
 origin. Each entry is written like a `servers` entry, `https://` then a host
 and an optional `:port`. During development an entry may also be
-`http://localhost:PORT`, with the port required; `ipe release` refuses it.
+`http://localhost:PORT`, with the port required. A loopback entry is for
+served `ipe dev` only: `ipe release` and a browser-built client refuse it.
 At most 16 origins are listed, each once, and their bytes in the served
 headers must fit 6144 bytes, which holds about seven origins of 30 bytes;
 the manifest refuses any other value.

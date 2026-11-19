@@ -615,19 +615,84 @@ macro_rules! wasm_deferred_entry {
 }
 const WASM_DEFERRED_ENTRY: &str = wasm_deferred_entry!();
 
-/// The `WasmClient` entry: `#[wasm_bindgen(start)]` replacing `fn main`.
-/// The panic hook makes a residual trap die with a classified console error;
-/// the entry task runs on the browser microtask queue.
+/// The `WasmClient` entry's lines before its startup statement.
+macro_rules! wasm_entry_head {
+    () => {
+        concat!(
+            "#[wasm_bindgen::prelude::wasm_bindgen(start)]\n",
+            "pub fn ipe_start() {\n",
+        )
+    };
+}
+
+/// The `WasmClient` entry's lines after its startup statement.
+macro_rules! wasm_entry_tail {
+    () => {
+        concat!(
+            "    ",
+            wasm_deferred_entry!(),
+            "\n",
+            "    ipe_runtime::wasm::run_start(entry);\n",
+            "}\n",
+        )
+    };
+}
+const WASM_ENTRY_HEAD: &str = wasm_entry_head!();
+const WASM_ENTRY_TAIL: &str = wasm_entry_tail!();
+
+/// The `WasmClient` entry of a program with no frame origins.
+///
+/// `#[wasm_bindgen(start)]` replaces `fn main`. The panic hook makes a
+/// residual trap die with a classified console error; the entry task runs on
+/// the browser microtask queue.
 const WASM_ENTRY: &str = concat!(
-    "#[wasm_bindgen::prelude::wasm_bindgen(start)]\n",
-    "pub fn ipe_start() {\n",
+    wasm_entry_head!(),
     "    ipe_runtime::wasm::install_panic_hook();\n",
-    "    ",
-    wasm_deferred_entry!(),
-    "\n",
-    "    ipe_runtime::wasm::run_start(entry);\n",
-    "}\n",
+    wasm_entry_tail!(),
 );
+
+/// The `WasmClient` entry for `ctx`'s frame origins.
+///
+/// An empty list is [`WASM_ENTRY`] byte for byte. A listed one opens with the
+/// trusting hook, which registers the origins and the program's granted
+/// web-capability suffixes (the set its `Push` worker choice reads) before
+/// the one startup judge runs, so a refused list never starts the program.
+fn wasm_entry(ctx: &EmitCtx) -> String {
+    let origins = crate::emit_web::frame_origin_literals(&ctx.frame_origins);
+    if origins.is_empty() {
+        return WASM_ENTRY.to_owned();
+    }
+    format!(
+        "{WASM_ENTRY_HEAD}    ipe_runtime::wasm::install_panic_hook_trusting_frames(&[{}], &[{}]);\n\
+         {WASM_ENTRY_TAIL}",
+        origins.join(", "),
+        crate::emit_web::granted_suffix_literals(ctx).join(", ")
+    )
+}
+
+/// [`wasm_entry`] for a `WasmClient` program listing `https://player.example`
+/// with `camera` granted.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // the planted origin is well-formed
+fn listed_wasm_entry() -> DResult<String> {
+    use ipe_runtime_rust::encoding::FrameOriginEntry;
+    let entry = FrameOriginEntry::parse("https://player.example").expect("a frame origin");
+    let settings = crate::EmitSettings {
+        target: ipe_ir::Target::WasmClient,
+        frame_origins: FrameOriginEntries::new([entry]).expect("a frame list"),
+        ..crate::EmitSettings::unconfigured()
+    };
+    let program = Program {
+        modules: vec![],
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::from([
+            ipe_kernels::WebCapability::Camera,
+        ]),
+    };
+    let interner = ipe_intern::Interner::new();
+    let ctx = EmitCtx::build(&interner, &program, settings)?;
+    Ok(wasm_entry(&ctx))
+}
 
 /// The `[wasm] mode = "hydrate"` second entry: parses island JSON as the
 /// user-declared `HydrationState` type, converts via `fromHydrationState`
@@ -683,7 +748,7 @@ pub fn hydrate(model_json: &str) {{
     )
 }
 
-/// [`epilogue`] with the native `fn main` block replaced by [`WASM_ENTRY`],
+/// [`epilogue`] with the native `fn main` block replaced by [`wasm_entry`],
 /// and — when `ctx.wasm_hydrate_mode` AND the program declares a
 /// `fromHydrationState` projection — a second `hydrate` wasm-bindgen export for
 /// fault-tolerant SSR takeover (M7 §"Fault-tolerant hydrate").
@@ -709,7 +774,7 @@ fn epilogue_wasm(ctx: &EmitCtx) -> DResult<String> {
     out.push(&format!(
         "{BANNER}// ==========================================="
     ));
-    out.push(WASM_ENTRY);
+    out.push(&wasm_entry(ctx));
     if ctx.wasm_hydrate_mode
         && let Some(ty) = ctx.hydration_state_rust_name.as_deref()
     {
@@ -5685,16 +5750,64 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// The browser entries replace `fn main` and run on the microtask queue: a
-    /// browser has no process to end, so neither holds a process exit.
+    /// browser has no process to end, so none holds a process exit.
     #[test]
-    fn wasm_entries_hold_no_process_exit() {
+    fn wasm_entries_hold_no_process_exit() -> ipe_diagnostics::DResult<()> {
         let hydrate = wasm_hydrate_entry("MainHydrationState");
-        for entry in [WASM_ENTRY, hydrate.as_str()] {
+        let listed = super::listed_wasm_entry()?;
+        for entry in [WASM_ENTRY, hydrate.as_str(), listed.as_str()] {
             assert!(
                 !entry.contains("process::") && !entry.contains("exit_process"),
                 "a browser entry ends no process: {entry}"
             );
         }
+        Ok(())
+    }
+
+    /// R37: an empty frame list emits [`WASM_ENTRY`] byte for byte; a listed one
+    /// opens with the trusting hook, before the deferred entry and `run_start`,
+    /// and never names the exiting `frames::register`.
+    #[test]
+    fn wasm_entry_registers_frames_before_run_start() -> ipe_diagnostics::DResult<()> {
+        let program = ipe_ir::Program {
+            modules: vec![],
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::from([
+                ipe_kernels::WebCapability::Camera,
+            ]),
+        };
+        let settings = crate::EmitSettings {
+            target: ipe_ir::Target::WasmClient,
+            ..crate::EmitSettings::unconfigured()
+        };
+        let interner = ipe_intern::Interner::new();
+        let ctx = crate::EmitCtx::build(&interner, &program, settings)?;
+        assert_eq!(super::wasm_entry(&ctx), WASM_ENTRY);
+
+        let listed = super::listed_wasm_entry()?;
+        let hook = "ipe_runtime::wasm::install_panic_hook_trusting_frames(\
+                    &[\"https://player.example\"], &[\"camera\"]);";
+        let body = listed
+            .split_once("pub fn ipe_start() {\n")
+            .map(|(_, body)| body.trim_start());
+        assert!(
+            body.is_some_and(|body| body.starts_with(hook)),
+            "the trusting hook is the entry's first statement: {listed}"
+        );
+        assert_eq!(listed.matches(hook).count(), 1, "{listed}");
+        assert!(!listed.contains("install_panic_hook();"), "{listed}");
+        let at_hook = listed.find(hook);
+        let at_entry = listed.find(super::WASM_DEFERRED_ENTRY);
+        let at_start = listed.find("run_start(");
+        assert!(
+            matches!((at_hook, at_entry, at_start), (Some(h), Some(e), Some(r)) if h < e && e < r),
+            "the hook precedes the deferred entry and `run_start`: {listed}"
+        );
+        assert!(
+            !listed.contains("frames::register(") && !listed.contains("exit_process"),
+            "{listed}"
+        );
+        Ok(())
     }
 
     /// Drift-guard for the `overflow-checks = false` dev-profile flag, stated
@@ -7358,10 +7471,11 @@ mod shape_entry_switch_tests {
     /// task, so a program whose startup `run_start` refuses evaluates none of
     /// it: outside that one line no `ipe_main()` call remains.
     #[test]
-    fn the_wasm_entries_build_ipe_main_only_when_polled() {
+    fn the_wasm_entries_build_ipe_main_only_when_polled() -> ipe_diagnostics::DResult<()> {
         for entry in [
             super::WASM_ENTRY.to_owned(),
             super::wasm_hydrate_entry("MainHydrationState"),
+            super::listed_wasm_entry()?,
         ] {
             assert_eq!(
                 entry_lines(&entry, super::WASM_DEFERRED_ENTRY),
@@ -7381,6 +7495,7 @@ mod shape_entry_switch_tests {
             matches!((deferred, converted), (Some(d), Some(c)) if d < c),
             "the hydrate entry converts the island before `run_start` judges startup: {hydrate}"
         );
+        Ok(())
     }
 
     #[test]

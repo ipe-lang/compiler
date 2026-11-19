@@ -327,7 +327,9 @@ fn served_register_stmts(ctx: &EmitCtx) -> String {
 
 /// The listed frame origins as Rust string literals, each its written form,
 /// in the list's sorted order.
-fn frame_origin_literals(frames: &ipe_runtime_rust::encoding::FrameOriginEntries) -> Vec<String> {
+pub fn frame_origin_literals(
+    frames: &ipe_runtime_rust::encoding::FrameOriginEntries,
+) -> Vec<String> {
     let mut written = String::new();
     frames
         .entries()
@@ -341,7 +343,7 @@ fn frame_origin_literals(frames: &ipe_runtime_rust::encoding::FrameOriginEntries
 
 /// The program's granted web-capability suffixes as Rust string literals, in
 /// sorted order.
-fn granted_suffix_literals(ctx: &EmitCtx) -> Vec<String> {
+pub fn granted_suffix_literals(ctx: &EmitCtx) -> Vec<String> {
     // Deterministic order (BTreeSet iteration is sorted); `rust_str_lit` renders
     // each `&'static str` suffix as a valid Rust string literal.
     ctx.web_capabilities

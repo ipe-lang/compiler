@@ -246,49 +246,73 @@ impl EmitSettings {
     }
 }
 
-/// A release build listing a loopback frame origin, which only `ipe dev`
-/// trusts.
+/// A frame-origin list a build of one intent and target cannot emit.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LoopbackAtRelease {
-    /// The refused loopback entry.
-    pub entry: FrameOriginEntry,
+pub enum FrameListRefused {
+    /// A release build lists a loopback entry, which only `ipe dev` trusts.
+    LoopbackAtRelease {
+        /// The refused loopback entry.
+        entry: FrameOriginEntry,
+    },
+    /// A browser-built development client lists a loopback entry, which its
+    /// runtime cannot represent.
+    LoopbackInBrowserClient {
+        /// The refused loopback entry.
+        entry: FrameOriginEntry,
+    },
 }
 
-impl std::fmt::Display for LoopbackAtRelease {
+impl std::fmt::Display for FrameListRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut written = String::with_capacity(self.entry.written_len());
-        self.entry.write(&mut written);
-        write!(
-            f,
-            "`delivery.frameOrigins` lists `{written}`, a loopback origin that is for `ipe dev` \
-             only; a release build trusts `https://` origins"
-        )
+        let (entry, why) = match self {
+            Self::LoopbackAtRelease { entry } => (
+                entry,
+                "a loopback origin that is for served `ipe dev` only; a release build trusts \
+                 `https://` origins",
+            ),
+            Self::LoopbackInBrowserClient { entry } => (
+                entry,
+                "a loopback origin that is for served `ipe dev` only; a browser-built client \
+                 trusts `https://` origins",
+            ),
+        };
+        let mut written = String::with_capacity(entry.written_len());
+        entry.write(&mut written);
+        write!(f, "`delivery.frameOrigins` lists `{written}`, {why}")
     }
 }
 
-/// The frame origins a build of `intent` may emit.
+/// The frame origins a build of `intent` for `target` may emit.
 ///
-/// A development build emits every entry; a release build only `https://`
-/// entries.
+/// A development build for `Native` or `WasmWasi` emits every entry (both
+/// promote `dev-posture`, so their runtime represents a loopback origin);
+/// every other build only `https://` entries.
 ///
 /// # Errors
 ///
-/// [`LoopbackAtRelease`] naming the first loopback entry of a release build.
-pub fn frame_origins_for_intent(
+/// [`FrameListRefused`] naming the first loopback entry a release build or a
+/// development browser client lists.
+pub fn frame_origins_for(
     entries: &FrameOriginEntries,
     intent: BuildIntent,
-) -> Result<&FrameOriginEntries, LoopbackAtRelease> {
-    match intent {
-        BuildIntent::Development => Ok(entries),
-        BuildIntent::Release => entries
-            .entries()
-            .find(|entry| matches!(entry, FrameOriginEntry::Loopback(_)))
-            .map_or(Ok(entries), |entry| {
-                Err(LoopbackAtRelease {
-                    entry: entry.clone(),
-                })
-            }),
-    }
+    target: ipe_ir::Target,
+) -> Result<&FrameOriginEntries, FrameListRefused> {
+    let refusal: fn(FrameOriginEntry) -> FrameListRefused = match (intent, target) {
+        (BuildIntent::Development, ipe_ir::Target::Native | ipe_ir::Target::WasmWasi) => {
+            return Ok(entries);
+        }
+        (BuildIntent::Development, ipe_ir::Target::WasmClient) => {
+            |entry| FrameListRefused::LoopbackInBrowserClient { entry }
+        }
+        (
+            BuildIntent::Release,
+            ipe_ir::Target::Native | ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi,
+        ) => |entry| FrameListRefused::LoopbackAtRelease { entry },
+    };
+    entries
+        .entries()
+        .find(|entry| matches!(entry, FrameOriginEntry::Loopback(_)))
+        .map_or(Ok(entries), |entry| Err(refusal(entry.clone())))
 }
 
 /// The [`FieldTag::Host`] payload of `host`.
@@ -455,33 +479,94 @@ mod tests {
     }
 
     /// R28: a release build refuses a loopback frame origin and names it; a
-    /// development build admits it; a release build admits `https://` entries.
+    /// development native build admits it; a release build admits `https://` entries.
     #[test]
     fn release_refuses_a_loopback_frame_origin() {
         let loopback = frames(&["https://player.example", "http://localhost:3000"]);
-        let refused = frame_origins_for_intent(&loopback, BuildIntent::Release);
+        let refused = frame_origins_for(&loopback, BuildIntent::Release, ipe_ir::Target::Native);
         assert!(
-            matches!(&refused, Err(LoopbackAtRelease { entry }) if matches!(entry, FrameOriginEntry::Loopback(_))),
+            matches!(&refused, Err(FrameListRefused::LoopbackAtRelease { entry }) if matches!(entry, FrameOriginEntry::Loopback(_))),
             "{refused:?}"
         );
         let Err(refusal) = refused else { return };
         let text = refusal.to_string();
         assert!(text.contains("`http://localhost:3000`"), "{text}");
-        assert!(text.contains("`ipe dev` only"), "{text}");
+        assert!(text.contains("served `ipe dev` only"), "{text}");
+        assert!(text.contains("a release build"), "{text}");
         assert_eq!(
-            frame_origins_for_intent(&loopback, BuildIntent::Development),
+            frame_origins_for(&loopback, BuildIntent::Development, ipe_ir::Target::Native),
             Ok(&loopback)
         );
         let https = frames(&["https://player.example"]);
         assert_eq!(
-            frame_origins_for_intent(&https, BuildIntent::Release),
+            frame_origins_for(&https, BuildIntent::Release, ipe_ir::Target::Native),
             Ok(&https)
         );
         let none = FrameOriginEntries::none();
         assert_eq!(
-            frame_origins_for_intent(&none, BuildIntent::Release),
+            frame_origins_for(&none, BuildIntent::Release, ipe_ir::Target::Native),
             Ok(&none)
         );
+    }
+
+    /// The verdict a refusal row expects.
+    #[derive(Clone, Copy, Debug)]
+    enum Row {
+        Admits,
+        AtRelease,
+        InBrowserClient,
+    }
+
+    /// R38: one row per `(BuildIntent, Target)`; a loopback entry is admitted
+    /// only by a development native or WASI build, and an `https://`-only list
+    /// by every build.
+    #[test]
+    fn frame_list_refusal_table() {
+        use ipe_ir::Target;
+        let loopback = frames(&["https://player.example", "http://localhost:3000"]);
+        let https = frames(&["https://player.example"]);
+        let table = [
+            (BuildIntent::Development, Target::Native, Row::Admits),
+            (BuildIntent::Development, Target::WasmWasi, Row::Admits),
+            (
+                BuildIntent::Development,
+                Target::WasmClient,
+                Row::InBrowserClient,
+            ),
+            (BuildIntent::Release, Target::Native, Row::AtRelease),
+            (BuildIntent::Release, Target::WasmClient, Row::AtRelease),
+            (BuildIntent::Release, Target::WasmWasi, Row::AtRelease),
+        ];
+        for (intent, target, row) in table {
+            let verdict = frame_origins_for(&loopback, intent, target);
+            let held = match row {
+                Row::Admits => verdict == Ok(&loopback),
+                Row::AtRelease => matches!(
+                    &verdict,
+                    Err(FrameListRefused::LoopbackAtRelease { entry })
+                        if matches!(entry, FrameOriginEntry::Loopback(_))
+                ),
+                Row::InBrowserClient => matches!(
+                    &verdict,
+                    Err(FrameListRefused::LoopbackInBrowserClient { entry })
+                        if matches!(entry, FrameOriginEntry::Loopback(_))
+                ),
+            };
+            assert!(held, "{intent:?} {target:?}: {verdict:?}, expected {row:?}");
+            if let Err(refusal) = &verdict {
+                let text = refusal.to_string();
+                assert!(text.contains("`http://localhost:3000`"), "{text}");
+            }
+            assert_eq!(
+                frame_origins_for(&https, intent, target),
+                Ok(&https),
+                "{intent:?} {target:?}"
+            );
+        }
+        let browser = frame_origins_for(&loopback, BuildIntent::Development, Target::WasmClient);
+        let Err(refusal) = browser else { return };
+        let text = refusal.to_string();
+        assert!(text.contains("a browser-built client"), "{text}");
     }
 
     /// The listed frame origins split the key, and an empty list keeps a

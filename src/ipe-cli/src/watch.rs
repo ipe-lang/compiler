@@ -1243,10 +1243,18 @@ fn run_inner(
                     opts.hot_appearance,
                     opts.runtime_emit,
                 );
-                // A development rebuild never refuses a frame origin; the
-                // notice is shown once, by the first build of the session.
-                if let Ok(reach) = crate::driver::frame_step(&settings) {
-                    crate::driver::show_frame_reach(reach);
+                // The notice is shown once, by the first build of the
+                // session. A refused list is a manifest the next save must
+                // fix, so no retry is scheduled.
+                match crate::driver::frame_step(&settings) {
+                    Ok(reach) => crate::driver::show_frame_reach(reach),
+                    Err(e) => {
+                        emit_watch_line(
+                            &crate::style::TerminalSafe::sanitize(&format!("[ipe dev watch] {e}")),
+                            WatchRole::Failure,
+                        );
+                        continue;
+                    }
                 }
                 // Borrow each module's text from the snapshot:
                 // `sync_source_root` clones only at the real mutation points

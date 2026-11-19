@@ -1015,18 +1015,62 @@ mod tests {
     /// The browser entry judges the environment before the program's first
     /// line, as a native `main` does, and a program whose environment was
     /// refused or never judged does not start.
+    ///
+    /// Both entry hooks reach the one judge, which sets the one latch from the
+    /// frame-admission fold; the trusting hook registers its frames before the
+    /// judge runs; the exiting `frames::register` has no wasm32 form.
     #[test]
     fn the_browser_entry_runs_the_startup_check_before_the_program() {
         let sources = runtime_sources();
-        let wasm = sources
-            .iter()
-            .find(|(file, _)| file == "wasm/mod.rs")
-            .map(|(_, text)| text.as_str());
+        let source_of = |name: &str| {
+            sources
+                .iter()
+                .find(|(file, _)| file == name)
+                .map(|(_, text)| text.as_str())
+        };
+        let wasm = source_of("wasm/mod.rs");
+        let judge = wasm.and_then(|text| item_body(text, "judge_startup("));
+        let check = judge.and_then(|body| body.find("crate::env_registry::startup_check()"));
+        let fold = judge.and_then(|body| body.find("startup_accepted("));
+        let set = judge.and_then(|body| body.find("STARTUP_ACCEPTED.set("));
+        assert!(
+            matches!((check, fold, set), (Some(c), Some(f), Some(s)) if c < f && f < s)
+                && judge.is_some_and(|body| body.matches("STARTUP_ACCEPTED.set(").count() == 1),
+            "the startup judge must check the environment, fold, then set the latch once: {judge:?}"
+        );
+        assert_eq!(
+            wasm.map(|text| text.matches("STARTUP_ACCEPTED.set(").count()),
+            Some(1),
+            "only the startup judge sets the latch"
+        );
         let hook = wasm.and_then(|text| item_body(text, "install_panic_hook()"));
         assert!(
-            hook.is_some_and(|body| body.contains("crate::env_registry::startup_check()")
-                && body.contains("STARTUP_ACCEPTED.set(")),
-            "the browser entry hook must judge the environment: {hook:?}"
+            hook.is_some_and(|body| body.contains("judge_startup(FrameAdmission::NoList)")),
+            "the browser entry hook must reach the startup judge: {hook:?}"
+        );
+        let trusting = wasm.and_then(|text| item_body(text, "install_panic_hook_trusting_frames("));
+        let register = trusting.and_then(|body| body.find("crate::frames::try_register("));
+        let judged = trusting.and_then(|body| body.find("judge_startup("));
+        assert!(
+            matches!((register, judged), (Some(r), Some(j)) if r < j),
+            "the trusting hook must register its frames before the judge: {trusting:?}"
+        );
+        let frames = source_of("frames.rs").unwrap_or_default();
+        let declared: Vec<&str> = frames
+            .lines()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|pair| {
+                pair.get(1)
+                    .is_some_and(|line| line.starts_with("pub fn register("))
+            })
+            .filter_map(|pair| pair.first().copied())
+            .collect();
+        assert!(
+            declared.len() == 1
+                && declared.iter().all(|attr| attr.starts_with("#[cfg(")
+                    && attr.contains("not(target_arch = \"wasm32\")")),
+            "`frames::register` must be declared once, never on wasm32: {declared:?}"
         );
         let start = wasm.and_then(|text| item_body(text, "run_start<"));
         let gate = start.and_then(|body| body.find("STARTUP_ACCEPTED.get() != Some(&true)"));

@@ -356,20 +356,25 @@ fn manifest_emit_settings(
 
 /// The trusted-frames reach a build of `settings` reports.
 ///
-/// Every intent reports a listed origin; a release build refuses a loopback
-/// origin first, since only `ipe dev` trusts one.
+/// Every intent and target reports a listed origin; a release build and a
+/// development browser client refuse a loopback origin first, since only a
+/// served `ipe dev` trusts one.
 ///
 /// # Errors
 ///
-/// [`CliError::ProjectRefused`] naming the loopback origin of a release
-/// build.
+/// [`CliError::ProjectRefused`] naming the loopback origin, under the verb of
+/// the command that refused it.
 pub fn frame_step(
     settings: &ipe_backend_rust::EmitSettings,
 ) -> Result<Option<crate::frame_reach::FrameReach>, CliError> {
-    ipe_backend_rust::frame_origins_for_intent(&settings.frame_origins, settings.intent)
+    ipe_backend_rust::frame_origins_for(&settings.frame_origins, settings.intent, settings.target)
         .map(crate::frame_reach::FrameReach::of)
         .map_err(|refusal| {
-            CliError::ProjectRefused(text::msg::command_refusal(&"release", &refusal))
+            let command = match refusal {
+                ipe_backend_rust::FrameListRefused::LoopbackAtRelease { .. } => "release",
+                ipe_backend_rust::FrameListRefused::LoopbackInBrowserClient { .. } => "dev",
+            };
+            CliError::ProjectRefused(text::msg::command_refusal(&command, &refusal))
         })
 }
 
@@ -3469,10 +3474,19 @@ mod tests {
         frame_origins: ipe_backend_rust::FrameOriginEntries,
         intent: ipe_backend_rust::BuildIntent,
     ) -> ipe_backend_rust::EmitSettings {
+        frame_settings_for(frame_origins, intent, ipe_ir::Target::Native)
+    }
+
+    /// A bare emit for `target` under `intent` trusting `frame_origins` to frame.
+    fn frame_settings_for(
+        frame_origins: ipe_backend_rust::FrameOriginEntries,
+        intent: ipe_backend_rust::BuildIntent,
+        target: ipe_ir::Target,
+    ) -> ipe_backend_rust::EmitSettings {
         ipe_backend_rust::EmitSettings {
             db_driver: ipe_backend_rust::DbDriver::Sqlite,
             ffi: None,
-            target: ipe_ir::Target::Native,
+            target,
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
             server_origins: ipe_backend_rust::ServerOrigins::none(),
@@ -3499,11 +3513,46 @@ mod tests {
         let refused = frame_step(&at(ipe_backend_rust::BuildIntent::Release));
         assert!(
             matches!(&refused, Err(CliError::ProjectRefused(text))
-                if text.contains("`http://localhost:3000`") && text.contains("`ipe dev` only")),
+                if text.starts_with("ipe release:")
+                    && text.contains("`http://localhost:3000`")
+                    && text.contains("served `ipe dev` only")),
             "{refused:?}"
         );
         assert!(matches!(
             frame_step(&at(ipe_backend_rust::BuildIntent::Development)),
+            Ok(Some(_))
+        ));
+    }
+
+    /// R38, the CLI half: a development browser client refuses a loopback
+    /// frame origin under `ipe dev`, never `ipe release`, and names it; a
+    /// development WASI build admits it.
+    #[test]
+    #[allow(clippy::expect_used)] // the planted origin is well-formed
+    fn wasm_client_refuses_a_loopback_frame_origin() {
+        let entry = ipe_backend_rust::FrameOriginEntry::parse("http://localhost:3000")
+            .expect("a frame origin");
+        let frames = ipe_backend_rust::FrameOriginEntries::new([entry]).expect("a frame list");
+        let development = ipe_backend_rust::BuildIntent::Development;
+        let refused = frame_step(&frame_settings_for(
+            frames.clone(),
+            development,
+            ipe_ir::Target::WasmClient,
+        ));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(text))
+                if text.starts_with("ipe dev:")
+                    && !text.contains("ipe release")
+                    && text.contains("`http://localhost:3000`")
+                    && text.contains("a browser-built client")),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            frame_step(&frame_settings_for(
+                frames,
+                development,
+                ipe_ir::Target::WasmWasi
+            )),
             Ok(Some(_))
         ));
     }

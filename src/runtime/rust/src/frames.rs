@@ -3,7 +3,7 @@
 //! [`DELEGATION_FEATURES`] is the one table of permission features a frame may
 //! be delegated, each with its [`FeatureClass`]; the `allow` attribute parser
 //! ([`Delegation::parse`]) and the served `Permissions-Policy` read it, and a
-//! build-time check ties it to the header's vocabulary. [`register`] takes the
+//! build-time check ties it to the header's vocabulary. [`try_register`] takes the
 //! manifest's origins and the app's granted web-capability suffixes, re-parses
 //! every origin, and holds the result as the program's one [`FramePolicy`]; a
 //! program that never registers holds [`FramePolicy::none`].
@@ -815,7 +815,7 @@ pub fn policy() -> &'static FramePolicy {
     REGISTERED.get().unwrap_or(&NONE)
 }
 
-/// Why [`register`] refused the program's frame origins.
+/// Why [`try_register`] refused the program's frame origins.
 #[cfg(feature = "encoding")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameRegisterRefusal {
@@ -882,15 +882,29 @@ fn register_into(
     Ok(())
 }
 
-/// Register the program's trusted frame origins and granted web-capability
-/// suffixes. Called by the generated program before the server binds.
+/// Register the program's trusted frame origins and granted web-capability suffixes.
 ///
 /// Each origin is re-parsed, so an emitted list cannot widen past the parser.
-/// Origins that do not form a policy stop the program with exit code 1 and
-/// the refusal on stderr. The first registration wins and is never widened.
+/// The first registration wins and is never widened.
+///
+/// # Errors
+///
+/// The [`FrameRegisterRefusal`] of origins that do not form a policy; nothing
+/// is registered then.
 #[cfg(feature = "encoding")]
+pub fn try_register(origins: &[&str], granted: &[&str]) -> Result<(), FrameRegisterRefusal> {
+    register_into(&REGISTERED, origins, granted)
+}
+
+/// Register the program's trusted frame origins, or stop the native program.
+///
+/// Called by the generated server before it binds. Origins that do not form
+/// a policy stop the program with exit code 1 and the refusal on stderr. A
+/// wasm32 build has no such form: its entry reports through
+/// `wasm::install_panic_hook_trusting_frames` and never starts the program.
+#[cfg(all(feature = "encoding", not(target_arch = "wasm32")))]
 pub fn register(origins: &[&str], granted: &[&str]) {
-    if let Err(refusal) = register_into(&REGISTERED, origins, granted) {
+    if let Err(refusal) = try_register(origins, granted) {
         crate::core::eprint_task_error(&refusal.to_string());
         crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
     }
