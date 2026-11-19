@@ -1867,7 +1867,7 @@ fn a_gamepad_app_without_the_grant_is_rejected_ipe_s0002() -> TestResult {
 // ── trusted frame origins ───────────────────────────────────────────────────
 
 /// A `Web.tea` page: a web leaf that registers the project's frame list.
-const WEB_TEA_PAGE: &str = r#"module Main exposing (main)
+const WEB_TEA_PAGE: &str = r"module Main exposing (main)
 
 import Ipe.Tea.Web as Web
 import Ipe.Ui as Ui
@@ -1902,7 +1902,7 @@ main =
         { init = init, update = update, view = view, subscriptions = subscriptions
         , routes = [], notFound = Noop
         }
-"#;
+";
 
 /// A project named `tag` whose `src/Main.ipe` is `source`, its manifest
 /// carrying `delivery`. The caller removes the returned dir.
@@ -1983,15 +1983,14 @@ fn capabilities_command_refuses_a_frame_list_without_a_web_leaf() -> TestResult 
                 "{tag}: `ipe capabilities` succeeds:\n{human}"
             );
             assert!(human.contains("pure"), "{tag}: {human}");
-            assert!(!plain.contains("frame:"), "{tag}: {plain}");
         } else {
             assert!(
                 !ok && !plain_ok,
                 "{tag}: `ipe capabilities` must refuse:\n{human}"
             );
             assert!(!human.contains("trusted frame origins"), "{tag}: {human}");
-            assert!(!plain.contains("frame:"), "{tag}: {plain}");
         }
+        assert!(!plain.contains("frame:"), "{tag}: {plain}");
     }
     Ok(())
 }
