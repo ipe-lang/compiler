@@ -6223,6 +6223,31 @@ class TestAptInstallScript(unittest.TestCase):
             self.assertEqual(self.left, ["partial"])
             self.assertTrue(os.path.isfile(target))
 
+    def test_unlisted_entry_of_any_extension_removed(self) -> None:
+        # apt names a cached archive after the index's file extension, so a
+        # cached entry not spelled `*.deb` is checked like any other: only
+        # apt's own `partial` directory and `lock` file stay unlisted.
+        debs: dict[str, bytes | None] = {
+            "gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb": self._GOOD,
+            "at_3.2.5-1ubuntu1_amd64.udeb": b"original bytes!!!!",
+            "notes.txt": b"x",
+            "lock": b"",
+        }
+        code, _calls = self.run_script("x", archives="{tmp}/archives", uris=self._listing(), debs=debs)
+        self.assertEqual(code, 0, self.stderr)
+        self.assertEqual(self.left, ["gir1.2-atk-1.0_2.60.4-0ubuntu0.1_amd64v3.deb", "lock", "partial"])
+        self.assertIn("keeps 1 cached archives the signed index lists and removes 2", self.stdout)
+
+    def test_symlinked_partial_and_lock_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as outside, tempfile.TemporaryDirectory() as tmp:
+            archives = os.path.join(tmp, "archives")
+            os.makedirs(archives)
+            os.symlink(outside, os.path.join(archives, "partial"))
+            os.symlink(os.path.join(outside, "lock"), os.path.join(archives, "lock"))
+            code, _calls = self.run_script("x", archives=archives, uris=self._listing())
+            self.assertEqual(code, 0, self.stderr)
+            self.assertEqual(self.left, [])
+
     def test_directory_named_as_archive_refused(self) -> None:
         code, calls = self.run_script("x", archives="{tmp}/archives", uris=self._listing(), debs={"odd_1_amd64.deb": None})
         self.assertNotEqual(code, 0)

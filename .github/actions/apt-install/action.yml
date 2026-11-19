@@ -15,7 +15,8 @@ description: >-
   archive directory is a job's cache, each attempt first asks apt, from the
   index `update` has just verified against its signature, for the name, size
   and SHA-256 of every archive the install needs, and removes every cached
-  archive that is not listed or whose size or hash differs (a hash type other
+  entry in it (apart from apt's own `partial` directory and `lock` file)
+  that is not a listed archive or whose size or hash differs (a hash type other
   than SHA-256 or SHA-512 counts as differing), so apt installs only archives
   the signed index vouches for. When every attempt fails the step fails, and
   so does a spent budget.
@@ -166,10 +167,13 @@ runs:
               kept=0
               removed=0
               shopt -s nullglob dotglob
-              debs=("$APT_ARCHIVES"/*.deb)
+              cached=("$APT_ARCHIVES"/*)
               shopt -u nullglob dotglob
-              for deb in "${debs[@]}"; do
+              for deb in "${cached[@]}"; do
                 name="${deb##*/}"
+                if [[ ! -L "$deb" ]] && { [[ "$name" == partial && -d "$deb" ]] || [[ "$name" == lock && -f "$deb" ]]; }; then
+                  continue
+                fi
                 entry="${listed[$name]-}"
                 size=""
                 hash_type=""
