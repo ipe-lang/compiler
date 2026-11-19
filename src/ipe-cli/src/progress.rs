@@ -26,10 +26,15 @@
 //! character set dropped is the one the runtime's replay dump drops too.
 
 use std::io::{IsTerminal, Write};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use ipe_diagnostics::terminal::{TerminalLine, TerminalSafe};
 
+use crate::cli_args::OutputFormat;
 use crate::style::{self, GUTTER, Outcome, Palette};
+use crate::threads::{self, ThreadRole};
 
 /// How a stage line is presented: animated and rewritten in place on a
 /// terminal, or one settled plain line per stage otherwise.
@@ -286,8 +291,159 @@ impl<W: Write> Drop for Stage<W> {
     }
 }
 
+/// Whether a slow step shows a spinner while it runs.
+///
+/// Decided once per command from its output format and stderr, so no render
+/// site re-tests either.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Indicator {
+    /// Nothing is painted.
+    Silent,
+    /// A delayed spinner on stderr, cleared before the step returns.
+    Spinner,
+}
+
+impl Indicator {
+    /// The indicator for a command's output `format` and its `stderr` mode.
+    ///
+    /// Only human output with a terminal stderr spins; machine output and a
+    /// piped or `NO_COLOR` stderr never do.
+    #[must_use]
+    pub const fn decide(format: OutputFormat, stderr: Mode) -> Self {
+        match (format, stderr) {
+            (OutputFormat::Human, Mode::Terminal) => Self::Spinner,
+            (OutputFormat::Human, Mode::Plain)
+            | (OutputFormat::Plain | OutputFormat::Json, Mode::Terminal | Mode::Plain) => {
+                Self::Silent
+            }
+        }
+    }
+}
+
+/// When a pending spinner first paints and how fast it turns.
+#[derive(Clone, Copy, Debug)]
+struct Timing {
+    /// How long a step runs before the first frame paints.
+    delay: Duration,
+    /// How long each frame stays up.
+    frame: Duration,
+}
+
+/// The spinner timing every pending step uses.
+const PENDING: Timing = Timing {
+    delay: Duration::from_millis(400),
+    frame: Duration::from_millis(80),
+};
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the spinner would paint at once or turn slower than it waits [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    !PENDING.delay.is_zero()
+        && !PENDING.frame.is_zero()
+        && PENDING.frame.as_nanos() < PENDING.delay.as_nanos()
+);
+
+/// Run `body`, showing `label` beside a spinner on stderr while it is slow.
+///
+/// [`Indicator::Silent`] runs `body` inline with nothing painted. Under
+/// [`Indicator::Spinner`] nothing paints unless `body` outlasts the delay, and
+/// whatever painted is cleared, never settled, before this returns — on a
+/// value, an error, or a panic alike. A ticker thread the OS refuses only
+/// costs the spinner.
+pub fn while_pending<T>(indicator: Indicator, label: &str, body: impl FnOnce() -> T) -> T {
+    while_pending_on(indicator, std::io::stderr(), PENDING, label, body).0
+}
+
+/// [`while_pending`] on an explicit `writer` and `timing`.
+///
+/// Hands the writer back when it was never moved or its ticker joined, so a
+/// test reads what was painted.
+fn while_pending_on<W: Write + Send + 'static, T>(
+    indicator: Indicator,
+    writer: W,
+    timing: Timing,
+    label: &str,
+    body: impl FnOnce() -> T,
+) -> (T, Option<W>) {
+    match indicator {
+        Indicator::Silent => (body(), Some(writer)),
+        Indicator::Spinner => {
+            let label = TerminalLine::sanitize(label);
+            let (stop, stopped) = mpsc::channel::<()>();
+            let Ok(handle) = threads::spawn_named(ThreadRole::ProgressTicker, move || {
+                tick(writer, &label, timing, &stopped)
+            }) else {
+                return (body(), None);
+            };
+            let mut ticker = Ticker {
+                stop: Some(stop),
+                handle: Some(handle),
+            };
+            let value = body();
+            (value, ticker.finish())
+        }
+    }
+}
+
+/// A running ticker: dropping its sender stops it, joining it waits for the
+/// clear.
+struct Ticker<W> {
+    stop: Option<Sender<()>>,
+    handle: Option<JoinHandle<W>>,
+}
+
+impl<W> Ticker<W> {
+    /// Stop the ticker and wait until it has cleared its line.
+    fn finish(&mut self) -> Option<W> {
+        drop(self.stop.take());
+        self.handle.take().and_then(|handle| handle.join().ok())
+    }
+}
+
+impl<W> Drop for Ticker<W> {
+    /// Stop and join a ticker whose body erred or panicked.
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// The ticker loop: wait out the delay, then paint frames until stopped.
+///
+/// A stop before the delay paints nothing; a stop after any frame clears the
+/// line without a newline.
+fn tick<W: Write>(
+    mut writer: W,
+    label: &TerminalLine,
+    timing: Timing,
+    stopped: &Receiver<()>,
+) -> W {
+    if !matches!(
+        stopped.recv_timeout(timing.delay),
+        Err(RecvTimeoutError::Timeout)
+    ) {
+        return writer;
+    }
+    let mut frame = 0_usize;
+    loop {
+        let _ = writer.write_all(running_line(Mode::Terminal, label, frame).as_bytes());
+        let _ = writer.flush();
+        if !matches!(
+            stopped.recv_timeout(timing.frame),
+            Err(RecvTimeoutError::Timeout)
+        ) {
+            break;
+        }
+        frame = frame.wrapping_add(1);
+    }
+    let _ = writer.write_all(format!("\r{CLEAR_TO_EOL}").as_bytes());
+    let _ = writer.flush();
+    writer
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
 
     #[test]
@@ -504,5 +660,188 @@ mod tests {
         );
         assert_eq!(text.matches('\n').count(), 1, "one settled line: {text:?}");
         assert!(text.ends_with('\n'), "{text:?}");
+    }
+
+    /// A writer that signals its first write and keeps every byte.
+    struct Signalling {
+        bytes: Vec<u8>,
+        first: Option<Sender<()>>,
+    }
+
+    impl Write for Signalling {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes.extend_from_slice(buf);
+            if let Some(first) = self.first.take() {
+                let _ = first.send(());
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer whose bytes a test still holds after the ticker drops it.
+    struct Shared(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Shared {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| std::io::Error::other("poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    const QUICK: Timing = Timing {
+        delay: Duration::ZERO,
+        frame: Duration::from_millis(1),
+    };
+
+    fn cleared() -> String {
+        format!("\r{CLEAR_TO_EOL}")
+    }
+
+    #[test]
+    fn an_indicator_spins_only_for_human_output_on_a_terminal_stderr() {
+        assert_eq!(
+            Indicator::decide(OutputFormat::Human, Mode::Terminal),
+            Indicator::Spinner
+        );
+        for (format, stderr) in [
+            (OutputFormat::Human, Mode::Plain),
+            (OutputFormat::Plain, Mode::Terminal),
+            (OutputFormat::Plain, Mode::Plain),
+            (OutputFormat::Json, Mode::Terminal),
+            (OutputFormat::Json, Mode::Plain),
+        ] {
+            assert_eq!(
+                Indicator::decide(format, stderr),
+                Indicator::Silent,
+                "{format:?} on {stderr:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_silent_pending_writes_nothing_and_runs_the_body() {
+        let (value, writer) = while_pending_on(Indicator::Silent, Vec::new(), QUICK, "x", || 7);
+        assert_eq!(value, 7);
+        assert_eq!(writer, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_pending_body_quicker_than_the_delay_writes_nothing() {
+        let slow = Timing {
+            delay: Duration::from_secs(10),
+            frame: Duration::from_secs(1),
+        };
+        let (value, writer) = while_pending_on(Indicator::Spinner, Vec::new(), slow, "x", || 7);
+        assert_eq!(value, 7);
+        assert_eq!(writer, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_pending_body_past_the_delay_is_cleared_before_it_returns() {
+        let (first, painted) = mpsc::channel();
+        let writer = Signalling {
+            bytes: Vec::new(),
+            first: Some(first),
+        };
+        let (value, writer) =
+            while_pending_on(Indicator::Spinner, writer, QUICK, "reading", || {
+                painted.recv_timeout(Duration::from_secs(5)).is_ok()
+            });
+        assert!(value, "the ticker painted while the body ran");
+        assert!(
+            writer.is_some(),
+            "the ticker joined and handed its writer back"
+        );
+        let Some(writer) = writer else { return };
+        let out = String::from_utf8_lossy(&writer.bytes).into_owned();
+        assert!(
+            style::SPINNER_FRAMES
+                .iter()
+                .any(|frame| out.contains(frame)),
+            "{out:?}"
+        );
+        assert!(out.contains("reading"), "{out:?}");
+        assert!(out.ends_with(&cleared()), "{out:?}");
+        assert!(!out.contains('\n'), "{out:?}");
+    }
+
+    #[test]
+    fn a_refused_ticker_thread_runs_the_body_without_a_spinner() {
+        threads::refusal::refuse(ThreadRole::ProgressTicker);
+        let (value, writer) = while_pending_on(Indicator::Spinner, Vec::new(), QUICK, "x", || 7);
+        assert_eq!(value, 7);
+        assert_eq!(writer, None);
+    }
+
+    #[test]
+    #[allow(clippy::panic)] // the body panics on purpose to prove the ticker still joins
+    fn an_erring_or_panicking_body_still_stops_and_joins_the_ticker() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let (value, _) = while_pending_on(
+            Indicator::Spinner,
+            Shared(Arc::clone(&bytes)),
+            QUICK,
+            "x",
+            || Err::<(), &str>("refused"),
+        );
+        assert_eq!(value, Err("refused"));
+        assert_eq!(Arc::strong_count(&bytes), 1);
+
+        let writer = Shared(Arc::clone(&bytes));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            while_pending_on(Indicator::Spinner, writer, QUICK, "x", || {
+                std::thread::sleep(Duration::from_millis(5));
+                panic!("the body fell over")
+            })
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(
+            Arc::strong_count(&bytes),
+            1,
+            "the ticker was joined and its writer dropped"
+        );
+        let out = bytes.lock().map(|b| b.clone()).unwrap_or_default();
+        let out = String::from_utf8_lossy(&out);
+        assert!(
+            out.is_empty() || out.ends_with(&cleared()),
+            "a painted line is cleared: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_painted_label_carries_no_escape_control_or_bidi_byte() {
+        let (first, painted) = mpsc::channel();
+        let writer = Signalling {
+            bytes: Vec::new(),
+            first: Some(first),
+        };
+        let hostile = "a\u{1b}]0;title\u{7}b\u{1b}[2Jc\u{202e}d\re";
+        let (value, writer) = while_pending_on(Indicator::Spinner, writer, QUICK, hostile, || {
+            painted.recv_timeout(Duration::from_secs(5)).is_ok()
+        });
+        assert!(value, "the ticker painted while the body ran");
+        let Some(writer) = writer else { return };
+        let out = String::from_utf8_lossy(&writer.bytes).into_owned();
+        for injected in ["\u{1b}]", "\u{7}", "\u{1b}[2J", "\u{202e}", "d\re"] {
+            assert!(!out.contains(injected), "{injected:?} reached {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_pending_label_is_one_terminal_line() {
+        let label = crate::text::doc_lookup_pending();
+        assert_eq!(TerminalLine::sanitize(label).as_str(), label);
+        assert!(!label.contains('\n'));
     }
 }

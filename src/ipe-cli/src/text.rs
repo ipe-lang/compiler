@@ -1131,6 +1131,8 @@ messages! {
     thread_role_watch_cargo_waiter = "thread-role-watch-cargo-waiter";
     /// The thread that enforces a WASI run's wall-clock ceiling.
     thread_role_wasi_wall_clock = "thread-role-wasi-wall-clock";
+    /// The thread that paints a progress spinner while a slow step runs.
+    thread_role_progress_ticker = "thread-role-progress-ticker";
     /// `ipe dev watch` could not start its dependency-resolve retry thread.
     watch_thread_refused(detail) = "watch-thread-refused";
     /// Publish from a dirty working tree.
@@ -1601,6 +1603,8 @@ messages! {
     doc_pick_retry = "doc-pick-retry";
     /// The `ipe doc` prompt ended without opening an entry.
     doc_pick_none = "doc-pick-none";
+    /// The progress label shown while a doc lookup reads documentation.
+    doc_lookup_pending = "doc-lookup-pending";
     /// An `ipe doc <query>` short name matched more than one stdlib module.
     doc_ambiguous_module(query, candidates: &crate::text::TerminalBlock) = "doc-ambiguous-module";
     /// `ipe doc --type` matched no symbol.

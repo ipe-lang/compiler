@@ -21,11 +21,12 @@ use ipe_syntax::BinOp;
 use super::ASSET;
 use crate::delivery::{DeliveryTokens, Shape};
 use crate::doc::{
-    DocMode, LookupTerm, MemberResolution, ModuleDoc, ModuleQuery, build_doc_bundle_over,
-    build_index, parse_doc, project_modules_at, resolve_member, resolve_module_query, resolve_term,
+    DocMode, LookupTerm, MemberResolution, ModuleQuery, ProjectScope, build_doc_bundle_over,
+    build_index, parse_doc, resolve_member, resolve_module_query, resolve_term,
 };
 use crate::doc_bundle::{DocBundle, DocKind, DocsOverlay};
 use crate::help::{CommandSpec, FlagSpec, all_command_specs, group_member, is_command, is_group};
+use crate::progress::Indicator;
 
 /// The names the guide states do not exist; each must stay unresolvable.
 const ABSENT: &[&str] = &["Result.fromTask", "Ipe.Prelude"];
@@ -414,8 +415,8 @@ struct Producers {
     specs: Vec<CommandSpec>,
     /// The content index and the doc bundle over it.
     docs: OnceCell<Docs>,
-    /// The modules of a freshly scaffolded project.
-    project: OnceCell<Vec<ModuleDoc>>,
+    /// A freshly scaffolded project, read once.
+    project: OnceCell<ProjectScope>,
 }
 
 impl Producers {
@@ -438,17 +439,22 @@ impl Producers {
         })
     }
 
-    /// The modules of the project `ipe init` scaffolds, the context of the
-    /// guide's "a project module" lookup.
-    fn project(&self) -> &[ModuleDoc] {
+    /// The project `ipe init` scaffolds, the context of the guide's "a
+    /// project module" and module-member lookups.
+    ///
+    /// The scope is read in full before its directory is removed, so every
+    /// later ask is answered from what it settled.
+    fn project(&self) -> &ProjectScope {
         self.project.get_or_init(|| {
             let dir = ipe_test_temp::temp_root()
                 .join(format!("ipe-agents-guide-claims-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
-            let scaffolded = crate::init::run_init(&[dir.display().to_string(), "web".to_owned()]);
-            let modules = scaffolded.map_or_else(|_| Vec::new(), |()| project_modules_at(&dir));
+            let scope = ProjectScope::at(&dir, Indicator::Silent);
+            if crate::init::run_init(&[dir.display().to_string(), "web".to_owned()]).is_ok() {
+                let _ = scope.all();
+            }
             let _ = std::fs::remove_dir_all(&dir);
-            modules
+            scope
         })
     }
 
@@ -466,7 +472,7 @@ impl Producers {
         match mode {
             DocMode::Lookup { key, .. } => self.looks_up(key),
             DocMode::Query { module, .. } => matches!(
-                resolve_module_query(module.text(), || self.project().to_vec()),
+                resolve_module_query(module.text(), self.project()),
                 Ok(ModuleQuery::Module(_) | ModuleQuery::Member(..))
             ),
             DocMode::Generate { .. }
@@ -490,7 +496,7 @@ impl Producers {
             .as_ref()
             .is_ok_and(|(index, _)| index.resolve(query.text()).is_some());
         indexed
-            || match resolve_member(query.text()) {
+            || match resolve_member(query.text(), self.project()) {
                 Ok(MemberResolution::Found(..)) => true,
                 Ok(MemberResolution::Ambiguous(_)) | Err(_) => false,
                 Ok(MemberResolution::Miss) => self.resolves(term),

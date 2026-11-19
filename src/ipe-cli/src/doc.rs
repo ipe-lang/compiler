@@ -108,6 +108,7 @@
 //! package index), full-text search, and remote hosting. `serve` is a local
 //! read-only preview of the static site, never a publish path.
 
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -120,7 +121,7 @@ use ipe_types::{Ty, VarNamer, ty_to_doc};
 
 use crate::CliError;
 use crate::api_surface::{
-    DiffError, ModuleApi, ModulePath, PublicApi, UnionApi, extract_walked, read_tree,
+    DiffError, ModuleApi, ModulePath, PublicApi, UnionApi, WalkedTree, extract_walked, read_tree,
 };
 use crate::cli_args::OutputFormat;
 use crate::doc_bundle::{
@@ -128,6 +129,8 @@ use crate::doc_bundle::{
 };
 use crate::doc_pick::Pick;
 use crate::doc_search::{DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
+use crate::progress::{Indicator, Mode};
+use crate::project_root::{ProjectRoot, RootArg};
 use crate::text;
 
 /// The `docs.json` schema version. Bumped only on an incompatible shape change,
@@ -198,8 +201,8 @@ pub enum DocMode {
     },
     /// List all stdlib + project module names.
     List {
-        /// The package whose modules are listed alongside stdlib (defaults to `.`).
-        path: PathBuf,
+        /// Where the project modules listed alongside stdlib come from.
+        target: ListTarget,
         /// How to render the list.
         format: OutputFormat,
     },
@@ -249,6 +252,15 @@ pub enum LookupTerm {
         /// The key part, proven a query too.
         key: DocQuery,
     },
+}
+
+/// Where `ipe doc list` reads the project modules it lists beside the stdlib.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ListTarget {
+    /// No path given: the current directory's package, when it is one.
+    Cwd,
+    /// The package or source tree the path names.
+    Named(PathBuf),
 }
 
 /// The default output directory when `--out` is omitted, mirroring Elm's `doc/`.
@@ -432,7 +444,12 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
             port: flags.port,
         },
         Sub::Check => DocMode::Check { path },
-        Sub::List => DocMode::List { path, format },
+        Sub::List => DocMode::List {
+            target: flags.path.as_deref().map_or(ListTarget::Cwd, |named| {
+                ListTarget::Named(PathBuf::from(named))
+            }),
+            format,
+        },
         Sub::Query(module) => DocMode::Query { module, format },
         Sub::CheckExamples => DocMode::CheckExamples,
         Sub::Lookup(key) => DocMode::Lookup { key, format },
@@ -1012,7 +1029,11 @@ fn run_bundle_lookup(
 /// codes, symbol keys, module names), then a project module member, then a
 /// unique exact bundle key. Only when all of those miss does the bundle
 /// ranking run, so a precise hit never has a list put in front of it.
-fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
+fn run_doc_lookup_with_fuzzy(
+    query: &DocQuery,
+    scope: &ProjectScope,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     let key = query.text();
     // An exact index key opens before a project member is tried; the bundle
     // is built only past both.
@@ -1023,7 +1044,7 @@ fn run_doc_lookup_with_fuzzy(query: &DocQuery, format: OutputFormat) -> Result<(
     }
 
     // A member of a module the index does not carry (a project module).
-    match resolve_member(key)? {
+    match resolve_member(key, scope)? {
         MemberResolution::Found(module, member) => {
             render_member(&module, &member, format);
             return Ok(());
@@ -1158,12 +1179,16 @@ fn ambiguous_module_error(query: &str, candidates: &[String], format: OutputForm
 /// exposes a value or type of that name.
 ///
 /// # Errors
-/// [`CliError`] when the matched stdlib module cannot be documented.
-pub(crate) fn resolve_member(key: &str) -> Result<MemberResolution, CliError> {
+/// [`CliError`] when the current directory's package cannot be read or typed,
+/// or the matched stdlib module cannot be documented.
+pub(crate) fn resolve_member(
+    key: &str,
+    scope: &ProjectScope,
+) -> Result<MemberResolution, CliError> {
     let Some((module_name, member)) = key.rsplit_once('.') else {
         return Ok(MemberResolution::Miss);
     };
-    Ok(match find_module_doc(module_name)? {
+    Ok(match find_module_doc(module_name, scope)? {
         ModuleLookup::Found(module) => {
             let exposed = module.values.iter().any(|v| v.name == member)
                 || module.unions.iter().any(|u| u.name == member);
@@ -1191,13 +1216,11 @@ enum ModuleLookup {
 /// standard library), then the standard library.
 ///
 /// # Errors
-/// [`CliError`] when the matched stdlib module cannot be documented.
-fn find_module_doc(module_name: &str) -> Result<ModuleLookup, CliError> {
-    if let Some(module) = query_project_modules()
-        .into_iter()
-        .find(|m| m.name == module_name)
-    {
-        return Ok(ModuleLookup::Found(module));
+/// [`CliError`] when the current directory's package cannot be read or typed,
+/// or the matched stdlib module cannot be documented.
+fn find_module_doc(module_name: &str, scope: &ProjectScope) -> Result<ModuleLookup, CliError> {
+    if let Some(module) = scope.module(module_name)? {
+        return Ok(ModuleLookup::Found(module.clone()));
     }
     Ok(match query_single_stdlib_module(module_name)? {
         StdlibModuleLookup::Found(module) => ModuleLookup::Found(module),
@@ -1263,13 +1286,23 @@ fn render_member(module: &ModuleDoc, member: &str, format: OutputFormat) {
 /// (lower score = better), up to 20 hits.
 ///
 /// Fail-closed: an unparseable query exits non-zero with a descriptive message.
-fn run_type_search(query: &str, format: OutputFormat) -> Result<(), CliError> {
+fn run_type_search(
+    query: &str,
+    scope: &ProjectScope,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     use crate::doc_type_search::{
         TypeSearchError, render_type_matches_human, render_type_matches_json, type_search,
     };
 
-    let (docs, _) = build_docs(&PathBuf::from(DEFAULT_PATH))?;
-    let hits = type_search(&docs.modules, query, 20).map_err(TypeSearchError::into_cli_error)?;
+    let project = scope.all()?.to_vec();
+    let stdlib = crate::progress::while_pending(
+        scope.indicator,
+        text::doc_lookup_pending(),
+        build_stdlib_docs,
+    )?;
+    let modules = project_then_stdlib(project, stdlib);
+    let hits = type_search(&modules, query, 20).map_err(TypeSearchError::into_cli_error)?;
 
     let stdout = std::io::stdout();
     match format {
@@ -1413,6 +1446,10 @@ fn render_doc_entry_human(entry: &ipe_docs::Entry, p: &crate::style::Palette) ->
 /// coverage report when `check` finds an undocumented binding.
 pub fn run_doc(rest: &[String]) -> Result<(), CliError> {
     let mode = parse_doc(rest)?;
+    let indicator = reads_project_as(&mode).map_or(Indicator::Silent, |format| {
+        Indicator::decide(format, Mode::for_stream(&std::io::stderr()))
+    });
+    let scope = ProjectScope::at_cwd(indicator);
     let human = matches!(
         mode,
         DocMode::Lookup {
@@ -1423,13 +1460,70 @@ pub fn run_doc(rest: &[String]) -> Result<(), CliError> {
             ..
         }
     );
-    match dispatch(mode) {
+    let format = output_format(&mode);
+    let outcome = match dispatch(mode, &scope) {
         Err(CliError::DocNotFound { miss })
             if human && !miss.hits.is_empty() && crate::unsafe_ack::is_interactive() =>
         {
-            open_picked(miss)
+            open_picked(miss, &scope)
         }
         outcome => outcome,
+    };
+    in_machine_form(format, outcome)
+}
+
+/// The output format a mode renders in; `None` for a mode with no format.
+const fn output_format(mode: &DocMode) -> Option<OutputFormat> {
+    match mode {
+        DocMode::List { format, .. }
+        | DocMode::Query { format, .. }
+        | DocMode::TypeSearch { format, .. }
+        | DocMode::Lookup { format, .. } => Some(*format),
+        DocMode::Generate { .. }
+        | DocMode::Serve { .. }
+        | DocMode::Check { .. }
+        | DocMode::CheckExamples => None,
+    }
+}
+
+/// `outcome` with any refusal not yet written put in the machine error
+/// envelope under `--json`/`--plain`, so no refusal of a machine-format
+/// command reaches the human frame.
+fn in_machine_form(
+    format: Option<OutputFormat>,
+    outcome: Result<(), CliError>,
+) -> Result<(), CliError> {
+    match (format, outcome) {
+        (_, Ok(())) => Ok(()),
+        (_, Err(CliError::DiagnosticJsonEmitted)) => Err(CliError::DiagnosticJsonEmitted),
+        (None | Some(OutputFormat::Human), Err(err)) => Err(err),
+        (Some(format @ (OutputFormat::Plain | OutputFormat::Json)), Err(err)) => {
+            Err(crate::driver::emit_machine_error(format, "doc", &err))
+        }
+    }
+}
+
+/// The output format of a mode that may read the current directory's package.
+///
+/// `None` for a mode that names its own path or reads no project, so it never
+/// consults a [`ProjectScope`].
+const fn reads_project_as(mode: &DocMode) -> Option<OutputFormat> {
+    match mode {
+        DocMode::List { format, .. }
+        | DocMode::Query { format, .. }
+        | DocMode::TypeSearch { format, .. }
+        | DocMode::Lookup {
+            key: LookupTerm::Bare(_),
+            format,
+        } => Some(*format),
+        DocMode::Generate { .. }
+        | DocMode::Serve { .. }
+        | DocMode::Check { .. }
+        | DocMode::CheckExamples
+        | DocMode::Lookup {
+            key: LookupTerm::Qualified { .. },
+            ..
+        } => None,
     }
 }
 
@@ -1442,7 +1536,7 @@ pub fn run_doc(rest: &[String]) -> Result<(), CliError> {
 /// # Errors
 /// [`CliError::Usage`] when the prompt ends without a pick, else whatever the
 /// picked entry's lookup returns.
-fn open_picked(miss: DocMiss) -> Result<(), CliError> {
+fn open_picked(miss: DocMiss, scope: &ProjectScope) -> Result<(), CliError> {
     let terms: Vec<String> = miss
         .hits
         .iter()
@@ -1459,13 +1553,14 @@ fn open_picked(miss: DocMiss) -> Result<(), CliError> {
         Pick::Cancelled | Pick::Exhausted => None,
     };
     match chosen {
-        Some(term) => dispatch(parse_doc(std::slice::from_ref(term))?),
+        Some(term) => dispatch(parse_doc(std::slice::from_ref(term))?, scope),
         None => Err(CliError::Usage(text::msg::doc_pick_none())),
     }
 }
 
-/// Run one parsed [`DocMode`].
-fn dispatch(mode: DocMode) -> Result<(), CliError> {
+/// Run one parsed [`DocMode`], reading the current directory's package only
+/// through `scope`.
+fn dispatch(mode: DocMode, scope: &ProjectScope) -> Result<(), CliError> {
     match mode {
         DocMode::Generate {
             path,
@@ -1474,11 +1569,8 @@ fn dispatch(mode: DocMode) -> Result<(), CliError> {
         } => generate(&path, &out, write_format),
         DocMode::Serve { path, port } => serve(&path, port),
         DocMode::Check { path } => check(&path),
-        DocMode::List { path, format } => {
-            list_modules(&path, format);
-            Ok(())
-        }
-        DocMode::Query { module, format } => query_module(&module, format),
+        DocMode::List { target, format } => list_modules(&target, scope, format),
+        DocMode::Query { module, format } => query_module(&module, scope, format),
         DocMode::CheckExamples => check_examples(),
         DocMode::Lookup {
             key: LookupTerm::Qualified { term, key },
@@ -1487,8 +1579,8 @@ fn dispatch(mode: DocMode) -> Result<(), CliError> {
         DocMode::Lookup {
             key: LookupTerm::Bare(query),
             format,
-        } => run_doc_lookup_with_fuzzy(&query, format),
-        DocMode::TypeSearch { query, format } => run_type_search(&query, format),
+        } => run_doc_lookup_with_fuzzy(&query, scope, format),
+        DocMode::TypeSearch { query, format } => run_type_search(&query, scope, format),
     }
 }
 
@@ -1660,36 +1752,8 @@ struct Undocumented {
 /// the [`DocInputs::Tree`] the build read.
 fn build_docs(path: &Path) -> Result<(DocsJson, DocInputs), CliError> {
     let walked = read_tree(path).map_err(CliError::from)?;
-    let api: PublicApi = extract_walked(&walked).map_err(CliError::from)?;
-    let sources = &walked.modules;
-
-    // Collect project modules.
-    let mut project_modules: Vec<ModuleDoc> = Vec::with_capacity(api.modules.len());
-    for (module_path, module_api) in &api.modules {
-        let comments = sources
-            .get(module_path)
-            .map(|(_, src)| scan_doc_comments(src))
-            .unwrap_or_default();
-        project_modules.push(module_doc(
-            module_path,
-            module_api,
-            &comments,
-            ModuleKind::Local,
-        ));
-    }
-    project_modules.sort_by(|a, b| a.name.cmp(&b.name));
-
-    // Collect stdlib modules (both compiled-source and kernel-backed).
-    let mut stdlib = build_stdlib_docs()?;
-    stdlib.sort_by(|a, b| a.name.cmp(&b.name));
-
-    // A project module shadows a stdlib module of the same name — project wins.
-    let project_names: BTreeSet<&str> = project_modules.iter().map(|m| m.name.as_str()).collect();
-    stdlib.retain(|m| !project_names.contains(m.name.as_str()));
-
-    // Present the user's own modules first, then the standard library.
-    let mut modules = project_modules;
-    modules.extend(stdlib);
+    let project_modules = project_module_docs(&walked)?;
+    let modules = project_then_stdlib(project_modules, build_stdlib_docs()?);
 
     let docs = DocsJson {
         version: DOCS_JSON_VERSION,
@@ -1697,6 +1761,39 @@ fn build_docs(path: &Path) -> Result<(DocsJson, DocInputs), CliError> {
         disclosure: package_disclosure(path)?,
     };
     Ok((docs, DocInputs::Tree(walked.root)))
+}
+
+/// The documented modules of a walked project tree, type-checked once.
+///
+/// # Errors
+/// The [`DiffError`] of a tree that does not type-check.
+fn project_module_docs(walked: &WalkedTree) -> Result<Vec<ModuleDoc>, CliError> {
+    let api: PublicApi = extract_walked(walked).map_err(CliError::from)?;
+    let sources = &walked.modules;
+    Ok(api
+        .modules
+        .iter()
+        .map(|(module_path, module_api)| {
+            let comments = sources
+                .get(module_path)
+                .map(|(_, src)| scan_doc_comments(src))
+                .unwrap_or_default();
+            module_doc(module_path, module_api, &comments, ModuleKind::Local)
+        })
+        .collect())
+}
+
+/// Project modules first, then the stdlib modules no project module shadows,
+/// each group in name order.
+fn project_then_stdlib(mut project: Vec<ModuleDoc>, mut stdlib: Vec<ModuleDoc>) -> Vec<ModuleDoc> {
+    project.sort_by(|a, b| a.name.cmp(&b.name));
+    stdlib.sort_by(|a, b| a.name.cmp(&b.name));
+    {
+        let project_names: BTreeSet<&str> = project.iter().map(|m| m.name.as_str()).collect();
+        stdlib.retain(|m| !project_names.contains(m.name.as_str()));
+    }
+    project.extend(stdlib);
+    project
 }
 
 /// The package's compiler-derived disclosure (control model + capability set),
@@ -1736,22 +1833,7 @@ fn package_disclosure(path: &Path) -> Result<Option<PackageDisclosure>, CliError
 /// Used by `check` — stdlib modules are exempt from the coverage gate.
 fn build_project_docs(path: &Path) -> Result<DocsJson, CliError> {
     let walked = read_tree(path).map_err(CliError::from)?;
-    let api: PublicApi = extract_walked(&walked).map_err(CliError::from)?;
-    let sources = &walked.modules;
-
-    let mut modules = Vec::with_capacity(api.modules.len());
-    for (module_path, module_api) in &api.modules {
-        let comments = sources
-            .get(module_path)
-            .map(|(_, src)| scan_doc_comments(src))
-            .unwrap_or_default();
-        modules.push(module_doc(
-            module_path,
-            module_api,
-            &comments,
-            ModuleKind::Local,
-        ));
-    }
+    let modules = project_module_docs(&walked)?;
     // The coverage gate (`ipe doc --check`) reasons over documentation coverage
     // only; the package disclosure is a `generate`/`query` surface, not part of
     // the coverage contract.
@@ -2416,27 +2498,23 @@ fn build_kernel_module_docs() -> Result<BTreeMap<String, ModuleDoc>, CliError> {
 /// * Human (default): guttered module names with a header.
 /// * `--plain`: one bare module name per line, no framing.
 /// * `--json`: `{"modules":["Ipe.List","Ipe.String",…]}`.
-fn list_modules(path: &Path, format: OutputFormat) {
+///
+/// # Errors
+/// The refusal of a package or named tree that cannot be read.
+fn list_modules(
+    target: &ListTarget,
+    scope: &ProjectScope,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     use crate::screen::{Screen, Stream, emit_machine};
     use crate::style::GUTTER;
+
+    let project_names = list_project_names(target, scope)?;
 
     // Collect stdlib names.
     let stdlib: Vec<String> = stdlib_module_names();
 
-    // Collect project module names (best-effort; an unresolvable project is skipped
-    // so `--list` always succeeds for stdlib).
-    let project: Vec<String> = read_tree(path).map_or_else(
-        |_| Vec::new(),
-        |walked| {
-            let mut names: Vec<String> = walked.modules.keys().map(|p| p.join(".")).collect();
-            names.sort();
-            names
-        },
-    );
-
     // A project module shadows a stdlib module of the same name.
-    let mut project_names: Vec<String> = project;
-    project_names.sort();
     let project_set: BTreeSet<&str> = project_names.iter().map(String::as_str).collect();
     let stdlib_names: Vec<String> = stdlib
         .into_iter()
@@ -2532,38 +2610,185 @@ fn list_modules(path: &Path, format: OutputFormat) {
                 .emit();
         }
     }
+    Ok(())
 }
 
-/// Collect project [`ModuleDoc`]s from the current directory (best-effort).
+/// The sorted project module names `list` shows for `target`.
 ///
-/// Returns an empty vec when the project cannot be read or typed, so `query`
-/// can still serve stdlib modules when no project is present.
-fn query_project_modules() -> Vec<ModuleDoc> {
-    project_modules_at(Path::new(DEFAULT_PATH))
+/// # Errors
+/// The refusal of a package or named tree that cannot be read.
+fn list_project_names(target: &ListTarget, scope: &ProjectScope) -> Result<Vec<String>, CliError> {
+    match target {
+        ListTarget::Cwd => scope.names(),
+        ListTarget::Named(path) => Ok(module_names(&read_tree(path)?)),
+    }
 }
 
-/// The documented modules of the project at `path`, empty when it holds none
-/// that extract.
-pub(crate) fn project_modules_at(path: &Path) -> Vec<ModuleDoc> {
-    read_tree(path).map_or_else(
-        |_| Vec::new(),
-        |walked| {
-            let Ok(api) = extract_walked(&walked) else {
-                return Vec::new();
-            };
-            let sources = &walked.modules;
-            api.modules
-                .iter()
-                .map(|(module_path, module_api)| {
-                    let comments = sources
-                        .get(module_path)
-                        .map(|(_, src)| scan_doc_comments(src))
-                        .unwrap_or_default();
-                    module_doc(module_path, module_api, &comments, ModuleKind::Local)
-                })
-                .collect()
-        },
-    )
+/// The dotted names of every module a walk discovered, sorted.
+fn module_names(walked: &WalkedTree) -> Vec<String> {
+    let mut names: Vec<String> = walked.modules.keys().map(|p| p.join(".")).collect();
+    names.sort();
+    names
+}
+
+/// The current directory's package as one `ipe doc` command may consult it.
+///
+/// Built once per command and read lazily: nothing is resolved until a
+/// non-reserved name is asked, a package's `src/` is walked at most once, and
+/// the walked package is type-checked at most once and only for a discovered
+/// module name. A directory with no `package.ipe` holds no project module and
+/// is never walked. Every other refusal is returned to the asker; only a
+/// settled outcome is kept, so the error type needs no `Clone`, and a later
+/// ask meets the same refusal again.
+pub(crate) struct ProjectScope {
+    /// The directory resolved: the current one in production.
+    dir: PathBuf,
+    /// Whether reads under this scope show a terminal spinner.
+    indicator: Indicator,
+    /// The settled resolution, set on the first non-reserved ask.
+    resolved: OnceCell<Resolved>,
+    /// How many reads each step ran, for the at-most-once proofs.
+    #[cfg(test)]
+    calls: ScopeCalls,
+}
+
+/// A settled [`ProjectScope`] resolution.
+enum Resolved {
+    /// The directory holds no `package.ipe`: no project module exists, nothing was walked.
+    NoPackage,
+    /// A package: its discovered `src/` tree and its documentation, typed lazily.
+    Package {
+        /// The package's `src/` modules as discovered.
+        walked: WalkedTree,
+        /// The documented modules, set by the first type-check that succeeds.
+        typed: OnceCell<Vec<ModuleDoc>>,
+    },
+}
+
+/// The read counts of one [`ProjectScope`].
+#[cfg(test)]
+#[derive(Default)]
+struct ScopeCalls {
+    /// Walks of a resolved package's `src/`.
+    discovers: std::cell::Cell<usize>,
+    /// Type-checks of a walked package.
+    type_checks: std::cell::Cell<usize>,
+}
+
+impl ProjectScope {
+    /// The scope of the current directory; reads nothing yet.
+    pub(crate) fn at_cwd(indicator: Indicator) -> Self {
+        Self::at(Path::new(DEFAULT_PATH), indicator)
+    }
+
+    /// The scope of `dir`; reads nothing yet.
+    pub(crate) fn at(dir: &Path, indicator: Indicator) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            indicator,
+            resolved: OnceCell::new(),
+            #[cfg(test)]
+            calls: ScopeCalls::default(),
+        }
+    }
+
+    /// The documented project module named `name`, if the package has one.
+    ///
+    /// A reserved-namespace name is never a project module, so it resolves
+    /// nothing. A name no discovered module carries misses without a
+    /// type-check.
+    ///
+    /// # Errors
+    /// A package that cannot be resolved, read, or type-checked.
+    pub(crate) fn module(&self, name: &str) -> Result<Option<&ModuleDoc>, CliError> {
+        if in_reserved_namespace(name) {
+            return Ok(None);
+        }
+        let Resolved::Package { walked, typed } = self.resolved()? else {
+            return Ok(None);
+        };
+        if !walked.modules.keys().any(|path| path.join(".") == name) {
+            return Ok(None);
+        }
+        Ok(self.typed(walked, typed)?.iter().find(|m| m.name == name))
+    }
+
+    /// Every documented project module; none outside a package.
+    ///
+    /// # Errors
+    /// A package that cannot be resolved, read, or type-checked.
+    pub(crate) fn all(&self) -> Result<&[ModuleDoc], CliError> {
+        match self.resolved()? {
+            Resolved::NoPackage => Ok(&[]),
+            Resolved::Package { walked, typed } => self.typed(walked, typed),
+        }
+    }
+
+    /// Every discovered project module name, sorted, without a type-check.
+    ///
+    /// # Errors
+    /// A package that cannot be resolved or read.
+    pub(crate) fn names(&self) -> Result<Vec<String>, CliError> {
+        Ok(match self.resolved()? {
+            Resolved::NoPackage => Vec::new(),
+            Resolved::Package { walked, .. } => module_names(walked),
+        })
+    }
+
+    /// The settled resolution, resolving the directory on first use.
+    fn resolved(&self) -> Result<&Resolved, CliError> {
+        if let Some(resolved) = self.resolved.get() {
+            return Ok(resolved);
+        }
+        let resolved = self.resolve()?;
+        Ok(self.resolved.get_or_init(|| resolved))
+    }
+
+    /// Resolve the directory by the project SSOT and walk a package's `src/`.
+    ///
+    /// Only [`CliError::NoManifest`] means "not a package"; any other refusal
+    /// is a package the user meant, reported.
+    fn resolve(&self) -> Result<Resolved, CliError> {
+        let root = match ProjectRoot::resolve(RootArg::at(&self.dir)) {
+            Ok(root) => root,
+            Err(CliError::NoManifest { .. }) => return Ok(Resolved::NoPackage),
+            Err(refused) => return Err(refused),
+        };
+        #[cfg(test)]
+        bump(&self.calls.discovers);
+        let walked =
+            crate::progress::while_pending(self.indicator, text::doc_lookup_pending(), || {
+                read_tree(root.path())
+            })?;
+        Ok(Resolved::Package {
+            walked,
+            typed: OnceCell::new(),
+        })
+    }
+
+    /// The package's documented modules, type-checking `walked` on first use.
+    fn typed<'a>(
+        &self,
+        walked: &WalkedTree,
+        typed: &'a OnceCell<Vec<ModuleDoc>>,
+    ) -> Result<&'a [ModuleDoc], CliError> {
+        if let Some(docs) = typed.get() {
+            return Ok(docs);
+        }
+        #[cfg(test)]
+        bump(&self.calls.type_checks);
+        let docs =
+            crate::progress::while_pending(self.indicator, text::doc_lookup_pending(), || {
+                project_module_docs(walked)
+            })?;
+        Ok(typed.get_or_init(|| docs))
+    }
+}
+
+/// Count one more read.
+#[cfg(test)]
+fn bump(count: &std::cell::Cell<usize>) {
+    count.set(count.get().saturating_add(1));
 }
 
 /// Render a single [`ModuleDoc`] in human-readable guttered form.
@@ -2628,34 +2853,28 @@ pub(crate) enum ModuleQuery {
     Miss,
 }
 
-/// Resolve an `ipe doc <Module>` query against `project` and the stdlib.
+/// Resolve an `ipe doc <Module>` query against `scope` and the stdlib.
 ///
-/// The project wins over the stdlib on a name collision, and a reserved-namespace
-/// name never reads `project`. A name that is no module tries a
-/// `Module.member` resolution.
+/// The project wins over the stdlib on a name collision. A name that is no
+/// module tries a `Module.member` resolution.
 ///
 /// # Errors
 ///
-/// The error of a stdlib module that fails to extract.
+/// The refusal of a package that cannot be read or typed, or the error of a
+/// stdlib module that fails to extract.
 pub(crate) fn resolve_module_query(
     module_name: &str,
-    project: impl FnOnce() -> Vec<ModuleDoc>,
+    scope: &ProjectScope,
 ) -> Result<ModuleQuery, CliError> {
-    // Project modules are already a single resolved pass; the stdlib side is
-    // resolved lazily so a single-name query type-checks one module, not all
-    // ~130 compiled-source modules.
-    let project = if in_reserved_namespace(module_name) {
-        Vec::new()
-    } else {
-        project()
-    };
-    if let Some(module) = project.into_iter().find(|m| m.name == module_name) {
-        return Ok(ModuleQuery::Module(module));
+    // The stdlib side is resolved lazily so a single-name query type-checks
+    // one module, not every compiled-source module.
+    if let Some(module) = scope.module(module_name)? {
+        return Ok(ModuleQuery::Module(module.clone()));
     }
     Ok(match query_single_stdlib_module(module_name)? {
         StdlibModuleLookup::Found(module) => ModuleQuery::Module(module),
         StdlibModuleLookup::Ambiguous(candidates) => ModuleQuery::Ambiguous(candidates),
-        StdlibModuleLookup::Miss => match resolve_member(module_name)? {
+        StdlibModuleLookup::Miss => match resolve_member(module_name, scope)? {
             MemberResolution::Found(owner, member) => ModuleQuery::Member(owner, member),
             MemberResolution::Ambiguous(candidates) => ModuleQuery::Ambiguous(candidates),
             MemberResolution::Miss => ModuleQuery::Miss,
@@ -2666,11 +2885,15 @@ pub(crate) fn resolve_module_query(
 /// Query one module's API and render it per `format`.
 ///
 /// Resolves `term` as [`resolve_module_query`] does, against the stdlib and the
-/// working directory's project. Errors with a typed message on an unknown
+/// working directory's package. Errors with a typed message on an unknown
 /// module.
-fn query_module(term: &DocQuery, format: OutputFormat) -> Result<(), CliError> {
+fn query_module(
+    term: &DocQuery,
+    scope: &ProjectScope,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     let module_name = term.text();
-    match resolve_module_query(module_name, query_project_modules)? {
+    match resolve_module_query(module_name, scope)? {
         ModuleQuery::Module(module) => {
             render_query_module(&module, format);
             Ok(())
@@ -10436,14 +10659,142 @@ total =
     /// candidate table rules it out before any module is built).
     #[test]
     fn find_module_doc_misses_an_unknown_module() {
+        let dir = scope_dir("unknown-module");
+        let scope = ProjectScope::at(&dir, Indicator::Silent);
         assert!(matches!(
-            find_module_doc("NotAModule"),
+            find_module_doc("NotAModule", &scope),
             Ok(ModuleLookup::Miss)
         ));
         assert!(matches!(
-            find_module_doc("Ipe.Nope"),
+            find_module_doc("Ipe.Nope", &scope),
             Ok(ModuleLookup::Miss)
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── The project scope: resolved lazily, walked and typed at most once ────
+
+    /// A fresh empty directory for one scope test.
+    fn scope_dir(tag: &str) -> PathBuf {
+        let dir =
+            ipe_test_temp::temp_root().join(format!("ipe-doc-scope-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scope dir");
+        dir
+    }
+
+    /// A package at a fresh directory: a manifest, `src/Main.ipe`, and
+    /// `src/Shapes.ipe`.
+    fn scope_package(tag: &str) -> PathBuf {
+        let dir = scope_dir(tag);
+        std::fs::write(
+            dir.join("package.ipe"),
+            format!(
+                "module Package exposing (package)\n\n\npackage =\n    {{ name = \"scope-{tag}\" }}\n"
+            ),
+        )
+        .expect("write the manifest");
+        std::fs::create_dir_all(dir.join("src")).expect("create src");
+        std::fs::write(
+            dir.join("src").join("Main.ipe"),
+            "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n",
+        )
+        .expect("write Main");
+        std::fs::write(
+            dir.join("src").join("Shapes.ipe"),
+            "module Shapes exposing (area)\n\n-- | The area.\narea : Int -> Int\narea n = n * n\n",
+        )
+        .expect("write Shapes");
+        dir
+    }
+
+    #[test]
+    fn a_scope_outside_a_package_discovers_nothing() {
+        let dir = scope_dir("outside");
+        std::fs::write(
+            dir.join("Loose.ipe"),
+            "module Loose exposing (x)\n\nx = 1\n",
+        )
+        .expect("write a loose module");
+        let scope = ProjectScope::at(&dir, Indicator::Silent);
+        assert!(matches!(scope.module("Loose"), Ok(None)));
+        assert!(matches!(scope.all(), Ok([])));
+        assert!(matches!(scope.names().as_deref(), Ok([])));
+        assert!(matches!(scope.resolved.get(), Some(Resolved::NoPackage)));
+        assert_eq!(scope.calls.discovers.get(), 0);
+        assert_eq!(scope.calls.type_checks.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_manifest_that_does_not_resolve_is_reported_not_read_as_no_package() {
+        let dir = scope_dir("no-src");
+        std::fs::write(
+            dir.join("package.ipe"),
+            "module Package exposing (package)\n\n\npackage =\n    { name = \"no-src\" }\n",
+        )
+        .expect("write the manifest");
+        let scope = ProjectScope::at(&dir, Indicator::Silent);
+        assert!(
+            scope.module("Shapes").is_err(),
+            "a refused package is reported"
+        );
+        assert!(scope.names().is_err(), "a refused package is reported");
+        assert!(scope.resolved.get().is_none(), "a refusal is never settled");
+        assert_eq!(scope.calls.discovers.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reserved_member_lookup_never_resolves_the_project() {
+        let dir = scope_dir("reserved");
+        let scope = ProjectScope::at(&dir, Indicator::Silent);
+        for name in ["Ipe.Nope", "Ipe", "Rust.Nope"] {
+            assert!(matches!(scope.module(name), Ok(None)), "{name}");
+        }
+        assert!(matches!(
+            resolve_member("Ipe.Nope.member", &scope),
+            Ok(MemberResolution::Miss)
+        ));
+        assert!(matches!(
+            resolve_module_query("Ipe.Nope", &scope),
+            Ok(ModuleQuery::Miss)
+        ));
+        assert!(
+            scope.resolved.get().is_none(),
+            "the directory was never resolved"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_package_miss_never_type_checks() {
+        let dir = scope_package("miss");
+        let scope = ProjectScope::at(&dir, Indicator::Silent);
+        assert!(matches!(scope.module("Nowhere"), Ok(None)));
+        assert!(matches!(scope.module("Shapes.Nope"), Ok(None)));
+        let names = scope.names().unwrap_or_default();
+        assert_eq!(names, ["Main", "Shapes"]);
+        assert_eq!(scope.calls.discovers.get(), 1);
+        assert_eq!(scope.calls.type_checks.get(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_module_hit_type_checks_once() {
+        let dir = scope_package("hit");
+        let scope = ProjectScope::at(&dir, Indicator::Silent);
+        let first = scope.module("Shapes");
+        assert!(
+            matches!(&first, Ok(Some(module)) if module.name == "Shapes"),
+            "{:?}",
+            first.as_ref().err()
+        );
+        assert!(matches!(scope.module("Main"), Ok(Some(_))));
+        assert!(scope.all().is_ok_and(|all| all.len() == 2));
+        assert_eq!(scope.calls.discovers.get(), 1);
+        assert_eq!(scope.calls.type_checks.get(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A lookup naming the coding-agent guide loosely lists it among the closest entries.

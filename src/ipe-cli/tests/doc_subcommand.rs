@@ -799,9 +799,8 @@ fn a_blank_term_is_refused() -> io::Result<()> {
 /// short and full forms name two different, independently reachable entries.
 #[test]
 fn a_project_module_shadows_stdlib_by_short_name_only() -> io::Result<()> {
-    let dir = fresh_dir("shadow_list")?;
+    let dir = package_dir("shadow_list")?;
     let src = dir.join("src");
-    fs::create_dir_all(&src)?;
     fs::write(
         src.join("List.ipe"),
         "-- | A project module that shadows the stdlib `List` by short name.\n\
@@ -827,6 +826,235 @@ fn a_project_module_shadows_stdlib_by_short_name_only() -> io::Result<()> {
         !stdout.contains("shadowMarker"),
         "the full name `Ipe.List` still reaches the STDLIB module:\n{stdout}"
     );
+    Ok(())
+}
+
+/// A package at a fresh directory: a manifest and a `src/Main.ipe` entry, the
+/// shape `ipe doc` reads as the current directory's package.
+fn package_dir(tag: &str) -> io::Result<PathBuf> {
+    let dir = fresh_dir(tag)?;
+    fs::write(dir.join("package.ipe"), support::package_ipe(tag))?;
+    let src = dir.join("src");
+    fs::create_dir_all(&src)?;
+    fs::write(
+        src.join("Main.ipe"),
+        "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n",
+    )?;
+    Ok(dir)
+}
+
+/// A documented project module whose one member `shapeMarker` is unique to it.
+const SHAPES: &str = "-- | Project shapes.\n\
+                      module Shapes exposing (shapeMarker)\n\n\
+                      -- | A marker unique to this project.\n\
+                      shapeMarker : Int\n\
+                      shapeMarker =\n    1\n";
+
+/// Outside a package (no `package.ipe`), a lookup reads the stdlib alone: an
+/// `.ipe` tree in the current directory is never read as a project.
+#[test]
+fn a_lookup_outside_a_package_never_reads_the_cwd_as_a_project() -> io::Result<()> {
+    let dir = fresh_dir("outside_package")?;
+    let src = dir.join("src");
+    fs::create_dir_all(&src)?;
+    fs::write(src.join("Shapes.ipe"), SHAPES)?;
+    fs::write(
+        src.join("Broken.ipe"),
+        "module Broken exposing (x)\n\nx = \n",
+    )?;
+    for key in ["Shapes", "Shapes.shapeMarker", "Broken"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--plain"]);
+        assert!(
+            !ok,
+            "`ipe doc {key}` outside a package must miss:\n{stdout}"
+        );
+        assert!(stdout.is_empty(), "{stdout}");
+        let project_terms = ["Shapes", "Shapes.shapeMarker", "Broken", "Broken.x"];
+        assert!(
+            stderr
+                .lines()
+                .filter_map(|line| line.split('\t').next())
+                .all(|term| !project_terms.contains(&term)),
+            "no candidate comes from the cwd tree:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("A marker unique to this project"),
+            "{stderr}"
+        );
+    }
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Ipe.List", "--plain"]);
+    assert!(ok, "the stdlib still resolves:\n{stderr}");
+    assert!(stdout.contains("map"), "{stdout}");
+    Ok(())
+}
+
+/// Inside a package, a lookup reads its `src/` modules and their members.
+#[test]
+fn a_lookup_in_a_package_reads_its_src() -> io::Result<()> {
+    let dir = package_dir("inside_package")?;
+    fs::write(dir.join("src").join("Shapes.ipe"), SHAPES)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Shapes", "--plain"]);
+    assert!(
+        ok,
+        "`ipe doc Shapes` resolves the package module:\n{stderr}"
+    );
+    assert!(stdout.contains("shapeMarker"), "{stdout}");
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Shapes.shapeMarker", "--plain"]);
+    assert!(ok, "`ipe doc Shapes.shapeMarker` resolves:\n{stderr}");
+    assert!(stdout.contains("shapeMarker"), "{stdout}");
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "--list", "--plain"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.lines().any(|line| line == "Shapes"), "{stdout}");
+    Ok(())
+}
+
+/// A package module that does not type-check is reported, never answered as
+/// a miss that hides the real error.
+#[test]
+fn a_project_module_that_does_not_type_check_is_reported_not_missed() -> io::Result<()> {
+    let dir = package_dir("ill_typed_package")?;
+    fs::write(
+        dir.join("src").join("Shapes.ipe"),
+        "module Shapes exposing (shapeMarker)\n\nshapeMarker : Int\nshapeMarker =\n    \"not an int\"\n",
+    )?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Shapes", "--plain"]);
+    assert!(!ok, "an ill-typed package module must fail:\n{stdout}");
+    assert!(
+        !stderr.contains("no documentation entry is named `Shapes`"),
+        "the type error is reported, not a miss:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// A reserved-namespace miss never resolves the package, so a package that
+/// cannot resolve (here: a manifest with no `src/`) still misses cleanly,
+/// while a project-shaped name in the same directory reports the refusal.
+#[test]
+fn a_reserved_miss_in_an_unresolvable_package_still_misses_cleanly() -> io::Result<()> {
+    let dir = fresh_dir("unresolvable_package")?;
+    fs::write(
+        dir.join("package.ipe"),
+        support::package_ipe("unresolvable_package"),
+    )?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Ipe.Nope"]);
+    assert!(!ok, "`ipe doc Ipe.Nope` must miss:\n{stdout}");
+    assert!(
+        stderr.contains("no documentation entry is named `Ipe.Nope`"),
+        "{stderr}"
+    );
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Shapes"]);
+    assert!(!ok, "`ipe doc Shapes` must fail:\n{stdout}");
+    assert!(
+        !stderr.contains("no documentation entry is named `Shapes`"),
+        "the unresolvable package is reported, not read as a miss:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// Under `--json`/`--plain`, a package that cannot be read or typed is
+/// refused through the machine error envelope, never the human frame.
+#[test]
+fn a_package_refusal_under_a_machine_format_is_the_machine_envelope() -> io::Result<()> {
+    let ill_typed = package_dir("machine_refusal_ill_typed")?;
+    fs::write(
+        ill_typed.join("src").join("Shapes.ipe"),
+        "module Shapes exposing (shapeMarker)\n\nshapeMarker : Int\nshapeMarker =\n    \"not an int\"\n",
+    )?;
+    let unresolvable = fresh_dir("machine_refusal_unresolvable")?;
+    fs::write(
+        unresolvable.join("package.ipe"),
+        support::package_ipe("machine_refusal_unresolvable"),
+    )?;
+    let cases: [(&Path, &[&str]); 4] = [
+        (&ill_typed, &["Shapes"]),
+        (&ill_typed, &["--type", "List a -> Int"]),
+        (&unresolvable, &["Shapes"]),
+        (&unresolvable, &["list"]),
+    ];
+    for (dir, query) in cases {
+        for format in ["--json", "--plain"] {
+            let mut args = vec!["doc"];
+            args.extend(query);
+            args.push(format);
+            let (ok, stdout, stderr) = run_in(dir, &args);
+            assert!(!ok, "{args:?} must fail:\n{stdout}");
+            assert!(stdout.is_empty(), "{args:?}:\n{stdout}");
+            assert!(
+                !stderr.contains("Ipê language"),
+                "{args:?} wrote the human frame:\n{stderr}"
+            );
+            if format == "--json" {
+                assert!(
+                    stderr.contains("\"ipe.cli.error/1\""),
+                    "{args:?}:\n{stderr}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Outside a package, a type search ranks the stdlib alone.
+#[test]
+fn type_search_outside_a_package_searches_the_stdlib() -> io::Result<()> {
+    let dir = fresh_dir("type_search_outside")?;
+    fs::write(
+        dir.join("Broken.ipe"),
+        "module Broken exposing (x)\n\nx = \n",
+    )?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "--type", "List a -> Int", "--plain"]);
+    assert!(ok, "the stdlib type search succeeds:\n{stderr}");
+    assert!(stdout.contains("length"), "{stdout}");
+    Ok(())
+}
+
+/// Outside a package, `--list` lists the stdlib alone.
+#[test]
+fn list_outside_a_package_lists_the_stdlib_alone() -> io::Result<()> {
+    let dir = fresh_dir("list_outside")?;
+    let src = dir.join("src");
+    fs::create_dir_all(&src)?;
+    fs::write(src.join("Shapes.ipe"), SHAPES)?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "--list", "--plain"]);
+    assert!(ok, "{stderr}");
+    assert!(stdout.lines().any(|line| line == "Ipe.List"), "{stdout}");
+    assert!(!stdout.lines().any(|line| line == "Shapes"), "{stdout}");
+    Ok(())
+}
+
+/// Off a terminal, no output format paints progress: stderr carries no
+/// carriage return, line clear, or spinner frame.
+#[test]
+fn a_lookup_writes_no_progress_bytes_off_a_terminal() -> io::Result<()> {
+    let dir = package_dir("no_progress_bytes")?;
+    fs::write(dir.join("src").join("Shapes.ipe"), SHAPES)?;
+    for format in [None, Some("--plain"), Some("--json")] {
+        for query in [
+            &["Ipe.Nope"][..],
+            &["Shapes"][..],
+            &["--type", "List a -> Int"][..],
+        ] {
+            let mut args = vec!["doc"];
+            args.extend(query);
+            args.extend(format);
+            let output = Command::new(support::ipe_bin())
+                .args(&args)
+                .current_dir(&dir)
+                .env_remove("NO_COLOR")
+                .output()?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !stderr.contains('\r') && !stderr.contains("\x1b[0K"),
+                "{args:?} wrote progress bytes:\n{stderr:?}"
+            );
+            assert!(
+                !ipe::style::SPINNER_FRAMES
+                    .iter()
+                    .any(|frame| stderr.contains(*frame)),
+                "{args:?} painted a spinner frame:\n{stderr:?}"
+            );
+        }
+    }
     Ok(())
 }
 
