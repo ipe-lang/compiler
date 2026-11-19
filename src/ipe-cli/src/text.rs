@@ -134,6 +134,7 @@ relayable!(
     ipe_sandbox::run_jail::FloorRefusal,
     ipe_ffi::diag::Diagnostic,
     ipe_ffi::diag::WireDefect,
+    ipe_backend_rust::FrameListRefused,
 );
 
 impl fmt::Display for Message {

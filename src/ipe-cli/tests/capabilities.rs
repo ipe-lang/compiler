@@ -1921,3 +1921,97 @@ fn capabilities_command_reads_frame_origins() -> TestResult {
     }
     Ok(())
 }
+
+/// A served page rendered through `Html.render`, with no `Web.tea` or `Web.embed` leaf.
+const SERVED_HTML: &str = r#"module Main exposing (main)
+
+import Ipe.Http.Server as Server
+import Ipe.Http.Server exposing (Request, Response)
+import Ipe.Task as Task
+import Ipe.Html as Html
+
+
+page : Request -> Task Error Response
+page _req =
+    Task.succeed (Server.html (Html.render (Html.div [] [ Html.text "hi" ])))
+
+
+main =
+    Server.listen 8000 [ Server.any "/" page ]
+"#;
+
+/// T16: a listed frame origin on a program with no web leaf is refused.
+///
+/// The served `Html.render` page registers no frame list, so `ipe dev build`
+/// and `ipe release eject` refuse the listed entry, naming the entry and the
+/// fix, and never print the trusted-origins notice. Without the list the same
+/// program ejects.
+#[test]
+fn a_frame_list_without_a_web_leaf_is_refused_at_build() -> TestResult {
+    for (tag, delivery) in [
+        (
+            "listed",
+            ", delivery = { frameOrigins = [ \"https://player.example\" ] }",
+        ),
+        ("absent", ""),
+    ] {
+        let dir = crate::support::scratch_root().join(format!(
+            "ipe-frames-noleaf-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        e2e_support::scratch::fresh(&dir);
+        std::fs::create_dir_all(dir.join("src"))?;
+        std::fs::write(
+            dir.join("package.ipe"),
+            format!(
+                "module Package exposing (package)\n\n\npackage =\n    {{ name = \"framepkg\", version = \"0.1.0\"{delivery} }}\n"
+            ),
+        )?;
+        std::fs::write(dir.join("src/Main.ipe"), SERVED_HTML)?;
+        let verbs: &[[&str; 2]] = if delivery.is_empty() {
+            &[["release", "eject"]]
+        } else {
+            &[["release", "eject"], ["dev", "build"]]
+        };
+        let ran = verbs
+            .iter()
+            .map(|verb| {
+                Command::new(support::ipe_bin())
+                    .args(verb)
+                    .arg("--out")
+                    .arg(dir.join(format!("out-{}", verb.join("-"))))
+                    .current_dir(dir.as_path())
+                    .env("NO_COLOR", "1")
+                    .output()
+                    .map(|output| (verb.join(" "), output))
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let _ = std::fs::remove_dir_all(dir.as_path());
+        for (verb, output) in ran? {
+            let said = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if delivery.is_empty() {
+                assert!(output.status.success(), "{tag} {verb}: {said}");
+                continue;
+            }
+            assert!(!output.status.success(), "{tag} {verb} must refuse: {said}");
+            assert!(
+                said.contains("`delivery.frameOrigins` lists `https://player.example`"),
+                "{tag} {verb}: {said}"
+            );
+            assert!(
+                said.contains("remove `frameOrigins` from `package.ipe`"),
+                "{tag} {verb}: {said}"
+            );
+            assert!(
+                !said.contains("trusted frame origins"),
+                "{tag} {verb}: {said}"
+            );
+        }
+    }
+    Ok(())
+}

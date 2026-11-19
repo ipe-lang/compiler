@@ -369,13 +369,37 @@ pub fn frame_step(
 ) -> Result<Option<crate::frame_reach::FrameReach>, CliError> {
     ipe_backend_rust::frame_origins_for(&settings.frame_origins, settings.intent, settings.target)
         .map(crate::frame_reach::FrameReach::of)
-        .map_err(|refusal| {
-            let command = match refusal {
-                ipe_backend_rust::FrameListRefused::LoopbackAtRelease { .. } => "release",
-                ipe_backend_rust::FrameListRefused::LoopbackInBrowserClient { .. } => "dev",
-            };
-            CliError::ProjectRefused(text::msg::command_refusal(&command, &refusal))
-        })
+        .map_err(|refusal| frame_refusal(&refusal))
+}
+
+/// Refuse a frame list `program` built under `settings` would drop.
+///
+/// # Errors
+///
+/// [`CliError::ProjectRefused`] naming the first listed origin when the
+/// program serves no `Web.tea`/`Web.embed` page and builds no browser client.
+fn frame_site_step(
+    program: &ipe_ir::Program,
+    settings: &ipe_backend_rust::EmitSettings,
+) -> Result<(), CliError> {
+    ipe_backend_rust::frame_origins_of(program, settings)
+        .map(|_| ())
+        .map_err(|refusal| frame_refusal(&refusal))
+}
+
+/// The CLI error of a frame-list refusal.
+///
+/// A loopback refusal names the command whose intent refused it; a list with
+/// no web leaf is refused by every command alike.
+fn frame_refusal(refusal: &ipe_backend_rust::FrameListRefused) -> CliError {
+    let command = match refusal {
+        ipe_backend_rust::FrameListRefused::LoopbackAtRelease { .. } => "release",
+        ipe_backend_rust::FrameListRefused::LoopbackInBrowserClient { .. } => "dev",
+        ipe_backend_rust::FrameListRefused::NoWebLeaf { .. } => {
+            return CliError::ProjectRefused(text::Message::relay(refusal));
+        }
+    };
+    CliError::ProjectRefused(text::msg::command_refusal(&command, refusal))
 }
 
 /// Set once the trusted-frames notice is shown, so an invocation shows it
@@ -1177,17 +1201,23 @@ fn compile_source_set_observed(
     cache_site: Option<&cache::CacheSite>,
     options: &BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
-    match frame_step(&settings) {
-        Ok(reach) => show_frame_reach(reach),
+    let reach = match frame_step(&settings) {
+        Ok(reach) => reach,
         Err(refusal) => return (Err(refusal), CacheOutcome::Miss),
-    }
+    };
     let front = front.on_compile_thread();
-    crate::threads::run_compile(move || {
+    let compiled = crate::threads::run_compile(move || {
         compile_source_set_here(
             &front, entry_path, target, runtime, blame_path, settings, cache_site, options,
         )
     })
-    .unwrap_or_else(|refused| (Err(refused), CacheOutcome::Miss))
+    .unwrap_or_else(|refused| (Err(refused), CacheOutcome::Miss));
+    // The notice follows the compile, which refuses a list the program
+    // registers nowhere, so a refused list is never reported as trusted.
+    if compiled.0.is_ok() {
+        show_frame_reach(reach);
+    }
+    compiled
 }
 
 /// [`compile_source_set_observed`] on the calling thread.
@@ -2328,6 +2358,15 @@ pub fn compile_prepared(
             }
         })?;
     }
+
+    // Frame-list shape gate: a listed origin on a program that registers no
+    // frame list (no served `Web.tea`/`Web.embed` leaf, no browser client) is
+    // refused before emission, never dropped. The emitter re-judges the same
+    // fact as its own boundary.
+    let folded = ipe_db::folded_program(db, source_root, entry_file)
+        .clone()
+        .map_err(span_attributed_err)?;
+    frame_site_step(&folded, config.settings(db))?;
 
     // `ipe_db::emit_manifest` (design doc §4.4) — the top-level
     // emit demand, assembled from the per-`RustFileId` query graph:

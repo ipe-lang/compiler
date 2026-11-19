@@ -36,7 +36,7 @@ mod emit_doc;
 mod emit_settings;
 pub use emit_settings::{
     CrateName, EmitHost, EmitSettings, FrameListRefused, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
-    TEST_RUN_KEY_ENV, frame_origins_for,
+    TEST_RUN_KEY_ENV, frame_origins_for, frame_origins_of,
 };
 mod emit_expr;
 mod emit_model_gate;
@@ -1704,6 +1704,21 @@ impl<'a> EmitCtx<'a> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::similar_names)] // `uses_ui` / `uses_tui` are intentionally similar
     fn build(interner: &'a Interner, program: &Program, settings: EmitSettings) -> DResult<Self> {
+        // The driver refuses a frame list the program registers nowhere
+        // (`frame_origins_of`); one reaching emission is a disagreement
+        // between that gate and this emitter, never a list to drop.
+        if let Some(entry) = emit_settings::dropped_frame_origin(program, &settings) {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::EmitCtx::build::frame_origins",
+                detail: format!(
+                    "{}; the driver's frame-list gate should have refused it",
+                    FrameListRefused::NoWebLeaf {
+                        entry: entry.clone()
+                    }
+                ),
+            });
+        }
+        let uses_webview = emit_settings::drives_webview(program, &settings.host);
         let EmitSettings {
             db_driver,
             ffi,
@@ -1720,9 +1735,9 @@ impl<'a> EmitCtx<'a> {
             host,
             intent: build_intent,
         } = settings;
-        let (webview_host, webview_window, served_install) = match host {
-            EmitHost::Served(install) => (false, None, install),
-            EmitHost::WebView(window) => (true, Some(window), ServedInstall::Off),
+        let (webview_window, served_install) = match host {
+            EmitHost::Served(install) => (None, install),
+            EmitHost::WebView(window) => (Some(window), ServedInstall::Off),
         };
         // Every emission entry builds its context here, so a malformed literal
         // route path or a runtime-owned literal attribute name is refused
@@ -2194,7 +2209,7 @@ impl<'a> EmitCtx<'a> {
         let uses_url = program.modules.iter().any(|m| m.uses_url);
 
         // detect Ipe.Ui / Ipe.Html / Ipe.Web / Ipe.Tui / Ipe.Console / Ipe.WebView usage.
-        // `uses_webview` is the webview-native delivery signal: the resolved
+        // `uses_webview` (`drives_webview`) is the webview-native delivery signal: the resolved
         // `web desktop` host (`EmitHost::WebView`) OR a source module
         // that still carries the leaf. A webview-native delivery renders the
         // server-free `web-core` core over a local IPC bridge; it does NOT run the
@@ -2202,7 +2217,6 @@ impl<'a> EmitCtx<'a> {
         // `uses_webview && !uses_web` path selects the lean render shell
         // (`RUNTIME_MOD_RS_WEBVIEW_CORE_APPEND`) and the `web-core`/`webview` Cargo
         // features; a program that reaches BOTH keeps the full `web` module.
-        let uses_webview = webview_host || program.modules.iter().any(|m| m.uses_webview);
         let entry_surface = entry_app_surface(program, uses_webview);
         let (uses_ui, uses_web, uses_tui, uses_console) = (
             program.modules.iter().any(|m| m.uses_ui),
