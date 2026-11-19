@@ -1112,14 +1112,14 @@ mod tests {
                     Some("application/octet-stream")
                 );
             }
+            let both: String = candidates.iter().map(|(_, meta)| meta.as_str()).collect();
+            assert!(
+                crate::bundle_www::sole_policy(&both, &candidates, |(_, m)| m.as_str()).is_none(),
+                "a page carrying two policies is refused"
+            );
         }
         let wasm = exchange(&plain_site(), &request("GET", "/pkg/ipe_app_bg.wasm"));
         assert_eq!(header(&wasm, "Content-Type"), Some("application/wasm"));
-        let both: String = candidates.iter().map(|(_, meta)| meta.as_str()).collect();
-        assert!(
-            crate::bundle_www::sole_policy(&both, &candidates, |(_, m)| m.as_str()).is_none(),
-            "a page carrying two policies is refused"
-        );
     }
 
     #[test]
