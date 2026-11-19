@@ -2780,22 +2780,26 @@ mod tests {
         let argv = dir.path().join("argv");
         std::fs::write(
             &ssh,
-            "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"$IPE_SSH_ARGV\"\nexit 1\n",
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 1\n",
+                argv.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // The production shape: `Git::isolated` runs ssh through
-        // `core.sshCommand`, which git hands to a shell with the host as `$@`.
-        let ssh_command = format!("core.sshCommand={} -o BatchMode=yes", ssh.display());
+        // The production invocation: the isolated git itself, whose
+        // `core.sshCommand` finds this stand-in first on `PATH`.
+        let mut path = std::ffi::OsString::from(dir.path());
+        if let Some(host) = ipe_env::var_os("PATH") {
+            path.push(":");
+            path.push(host);
+        }
         let host_argument = |url: &str| {
             let _ = std::fs::remove_file(&argv);
-            let _ran = crate::remote_ingest::fixture_git(dir.path())
-                .args(["-c", ssh_command.as_str(), "ls-remote", "--", url])
-                .env_remove("GIT_SSH_COMMAND")
-                .env_remove("GIT_SSH")
-                .env_remove("GIT_SSH_VARIANT")
-                .env("GIT_ALLOW_PROTOCOL", "ssh")
-                .env("IPE_SSH_ARGV", &argv)
+            let _ran = crate::remote_ingest::Git::isolated(dir.path())
+                .args(["ls-remote", "--", url])
+                .into_command()
+                .env("PATH", &path)
                 .output()
                 .unwrap();
             let lines = std::fs::read_to_string(&argv).unwrap();

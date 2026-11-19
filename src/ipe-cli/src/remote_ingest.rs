@@ -3683,23 +3683,146 @@ const GIT_LOCATION_VARS: [&str; 7] = [
     "GIT_NAMESPACE",
 ];
 
-/// Variables that inject configuration or a helper program into git from the environment.
-const GIT_INJECTION_VARS: [&str; 7] = [
-    "GIT_CONFIG_PARAMETERS",
-    "GIT_CONFIG_COUNT",
-    "GIT_SSH_COMMAND",
-    "GIT_SSH",
-    "GIT_ASKPASS",
-    "GIT_PROXY_COMMAND",
-    "GIT_TEMPLATE_DIR",
-];
+/// A host variable an isolated git keeps, each needed by git or `ssh`.
+///
+/// An isolated git starts from an empty environment and receives only these
+/// names' host values and the validated home, so no other variable — a
+/// `GIT_*` configuration, helper, ssh variant, trace or transport setting, or
+/// one a later git learns to read — can reach it. None configures git, picks a
+/// program, or relaxes TLS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IsolatedHostVar {
+    /// Where `git`, its `sh`, and `ssh` are found.
+    Path,
+    /// The Windows system directory, without which no socket opens.
+    SystemRoot,
+    /// The operator's ssh agent.
+    SshAuthSock,
+    /// The language of git's own messages.
+    Lang,
+    /// The language of git's own messages.
+    LcAll,
+    /// The language of git's own messages.
+    LcMessages,
+    /// The language of git's own messages.
+    Language,
+    /// The HTTP proxy, as libcurl reads it.
+    HttpProxy,
+    /// The HTTPS proxy, as libcurl reads it.
+    HttpsProxy,
+    /// The HTTPS proxy, as libcurl reads it.
+    HttpsProxyUpper,
+    /// The fallback proxy, as libcurl reads it.
+    AllProxy,
+    /// The fallback proxy, as libcurl reads it.
+    AllProxyUpper,
+    /// The proxy exemptions, as libcurl reads them.
+    NoProxy,
+    /// The proxy exemptions, as libcurl reads them.
+    NoProxyUpper,
+    /// The operator's TLS trust anchors, as the TLS library reads them.
+    SslCertFile,
+    /// The operator's TLS trust anchors, as the TLS library reads them.
+    SslCertDir,
+    /// The operator's TLS trust anchors, as git reads them.
+    GitSslCaInfo,
+    /// The operator's TLS trust anchors, as git reads them.
+    GitSslCaPath,
+}
+
+impl IsolatedHostVar {
+    /// Every kept variable.
+    const ALL: [Self; 18] = [
+        Self::Path,
+        Self::SystemRoot,
+        Self::SshAuthSock,
+        Self::Lang,
+        Self::LcAll,
+        Self::LcMessages,
+        Self::Language,
+        Self::HttpProxy,
+        Self::HttpsProxy,
+        Self::HttpsProxyUpper,
+        Self::AllProxy,
+        Self::AllProxyUpper,
+        Self::NoProxy,
+        Self::NoProxyUpper,
+        Self::SslCertFile,
+        Self::SslCertDir,
+        Self::GitSslCaInfo,
+        Self::GitSslCaPath,
+    ];
+
+    /// The variable's name and its host value, `None` when the host leaves it unset.
+    fn read(self) -> (&'static str, Option<std::ffi::OsString>) {
+        match self {
+            Self::Path => ("PATH", ipe_env::var_os("PATH")),
+            Self::SystemRoot => ("SystemRoot", ipe_env::var_os("SystemRoot")),
+            Self::SshAuthSock => ("SSH_AUTH_SOCK", ipe_env::var_os("SSH_AUTH_SOCK")),
+            Self::Lang => ("LANG", ipe_env::var_os("LANG")),
+            Self::LcAll => ("LC_ALL", ipe_env::var_os("LC_ALL")),
+            Self::LcMessages => ("LC_MESSAGES", ipe_env::var_os("LC_MESSAGES")),
+            Self::Language => ("LANGUAGE", ipe_env::var_os("LANGUAGE")),
+            Self::HttpProxy => ("http_proxy", ipe_env::var_os("http_proxy")),
+            Self::HttpsProxy => ("https_proxy", ipe_env::var_os("https_proxy")),
+            Self::HttpsProxyUpper => ("HTTPS_PROXY", ipe_env::var_os("HTTPS_PROXY")),
+            Self::AllProxy => ("all_proxy", ipe_env::var_os("all_proxy")),
+            Self::AllProxyUpper => ("ALL_PROXY", ipe_env::var_os("ALL_PROXY")),
+            Self::NoProxy => ("no_proxy", ipe_env::var_os("no_proxy")),
+            Self::NoProxyUpper => ("NO_PROXY", ipe_env::var_os("NO_PROXY")),
+            Self::SslCertFile => ("SSL_CERT_FILE", ipe_env::var_os("SSL_CERT_FILE")),
+            Self::SslCertDir => ("SSL_CERT_DIR", ipe_env::var_os("SSL_CERT_DIR")),
+            Self::GitSslCaInfo => ("GIT_SSL_CAINFO", ipe_env::var_os("GIT_SSL_CAINFO")),
+            Self::GitSslCaPath => ("GIT_SSL_CAPATH", ipe_env::var_os("GIT_SSL_CAPATH")),
+        }
+    }
+}
+
+/// The environment an isolated git starts from: the host values of the
+/// [`IsolatedHostVar`]s the host sets, and the validated home, where `ssh`
+/// finds the operator's `known_hosts` and keys.
+///
+/// The home is the accessor's parsed value; a home it refuses is not passed.
+fn isolated_host_env() -> Vec<(&'static str, std::ffi::OsString)> {
+    let home = crate::env_dir::home()
+        .ok()
+        .map(|home| home.as_path().as_os_str().to_owned());
+    IsolatedHostVar::ALL
+        .into_iter()
+        .map(IsolatedHostVar::read)
+        .chain([isolated_home_env(home)])
+        .filter_map(|(name, value)| value.map(|value| (name, value)))
+        .collect()
+}
+
+/// The entry that writes the validated `home` into an isolated git's environment.
+const fn isolated_home_env(
+    home: Option<std::ffi::OsString>,
+) -> (&'static str, Option<std::ffi::OsString>) {
+    ("HOME", home)
+}
+
+/// The environment a `git` child starts from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitEnvStart {
+    /// The user's environment, as the user's own git would see it.
+    Inherited,
+    /// Empty but for [`isolated_host_env`].
+    HostAllowlist,
+}
 
 impl Git {
-    /// The shared hardening of both flavours, run in `cwd`.
+    /// The shared hardening of both flavours, run in `cwd` from `start`.
     ///
     /// TLS certificate verification is never disabled from the environment.
-    fn base(cwd: &Path) -> Command {
+    fn base(cwd: &Path, start: GitEnvStart) -> Command {
         let mut command = Command::new("git");
+        match start {
+            GitEnvStart::Inherited => {}
+            GitEnvStart::HostAllowlist => {
+                command.env_clear().envs(isolated_host_env());
+            }
+        }
         command.current_dir(cwd);
         for var in GIT_LOCATION_VARS {
             command.env_remove(var);
@@ -3717,9 +3840,11 @@ impl Git {
 
     /// git on a repository the CLI owns and fills from a remote, blind to every user and system setting.
     ///
-    /// No system or global configuration is read and no configuration, helper
-    /// or template is taken from the environment, so a setting cannot swap the
-    /// transport, run a program, or rewrite a URL. Only the
+    /// No system or global configuration is read, and git starts from an empty
+    /// environment holding only [`isolated_host_env`], so no configuration,
+    /// helper, ssh variant, template or trace setting is taken from the
+    /// environment: a setting cannot swap the transport, run a program, change
+    /// what `ssh` is handed, or rewrite a URL. Only the
     /// `ISOLATED_GIT_PROTOCOLS` transports are allowed; ssh runs in batch mode,
     /// submodules are not fetched, and every fetched object stays in one pack
     /// rather than unpacking into loose files, so the stage's entry count is
@@ -3729,10 +3854,7 @@ impl Git {
     /// being held in memory.
     #[must_use]
     pub fn isolated(cwd: &Path) -> Self {
-        let mut command = Self::base(cwd);
-        for var in GIT_INJECTION_VARS {
-            command.env_remove(var);
-        }
+        let mut command = Self::base(cwd, GitEnvStart::HostAllowlist);
         command
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -3760,7 +3882,7 @@ impl Git {
     /// no large-file filter runs.
     #[must_use]
     pub fn user(cwd: &Path) -> Self {
-        let mut command = Self::base(cwd);
+        let mut command = Self::base(cwd, GitEnvStart::Inherited);
         command
             .env("GIT_ALLOW_PROTOCOL", "https")
             .args(["-c", "filter.lfs.smudge="])
@@ -3819,6 +3941,13 @@ impl Git {
     #[cfg(test)]
     pub fn get_args(&self) -> std::process::CommandArgs<'_> {
         self.command.get_args()
+    }
+
+    /// The `git` command as built, for a test to run it directly.
+    #[cfg(test)]
+    #[must_use]
+    pub fn into_command(self) -> Command {
+        self.command
     }
 }
 
@@ -5253,7 +5382,6 @@ mod tests {
             envs.iter()
                 .any(|(k, v)| k == name && v.as_deref() == Some(value))
         };
-        let removed = |name: &str| envs.iter().any(|(k, v)| k == name && v.is_none());
         assert!(set("GIT_CONFIG_NOSYSTEM", "1"));
         assert!(set("GIT_CONFIG_GLOBAL", "/dev/null"));
         assert!(set("GIT_TERMINAL_PROMPT", "0"));
@@ -5263,11 +5391,35 @@ mod tests {
             "GIT_ALLOC_LIMIT",
             &PACKAGE_SOURCE.tree().per_file().to_string()
         ));
-        for var in super::GIT_LOCATION_VARS
-            .iter()
-            .chain(super::GIT_INJECTION_VARS.iter())
-        {
-            assert!(removed(var), "{var} is not cleared");
+        // The environment is cleared first, so a location variable is never
+        // set; the re-exec test proves the clearing reaches the child.
+        for var in super::GIT_LOCATION_VARS {
+            assert!(
+                envs.iter().all(|(k, v)| k != var || v.is_none()),
+                "{var} reaches the isolated git"
+            );
+        }
+        let fixed = [
+            "GIT_TERMINAL_PROMPT",
+            "GIT_LFS_SKIP_SMUDGE",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_ALLOW_PROTOCOL",
+            "GIT_NO_REPLACE_OBJECTS",
+            "GIT_ALLOC_LIMIT",
+            "HOME",
+        ];
+        let host: Vec<&str> = super::IsolatedHostVar::ALL
+            .into_iter()
+            .map(|var| var.read().0)
+            .collect();
+        for (name, value) in &envs {
+            if value.is_some() {
+                assert!(
+                    fixed.contains(&name.as_str()) || host.contains(&name.as_str()),
+                    "{name} reaches the isolated git"
+                );
+            }
         }
         let args: Vec<String> = git
             .get_args()
@@ -5283,6 +5435,132 @@ mod tests {
                 .any(|w| w == ["-c", "transfer.unpackLimit=1"])
         );
         assert!(args.ends_with(&["fetch".to_owned(), "origin".to_owned()]));
+    }
+
+    /// Every kept host variable is read under its own name.
+    #[test]
+    fn isolated_host_vars_read_their_own_names() {
+        let names: Vec<&str> = super::IsolatedHostVar::ALL
+            .into_iter()
+            .map(|var| var.read().0)
+            .collect();
+        let mut unique = names.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), names.len(), "{names:?}");
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.starts_with("GIT_") && !name.starts_with("GIT_SSL_CA")),
+            "{names:?}"
+        );
+        assert_eq!(
+            super::isolated_home_env(Some("/h".into())),
+            ("HOME", Some("/h".into()))
+        );
+    }
+
+    /// The ambient variables the re-exec child of
+    /// [`ambient_git_settings_never_reach_the_isolated_git`] is started under,
+    /// each a way the environment could change what git hands `ssh`.
+    #[cfg(unix)]
+    fn hostile_git_environment(dir: &std::path::Path) -> Vec<(&'static str, std::ffi::OsString)> {
+        let evil = dir.join("evil").into_os_string();
+        let mut parameters = std::ffi::OsString::from("'core.sshcommand'='");
+        parameters.push(&evil);
+        parameters.push("'");
+        vec![
+            ("GIT_SSH_VARIANT", "putty".into()),
+            ("GIT_SSH_COMMAND", evil.clone()),
+            ("GIT_SSH", evil.clone()),
+            ("GIT_CONFIG_COUNT", "1".into()),
+            ("GIT_CONFIG_KEY_0", "core.sshCommand".into()),
+            ("GIT_CONFIG_VALUE_0", evil.clone()),
+            ("GIT_CONFIG_PARAMETERS", parameters),
+            ("GIT_TRACE", dir.join("trace").into_os_string()),
+        ]
+    }
+
+    /// An ambient ssh variant, ssh program, or configuration cannot change
+    /// what the isolated git hands `ssh`, nor make it write a trace.
+    ///
+    /// The hostile variables are the environment of a re-exec of this test
+    /// binary, so the isolated git built in that child inherits them exactly
+    /// as it would inherit an operator's.
+    #[cfg(unix)]
+    #[test]
+    fn ambient_git_settings_never_reach_the_isolated_git() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch();
+        let argv = dir.path().join("argv");
+        let script = |marker: &std::path::Path| {
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > '{}'\nexit 1\n",
+                marker.display()
+            )
+        };
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).expect("stub dir");
+        for (path, marker) in [
+            (bin.join("ssh"), argv.clone()),
+            (dir.path().join("evil"), dir.path().join("evil-ran")),
+        ] {
+            std::fs::write(&path, script(&marker)).expect("write stub");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("stub mode");
+        }
+        let mut path = std::ffi::OsString::from(&bin);
+        if let Some(host) = ipe_env::var_os("PATH") {
+            path.push(":");
+            path.push(host);
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let child = Command::new(exe)
+            .args([
+                "--exact",
+                "remote_ingest::tests::isolated_git_ssh_argv_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .envs(hostile_git_environment(dir.path()))
+            .env("PATH", path)
+            .env("IPE_TEST_ISOLATED_GIT_DIR", dir.path())
+            .output()
+            .expect("run the child test");
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
+        );
+        let argv = std::fs::read_to_string(&argv).expect("the stand-in ssh ran");
+        let argv: Vec<&str> = argv.lines().collect();
+        assert_eq!(argv.first(), Some(&"-o"), "{argv:?}");
+        assert_eq!(argv.get(1), Some(&"BatchMode=yes"), "{argv:?}");
+        assert!(argv.windows(2).any(|w| w == ["-p", "2222"]), "{argv:?}");
+        assert!(!argv.contains(&"-P"), "{argv:?}");
+        assert!(argv.contains(&"h"), "{argv:?}");
+        assert!(!dir.path().join("evil-ran").exists(), "an ambient ssh ran");
+        assert!(
+            !dir.path().join("trace").exists(),
+            "an ambient trace was written"
+        );
+    }
+
+    /// The re-exec child of [`ambient_git_settings_never_reach_the_isolated_git`]:
+    /// runs an isolated `git ls-remote` of an `ssh://` source with a port.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "re-exec child of ambient_git_settings_never_reach_the_isolated_git"]
+    fn isolated_git_ssh_argv_child() {
+        let Some(dir) = ipe_env::var_os("IPE_TEST_ISOLATED_GIT_DIR") else {
+            return;
+        };
+        let _ran = Git::isolated(std::path::Path::new(&dir))
+            .args(["ls-remote", "--", "ssh://h:2222/r"])
+            .command
+            .output()
+            .expect("run git");
     }
 
     /// The isolated git allows exactly the transports a source URL can parse
@@ -5372,7 +5650,8 @@ mod tests {
                 .get_envs()
                 .any(|(k, v)| k == "GIT_SSL_NO_VERIFY" && v.is_none())
         };
-        assert!(removed(Git::isolated(dir.path())), "isolated git");
+        // The isolated git starts from a cleared environment, which holds no
+        // `GIT_SSL_NO_VERIFY` (asserted below); the user git removes it.
         assert!(removed(Git::user(dir.path())), "user git");
         let isolated = Git::isolated(dir.path());
         assert!(
@@ -5383,10 +5662,9 @@ mod tests {
             "no flavour sets it"
         );
         assert!(
-            !isolated
-                .command
-                .get_envs()
-                .any(|(k, v)| k == "GIT_SSL_CAINFO" && v.is_none()),
+            super::IsolatedHostVar::ALL
+                .into_iter()
+                .any(|var| var.read().0 == "GIT_SSL_CAINFO"),
             "an operator trust anchor is kept"
         );
     }
