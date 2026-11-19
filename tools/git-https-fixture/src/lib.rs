@@ -153,6 +153,8 @@ impl std::fmt::Display for RepoUrl {
 pub struct GitHttpsFixture {
     addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
+    /// The live handler count the ceiling tests observe.
+    #[cfg(test)]
     active: Arc<AtomicUsize>,
     accept: Option<JoinHandle<()>>,
     ca_file: PathBuf,
@@ -201,6 +203,7 @@ impl GitHttpsFixture {
         let fixture = Self {
             addr,
             shutdown,
+            #[cfg(test)]
             active,
             accept: Some(accept),
             ca_file,

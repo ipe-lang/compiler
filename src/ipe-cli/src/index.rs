@@ -180,13 +180,6 @@ pub enum LocalRefusal {
 /// a non-local `file://` host, under either host regime.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalRepo {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "an escape origin records its local source and never opens it"
-        )
-    )]
     plain: String,
 }
 

@@ -3927,11 +3927,10 @@ static FIXTURE_TRUST: std::sync::OnceLock<FixtureTrust> = std::sync::OnceLock::n
 /// [`FixtureTrustConflict`] when another trust is already in force.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub fn trust_fixture(trust: FixtureTrust) -> Result<(), FixtureTrustConflict> {
-    let held = FIXTURE_TRUST.get_or_init(|| trust.clone());
-    if *held == trust {
-        Ok(())
-    } else {
-        Err(FixtureTrustConflict)
+    match FIXTURE_TRUST.set(trust) {
+        Ok(()) => Ok(()),
+        Err(trust) if FIXTURE_TRUST.get() == Some(&trust) => Ok(()),
+        Err(_) => Err(FixtureTrustConflict),
     }
 }
 
