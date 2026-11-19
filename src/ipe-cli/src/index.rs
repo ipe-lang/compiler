@@ -339,6 +339,10 @@ pub enum NetworkRefusal {
     /// An injection-shaped value: a leading `-`, a `::`, or an `https://` /
     /// `ssh://` URL holding a character outside [`is_url_char`].
     Invalid,
+    /// An `https://` or `ssh://` URL whose authority is not a plain
+    /// [`NetworkAuthority`]: a host, user or port holding text a program
+    /// handed it (`ssh`, a proxy command) could read as more than a name.
+    Authority,
 }
 
 impl NetworkRefusal {
@@ -351,6 +355,7 @@ impl NetworkRefusal {
         match self {
             Self::Plaintext => crate::text::msg::index_source_url_plaintext(pkg, shown),
             Self::Invalid => crate::text::msg::index_source_url_invalid(pkg, shown),
+            Self::Authority => crate::text::msg::index_source_url_authority(pkg, shown),
         }
     }
 }
@@ -441,6 +446,9 @@ impl SourceUrl {
         if !raw.chars().all(is_url_char) {
             return Err(NetworkRefusal::Invalid);
         }
+        if !NetworkAuthority::admits(raw) {
+            return Err(NetworkRefusal::Authority);
+        }
         Ok(Some(Self {
             recorded: raw.to_owned(),
             transport,
@@ -495,7 +503,90 @@ fn sink_check(arg: &str) -> Result<(), SourceRefusal> {
     if arg.starts_with('-') || arg.contains("::") {
         return Err(SourceRefusal::Network(NetworkRefusal::Invalid));
     }
+    if !NetworkAuthority::admits(arg) {
+        return Err(SourceRefusal::Network(NetworkRefusal::Authority));
+    }
     Ok(())
+}
+
+/// The authority grammar of a network source URL: `[user@]host[:port]`.
+///
+/// `git` hands an `ssh://` URL's `user@host` to `ssh` as one argument, and
+/// `ssh` substitutes it into a configured `ProxyCommand` or `Match exec`
+/// shell line, so the authority admits only name characters:
+/// - user: ASCII letters, digits, `.`, `_`, `-`, not starting with `-`;
+/// - host: ASCII letters, digits, `.`, `-`, not starting with `-` or `.`, or a
+///   bracketed IPv6 literal of hex digits, `:` and `.`;
+/// - port: 1 to 65535 in decimal digits.
+///
+/// The authority ends at the first `/`, which must follow it.
+struct NetworkAuthority;
+
+impl NetworkAuthority {
+    /// Whether the `https://` or `ssh://` URL `url` has a plain authority
+    /// followed by a path; any other text is not admitted.
+    fn admits(url: &str) -> bool {
+        let Some(rest) = url
+            .strip_prefix("https://")
+            .or_else(|| url.strip_prefix("ssh://"))
+        else {
+            return false;
+        };
+        let Some((authority, _path)) = rest.split_once('/') else {
+            return false;
+        };
+        let (user, host_port) = match authority.split_once('@') {
+            Some((user, host_port)) => (Some(user), host_port),
+            None => (None, authority),
+        };
+        let user_ok = user.is_none_or(|user| {
+            !user.is_empty()
+                && !user.starts_with('-')
+                && user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        });
+        let Some(port) = host_port
+            .strip_prefix('[')
+            .map_or_else(|| Self::name_host(host_port), Self::bracketed_host)
+        else {
+            return false;
+        };
+        let port_ok = port.is_empty()
+            || port.strip_prefix(':').is_some_and(|digits| {
+                !digits.is_empty()
+                    && digits.chars().all(|c| c.is_ascii_digit())
+                    && digits.parse::<u16>().is_ok_and(|port| port != 0)
+            });
+        user_ok && port_ok
+    }
+
+    /// The text after a plain host name at the start of `host_port`, or
+    /// `None` when that name is empty, starts with `-` or `.`, or holds a
+    /// character other than an ASCII letter, digit, `.` or `-`.
+    fn name_host(host_port: &str) -> Option<&str> {
+        let (host, after) = host_port
+            .find(':')
+            .map_or((host_port, ""), |at| host_port.split_at(at));
+        (!host.is_empty()
+            && !host.starts_with(['-', '.'])
+            && host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-')))
+        .then_some(after)
+    }
+
+    /// The text after the `]` closing a bracketed IPv6 literal (`bracketed`
+    /// starts after its `[`), or `None` when the literal is unclosed, empty,
+    /// or holds a character other than a hex digit, `:` or `.`.
+    fn bracketed_host(bracketed: &str) -> Option<&str> {
+        let (literal, after) = bracketed.split_once(']')?;
+        (!literal.is_empty()
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || matches!(c, ':' | '.')))
+        .then_some(after)
+    }
 }
 
 /// Why a lockfile escape origin's `source` was refused.
@@ -2536,6 +2627,72 @@ mod tests {
         assert!(super::parse_entry(&pn("p"), &toml(control)).is_ok());
         let json_control = super::parse_entry_json("p", &json(control));
         assert!(json_control.is_ok(), "{json_control:?}");
+    }
+
+    /// A network source's authority admits only name characters, so `git`
+    /// never hands `ssh` a user or host a proxy command's shell line could run.
+    #[test]
+    fn a_network_source_authority_is_a_plain_name() {
+        use super::{NetworkRefusal, SourceRefusal, sink_check};
+        let refused = [
+            "ssh://h;id/r",
+            "ssh://u$(id)@h/r",
+            "ssh://u+x,y=z@h/r",
+            "ssh://h~x/r",
+            "ssh://h&id/r",
+            "ssh://h'x/r",
+            "ssh://-oProxyCommand=id/r",
+            "ssh://-u@h/r",
+            "ssh://.h/r",
+            "ssh://@h/r",
+            "ssh://h:/r",
+            "ssh://h:0/r",
+            "ssh://h:65536/r",
+            "ssh://h:22x/r",
+            "ssh://h%3bid/r",
+            "ssh://[h;id]/r",
+            "ssh://[fe80:1]x/r",
+            "ssh://h",
+            "https://u:pw@h/r",
+            "https://h!x/r",
+            "https://h?x/r",
+            "https://h#x/r",
+            "https://h*/r",
+        ];
+        for raw in refused {
+            assert_eq!(
+                SourceUrl::parse_in(raw),
+                Err(SourceRefusal::Network(NetworkRefusal::Authority)),
+                "{raw:?}"
+            );
+            assert_eq!(
+                sink_check(raw),
+                Err(SourceRefusal::Network(NetworkRefusal::Authority)),
+                "{raw:?}"
+            );
+            let shown = crate::style::TerminalSafe::sanitize(&format!("{raw:?}"));
+            let err = SourceUrl::parse(&pn("p"), raw).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                crate::CliError::Resolve(crate::text::msg::index_source_url_authority(
+                    &pn("p"),
+                    &shown
+                ))
+                .to_string(),
+                "{raw:?}"
+            );
+        }
+        for admitted in [
+            "ssh://git@github.com/user/repo",
+            "ssh://git_user.x-y@h-1.example:2222/r",
+            "ssh://[fe80:0:0:0:0:0:0:1]:22/r",
+            "https://github.com/user/repo.git",
+            "https://127.0.0.1:65535/r/0",
+            "https://h/r;x=$y&z!",
+        ] {
+            assert!(SourceUrl::parse_in(admitted).is_ok(), "{admitted:?}");
+            assert_eq!(sink_check(admitted), Ok(()), "{admitted:?}");
+        }
     }
 
     #[test]

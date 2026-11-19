@@ -702,8 +702,10 @@ fn run_cgi(served: &Served, request: Request) -> Response {
 
 /// Feed `body` to the child and read at most `ceiling` bytes of its output by `deadline`.
 ///
-/// On a refusal the feeding and reading threads are left to end on their own:
-/// once the caller kills the child, its pipes close and both threads return.
+/// The feeding thread is never joined, and on a refusal neither is the
+/// reading one: a child that closes its output without reading its input
+/// would hold the feeder past the wall time. Each thread ends once the child
+/// exits or the caller kills it, closing its pipes.
 fn bounded_output(
     child: &mut Child,
     body: Vec<u8>,
@@ -713,7 +715,7 @@ fn bounded_output(
     let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(Refused::BadGateway);
     };
-    let feeder = std::thread::Builder::new()
+    let _feeder = std::thread::Builder::new()
         .name("git-https-fixture-feed".to_owned())
         .spawn(move || {
             let _fed = stdin.write_all(&body);
@@ -740,7 +742,6 @@ fn bounded_output(
     if u64::try_from(out.len()).map_or(true, |len| len > ceiling) {
         return Err(Refused::BadGateway);
     }
-    let _fed = feeder.join();
     let _read = reader.join();
     Ok(out)
 }
@@ -1190,5 +1191,40 @@ mod tests {
             status(&exchange(addr(&url), INFO_REFS.as_bytes())),
             Some(200)
         );
+    }
+
+    /// A CGI child that closes its output and never reads a body larger than
+    /// a pipe holds is still killed at the wall time and answered 504.
+    #[cfg(unix)]
+    #[test]
+    fn cgi_ignoring_its_body_past_its_wall_time_is_refused() {
+        let ceilings = CgiCeilings {
+            stdout: SMALL.stdout,
+            wall: Duration::from_millis(300),
+        };
+        let body = vec![b'0'; 512 * 1024];
+        let mut request = format!(
+            "POST /r/0/git-upload-pack HTTP/1.1\r\nHost: localhost\r\n\
+             Content-Type: application/x-git-upload-pack-request\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(&body);
+        let deaf = "#!/bin/sh\nprintf 'Content-Type: text/plain\\r\\n\\r\\n'\nexec >&-\nexec /bin/sleep 3\n";
+        let (_dir, fixture, url) = serve_script(deaf, ceilings);
+        let started = std::time::Instant::now();
+        assert_eq!(status(&exchange(addr(&url), &request)), Some(504));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wall time, not the child's own exit, ends the request"
+        );
+        settle(&fixture);
+        // Control twin: a child that reads the same body and answers within its wall time.
+        let reads = "#!/bin/sh\n/bin/cat > /dev/null\nprintf 'Content-Type: text/plain\\r\\n\\r\\nserved'\n";
+        let (_dir, _fixture, url) = serve_script(reads, SMALL);
+        let response = exchange(addr(&url), &request);
+        assert_eq!(status(&response), Some(200));
+        assert!(response.ends_with(b"served"), "{response:?}");
     }
 }

@@ -2082,6 +2082,8 @@ messages! {
     publish_fresh_claim_not_covered(claimed) = "publish-fresh-claim-not-covered";
     /// An index `source` that is an injection-shaped or off-alphabet network URL.
     index_source_url_invalid(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-invalid";
+    /// An index `source` URL whose `[user@]host[:port]` is not a plain name.
+    index_source_url_authority(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-authority";
     /// An index `source` that is not an `https://` or `ssh://` URL.
     index_source_url_not_network(pkg: &crate::package_name::PackageName, raw: &crate::style::TerminalSafe) = "index-source-url-not-network";
     /// A lockfile escape `source` that is neither a network URL nor an absolute local location.

@@ -3067,6 +3067,10 @@ error[IPE-P0001]: the packaged {platform} manifest declares OS permission(s) the
 
 package `{pkg}`: `source` must be an https:// or ssh:// URL with no option-shaped or transport-helper text, got: {raw}
 
+## index-source-url-authority
+
+package `{pkg}`: a `source` URL's `[user@]host[:port]` must be a plain name — a host of letters, digits, `.` and `-` (or a bracketed IPv6 address), an optional user of letters, digits, `.`, `_` and `-`, and an optional port number, followed by the repository path — got: {raw}
+
 ## index-source-url-not-network
 
 package `{pkg}`: an index `source` must be the repository's https:// or ssh:// URL — a local path or `file://` URL is never an index source, got: {raw}
