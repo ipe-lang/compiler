@@ -2120,8 +2120,8 @@ mod frame_tests {
         }
         let listed = entries(&HTTPS_VECTORS);
         let trusted = origins(&HTTPS_VECTORS);
-        let bundle =
-            ContentSecurityPolicy::bundle(&ServerOrigins::none(), &listed, BundleWorker::None);
+        let servers = ServerOrigins::none();
+        let bundle = ContentSecurityPolicy::bundle(&servers, &listed, BundleWorker::None);
         let want = frame_and_object(&bundle);
         assert_eq!(want.0.len(), HTTPS_VECTORS.len());
         let written: Vec<String> = trusted.origins().iter().map(FrameOrigin::written).collect();
@@ -2150,8 +2150,8 @@ mod frame_tests {
         assert_eq!(entry, FrameOrigin::parse(text).expect("origin").written());
         let texts = [text, "https://a.example"];
         let listed = entries(&texts);
-        let bundle =
-            ContentSecurityPolicy::bundle(&ServerOrigins::none(), &listed, BundleWorker::None);
+        let servers = ServerOrigins::none();
+        let bundle = ContentSecurityPolicy::bundle(&servers, &listed, BundleWorker::None);
         let want = frame_and_object(&bundle);
         assert!(want.0.iter().any(|source| source == text), "{want:?}");
         let written: Vec<String> = origins(&texts)
