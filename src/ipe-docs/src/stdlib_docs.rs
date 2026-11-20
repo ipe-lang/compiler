@@ -22,6 +22,25 @@
 
 use ipe_stdlib::{COMPILED_STD_MODULES, DOC_ONLY_MODULES, MODULES as STDLIB_MODULES, StdTier};
 
+/// Which kind of top-level declaration an [`ExportDoc`] relays.
+///
+/// Carried explicitly rather than inferred from `signature.is_none()`: a type
+/// alias and a true union both have no value signature, but only a union has
+/// constructors a doc page can ever list, and a consumer that must tell them
+/// apart (e.g. [`crate`]'s doc-only-module renderer, which may show a union as
+/// a queryable member but never an alias) needs the real distinction, not a
+/// heuristic that happens to work only because today's doc-only modules carry
+/// no aliases.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExportKind {
+    /// A value binding, with or without a separate signature line.
+    Value,
+    /// A true union (`type Name = Ctor …`).
+    Union,
+    /// A type alias (`type alias Name = …`).
+    Alias,
+}
+
 /// A single documented export of a stdlib module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExportDoc {
@@ -29,12 +48,15 @@ pub struct ExportDoc {
     pub name: String,
     /// The `name : Type` signature line as written in the source, when the
     /// declaration carries a type annotation; `None` for a declaration with no
-    /// annotation (rare in the stdlib).
+    /// annotation (rare in the stdlib) or a type declaration (a union or an
+    /// alias never has one).
     pub signature: Option<String>,
     /// The declaration's documentation body, gathered from either a `{-| … -}`
     /// block or a `-- |` line block. `None` when the declaration is
     /// undocumented.
     pub doc: Option<String>,
+    /// Which kind of declaration this export relays.
+    pub kind: ExportKind,
 }
 
 /// A stdlib module's documentation, extracted from its raw source.
@@ -114,6 +136,7 @@ pub fn extract_module_doc(dotted: &str, source: &str) -> ModuleDoc {
             name: export.name,
             signature: export.signature,
             doc: export.doc.map(|doc| doc.body),
+            kind: export.kind,
         })
         .collect();
     ModuleDoc {
@@ -167,6 +190,7 @@ struct SourcedExport {
     name: String,
     signature: Option<String>,
     doc: Option<DocText>,
+    kind: ExportKind,
 }
 
 /// Parse the names listed in the module's `exposing ( … )` clause, in source
@@ -358,7 +382,7 @@ fn extract_exports(source: &str) -> Vec<SourcedExport> {
             continue;
         }
 
-        let Some((name, signature)) = declaration_head(raw) else {
+        let Some((name, signature, kind)) = declaration_head(raw) else {
             continue;
         };
         if decls.contains_key(&name) {
@@ -372,6 +396,7 @@ fn extract_exports(source: &str) -> Vec<SourcedExport> {
                 name,
                 signature,
                 doc,
+                kind,
             },
         );
     }
@@ -414,27 +439,31 @@ fn update_block_depth(mut depth: usize, line: &str) -> usize {
 }
 
 /// If `line` begins a top-level declaration at column 0, return its exported
-/// name and, for a value signature line, that full `name : Type` signature.
+/// name, its signature line (value declarations only), and its [`ExportKind`].
 ///
 /// Recognises `name : Type` (a value signature), `name arg… = …` / `name = …`
-/// (a value binding), and `type Name …` / `type alias Name …` (a type
-/// declaration). Indented lines are never declaration heads.
-fn declaration_head(line: &str) -> Option<(String, Option<String>)> {
+/// (a value binding), `type Name …` (a true union), and `type alias Name …`
+/// (a type alias). Indented lines are never declaration heads.
+fn declaration_head(line: &str) -> Option<(String, Option<String>, ExportKind)> {
     // Column 0 only: a leading space means a continuation / body line.
     if line.starts_with(char::is_whitespace) {
         return None;
     }
 
-    // `type Name …` / `type alias Name …` — the exported name is the type name.
+    // `type Name …` / `type alias Name …` — the exported name is the type
+    // name; an `alias ` prefix after `type ` distinguishes the two kinds.
     if let Some(rest) = line.strip_prefix("type ") {
-        let rest = rest.strip_prefix("alias ").unwrap_or(rest).trim_start();
+        let (kind, rest) = match rest.strip_prefix("alias ") {
+            Some(rest) => (ExportKind::Alias, rest.trim_start()),
+            None => (ExportKind::Union, rest.trim_start()),
+        };
         let name = rest
             .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .next()
             .unwrap_or("");
         if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             // A type declaration has no `name : Type` value signature.
-            return Some((name.to_owned(), None));
+            return Some((name.to_owned(), None, kind));
         }
         return None;
     }
@@ -460,7 +489,11 @@ fn declaration_head(line: &str) -> Option<(String, Option<String>)> {
     if rest.starts_with(':') {
         // `name : Type` — a signature line. Keep the whole line as the
         // signature text.
-        return Some((name.to_owned(), Some(line.trim_end().to_owned())));
+        return Some((
+            name.to_owned(),
+            Some(line.trim_end().to_owned()),
+            ExportKind::Value,
+        ));
     }
     if rest == "="
         || rest.starts_with("= ")
@@ -468,7 +501,7 @@ fn declaration_head(line: &str) -> Option<(String, Option<String>)> {
     {
         // `name = …` or `name arg … = …` — a binding with no separate
         // signature line.
-        return Some((name.to_owned(), None));
+        return Some((name.to_owned(), None, ExportKind::Value));
     }
     None
 }
@@ -623,7 +656,7 @@ mod tests {
         for name in ["port", "where", "alias"] {
             let line = format!("{name} : Int");
             assert_eq!(
-                declaration_head(&line).map(|(n, _)| n).as_deref(),
+                declaration_head(&line).map(|(n, _, _)| n).as_deref(),
                 Some(name),
                 "{name:?} must head a value declaration"
             );

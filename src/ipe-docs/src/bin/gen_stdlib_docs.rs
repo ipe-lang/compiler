@@ -324,6 +324,7 @@ mod tests {
                 name: "thing".to_owned(),
                 signature: Some("thing : Int".to_owned()),
                 doc: None,
+                kind: ipe_docs::stdlib_docs::ExportKind::Value,
             }],
             tier: ipe_stdlib::StdTier::Public,
         };

@@ -16,6 +16,10 @@
 -- `WasmClient`, `WasmMode`, `WrapperSpec`, `Capability`); open text is `String`,
 -- parsed at the read boundary (semver, module path, path jail, secret denylist);
 -- a plain boolean setting is `Bool`.
+--
+-- The field-by-field walkthrough and the rationale for the manifest's shape
+-- live in the package guide (`ipe doc guide:package`); this module doc is the
+-- per-field reference that guide points at.
 
 
 module Ipe.Package exposing

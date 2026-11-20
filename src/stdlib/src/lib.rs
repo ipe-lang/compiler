@@ -714,6 +714,22 @@ const IPE_FFI_KERNEL: &str = include_str!("../Ipe/Ffi/Kernel.ipe");
 /// discoverable through `ipe doc`.
 const IPE_FFI_RUST: &str = include_str!("../Ipe/Ffi/Rust.ipe");
 
+/// `Ipe.Package` — the schema of a project's `package.ipe` manifest.
+///
+/// A DOC-ONLY surface (registered in [`DOC_ONLY_MODULES`], NOT
+/// `COMPILED_STD_MODULES`): a `package.ipe` manifest lives OUTSIDE a project's
+/// `sourceRoot` and is read by the bespoke syntactic reader in
+/// `ipe-cli::package_manifest` (`SCHEMA_MODULE`), which loads this exact file
+/// from disk and validates a manifest's own `import Ipe.Package` against it
+/// independently of the compiler's stdlib-injection tables. Keeping it out of
+/// `COMPILED_STD_MODULES` is load-bearing for the SAME reason as the two
+/// qualifiers above: the manifest schema must never become an ordinary
+/// program's injectable dependency. The embedded source carries the real
+/// module — every type and builder a manifest's author may reference — so the
+/// surface is discoverable through `ipe doc` and the generated stdlib
+/// reference; see `guide:package` for the manifest format itself.
+const IPE_PACKAGE: &str = include_str!("../Ipe/Package.ipe");
+
 /// `Ipe.Browser.Clipboard` — write text to the system clipboard over `Ipe.Ffi.Js`
 /// ports (compiled source).
 ///
@@ -2314,21 +2330,30 @@ const _: () = assert!(
 );
 
 // ===========================================================================
-// Documentation-only modules — reserved compiler-internal qualifiers.
+// Documentation-only modules — surfaces with no injectable module behind them.
 // ===========================================================================
 //
-// These name reserved FFI qualifiers (`Ipe.Ffi.Kernel`, `Ipe.Ffi.Rust`) that
-// the compiler recognises structurally, not as importable member-bearing
-// modules: `Kernel.kernel "…"` is rewritten by `detect_kernel_alias` and
-// `Rust.fn`/`Rust.const` by `canonicalise_asserted_call`, each only in a
-// driver-vouched origin. They carry doc-comments + signatures purely so the
-// surface is discoverable through `ipe doc` and the generated stdlib reference.
+// Two reasons land a name here instead of in `COMPILED_STD_MODULES`, and every
+// entry carries one of them:
+//
+// - Reserved FFI qualifiers (`Ipe.Ffi.Kernel`, `Ipe.Ffi.Rust`) that the
+//   compiler recognises structurally, not as importable member-bearing
+//   modules: `Kernel.kernel "…"` is rewritten by `detect_kernel_alias` and
+//   `Rust.fn`/`Rust.const` by `canonicalise_asserted_call`, each only in a
+//   driver-vouched origin.
+// - A schema read by a bespoke reader outside the normal module graph
+//   (`Ipe.Package`, read by `ipe-cli::package_manifest` straight from disk for
+//   a project's `package.ipe`, never through stdlib injection).
+//
+// Every entry carries doc-comments + signatures purely so the surface is
+// discoverable through `ipe doc` and the generated stdlib reference.
 //
 // They are DISJOINT from both `MODULES` and `COMPILED_STD_MODULES` on purpose:
 // the doc-enumeration paths read this table, but the build-driver injection
 // path (`is_compiled_source_segments`) does NOT, so a stdlib module that does
 // `import Ipe.Ffi.Kernel as Kernel` never pulls a body-less veneer in as a
-// compiled dependency.
+// compiled dependency, and no ordinary program can `import Ipe.Package` as a
+// dependency either.
 
 /// One documentation-only stdlib module: its dotted name and its embedded Ipê
 /// source.
@@ -2342,9 +2367,9 @@ pub struct DocOnlyModule {
     pub source: &'static str,
 }
 
-/// The reserved FFI qualifiers surfaced for documentation only. Enumerated by
-/// the `ipe doc` module list and the stdlib-reference generator; never compiled
-/// or injected.
+/// Surfaces with no injectable module behind them, documented for
+/// discoverability only. Enumerated by the `ipe doc` module list and the
+/// stdlib-reference generator; never compiled or injected.
 pub const DOC_ONLY_MODULES: &[DocOnlyModule] = &[
     DocOnlyModule {
         dotted: "Ipe.Ffi.Kernel",
@@ -2353,6 +2378,10 @@ pub const DOC_ONLY_MODULES: &[DocOnlyModule] = &[
     DocOnlyModule {
         dotted: "Ipe.Ffi.Rust",
         source: IPE_FFI_RUST,
+    },
+    DocOnlyModule {
+        dotted: "Ipe.Package",
+        source: IPE_PACKAGE,
     },
 ];
 
@@ -2855,6 +2884,109 @@ mod tests {
                 d.dotted
             );
         }
+    }
+
+    /// Stdlib modules intentionally registered in BOTH `MODULES` (a
+    /// kernel-veneer parse fixture) and `COMPILED_STD_MODULES` (the real
+    /// compiled source), sharing one embedded source file. `Ipe.Char`'s
+    /// veneer IS its implementation (every member a point-free
+    /// `Kernel.kernel "Char_*"` alias), so one file legitimately serves both
+    /// roles. The one tracked exception to "every stdlib file registered
+    /// exactly once" below — a new dual-registration needs a new, named entry
+    /// here, not a silently widened check.
+    const DUAL_REGISTERED: &[&str] = &["Ipe.Char"];
+
+    /// `Ffi/Js/CustomElement.ipe` (relative to the `Ipe/` root) →
+    /// `Ipe.Ffi.Js.CustomElement`.
+    fn dotted_name_from_relative_path(rel: &std::path::Path) -> String {
+        let mut segments: Vec<String> = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        if let Some(last) = segments.pop() {
+            segments.push(match last.strip_suffix(".ipe") {
+                Some(stripped) => stripped.to_owned(),
+                None => last,
+            });
+        }
+        format!("Ipe.{}", segments.join("."))
+    }
+
+    /// Every `.ipe` file under `dir`, recursively.
+    fn collect_ipe_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_ipe_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "ipe") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Class-closing floor: every `.ipe` file under `Ipe/` is registered in
+    /// EXACTLY ONE of `MODULES`, `COMPILED_STD_MODULES`, `DOC_ONLY_MODULES` —
+    /// the three tables `ipe doc` and the stdlib-reference generator read —
+    /// unless it is a named, justified exception in [`DUAL_REGISTERED`].
+    ///
+    /// A file registered in NONE is undiscoverable by `ipe doc`: this is the
+    /// `Ipe.Package` bug this test exists to close, generalised to every
+    /// current and future stdlib source so no module can go undocumented
+    /// again. A file registered in more than one (and not in
+    /// `DUAL_REGISTERED`) risks the ambiguous compiled-vs-doc-only-vs-fixture
+    /// resolution `doc_only_disjoint_from_compiled_and_parse_fixtures` and
+    /// `compiled_vs_kernel_qualifier_disjoint` guard against from the other
+    /// direction.
+    #[test]
+    fn every_stdlib_file_is_registered_exactly_once() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Ipe");
+        let mut files = Vec::new();
+        collect_ipe_files(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "sanity: the walk must find the embedded stdlib sources under {}",
+            root.display()
+        );
+
+        let mut orphans = Vec::new();
+        let mut ambiguous = Vec::new();
+        for file in &files {
+            let rel = file.strip_prefix(&root).unwrap_or(file.as_path());
+            let dotted = dotted_name_from_relative_path(rel);
+
+            let in_modules = MODULES.iter().any(|m| m.name == dotted);
+            let in_compiled = COMPILED_STD_MODULES.iter().any(|m| m.dotted == dotted);
+            let in_doc_only = DOC_ONLY_MODULES.iter().any(|m| m.dotted == dotted);
+            let count =
+                usize::from(in_modules) + usize::from(in_compiled) + usize::from(in_doc_only);
+
+            match count {
+                0 => orphans.push(dotted),
+                1 => {}
+                _ if in_modules
+                    && in_compiled
+                    && !in_doc_only
+                    && DUAL_REGISTERED.contains(&dotted.as_str()) => {}
+                _ => ambiguous.push(dotted),
+            }
+        }
+
+        assert!(
+            orphans.is_empty(),
+            "stdlib file(s) under `Ipe/` registered in NONE of `MODULES`, \
+             `COMPILED_STD_MODULES`, `DOC_ONLY_MODULES` — undiscoverable by \
+             `ipe doc`: {orphans:?}. Register each in the table that matches \
+             its role (see the comment above `DOC_ONLY_MODULES`)."
+        );
+        assert!(
+            ambiguous.is_empty(),
+            "stdlib file(s) registered in more than one table with no tracked \
+             justification: {ambiguous:?}. Either remove the duplicate \
+             registration or add a named, justified entry to `DUAL_REGISTERED`."
+        );
     }
 
     /// Load-bearing invariant (design §2.1): a module is EITHER a kernel

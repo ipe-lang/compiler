@@ -2004,6 +2004,8 @@ enum StdlibModuleLookup {
 /// 1. A compiled-source module (`COMPILED_STD_MODULES`) — build only that one
 ///    (the single expensive per-module type-check), matching what the full pass
 ///    would have produced for this name.
+/// 1b. A documentation-only module (`DOC_ONLY_MODULES`) — relayed straight from
+///    its embedded source, same as the full pass; no type-check to run.
 /// 2. A kernel-qualifier module — the kernel type table is a single shared db, so
 ///    the full kernel-doc pass already costs one check; take this name's entry.
 /// 3. A listed-but-otherwise-undocumentable name — the signature-less fallback,
@@ -2029,6 +2031,17 @@ fn query_single_stdlib_module(module_name: &str) -> Result<StdlibModuleLookup, C
             return Ok(StdlibModuleLookup::Found(build_compiled_std_module_doc(
                 &segments, csm.source,
             )?));
+        }
+    }
+
+    // 1b. Documentation-only: relayed straight from the embedded source, same as
+    // the full `build_stdlib_docs` pass — no type-check to run.
+    for dom in ipe_stdlib::DOC_ONLY_MODULES {
+        if dom.dotted == dotted {
+            let segments: Vec<String> = dom.dotted.split('.').map(str::to_owned).collect();
+            return Ok(StdlibModuleLookup::Found(build_source_only_module_doc(
+                &segments, dom.source,
+            )));
         }
     }
 
@@ -2145,36 +2158,67 @@ fn value_annotations(
     Ok(annotations)
 }
 
-/// Build a [`ModuleDoc`] for a documentation-only reserved qualifier
-/// (`Ipe.Ffi.Kernel` / `Ipe.Ffi.Rust`) straight from its embedded source.
+/// Build a [`ModuleDoc`] for a documentation-only module (a reserved FFI
+/// qualifier, or a bespoke-reader schema such as `Ipe.Package`) straight from
+/// its embedded source.
 ///
-/// These qualifiers are recognised structurally by the compiler, never compiled
-/// as importable modules, so there is no type-checked API to read. The
-/// module-header doc and each exposed member's `name : Type` signature line +
-/// doc-comment are relayed verbatim from the source via
-/// [`ipe_docs::stdlib_docs::extract_module_doc`]; the resolved-type field is a
-/// placeholder ([`TyDoc::Unit`]) because no cross-reference identity exists for a
-/// compiler primitive. Always yields a [`ModuleDoc`] so the qualifier stays
-/// queryable and `--list`/query agree.
+/// None of these have a type-checked API to read: an FFI qualifier is
+/// recognised structurally by the compiler, never compiled as an importable
+/// module; a bespoke-reader schema is read by its own syntactic reader,
+/// outside the stdlib-injection pipeline entirely. The module-header doc and
+/// each export's doc-comment are relayed verbatim from the source via
+/// [`ipe_docs::stdlib_docs::extract_module_doc`], split by
+/// [`ipe_docs::stdlib_docs::ExportKind`]:
+///
+/// - A value export keeps its `name : Type` signature line; one with no
+///   signature at all (rare) is dropped, as it was before this split, since
+///   [`ValueDoc`] has no unsigned form.
+/// - A true union export becomes a queryable [`UnionDoc`] — `params: 0` and no
+///   constructors, since the raw-source scrape reads neither (an honest
+///   limitation rather than a guess); the module stays discoverable and
+///   `Module.Name` resolves, even though its constructors cannot be listed.
+/// - A type-alias export is dropped. No stdlib module — compiled or
+///   doc-only — surfaces a type alias as a queryable member, so a doc-only
+///   module does not either; the resolved-type field above the union split is
+///   a placeholder ([`TyDoc::Unit`]) because no cross-reference identity
+///   exists for a compiler primitive.
+///
+/// Always yields a [`ModuleDoc`] so the module stays queryable and
+/// `--list`/query agree.
 fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc {
+    use ipe_docs::stdlib_docs::ExportKind;
+
     let extracted = ipe_docs::stdlib_docs::extract_module_doc(&segments.join("."), source);
-    let values = extracted
-        .exports
-        .into_iter()
-        .filter_map(|e| {
-            let signature = e.signature?;
-            Some(ValueDoc {
-                name: e.name,
-                signature: ValueSignature::Written(signature),
-                comment: e.doc.unwrap_or_default(),
-            })
-        })
-        .collect();
+    let mut values = Vec::new();
+    let mut unions = Vec::new();
+    for e in extracted.exports {
+        match e.kind {
+            ExportKind::Value => {
+                let Some(signature) = e.signature else {
+                    continue;
+                };
+                values.push(ValueDoc {
+                    name: e.name,
+                    signature: ValueSignature::Written(signature),
+                    comment: e.doc.unwrap_or_default(),
+                });
+            }
+            ExportKind::Union => {
+                unions.push(UnionDoc {
+                    name: e.name,
+                    params: 0,
+                    ctors: Vec::new(),
+                    comment: e.doc.unwrap_or_default(),
+                });
+            }
+            ExportKind::Alias => {}
+        }
+    }
     ModuleDoc {
         name: segments.join("."),
         kind: ModuleKind::Stdlib,
         comment: extracted.module_doc.unwrap_or_default(),
-        unions: Vec::new(),
+        unions,
         values,
     }
 }
