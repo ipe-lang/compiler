@@ -19411,7 +19411,7 @@ mod tests {
             );
         }
         for k in StdlibKernel::ALL {
-            if k.decl().qualifier == "Http" && !in_http_method.contains(&k) {
+            if k.decl().qualifier == "Http" && !in_http_method.contains(k) {
                 assert!(
                     k.is_http_client(),
                     "{k:?} is an `Ipe.Http` kernel (emits `{}` in http_client) but \
