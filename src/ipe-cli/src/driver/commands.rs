@@ -4638,24 +4638,12 @@ pub fn lowering_check_query(
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
 /// refusal of [`analysis_graphs`].
 pub fn front_check(root: &ProjectRoot) -> Result<(), CliError> {
-    let manifest_path = root.path().join(package_manifest::PACKAGE_IPE);
-    let source = SettingsSource::Manifest {
-        manifest: root.manifest(),
-        manifest_path: &manifest_path,
-        // A front check writes no artifact and opens no window: it judges the
-        // program the served build compiles.
-        host: HostIntent::Served,
-    };
-    let options = BuildOptions {
-        target: ipe_ir::Target::Native,
-        intent: ipe_backend_rust::BuildIntent::Development,
-        ..BuildOptions::from_env()?
-    };
+    let base = BuildOptions::from_env()?;
     crate::threads::run_compile(|| {
         for graph in analysis_graphs(&AnalysisTarget::Project(root))? {
             let config = ipe_db::BuildConfig::new(
                 &graph.db,
-                emit_settings(&source, &options, runtime_embed::BundleRole::Out),
+                super::build_pipeline::served_dev_settings(root, &base),
             );
             compile_prepared(
                 &graph.db,

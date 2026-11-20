@@ -317,12 +317,13 @@ const ADMITTED: &[(&str, &str, &str, usize)] = &[
         "release_pipeline",
         3,
     ),
-    // A front check writes no artifact and opens no window: it judges the
-    // served build.
+    // A judge that writes no artifact and opens no window (the front check,
+    // the capability report's frame judge) reads the served development
+    // build's settings from this one site.
     (
         "HostIntent::Served",
-        "src/ipe-cli/src/driver/commands.rs",
-        "front_check",
+        "src/ipe-cli/src/driver/build_pipeline.rs",
+        "served_dev_settings",
         1,
     ),
     (
@@ -1171,6 +1172,7 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
              fn compile_source_set_here() { RustBackend::configured(&g, &s); }\n\
              fn build_project_with_options() { go(HostIntent::Served); }\n\
              fn build_from_sources() { go(HostIntent::Served); }\n\
+             fn served_dev_settings() { go(HostIntent::Served); }\n\
              fn manifest_emit_settings() { let e = m.wasm.public_env.to_names(); \
              let b = m.delivery.browser.base.clone(); let h = w.mode == WasmMode::Hydrate; \
              let v = m.delivery.servers.clone(); let f = m.delivery.frame_origins.clone(); }\n\
@@ -1199,7 +1201,6 @@ const fn admitted_sources() -> [(&'static str, &'static str); 7] {
              fn run_eject() { go(HostIntent::Served); }\n\
              fn release_pipeline() { go(HostIntent::Served); go(HostIntent::Served); \
              go(HostIntent::Served); }\n\
-             fn front_check() { go(HostIntent::Served); }\n\
              fn serve_client_bundle() { let b = manifest.delivery.browser.base.clone(); \
              let s = &manifest.delivery.servers; let f = &manifest.delivery.frame_origins; }\n",
         ),

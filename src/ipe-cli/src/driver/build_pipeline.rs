@@ -403,13 +403,29 @@ pub(super) fn served_frame_site_step(
     root: &ProjectRoot,
     program: &ipe_ir::Program,
 ) -> Result<(), CliError> {
+    frame_site_step(
+        program,
+        &served_dev_settings(root, &BuildOptions::default()),
+    )
+}
+
+/// The settings of the native development build of `root`'s served host,
+/// the build `ipe dev build` runs, with every other option from `base`.
+///
+/// A command that judges that build without writing an artifact or opening a
+/// window (the front check, the capability report's frame judge) reads these,
+/// so it judges the program the served build compiles.
+pub(super) fn served_dev_settings(
+    root: &ProjectRoot,
+    base: &BuildOptions,
+) -> ipe_backend_rust::EmitSettings {
     let manifest_path = root.path().join(crate::package_manifest::PACKAGE_IPE);
     let options = BuildOptions {
         target: ipe_ir::Target::Native,
         intent: ipe_backend_rust::BuildIntent::Development,
-        ..BuildOptions::default()
+        ..base.clone()
     };
-    let settings = emit_settings(
+    emit_settings(
         &SettingsSource::Manifest {
             manifest: root.manifest(),
             manifest_path: &manifest_path,
@@ -417,8 +433,7 @@ pub(super) fn served_frame_site_step(
         },
         &options,
         runtime_embed::BundleRole::Out,
-    );
-    frame_site_step(program, &settings)
+    )
 }
 
 /// The refusal of a frame list, `entry` its first origin, on a project no
