@@ -3142,7 +3142,7 @@ fn derive_target_client_iff_browser_wasm() {
     );
 }
 
-/// `mod_decls` reads module declarations by Rust's own lexical grammar.
+/// `scan_module` reads module declarations by Rust's own lexical grammar.
 ///
 /// A `mod` inside a comment, a string, a raw string or a char literal is not a
 /// declaration; a brace inside a char literal never unbalances the blocks; a
@@ -3150,7 +3150,7 @@ fn derive_target_client_iff_browser_wasm() {
 /// inline `mod web { … }` block records the block; a `#[path]` attribute
 /// travels with the declaration it decorates, past a `#[cfg]` beside it.
 #[test]
-fn mod_decls_reads_declarations_by_rust_lexical_grammar() {
+fn scan_module_reads_declarations_by_rust_lexical_grammar() {
     let text = r##"
 // mod in_line_comment;
 /* mod in_block_comment; /* nested */ mod still_comment; */
@@ -3173,9 +3173,10 @@ pub mod r#async;
         name: name.to_owned(),
         inline: inline.iter().map(|s| (*s).to_owned()).collect(),
         path_attr: path_attr.map(str::to_owned),
+        test_only: false,
     };
     assert_eq!(
-        mod_decls(text),
+        scan_module(text).map(|scan| scan.decls),
         Ok(vec![
             decl("basics", &[], None),
             decl("path_core", &[], None),
@@ -3186,9 +3187,9 @@ pub mod r#async;
     );
 }
 
-/// `mod_decls` refuses every shape it cannot resolve exactly, never guessing.
+/// `scan_module` refuses every shape it cannot resolve exactly, never guessing.
 #[test]
-fn mod_decls_refuses_shapes_it_cannot_resolve_exactly() {
+fn scan_module_refuses_shapes_it_cannot_resolve_exactly() {
     let refusals = [
         ("#![path = \"x.rs\"]\n", ModScanRefusal::UnreadablePathAttr),
         (
@@ -3216,9 +3217,147 @@ fn mod_decls_refuses_shapes_it_cannot_resolve_exactly() {
             ModScanRefusal::Unterminated("string literal"),
         ),
         ("/* open\n", ModScanRefusal::Unterminated("block comment")),
+        (
+            "const S: &str = include!(\"x.rs\");\n",
+            ModScanRefusal::UnreadableInclude("include".to_owned()),
+        ),
+        (
+            "const S: &str = include_str!(concat!(\"x\", \".js\"));\n",
+            ModScanRefusal::UnreadableInclude("include_str".to_owned()),
+        ),
+        (
+            "const S: &[u8] = include_bytes!(\"a\\\\b\");\n",
+            ModScanRefusal::UnreadableInclude("include_bytes".to_owned()),
+        ),
+        // A test gate not in one of the two read spellings counts as production.
+        (
+            "#[cfg(any(test))]\nconst S: &str = include!(\"x.rs\");\n",
+            ModScanRefusal::UnreadableInclude("include".to_owned()),
+        ),
+        // The gate ends at its item: a later item is production code.
+        (
+            "#[cfg(test)]\nuse a;\nconst S: &str = include!(\"x.rs\");\n",
+            ModScanRefusal::UnreadableInclude("include".to_owned()),
+        ),
+        (
+            "match x {\n#[cfg(test)]\nA => 1,\nB => { include!(\"x.rs\") }\n}\n",
+            ModScanRefusal::UnreadableInclude("include".to_owned()),
+        ),
     ];
     for (text, refusal) in refusals {
-        assert_eq!(mod_decls(text), Err(refusal), "{text:?}");
+        assert_eq!(scan_module(text), Err(refusal), "{text:?}");
+    }
+}
+
+/// `scan_module` records the production includes and marks test-only code.
+///
+/// An include outside test-only code is recorded in every delimiter form; one
+/// under `#[cfg(test)]` or `#[cfg(all(…, test, …))]`, on its item or an
+/// enclosing block, is not, and a declaration there is marked test-only.
+#[test]
+fn scan_module_records_production_includes_and_test_only_code() {
+    let text = r#"
+const A: &str = include_str!("client.js");
+const B: &[u8] = std::include_bytes!["../assets/b.bin"];
+#[cfg(test)]
+const C: &str = include_str!("../../outside.md");
+#[cfg(all(test, feature = "x"))]
+#[allow(dead_code)]
+mod tests {
+    const D: &str = include_str!(concat!(env!("X"), "/d"));
+    mod helpers;
+}
+#[cfg(all(feature = "x", test))]
+fn t() { include!("x.rs"); }
+fn production() { let e = include_str!{"e.txt"}; }
+"#;
+    let scan = scan_module(text);
+    assert_eq!(
+        scan.as_ref().map(|scan| scan.includes.clone()),
+        Ok(vec![
+            "client.js".to_owned(),
+            "../assets/b.bin".to_owned(),
+            "e.txt".to_owned(),
+        ])
+    );
+    assert_eq!(
+        scan.map(|scan| scan.decls),
+        Ok(vec![ModDecl {
+            name: "helpers".to_owned(),
+            inline: vec!["tests".to_owned()],
+            path_attr: None,
+            test_only: true,
+        }])
+    );
+}
+
+/// The eject closure vendors every production include, wherever it sits.
+///
+/// A root-level `#[path]`-loaded file owns no module directory, so its embedded
+/// asset is reached only through its include; an include of a test-only module
+/// is never read by a build and refuses nothing.
+#[test]
+fn reachable_runtime_copy_vendors_production_includes() -> Result<(), CliError> {
+    let tree = runtime_tree(&[
+        ("mod.rs", ""),
+        ("glue.rs", "#[path = \"bridge.rs\"]\npub mod bridge;\n"),
+        (
+            "bridge.rs",
+            "const JS: &str = include_str!(\"assets/bridge.js\");\n#[cfg(test)]\nmod tests;\n",
+        ),
+        // A `#[path]`-loaded file owns its own directory: `mod tests;` is `tests.rs`.
+        (
+            "tests.rs",
+            "const T: &str = include_str!(\"../../../x\");\n",
+        ),
+        ("assets/bridge.js", "// js"),
+        ("assets/unused.js", "// unused"),
+        (
+            "web/mod.rs",
+            "const W: &str = include_str!(\"../assets/shared.css\");\n",
+        ),
+        ("assets/shared.css", "/* css */"),
+    ]);
+
+    let manifest = eject_closure(&tree, "pub mod glue;\npub mod web;\n")?;
+
+    let has = |p: &str| manifest.contains_key(&PathBuf::from(p));
+    assert!(has("src/ipe_runtime/bridge.rs"), "the `#[path]` sibling");
+    assert!(
+        has("src/ipe_runtime/assets/bridge.js"),
+        "a root-level path-loaded file's embedded asset"
+    );
+    assert!(
+        has("src/ipe_runtime/assets/shared.css"),
+        "an asset a directory module embeds from outside its directory"
+    );
+    assert!(!has("src/ipe_runtime/assets/unused.js"), "an unread asset");
+    Ok(())
+}
+
+/// A production include naming no tree file refuses the eject.
+#[test]
+fn reachable_runtime_copy_refuses_includes_naming_no_tree_file() {
+    for literal in [
+        "gone.js",
+        "../outside.js",
+        "/abs.js",
+        "a//b.js",
+        "C:/x.js",
+        "",
+    ] {
+        let including = format!("const S: &str = include_str!({literal:?});\n");
+        let tree = runtime_tree(&[
+            ("mod.rs", ""),
+            ("a.rs", &including),
+            ("abs.js", "// js"),
+            ("a/b.js", "// js"),
+            ("x.js", "// js"),
+        ]);
+        assert!(
+            is_compiler_bug(&eject_closure(&tree, "pub mod a;\n")),
+            "{literal:?}"
+        );
     }
 }
 
@@ -3382,6 +3521,181 @@ fn reachable_runtime_copy_refuses_path_attributes_leaving_the_tree() {
     }
 }
 
+/// The module scan's token stream over `text`, as comparable words.
+///
+/// A doc attribute is dropped: rustc turns a doc comment into one, and the
+/// scan drops comments.
+fn scan_words(text: &str) -> Result<Vec<String>, ModScanRefusal> {
+    let words: Vec<String> = mod_tokens(text)?
+        .into_iter()
+        .map(|tok| match tok {
+            ModTok::Ident(word) => format!("i:{word}"),
+            ModTok::Str(Some(value)) => format!("s:{value}"),
+            ModTok::Str(None) => "s?".to_owned(),
+            ModTok::Punct(c) => format!("p:{c}"),
+        })
+        .collect();
+    Ok(without_doc_attributes(&words))
+}
+
+/// rustc's own token stream over `text` (via `proc_macro2`), in the words of
+/// [`scan_words`]: lifetimes and non-string literals dropped.
+fn rustc_words(text: &str) -> Option<Vec<String>> {
+    fn push(stream: proc_macro2::TokenStream, words: &mut Vec<String>) {
+        use proc_macro2::{Delimiter, TokenTree};
+        let mut lifetime = false;
+        for tree in stream {
+            match tree {
+                TokenTree::Punct(punct) if punct.as_char() == '\'' => lifetime = true,
+                TokenTree::Ident(_) if lifetime => lifetime = false,
+                TokenTree::Ident(ident) => words.push(format!("i:{ident}")),
+                TokenTree::Punct(punct) => words.push(format!("p:{}", punct.as_char())),
+                TokenTree::Literal(literal) => {
+                    let spelled = literal.to_string();
+                    let raw = ["r", "br", "cr"].iter().any(|prefix| {
+                        spelled
+                            .strip_prefix(prefix)
+                            .is_some_and(|rest| rest.starts_with(['"', '#']))
+                    });
+                    // A string of any kind: its UTF-8 value, if it has one.
+                    let value = match syn::parse_str::<syn::Lit>(&spelled) {
+                        Ok(syn::Lit::Str(lit)) => Some(Some(lit.value())),
+                        Ok(syn::Lit::ByteStr(lit)) => Some(String::from_utf8(lit.value()).ok()),
+                        Ok(syn::Lit::CStr(lit)) => Some(lit.value().into_string().ok()),
+                        _ => None,
+                    };
+                    match value {
+                        Some(Some(value)) if raw || !spelled.contains('\\') => {
+                            words.push(format!("s:{value}"));
+                        }
+                        Some(_) => words.push("s?".to_owned()),
+                        None => {}
+                    }
+                }
+                TokenTree::Group(group) => {
+                    let (open, close) = match group.delimiter() {
+                        Delimiter::Parenthesis => (Some('('), Some(')')),
+                        Delimiter::Brace => (Some('{'), Some('}')),
+                        Delimiter::Bracket => (Some('['), Some(']')),
+                        Delimiter::None => (None, None),
+                    };
+                    words.extend(open.map(|c| format!("p:{c}")));
+                    push(group.stream(), words);
+                    words.extend(close.map(|c| format!("p:{c}")));
+                }
+            }
+        }
+    }
+    let stream: proc_macro2::TokenStream = text.parse().ok()?;
+    let mut words = Vec::new();
+    push(stream, &mut words);
+    Some(without_doc_attributes(&words))
+}
+
+/// `words` with every `#[doc = "…"]` and `#![doc = "…"]` removed.
+fn without_doc_attributes(words: &[String]) -> Vec<String> {
+    let is_lit = |word: &str| word.starts_with("s:") || word == "s?";
+    let mut kept = Vec::with_capacity(words.len());
+    let mut rest = words;
+    while let Some((first, tail)) = rest.split_first() {
+        let body = match tail {
+            [bang, more @ ..] if bang == "p:!" => more,
+            more => more,
+        };
+        if first == "p:#"
+            && let [open, doc, eq, lit, close, after @ ..] = body
+            && open == "p:["
+            && doc == "i:doc"
+            && eq == "p:="
+            && is_lit(lit)
+            && close == "p:]"
+        {
+            rest = after;
+            continue;
+        }
+        kept.push(first.clone());
+        rest = tail;
+    }
+    kept
+}
+
+/// The module scan reads every runtime source file token for token as rustc.
+///
+/// A differential over the whole embedded tree: a literal, comment or number
+/// form the scan's lexer misreads would hide or forge a `mod` declaration.
+#[test]
+fn scan_module_lexes_every_runtime_file_as_rustc() -> Result<(), CliError> {
+    let tree = RuntimeSource::Embedded.module_tree()?;
+    let mut compared = 0_usize;
+    for (rel, text) in tree.files() {
+        if rel.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let rustc = rustc_words(text);
+        assert!(rustc.is_some(), "{} lexes under rustc", rel.display());
+        let scanned = scan_words(text).ok();
+        assert_eq!(
+            first_divergence(scanned.as_deref(), rustc.as_deref()),
+            None,
+            "the module scan lexes {} as rustc does",
+            rel.display()
+        );
+        compared += 1;
+    }
+    assert!(compared > 0, "the embedded runtime holds Rust sources");
+    Ok(())
+}
+
+/// The scan lexer agrees with rustc on every literal, comment and number form.
+#[test]
+fn scan_module_lexes_literal_forms_as_rustc() {
+    let text = r###"
+/* outer /* inner */ still */ /// doc "mod"
+//! inner doc
+const A: &str = "esc\"aped"; const B: &[u8] = b"by\x00te";
+const C: &str = r#"raw "mod x;" \ "#; const D: &[u8] = br##"x"#y"##;
+const E: char = '\''; const F: char = '"'; const G: u8 = b'{';
+const H: f64 = 1.5e-3 + 2.0f64 + 0x1e-3 + 1E+5;
+fn f<'a, 'b: 'a>(x: &'a str) -> &'a str { 'outer: loop { break 'outer x; } }
+let t = x.0.1; let r = 0..10; let m = 1.max(2); let r#mod = c"cstr";
+#[doc = "explicit"] struct S;
+"###;
+    let (scanned, rustc) = (scan_words(text).ok(), rustc_words(text));
+    assert_eq!(first_divergence(scanned.as_deref(), rustc.as_deref()), None);
+}
+
+/// The words around the first place `scanned` and `rustc` differ, if any.
+fn first_divergence(scanned: Option<&[String]>, rustc: Option<&[String]>) -> Option<String> {
+    let (Some(scanned), Some(rustc)) = (scanned, rustc) else {
+        return (scanned.is_some() != rustc.is_some()).then(|| {
+            format!(
+                "scan {:?} vs rustc {:?}",
+                scanned.is_some(),
+                rustc.is_some()
+            )
+        });
+    };
+    let at = scanned
+        .iter()
+        .zip(rustc)
+        .position(|(a, b)| a != b)
+        .or_else(|| (scanned.len() != rustc.len()).then(|| scanned.len().min(rustc.len())))?;
+    let window = |words: &[String]| {
+        words
+            .get(at.saturating_sub(8)..)
+            .unwrap_or_default()
+            .iter()
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    Some(format!(
+        "at word {at}: scan {:?} vs rustc {:?}",
+        window(scanned),
+        window(rustc)
+    ))
+}
+
 /// The embedded runtime's eject closure vendors every `#[path]` target.
 ///
 /// Declaring any top-level module alone yields a closure, and every `#[path]`
@@ -3418,7 +3732,7 @@ fn embedded_runtime_closure_vendors_every_path_attribute_target() -> Result<(), 
             if rel.extension().is_none_or(|ext| ext != "rs") {
                 continue;
             }
-            let decls = mod_decls(text);
+            let decls = scan_module(text).map(|scan| scan.decls);
             assert!(decls.is_ok(), "{}: {decls:?}", rel.display());
             let dir = rel.parent().unwrap_or_else(|| Path::new(""));
             for literal in decls
