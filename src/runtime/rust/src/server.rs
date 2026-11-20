@@ -7373,7 +7373,7 @@ mod tests {
             );
             assert!(!msg.contains('\u{202e}'), "{raw:?}: {msg:?}");
         }
-        assert_eq!(RefusedText::new("a\tb").as_str(), "a\\tb");
+        assert_eq!(RefusedText::new("a\tb").to_string(), "a\\tb");
     }
 
     /// Prove the bound on a refused method: a method of any length is quoted

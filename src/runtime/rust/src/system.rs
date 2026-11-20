@@ -196,7 +196,12 @@ impl EnvCeiling {
         raw: Result<String, std::env::VarError>,
     ) -> Result<T, EnvCeilingRefusal> {
         let n = self.parse(raw)?;
-        T::try_from(n).map_err(|_| self.refusal(n.to_string(), CeilingDefect::TooLarge))
+        T::try_from(n).map_err(|_| {
+            self.refusal(
+                shown_env_value(n.to_string().as_bytes()),
+                CeilingDefect::TooLarge,
+            )
+        })
     }
 
     /// The raw lookup of this ceiling's variable in the live environment (overlay first).
@@ -241,7 +246,7 @@ impl EnvCeiling {
         checked.map_err(|defect| EnvCeilingRefusal {
             name: self.name,
             unit: self.unit,
-            shown: value.to_string(),
+            shown: shown_env_value(value.to_string().as_bytes()),
             defect,
             source: CeilingSource::InCode {
                 setting,
@@ -264,7 +269,7 @@ impl EnvCeiling {
             .map_err(|defect| EnvCeilingRefusal {
                 name: self.name,
                 unit: self.unit,
-                shown: self.default.to_string(),
+                shown: shown_env_value(self.default.to_string().as_bytes()),
                 defect,
                 source: CeilingSource::Default { max: self.max },
             })
@@ -281,7 +286,7 @@ impl EnvCeiling {
         }
     }
 
-    const fn refusal(self, shown: String, defect: CeilingDefect) -> EnvCeilingRefusal {
+    const fn refusal(self, shown: ShownEnvValue, defect: CeilingDefect) -> EnvCeilingRefusal {
         EnvCeilingRefusal {
             name: self.name,
             unit: self.unit,
@@ -292,7 +297,7 @@ impl EnvCeiling {
     }
 
     /// A refusal of a parsed value above [`Self::max_value`].
-    const fn refusal_over_bound(self, shown: String) -> EnvCeilingRefusal {
+    const fn refusal_over_bound(self, shown: ShownEnvValue) -> EnvCeilingRefusal {
         EnvCeilingRefusal {
             name: self.name,
             unit: self.unit,
@@ -477,14 +482,15 @@ pub enum CeilingDefect {
 
 /// A present-but-malformed environment ceiling, naming the variable.
 ///
-/// The echoed value is truncated to [`ENV_VALUE_SHOWN_CHARS`] and escaped, so
-/// the refusal can neither flood nor forge the line it lands on. It reaches an
-/// `IpeError` channel as `InvalidInput`.
+/// The echoed value is held raw and truncated to [`ENV_VALUE_SHOWN_CHARS`], so
+/// the refusal cannot flood the line it lands on: an operator line escapes it
+/// once ([`ScrubbedLine::of_refusal`]), and the `Display` text, a value, holds
+/// it raw. It reaches an `IpeError` channel as `InvalidInput`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvCeilingRefusal {
     name: &'static str,
     unit: &'static str,
-    shown: String,
+    shown: ShownEnvValue,
     defect: CeilingDefect,
     source: CeilingSource,
 }
@@ -538,41 +544,53 @@ impl EnvCeilingRefusal {
     }
 }
 
-impl std::fmt::Display for EnvCeilingRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ScrubbedDisplay for EnvCeilingRefusal {
+    fn render(&self, out: &mut Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         let Self {
             name, unit, shown, ..
         } = self;
         match (self.source, self.defect) {
             (CeilingSource::Env, CeilingDefect::NotDecimal) => {
-                write!(f, "{name} must be a {unit} (got \"{shown}\")")
+                write!(out, "{name} must be a {unit} (got \"")?;
             }
             (CeilingSource::Env, CeilingDefect::Zero) => {
-                write!(f, "{name} must be a positive {unit} (got \"{shown}\")")
+                write!(out, "{name} must be a positive {unit} (got \"")?;
             }
             (CeilingSource::Env, CeilingDefect::TooLarge) => {
-                write!(f, "{name} is too large for this platform (got \"{shown}\")")
+                write!(out, "{name} is too large for this platform (got \"")?;
             }
             (CeilingSource::EnvOverBound { max }, _) => {
-                write!(f, "{name} must be at most {max} (got \"{shown}\")")
+                write!(out, "{name} must be at most {max} (got \"")?;
             }
-            (CeilingSource::Default { max }, _) => write!(
-                f,
-                "{name} is unset and its default {shown} is out of range; set {name} to at most {max}"
-            ),
+            (CeilingSource::Default { max }, _) => {
+                write!(out, "{name} is unset and its default ")?;
+                shown.render(out);
+                return write!(out, " is out of range; set {name} to at most {max}");
+            }
             (
                 CeilingSource::InCode { setting, .. },
                 CeilingDefect::NotDecimal | CeilingDefect::Zero,
             ) => {
-                write!(f, "the `{setting}` setting must be positive (got {shown})")
+                write!(out, "the `{setting}` setting must be positive (got ")?;
+                shown.render(out);
+                return out.write_str(")");
             }
             (CeilingSource::InCode { setting, max }, CeilingDefect::TooLarge) => {
-                write!(
-                    f,
-                    "the `{setting}` setting must be at most {max} (got {shown})"
-                )
+                write!(out, "the `{setting}` setting must be at most {max} (got ")?;
+                shown.render(out);
+                return out.write_str(")");
             }
         }
+        shown.render(out);
+        out.write_str("\")")
+    }
+}
+
+/// The text value: the refused value raw (see [`ScrubbedDisplay`]).
+impl std::fmt::Display for EnvCeilingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&refusal_text(self))
     }
 }
 
@@ -580,31 +598,33 @@ impl std::error::Error for EnvCeilingRefusal {}
 
 impl From<EnvCeilingRefusal> for String {
     fn from(refusal: EnvCeilingRefusal) -> Self {
-        refusal.to_string()
+        refusal_text(&refusal)
     }
 }
 
 impl From<EnvCeilingRefusal> for IpeError {
     fn from(refusal: EnvCeilingRefusal) -> Self {
-        Self::invalid_input(refusal.to_string())
+        Self::invalid_input(refusal_text(&refusal))
     }
 }
 
 impl From<EnvCeilingRefusal> for KernelFailure {
     fn from(refusal: EnvCeilingRefusal) -> Self {
-        Self::InvalidInput(refusal.to_string())
+        Self::InvalidInput(refusal_text(&refusal))
     }
 }
 
 /// A present environment value outside its variable's grammar, naming the variable.
 ///
-/// The echoed value is truncated and escaped as an [`EnvCeilingRefusal`]'s is,
-/// and it reaches an `IpeError` channel as `InvalidInput`.
+/// The echoed value is held raw and truncated as an [`EnvCeilingRefusal`]'s
+/// is: escaped once for an operator line ([`ScrubbedLine::of_refusal`]), raw
+/// in its `Display` text, and raw in the `IpeError` it reaches as
+/// `InvalidInput`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvValueRefusal {
     name: &'static str,
     expected: &'static str,
-    shown: String,
+    shown: ShownEnvValue,
 }
 
 impl EnvValueRefusal {
@@ -627,14 +647,24 @@ impl EnvValueRefusal {
     }
 }
 
-impl std::fmt::Display for EnvValueRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ScrubbedDisplay for EnvValueRefusal {
+    fn render(&self, out: &mut Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         let Self {
             name,
             expected,
             shown,
         } = self;
-        write!(f, "{name} must be {expected} (got \"{shown}\")")
+        write!(out, "{name} must be {expected} (got \"")?;
+        shown.render(out);
+        out.write_str("\")")
+    }
+}
+
+/// The text value: the refused value raw (see [`ScrubbedDisplay`]).
+impl std::fmt::Display for EnvValueRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&refusal_text(self))
     }
 }
 
@@ -642,36 +672,46 @@ impl std::error::Error for EnvValueRefusal {}
 
 impl From<EnvValueRefusal> for IpeError {
     fn from(refusal: EnvValueRefusal) -> Self {
-        Self::invalid_input(refusal.to_string())
+        Self::invalid_input(refusal_text(&refusal))
     }
 }
 
-/// Renders a refused environment value for its error text without losing or
-/// smuggling a byte: valid UTF-8 keeps its printable characters and escapes
-/// every other one (`char::escape_debug` — controls, ESC, CR/LF, bidi
-/// overrides, `"` and `\`), and each byte that is not UTF-8 shows as `\xNN`.
-/// At most [`ENV_VALUE_SHOWN_CHARS`] source characters or bytes are shown.
-pub(crate) fn shown_env_value(raw: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::new();
+/// An environment value a refusal quotes, held raw.
+///
+/// Built only by [`shown_env_value`], which keeps at most
+/// [`ENV_VALUE_SHOWN_CHARS`] source characters (or bytes that are not UTF-8),
+/// so a refusal's size never follows the value. It is written only through a
+/// [`Render`]: escaped once for an operator line, raw for a text value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownEnvValue(Box<[u8]>);
+
+impl ShownEnvValue {
+    /// Writes the value in `out`'s mode ([`Render::quote_bytes`]).
+    pub(crate) fn render(&self, out: &mut Render) {
+        out.quote_bytes(&self.0);
+    }
+}
+
+/// The first [`ENV_VALUE_SHOWN_CHARS`] source characters of `raw`, each byte
+/// that is not UTF-8 counting as one, kept raw for a refusal to quote.
+pub(crate) fn shown_env_value(raw: &[u8]) -> ShownEnvValue {
     let mut budget = ENV_VALUE_SHOWN_CHARS;
-    for chunk in raw.utf8_chunks() {
-        for c in chunk.valid().chars() {
+    let mut end = 0usize;
+    'chunks: for chunk in raw.utf8_chunks() {
+        let lengths = chunk
+            .valid()
+            .chars()
+            .map(char::len_utf8)
+            .chain(chunk.invalid().iter().map(|_| 1));
+        for len in lengths {
             let Some(left) = budget.checked_sub(1) else {
-                return out;
+                break 'chunks;
             };
             budget = left;
-            out.extend(c.escape_debug());
-        }
-        for b in chunk.invalid() {
-            let Some(left) = budget.checked_sub(1) else {
-                return out;
-            };
-            budget = left;
-            let _ = write!(out, "\\x{b:02X}");
+            end = end.saturating_add(len);
         }
     }
-    out
+    ShownEnvValue(raw.get(..end).unwrap_or(raw).into())
 }
 
 /// The invoking user's home directory: the one runtime home reader.
@@ -853,41 +893,165 @@ pub(crate) fn scrub_log_controls_capped(s: &str, max_bytes: usize) -> String {
     out
 }
 
-/// Author, operator or remote text a refusal quotes, scrubbed for a log line.
+/// Longest raw text, in bytes, a [`RefusedText`] holds; a longer text is cut
+/// on a character boundary and its render marks the cut.
+pub const REFUSED_TEXT_MAX_BYTES: usize = 4096;
+
+/// Author, operator or remote text a refusal quotes, held raw.
 ///
-/// Built only by [`RefusedText::new`], which runs [`scrub_log_controls`], so a
-/// refusal's `Display` prints it as is: every log hazard in it is already a
-/// visible escape, and no refusal can carry the raw text by mistake.
+/// Capped at [`REFUSED_TEXT_MAX_BYTES`], cut on a character boundary. A
+/// refusal writes it through a [`Render`] ([`Render::quote`]), so an operator
+/// line escapes it exactly once and a text value (an `IpeError` message)
+/// holds it raw.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RefusedText(String);
+pub struct RefusedText {
+    text: Box<str>,
+    cut: bool,
+}
 
 impl RefusedText {
-    /// The scrubbed form of `raw`.
+    /// `raw`, cut to [`REFUSED_TEXT_MAX_BYTES`] on a character boundary.
     #[must_use]
     pub fn new(raw: &str) -> Self {
-        Self(scrub_log_controls(raw).into_owned())
+        if raw.len() <= REFUSED_TEXT_MAX_BYTES {
+            return Self {
+                text: raw.into(),
+                cut: false,
+            };
+        }
+        let head = (0..=REFUSED_TEXT_MAX_BYTES)
+            .rev()
+            .find_map(|end| raw.get(..end))
+            .unwrap_or("");
+        Self {
+            text: head.into(),
+            cut: true,
+        }
     }
 
-    /// The scrubbed text.
+    /// The raw text kept, without the cut marker.
     #[must_use]
-    pub const fn as_str(&self) -> &str {
-        self.0.as_str()
+    pub fn raw(&self) -> &str {
+        &self.text
+    }
+
+    /// Whether the text was cut at [`REFUSED_TEXT_MAX_BYTES`].
+    #[must_use]
+    pub const fn is_cut(&self) -> bool {
+        self.cut
     }
 }
 
+impl ScrubbedDisplay for RefusedText {
+    fn render(&self, out: &mut Render) -> std::fmt::Result {
+        out.quote(&self.text);
+        if self.cut {
+            out.cut_marker();
+        }
+        Ok(())
+    }
+}
+
+/// The scrubbed text, for the `Server.listen` refusals that embed it in their
+/// own operator text.
 impl std::fmt::Display for RefusedText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&render(self, Quote::Scrubbed))
     }
+}
+
+/// How a [`Render`] writes the foreign text a refusal quotes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Quote {
+    /// As it is: for a text value (an `IpeError` message, a `String`).
+    Raw,
+    /// Escaped once by [`scrub_log_controls`]: for an operator line.
+    Scrubbed,
+}
+
+/// The text of one refusal rendered in one [`Quote`] mode.
+///
+/// Fixed words go in through [`std::fmt::Write`]; foreign text only through
+/// [`Self::quote`] or [`Self::quote_bytes`], so the mode decides how every
+/// quoted piece is written and the fixed words are written once for both.
+pub(crate) struct Render {
+    text: String,
+    mode: Quote,
+}
+
+impl Render {
+    /// An empty render in `mode`.
+    const fn new(mode: Quote) -> Self {
+        Self {
+            text: String::new(),
+            mode,
+        }
+    }
+
+    /// Writes foreign text: raw, or escaped by [`scrub_log_controls`].
+    pub(crate) fn quote(&mut self, raw: &str) {
+        match self.mode {
+            Quote::Raw => self.text.push_str(raw),
+            Quote::Scrubbed => self.text.push_str(&scrub_log_controls(raw)),
+        }
+    }
+
+    /// Writes foreign bytes: each UTF-8 run as [`Self::quote`] does, and each
+    /// byte that is not UTF-8 as `\xNN` when scrubbed (an escape the scrub
+    /// never writes otherwise) or as U+FFFD when raw.
+    pub(crate) fn quote_bytes(&mut self, raw: &[u8]) {
+        use std::fmt::Write as _;
+        for chunk in raw.utf8_chunks() {
+            self.quote(chunk.valid());
+            for b in chunk.invalid() {
+                match self.mode {
+                    Quote::Raw => self.text.push(char::REPLACEMENT_CHARACTER),
+                    Quote::Scrubbed => {
+                        let _ = write!(self.text, "\\x{b:02X}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Marks a quoted text cut at its cap: [`SCRUB_TRUNCATED`] when scrubbed,
+    /// `…` when raw.
+    pub(crate) fn cut_marker(&mut self) {
+        self.text.push_str(match self.mode {
+            Quote::Raw => "\u{2026}",
+            Quote::Scrubbed => SCRUB_TRUNCATED,
+        });
+    }
+}
+
+impl std::fmt::Write for Render {
+    fn write_str(&mut self, fixed: &str) -> std::fmt::Result {
+        self.text.push_str(fixed);
+        Ok(())
+    }
+}
+
+/// The text of `refusal` rendered in `mode`.
+pub(crate) fn render<R: ScrubbedDisplay + ?Sized>(refusal: &R, mode: Quote) -> String {
+    let mut out = Render::new(mode);
+    // Writing to a `String` never fails.
+    let _ = refusal.render(&mut out);
+    out.text
+}
+
+/// The text value of `refusal`: its quoted text raw. The message of the
+/// `IpeError` a refusal converts into.
+pub(crate) fn refusal_text<R: ScrubbedDisplay + ?Sized>(refusal: &R) -> String {
+    render(refusal, Quote::Raw)
 }
 
 /// A log message already escaped by [`scrub_log_controls`], exactly once.
 ///
-/// Built only by scrubbing raw text ([`Self::scrub`]), from a [`RefusedText`],
-/// or from a [`ScrubbedDisplay`] refusal whose text is assembled from scrubbed
-/// parts. The scrubbed sinks ([`emit_runtime_log_scrubbed`]) take it as is,
-/// so raw text cannot skip the scrub and scrubbed text is never scrubbed a
-/// second time (which would double every `\` it shows).
+/// Built only by scrubbing raw text ([`Self::scrub`]) or by rendering a
+/// [`ScrubbedDisplay`] refusal in [`Quote::Scrubbed`]. The scrubbed sinks
+/// ([`emit_runtime_log_scrubbed`]) take it as is, so raw text cannot skip the
+/// scrub and scrubbed text is never scrubbed a second time (which would
+/// double every `\` it shows). The one pre-escaped text carrier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScrubbedLine(String);
 
@@ -898,18 +1062,19 @@ impl ScrubbedLine {
         Self(scrub_log_controls(raw).into_owned())
     }
 
-    /// The rendered text of `refusal`, whose `Display` quotes only scrubbed
-    /// text beside its own fixed words.
+    /// `refusal` rendered in [`Quote::Scrubbed`]: its fixed words beside its
+    /// quoted text escaped once.
     ///
-    /// Fails closed: a rendering that still holds a log hazard (which no
-    /// [`ScrubbedDisplay`] refusal writes) is scrubbed whole.
+    /// Fails closed: a rendering that still holds a log hazard (which only a
+    /// fixed word written outside [`Render::quote`] could carry) is scrubbed
+    /// whole.
     #[must_use]
     #[cfg_attr(
         not(feature = "web-core"),
         allow(dead_code) // only the web render core renders a refusal
     )]
     pub(crate) fn of_refusal<R: ScrubbedDisplay + ?Sized>(refusal: &R) -> Self {
-        let shown = refusal.to_string();
+        let shown = render(refusal, Quote::Scrubbed);
         if shown.chars().any(is_log_hazard) {
             Self::scrub(&shown)
         } else {
@@ -935,7 +1100,7 @@ impl ScrubbedLine {
 
 impl From<RefusedText> for ScrubbedLine {
     fn from(text: RefusedText) -> Self {
-        Self(text.0)
+        Self::of_refusal(&text)
     }
 }
 
@@ -945,15 +1110,22 @@ impl std::fmt::Display for ScrubbedLine {
     }
 }
 
-/// A refusal whose `Display` writes its own fixed words and text already
-/// escaped where the refusal was built ([`RefusedText`], `shown_env_value`),
-/// so it reaches a log line through [`ScrubbedLine::of_refusal`], never a
-/// second scrub.
-#[cfg_attr(
-    not(feature = "web-core"),
-    allow(dead_code) // only the web render core renders a refusal
-)]
-pub(crate) trait ScrubbedDisplay: std::fmt::Display {}
+/// A refusal that renders its own text in a [`Quote`] mode.
+///
+/// One render per refusal holds its wording: [`ScrubbedLine::of_refusal`]
+/// renders it escaped once for an operator line, [`refusal_text`] raw for a
+/// text value. A refusal that quotes foreign text has no free-form `Display`
+/// that could be fed to a line sink as already escaped; where an `Error` impl
+/// needs one, it renders [`Quote::Raw`].
+pub(crate) trait ScrubbedDisplay {
+    /// Writes this refusal's text into `out`, foreign text through
+    /// [`Render::quote`] or [`Render::quote_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Only a failing fixed-word write, which a [`Render`] never returns.
+    fn render(&self, out: &mut Render) -> std::fmt::Result;
+}
 
 /// Append the scrubbed spelling of one character to `out`.
 fn push_scrubbed(c: char, out: &mut String) {
@@ -5690,10 +5862,10 @@ mod signal_mask_tests {
 #[cfg(not(target_arch = "wasm32"))]
 mod env_ceiling_tests {
     use super::{
-        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, EnvValueRefusal,
-        PROCESS_OUTPUT_CEILING, PROCESS_WALL_CEILING, ZeroCeiling, assert_env_ceiling_contract,
-        assert_env_duration_contract, locked_remove_var, locked_set_var, process_bounds,
-        process_output_ceiling,
+        CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, EnvValueRefusal, IpeError,
+        PROCESS_OUTPUT_CEILING, PROCESS_WALL_CEILING, ScrubbedLine, ZeroCeiling,
+        assert_env_ceiling_contract, assert_env_duration_contract, locked_remove_var,
+        locked_set_var, process_bounds, process_output_ceiling, refusal_text, scrub_log_controls,
     };
 
     #[test]
@@ -5794,7 +5966,7 @@ mod env_ceiling_tests {
             "an IP address",
             format!("\u{1b}[31m\n{}", "x".repeat(ENV_VALUE_SHOWN_CHARS * 2)).as_bytes(),
         );
-        let shown = refusal.to_string();
+        let shown = ScrubbedLine::of_refusal(&refusal).to_string();
         assert_eq!(refusal.name(), "EXAMPLE_VALUE");
         assert!(!shown.contains('\u{1b}'), "ESC is escaped: {shown}");
         assert!(!shown.contains('\n'), "a newline is escaped: {shown}");
@@ -5809,8 +5981,47 @@ mod env_ceiling_tests {
         );
         let invalid = EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", b"\xFF1");
         assert_eq!(
-            invalid.to_string(),
+            ScrubbedLine::of_refusal(&invalid).to_string(),
             "EXAMPLE_VALUE must be an IP address (got \"\\xFF1\")"
+        );
+        assert_eq!(
+            refusal_text(&invalid),
+            "EXAMPLE_VALUE must be an IP address (got \"\u{fffd}1\")",
+            "the text value shows a byte that is not UTF-8 as U+FFFD"
+        );
+    }
+
+    /// The text value of an env refusal holds the refused value raw: an
+    /// `IpeError` message is never pre-escaped, so a sink that scrubs it
+    /// escapes each byte exactly once.
+    #[test]
+    fn an_env_refusal_text_value_is_raw() {
+        let refusal = EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", b"a\\b\n");
+        let raw = "EXAMPLE_VALUE must be an IP address (got \"a\\b\n\")";
+        assert_eq!(refusal_text(&refusal), raw);
+        assert_eq!(refusal.to_string(), raw);
+        assert_eq!(
+            crate::ipe_error_message(IpeError::from(refusal.clone())),
+            raw
+        );
+        assert_eq!(
+            ScrubbedLine::of_refusal(&refusal).to_string(),
+            scrub_log_controls(raw),
+            "the operator line escapes the raw text exactly once"
+        );
+        let ceiling = EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count");
+        let Err(refused) = ceiling.parse(Ok("a\\b\n".to_owned())) else {
+            return;
+        };
+        let raw = "IPE_TEST_CEILING must be a count (got \"a\\b\n\")";
+        assert_eq!(refused.to_string(), raw);
+        assert_eq!(
+            crate::ipe_error_message(IpeError::from(refused.clone())),
+            raw
+        );
+        assert_eq!(
+            ScrubbedLine::of_refusal(&refused).to_string(),
+            scrub_log_controls(raw)
         );
     }
 
@@ -5846,7 +6057,7 @@ mod env_ceiling_tests {
         let duration = EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
         let shown = duration
             .parse(Ok(format!("\u{1b}[31m{}", "9x".repeat(64))))
-            .map_err(|r| r.to_string())
+            .map_err(|r| ScrubbedLine::of_refusal(&r).to_string())
             .expect_err("a malformed duration is refused");
         assert!(
             !shown.contains('\u{1b}'),
@@ -5920,7 +6131,7 @@ mod env_ceiling_tests {
         let long = format!("\u{1b}[31m{}", "9x".repeat(64));
         let shown = ceiling
             .parse(Ok(long))
-            .map_err(|r| r.to_string())
+            .map_err(|r| ScrubbedLine::of_refusal(&r).to_string())
             .expect_err("a non-decimal value is refused");
         assert!(
             !shown.contains('\u{1b}'),
@@ -7195,8 +7406,8 @@ mod scrub_log_controls_tests {
         );
     }
 
-    /// Text a [`super::RefusedText`] already scrubbed reaches the log line as
-    /// is: `a\b` shows as `a\\b`, never re-escaped to `a\\\\b`.
+    /// Text a [`super::RefusedText`] holds reaches the log line escaped
+    /// exactly once: `a\b` shows as `a\\b`, never re-escaped to `a\\\\b`.
     #[test]
     fn refused_text_with_backslash_logs_once_escaped() {
         let msg = super::ScrubbedLine::from(super::RefusedText::new("a\\b"));
@@ -7212,12 +7423,12 @@ mod scrub_log_controls_tests {
     #[test]
     fn raw_text_reaching_a_scrubbed_line_is_still_escaped() {
         struct Leaky;
-        impl std::fmt::Display for Leaky {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("x\n[ipe.live] forged\u{202e}")
+        impl super::ScrubbedDisplay for Leaky {
+            fn render(&self, out: &mut super::Render) -> std::fmt::Result {
+                use std::fmt::Write as _;
+                out.write_str("x\n[ipe.live] forged\u{202e}")
             }
         }
-        impl super::ScrubbedDisplay for Leaky {}
         for (msg, want) in [
             (
                 super::ScrubbedLine::scrub("a\\b\r\n\u{1b}[31m"),
@@ -7239,6 +7450,170 @@ mod scrub_log_controls_tests {
             );
             assert_eq!(line.trim_start(), want);
         }
+    }
+
+    /// A raw [`super::RefusedText`] is capped at
+    /// [`super::REFUSED_TEXT_MAX_BYTES`], cut on a character boundary, and
+    /// each render marks the cut: the scrub's own truncation marker on an
+    /// operator line, `…` in a text value.
+    #[test]
+    fn refused_text_is_capped_on_a_char_boundary() {
+        use super::{REFUSED_TEXT_MAX_BYTES, RefusedText, SCRUB_TRUNCATED, ScrubbedLine};
+        let fits = "é".repeat(REFUSED_TEXT_MAX_BYTES / 2);
+        let kept = RefusedText::new(&fits);
+        assert!(!kept.is_cut(), "a text at the cap is kept whole");
+        assert_eq!(kept.raw(), fits);
+        // One byte past the cap, so the cut lands inside a two-byte `é`.
+        let long = format!("a{fits}");
+        let cut = RefusedText::new(&long);
+        assert!(cut.is_cut());
+        assert!(
+            cut.raw().len() <= REFUSED_TEXT_MAX_BYTES,
+            "{}",
+            cut.raw().len()
+        );
+        assert_eq!(
+            cut.raw().len(),
+            REFUSED_TEXT_MAX_BYTES - 1,
+            "the cut backs off to a boundary"
+        );
+        assert!(long.starts_with(cut.raw()));
+        assert!(
+            super::refusal_text(&cut).ends_with('\u{2026}'),
+            "the text value marks the cut"
+        );
+        let line = ScrubbedLine::of_refusal(&cut).to_string();
+        assert!(
+            line.ends_with(SCRUB_TRUNCATED),
+            "the operator line marks the cut"
+        );
+        let huge = RefusedText::new(&"\n".repeat(REFUSED_TEXT_MAX_BYTES * 4));
+        assert!(
+            ScrubbedLine::of_refusal(&huge).to_string().len()
+                <= 2 * REFUSED_TEXT_MAX_BYTES + SCRUB_TRUNCATED.len(),
+            "a refusal's size never follows its input"
+        );
+    }
+
+    /// A secret-class value is shown by its length alone in every render: the
+    /// raw text value of its refusal never un-redacts it.
+    #[test]
+    fn redacted_value_stays_redacted_in_raw_render() {
+        use crate::env_grammar::{Class, EnvRefusal, Grammar, Shown};
+        let secret = "hunter2\n";
+        for refusal in [
+            EnvRefusal::Malformed {
+                name: "EXAMPLE_SECRET",
+                grammar: Grammar::Flag,
+                class: Class::Secret,
+                shown: Shown::of(Class::Secret, secret.as_bytes()),
+            },
+            EnvRefusal::NotUnicode {
+                name: "EXAMPLE_SECRET",
+                grammar: Grammar::Flag,
+                class: Class::Secret,
+                shown: Shown::of(Class::Secret, secret.as_bytes()),
+            },
+        ] {
+            for shown in [
+                super::refusal_text(&refusal),
+                refusal.to_string(),
+                crate::ipe_error_message(refusal.clone().into()),
+                super::ScrubbedLine::of_refusal(&refusal).to_string(),
+            ] {
+                assert!(!shown.contains("hunter2"), "secret leaked: {shown}");
+                assert!(shown.contains("<redacted, 8 bytes>"), "{shown}");
+            }
+        }
+    }
+
+    /// A refusal's fixed words never hold a log hazard, so its render in
+    /// either mode differs only where it quotes foreign text.
+    #[test]
+    fn refusal_fixed_words_hold_no_hazard() {
+        use crate::env_grammar::{Class, EnvRefusal, Grammar, Shown};
+        let ceiling =
+            super::EnvCeiling::new("IPE_TEST_CEILING", 7, super::ZeroCeiling::Refused, "count");
+        let duration = super::EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
+        let mut rendered = vec![
+            super::refusal_text(&super::RefusedText::new("plain")),
+            super::refusal_text(&super::EnvValueRefusal::new(
+                "EXAMPLE",
+                "an IP address",
+                b"v",
+            )),
+        ];
+        for raw in ["x", "0", "99", "18446744073709551616"] {
+            if let Err(r) = ceiling.parse(Ok(raw.to_owned())) {
+                rendered.push(super::refusal_text(&r));
+            }
+            if let Err(r) = duration.parse(Ok(raw.to_owned())) {
+                rendered.push(super::refusal_text(&r));
+            }
+        }
+        for value in [0, 99] {
+            if let Err(r) = ceiling.check_setting("example", value) {
+                rendered.push(super::refusal_text(&r));
+            }
+        }
+        if let Err(r) = ceiling.at_most(0).check_default() {
+            rendered.push(super::refusal_text(&r));
+        }
+        for class in [
+            Class::Tunable,
+            Class::Secret,
+            Class::SecurityTunable,
+            Class::Internal,
+        ] {
+            for refusal in [
+                EnvRefusal::Malformed {
+                    name: "EXAMPLE",
+                    grammar: Grammar::Flag,
+                    class,
+                    shown: Shown::of(class, b"v"),
+                },
+                EnvRefusal::NotUnicode {
+                    name: "EXAMPLE",
+                    grammar: Grammar::Flag,
+                    class,
+                    shown: Shown::of(class, b"v"),
+                },
+                EnvRefusal::Empty {
+                    name: "EXAMPLE",
+                    grammar: Grammar::Flag,
+                    class,
+                },
+            ] {
+                rendered.push(super::refusal_text(&refusal));
+            }
+        }
+        assert!(rendered.len() > 12, "{rendered:?}");
+        for text in rendered {
+            assert!(!text.chars().any(super::is_log_hazard), "{text:?}");
+            assert_eq!(
+                super::render(&super::RefusedText::new(&text), super::Quote::Scrubbed),
+                text,
+                "with harmless quoted text both modes agree"
+            );
+        }
+    }
+
+    /// A startup refusal converts into an `IpeError` whose message holds the
+    /// refused text raw, so the sink that prints it escapes it exactly once.
+    #[cfg(feature = "web")]
+    #[test]
+    fn startup_refusal_into_ipe_error_is_raw() {
+        let refusal = crate::web::StartupRefusal::Bind(super::EnvValueRefusal::new(
+            "IPE_HTTP_BIND",
+            "an IP address",
+            b"a\\b\n",
+        ));
+        let message = crate::ipe_error_message(refusal.clone().into());
+        assert!(message.contains("a\\b\n"), "{message:?}");
+        assert!(!message.contains("a\\\\b"), "{message:?}");
+        let line = super::ScrubbedLine::of_refusal(&refusal).to_string();
+        assert!(line.contains("a\\\\b\\n"), "{line:?}");
+        assert_eq!(line, super::scrub_log_controls(&message));
     }
 }
 

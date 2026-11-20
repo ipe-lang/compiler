@@ -848,14 +848,14 @@ pub(crate) enum AuthStartupRefusal {
 }
 
 #[cfg(feature = "web")]
-impl std::fmt::Display for AuthStartupRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::system::ScrubbedDisplay for AuthStartupRefusal {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
-            Self::Revocation(refusal) => write!(f, "{refusal}"),
-            Self::RevocationUnbound => write!(
-                f,
+            Self::Revocation(refusal) => refusal.render(out),
+            Self::RevocationUnbound => out.write_str(
                 "Web.withRevocation / IPE_AUTH_REVOCATION=store needs Ipe.Auth (no token \
-                 verifier is compiled into this app)"
+                 verifier is compiled into this app)",
             ),
         }
     }
@@ -1161,7 +1161,11 @@ mod tests {
         use std::os::unix::ffi::OsStringExt as _;
         let raw = std::ffi::OsString::from_vec(b"127.0.0.\xFF".to_vec());
         let outcome = host_bind_from(Err(std::env::VarError::NotUnicode(raw)), None);
-        assert!(outcome.is_err_and(|r| r.to_string().contains("\\xFF")));
+        assert!(outcome.is_err_and(|r| {
+            crate::system::ScrubbedLine::of_refusal(&r)
+                .to_string()
+                .contains("\\xFF")
+        }));
     }
 
     // ── CSRF: stricter-only, env may disable, setting may only enforce ────
@@ -1615,7 +1619,7 @@ mod tests {
             );
         }
         assert_eq!(
-            AuthStartupRefusal::RevocationUnbound.to_string(),
+            crate::system::refusal_text(&AuthStartupRefusal::RevocationUnbound),
             "Web.withRevocation / IPE_AUTH_REVOCATION=store needs Ipe.Auth (no token verifier \
              is compiled into this app)"
         );
