@@ -285,6 +285,28 @@ fn a_sibling_main_does_not_hide_an_uncalled_export() -> Result<(), Box<dyn Error
     )
 }
 
+/// A nested module whose last segment is `Main`, with a `main` the build
+/// never runs.
+const NESTED_MAIN_NOT_A_PROGRAM: &[(&str, &str)] = &[
+    (
+        "Main.ipe",
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\
+         main : Task ()\nmain =\n\x20   Io.println \"ok\"\n",
+    ),
+    (
+        "App/Main.ipe",
+        "module App.Main exposing (main)\n\nmain : Int\nmain =\n\x20   1\n",
+    ),
+];
+
+/// Only the root `Main` is the program entry: `App.Main`'s `main` is an
+/// ordinary function the build never runs, so inference does not gate its
+/// shape as a program entry (`IPE-L0136`) and refuse a package that builds.
+#[test]
+fn a_nested_main_module_is_not_gated_as_the_program_entry() -> Result<(), Box<dyn Error>> {
+    assert_shared_equals_per_entry("nested_main_not_a_program", NESTED_MAIN_NOT_A_PROGRAM, &[])
+}
+
 /// The result is a `Pipeline` error framed against `file_name`.
 fn is_pipeline_error_in<T>(result: &Result<T, ipe::CliError>, file_name: &str) -> bool {
     matches!(result, Err(ipe::CliError::Pipeline { file, .. }) if file.ends_with(file_name))
