@@ -256,6 +256,14 @@ this is a library package (it declares `exposedModules` and no runnable program)
 
 {arg} is not an entry of this project: a capability set is a program's, so name one of its entries ({entries}), or give no argument to report every entry
 
+## capabilities-frame-program
+
+The trusted frame origins apply to program `{name}` ({file}), the one a build compiles.
+
+## capabilities-frame-not-applicable
+
+They do not apply to program `{name}` ({file}): no build compiles it, so none of its pages trusts a listed origin.
+
 ## debugger-needs-runtime-dep
 
 `--debugger` needs the runtime crate: the vendored runtime source (`IPE_RUNTIME_VENDORED=1`) carries no debugger. Unset `IPE_RUNTIME_VENDORED` to build with it

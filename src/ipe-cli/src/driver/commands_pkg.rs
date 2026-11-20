@@ -3,7 +3,7 @@ use super::{
     SourceGraph, analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
     attribute_post_link_error, backend_invariant_err, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
-    emitted_bin_filename, entry_modules, frame_infer_error, home_to_source_map,
+    emitted_bin_filename, entry_modules, frame_infer_error, graph_over, home_to_source_map,
     lowering_check_query, lowering_check_target, program_constructs_a_widget, run_build,
     runtime_context_for_message, working_dir, write_emitted_project,
 };
@@ -12,7 +12,7 @@ use crate::output_dir::held::{BACKUP_SLOTS, BackedUp, HeldDir, RelativeLeaf};
 use crate::output_dir::{
     EmitTarget, OutputArea, OutputRoot, OwnedDir, ProjectPaths, ReleaseMember,
 };
-use crate::project_root::{AnalysisTarget, FileArg, ProjectRoot, SourceDir};
+use crate::project_root::{AnalysisTarget, EntrySet, FileArg, ProjectRoot, SourceDir};
 use crate::publisher::{AttestedActor, BlessedPublisher};
 use crate::remote_ingest::{InheritedError, InheritedInput, InheritedRole, run_inherited};
 use crate::source_snapshot::{BuildRole, Limits, SourceOrigin, SourceSnapshot, TestView};
@@ -2382,30 +2382,37 @@ pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
 }
 
 /// The capabilities what `arg` names in the project at `cwd` exercises, with
-/// the reach its trusted frame origins give a page.
+/// what its trusted frame origins mean for the analysed programs.
 ///
 /// No argument (or a directory, or `package.ipe`) is every entry of the
 /// project, their sets unioned. A file argument must name one of the
 /// project's entries: a capability set is a program's, and any other module
-/// is not one. The frame reach is the project's `delivery.frameOrigins`,
-/// `None` when the list is empty; a listed origin an analyzed entry would drop
-/// is refused, as its build refuses it, so no trust is claimed for it.
+/// is not one. The frame report is `None` when `delivery.frameOrigins` is
+/// empty. Otherwise the list applies to the one program a build compiles
+/// ([`project::ProjectManifest::resolved_entry`]), and only that program is
+/// judged with the served build's settings: a listed origin it would drop is
+/// refused, as its build refuses it, so no trust is claimed for it. It is
+/// judged whatever `arg` names, since the list is the project's. Every other
+/// analysed entry is analysed without the judge and reported not applicable.
 ///
 /// # Errors
 /// Every refusal of [`analysis_root`] and [`analysis_target`];
 /// [`CliError::Usage`] for a file naming no entry; [`CliError::Pipeline`] when
-/// an entry does not lower; [`CliError::ProjectRefused`] when an entry serves
-/// no page that registers the listed frame origins.
+/// an entry does not lower; [`CliError::EntryMissing`] when the built program
+/// is not among the entries; [`CliError::ProjectRefused`] when the built
+/// program serves no page that registers the listed frame origins, or the
+/// project builds no program at all.
 pub fn capabilities_in(
     cwd: &Path,
     arg: Option<&str>,
 ) -> Result<
     (
         std::collections::BTreeSet<ipe_ir::Capability>,
-        Option<crate::frame_reach::FrameReach>,
+        Option<crate::frame_reach::FrameReport>,
     ),
     CliError,
 > {
+    use crate::frame_reach::{FrameProgram, FrameReach, FrameReport};
     let (root, file) = analysis_root(cwd, arg.map(Path::new))?;
     let target = analysis_target(&root, file.as_ref())?;
     if let (Some(file), AnalysisTarget::Module { dir, module, .. }) = (file.as_ref(), &target) {
@@ -2422,47 +2429,120 @@ pub fn capabilities_in(
         }
     }
     let frame_origins = &root.manifest().delivery.frame_origins;
-    let judge = if frame_origins.is_empty() {
-        FrameJudge::Unlisted
-    } else {
-        FrameJudge::Served(&root)
+    let (Some(first), Some(reach)) = (
+        frame_origins.entries().next(),
+        FrameReach::of(frame_origins),
+    ) else {
+        return Ok((target_capabilities(&target, FrameJudge::Unlisted)?, None));
     };
-    let caps = target_capabilities(&target, judge)?;
-    Ok((caps, crate::frame_reach::FrameReach::of(frame_origins)))
+    let EntrySet::Programs(programs) = root.entries() else {
+        return Err(super::build_pipeline::no_web_leaf_refusal(first));
+    };
+    let built_module = root.manifest().resolved_entry()?;
+    let built = programs
+        .iter()
+        .find(|entry| entry.module() == built_module.as_slice())
+        .ok_or_else(|| CliError::EntryMissing {
+            entry: format!("{}.ipe", built_module.join("/")),
+        })?;
+    let analysed: Vec<FrameProgram> = programs
+        .iter()
+        .filter(|entry| match &target {
+            AnalysisTarget::Project(_) => true,
+            AnalysisTarget::Module { module, .. } => entry.module() == module.as_slice(),
+        })
+        .map(|entry| FrameProgram::new(entry.name().as_str(), entry.module()))
+        .collect();
+    let built_program = FrameProgram::new(built.name().as_str(), built.module());
+    if !analysed.contains(&built_program) {
+        // The list is the project's: a file argument naming another entry
+        // still answers whether the build accepts it.
+        judge_built_frame_list(&root, built.module())?;
+    }
+    let caps = target_capabilities(
+        &target,
+        FrameJudge::Served {
+            root: &root,
+            built: built.module(),
+        },
+    )?;
+    Ok((caps, FrameReport::of(reach, built_program, analysed)))
 }
 
-/// Whether a capability analysis judges each entry's frame list.
+/// Refuse the frame list of `root` when `built`, the entry module its build
+/// compiles, would drop it under the served build.
+///
+/// # Errors
+/// Every refusal of [`analysis_graphs`]; [`CliError::Pipeline`] when the
+/// entry does not lower; [`CliError::ProjectRefused`] when the program
+/// registers no frame list.
+fn judge_built_frame_list(root: &ProjectRoot, built: &[String]) -> Result<(), CliError> {
+    let target = AnalysisTarget::Module {
+        root,
+        dir: SourceDir::Src,
+        module: built.to_vec(),
+    };
+    crate::threads::run_compile(|| {
+        for graph in analysis_graphs(&target)? {
+            judge_frame_list(root, &graph)?;
+        }
+        Ok(())
+    })?
+}
+
+/// Refuse the frame list of `root` when the served build of `graph`'s entry
+/// would drop it.
+///
+/// # Errors
+/// [`CliError::Pipeline`] when the entry does not lower;
+/// [`CliError::ProjectRefused`] when the program registers no frame list.
+fn judge_frame_list(root: &ProjectRoot, graph: &SourceGraph) -> Result<(), CliError> {
+    let folded = graph.run_attributed(graph.entry_path(), |db, source_root, file| {
+        ipe_db::folded_program(db, source_root, file).clone()
+    })?;
+    super::build_pipeline::served_frame_site_step(root, &folded)
+}
+
+/// Whether a capability analysis judges the built program's frame list.
 #[derive(Clone, Copy)]
 enum FrameJudge<'a> {
     /// No frame origin is listed, or the caller reports none.
     Unlisted,
-    /// Refuse an entry the served build of `root` would drop the list of.
-    Served(&'a ProjectRoot),
+    /// Refuse the list when `built`, the entry module a build of `root`
+    /// compiles, would drop it under the served build; every other entry is
+    /// not judged, since no build compiles it.
+    Served {
+        /// The project whose served build is the judge.
+        root: &'a ProjectRoot,
+        /// The entry module a build of `root` compiles.
+        built: &'a [String],
+    },
 }
 
 /// The union of the capabilities every entry `target` names exercises.
 ///
 /// # Errors
 /// [`CliError::Pipeline`] when an entry does not lower; every refusal of
-/// [`analysis_graphs`].
+/// [`analysis_graphs`]; [`CliError::ProjectRefused`] when the judged built
+/// program would drop the listed frame origins.
 fn target_capabilities(
     target: &AnalysisTarget<'_>,
     judge: FrameJudge<'_>,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
     crate::threads::run_compile(|| {
         let mut caps = std::collections::BTreeSet::new();
-        for graph in analysis_graphs(target)? {
+        for (module, graph) in entry_graphs(target)? {
             let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
                 ipe_db::lower_program(db, root, file).clone()
             })?;
             match judge {
-                FrameJudge::Unlisted => {}
-                FrameJudge::Served(project) => {
-                    let folded = graph.run_attributed(graph.entry_path(), |db, root, file| {
-                        ipe_db::folded_program(db, root, file).clone()
-                    })?;
-                    super::build_pipeline::served_frame_site_step(project, &folded)?;
+                FrameJudge::Served {
+                    root: project,
+                    built,
+                } if module == built => {
+                    judge_frame_list(project, &graph)?;
                 }
+                FrameJudge::Served { .. } | FrameJudge::Unlisted => {}
             }
             caps.extend(capabilities_including_served_widgets(
                 &graph.db,
@@ -2475,28 +2555,63 @@ fn target_capabilities(
     })?
 }
 
+/// Every entry `target` names, each with its source graph, in declared order.
+///
+/// # Errors
+/// Every refusal of [`analysis_graphs`] and [`graph_over`].
+fn entry_graphs<'t>(
+    target: &'t AnalysisTarget<'_>,
+) -> Result<Vec<(&'t [String], SourceGraph)>, CliError> {
+    match target {
+        AnalysisTarget::Project(root) => {
+            let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
+            entry_modules(root.entries())
+                .into_iter()
+                .map(|module| {
+                    graph_over(root, snapshot.modules(), SourceDir::Src, module)
+                        .map(|graph| (module, graph))
+                })
+                .collect()
+        }
+        AnalysisTarget::Module { module, .. } => Ok(analysis_graphs(target)?
+            .into_iter()
+            .map(|graph| (module.as_slice(), graph))
+            .collect()),
+    }
+}
+
 /// Render a program's inferred capability set in the requested [`OutputFormat`].
 ///
+/// A `frames` report names the program a build compiles, the one the frame
+/// list applies to, and every analysed program it does not apply to; only a
+/// report that [`applies`](crate::frame_reach::FrameReport::Applies) carries
+/// the reach.
+///
 /// - Human (default): a guttered, labelled report — a heading and one bullet per
-///   capability, or a line saying the program is pure; with a `frames` reach,
-///   the frame notice follows as a second block and the program is never
-///   called pure.
+///   capability, or a line saying the program is pure; with a `frames`
+///   report, a second block names the programs, led by the frame notice when
+///   the list applies, and then the program is never called pure.
 /// - `--plain`: the bare capability names, one per line, flush-left (or nothing
 ///   at all for a pure program — the scriptable form pipelines already
-///   consume), then one `frame:<origin>` line per trusted frame origin.
+///   consume), then one `frame:<origin>` line per trusted frame origin when
+///   the list applies, one `frame-program:<file>` line for the built program
+///   and one `frame-not-applicable:<file>` line per other analysed program.
 /// - `--json`: the shared `{schema, status, command, payload}` machine envelope
 ///   (`ipe.cli.capabilities/1`), with the sorted capability name array under
-///   `payload.capabilities` (empty for a pure program); with a `frames` reach,
-///   `payload.frameOrigins` and `payload.undisclosedThroughFrames` too.
+///   `payload.capabilities` (empty for a pure program); with a `frames`
+///   report, `payload.frameProgram` and `payload.frameNotApplicable`, and
+///   `payload.frameOrigins` and `payload.undisclosedThroughFrames` when the
+///   list applies.
 pub fn render_capabilities(
     names: &[&str],
-    frames: Option<&crate::frame_reach::FrameReach>,
+    frames: Option<&crate::frame_reach::FrameReport>,
     format: cli_args::OutputFormat,
     stream: &impl std::io::IsTerminal,
 ) -> String {
     use std::fmt::Write as _;
 
     use cli_args::OutputFormat::{Human, Json, Plain};
+    let reach = frames.and_then(crate::frame_reach::FrameReport::reach);
     match format {
         Plain => {
             // The historical scriptable form: bare names, one per line. A pure
@@ -2506,16 +2621,28 @@ pub fn render_capabilities(
                 out.push_str(name);
                 out.push('\n');
             }
-            for origin in frames.map_or(&[][..], |reach| reach.origins()) {
+            for origin in reach.map_or(&[][..], |reach| reach.origins()) {
                 let _ = writeln!(out, "frame:{origin}");
+            }
+            if let Some(report) = frames {
+                let _ = writeln!(out, "frame-program:{}", report.built().file());
+                for program in report.not_applicable() {
+                    let _ = writeln!(out, "frame-not-applicable:{}", program.file());
+                }
             }
             out
         }
         Json => {
             // The shared machine envelope: a command may never hand-roll a bare
             // success object. The capability list rides under `payload`.
+            let program = |program: &crate::frame_reach::FrameProgram| {
+                cli_args::json::object(&[
+                    ("name", cli_args::json::string(program.name())),
+                    ("file", cli_args::json::string(program.file())),
+                ])
+            };
             let mut fields = vec![("capabilities", cli_args::json::string_array(names))];
-            if let Some(reach) = frames {
+            if let Some(reach) = reach {
                 let origins: Vec<&str> = reach.origins().iter().map(String::as_str).collect();
                 let undisclosed: Vec<&str> = crate::frame_reach::FrameReach::undisclosed()
                     .map(|row| row.name)
@@ -2525,6 +2652,12 @@ pub fn render_capabilities(
                     "undisclosedThroughFrames",
                     cli_args::json::string_array(&undisclosed),
                 ));
+            }
+            if let Some(report) = frames {
+                let others: Vec<String> =
+                    report.not_applicable().into_iter().map(program).collect();
+                fields.push(("frameProgram", program(report.built())));
+                fields.push(("frameNotApplicable", cli_args::json::array(&others)));
             }
             let payload = cli_args::json::object(&fields);
             crate::machine_output::MachineOutput::ok(
@@ -2537,7 +2670,7 @@ pub fn render_capabilities(
         Human => {
             let p = style::Palette::for_stream(stream);
             let mut body = String::new();
-            if names.is_empty() && frames.is_some() {
+            if names.is_empty() && reach.is_some() {
                 body.push_str("This program exercises no security capabilities of its own.\n");
             } else if names.is_empty() {
                 body.push_str("This program is pure — it exercises no security capabilities.\n");
@@ -2567,11 +2700,28 @@ pub fn render_capabilities(
                 }
             }
             let mut out = style::frame(&style::gutter(&body));
-            if let Some(reach) = frames {
-                out.push_str(&style::frame(&style::gutter(&format!(
-                    "{}\n",
-                    reach.notice()
-                ))));
+            if let Some(report) = frames {
+                let mut block = String::new();
+                if let Some(reach) = reach {
+                    let _ = writeln!(block, "{}", reach.notice());
+                }
+                let built = report.built();
+                let _ = writeln!(
+                    block,
+                    "{}",
+                    text::msg::capabilities_frame_program(&built.name(), &built.file())
+                );
+                for program in report.not_applicable() {
+                    let _ = writeln!(
+                        block,
+                        "{}",
+                        text::msg::capabilities_frame_not_applicable(
+                            &program.name(),
+                            &program.file()
+                        )
+                    );
+                }
+                out.push_str(&style::frame(&style::gutter(&block)));
             }
             out
         }
@@ -5366,35 +5516,63 @@ mod mobile_base_tests {
         );
     }
 
-    /// R30: the capability report with a frame reach carries the notice in
-    /// human form and never calls the program pure, names the origins and the
-    /// undisclosed features in JSON, and ends with one `frame:` line per
-    /// origin in plain form; without a reach every form is unchanged.
-    #[test]
-    fn capabilities_report_names_frame_reach() {
-        use crate::cli_args::OutputFormat;
-        use crate::frame_reach::FrameReach;
+    /// The frame report of `analysed` programs when a build compiles `web`
+    /// (`src/Main.ipe`), over two listed origins.
+    fn web_frame_report(analysed: &[(&str, &str)]) -> Option<crate::frame_reach::FrameReport> {
+        use crate::frame_reach::{FrameProgram, FrameReach, FrameReport};
         use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
         let entries = FrameOriginEntries::new(
             ["https://b.example", "https://a.example"]
                 .into_iter()
                 .filter_map(|text| FrameOriginEntry::parse(text).ok()),
         );
-        let reach = entries.as_ref().ok().and_then(FrameReach::of);
-        assert!(reach.is_some(), "{entries:?}");
-        let Some(reach) = reach else { return };
+        let reach = entries.as_ref().ok().and_then(FrameReach::of)?;
+        let program = |name: &str, module: &str| FrameProgram::new(name, &[module.to_owned()]);
+        FrameReport::of(
+            reach,
+            program("web", "Main"),
+            analysed
+                .iter()
+                .map(|(name, module)| program(name, module))
+                .collect(),
+        )
+    }
+
+    /// R30: the capability report with a frame list that applies carries the
+    /// notice in human form and never calls the program pure, names the
+    /// origins and the undisclosed features in JSON, and ends with one
+    /// `frame:` line per origin in plain form; every form names the built
+    /// program and each analysed program the list does not apply to (DP-12);
+    /// without a report every form is unchanged.
+    #[test]
+    fn capabilities_report_names_frame_reach() {
+        use crate::cli_args::OutputFormat;
+        use crate::frame_reach::FrameReach;
+        let report = web_frame_report(&[("web", "Main"), ("cli", "Cli")]);
+        let Some(reach) = report.as_ref().and_then(|report| report.reach()) else {
+            assert!(report.is_some(), "the built program is analysed");
+            return;
+        };
         let stream = std::io::stdout();
         for names in [&[][..], &["network"][..]] {
-            let human = render_capabilities(names, Some(&reach), OutputFormat::Human, &stream);
+            let human = render_capabilities(names, report.as_ref(), OutputFormat::Human, &stream);
             assert!(human.contains(&reach.notice()), "{human}");
             assert!(!human.contains("pure"), "{human}");
+            assert!(
+                human.contains("apply to program `web` (src/Main.ipe), the one a build compiles"),
+                "{human}"
+            );
+            assert!(
+                human.contains("do not apply to program `cli` (src/Cli.ipe)"),
+                "{human}"
+            );
             if names.is_empty() {
                 assert!(
                     human.contains("This program exercises no security capabilities of its own."),
                     "{human}"
                 );
             }
-            let plain = render_capabilities(names, Some(&reach), OutputFormat::Plain, &stream);
+            let plain = render_capabilities(names, report.as_ref(), OutputFormat::Plain, &stream);
             let lines: Vec<&str> = plain.lines().collect();
             let mut want: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
             want.extend(
@@ -5403,8 +5581,10 @@ mod mobile_base_tests {
                     .iter()
                     .map(|origin| format!("frame:{origin}")),
             );
+            want.push("frame-program:src/Main.ipe".to_owned());
+            want.push("frame-not-applicable:src/Cli.ipe".to_owned());
             assert_eq!(lines, want, "{plain}");
-            let json = render_capabilities(names, Some(&reach), OutputFormat::Json, &stream);
+            let json = render_capabilities(names, report.as_ref(), OutputFormat::Json, &stream);
             assert!(json.contains("\"frameOrigins\""), "{json}");
             for origin in reach.origins() {
                 assert!(json.contains(&format!("\"{origin}\"")), "{json}");
@@ -5413,6 +5593,10 @@ mod mobile_base_tests {
                 assert!(json.contains(&format!("\"{}\"", row.name)), "{json}");
             }
             assert!(json.contains("\"undisclosedThroughFrames\""), "{json}");
+            assert!(json.contains("\"frameProgram\""), "{json}");
+            assert!(json.contains("\"src/Main.ipe\""), "{json}");
+            assert!(json.contains("\"frameNotApplicable\""), "{json}");
+            assert!(json.contains("\"src/Cli.ipe\""), "{json}");
         }
         let pure_human = render_capabilities(&[], None, OutputFormat::Human, &stream);
         assert!(pure_human.contains("This program is pure"), "{pure_human}");
@@ -5423,9 +5607,46 @@ mod mobile_base_tests {
         );
         let json = render_capabilities(&["network"], None, OutputFormat::Json, &stream);
         assert!(
+            !json.contains("frameOrigins")
+                && !json.contains("undisclosedThroughFrames")
+                && !json.contains("frameProgram"),
+            "{json}"
+        );
+    }
+
+    /// DP-12: a report on programs a build does not compile names no origin
+    /// and no notice in any form, names the built program and marks each
+    /// analysed one not applicable; a pure analysed program is called pure,
+    /// since the list gives its pages nothing.
+    #[test]
+    fn capabilities_report_marks_an_unbuilt_program_not_applicable() {
+        use crate::cli_args::OutputFormat;
+        let report = web_frame_report(&[("cli", "Cli")]);
+        assert!(
+            report
+                .as_ref()
+                .is_some_and(|report| report.reach().is_none()),
+            "{report:?}"
+        );
+        let stream = std::io::stdout();
+        let human = render_capabilities(&[], report.as_ref(), OutputFormat::Human, &stream);
+        assert!(human.contains("This program is pure"), "{human}");
+        assert!(!human.contains("trusted frame origins ("), "{human}");
+        assert!(
+            human.contains("do not apply to program `cli` (src/Cli.ipe)"),
+            "{human}"
+        );
+        assert!(human.contains("program `web` (src/Main.ipe)"), "{human}");
+        assert_eq!(
+            render_capabilities(&["network"], report.as_ref(), OutputFormat::Plain, &stream),
+            "network\nframe-program:src/Main.ipe\nframe-not-applicable:src/Cli.ipe\n"
+        );
+        let json = render_capabilities(&[], report.as_ref(), OutputFormat::Json, &stream);
+        assert!(
             !json.contains("frameOrigins") && !json.contains("undisclosedThroughFrames"),
             "{json}"
         );
+        assert!(json.contains("\"frameNotApplicable\""), "{json}");
     }
 
     /// The client desktop's publish refuses an asset whose name the bundle path grammar cannot carry.

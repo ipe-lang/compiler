@@ -59,6 +59,110 @@ impl FrameReach {
     }
 }
 
+/// One program of a project as a frame report names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FrameProgram {
+    /// The program's name, as `package.ipe` writes it.
+    name: String,
+    /// The entry file, `src/<Module/Path>.ipe`; its segments are module
+    /// segments, so it holds no line break or control character.
+    file: String,
+}
+
+impl FrameProgram {
+    /// The program `name` whose entry module is `module`.
+    #[must_use]
+    pub fn new(name: &str, module: &[String]) -> Self {
+        Self {
+            name: name.to_owned(),
+            file: format!("src/{}.ipe", module.join("/")),
+        }
+    }
+
+    /// The program's name, as `package.ipe` writes it.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The entry file, `src/<Module/Path>.ipe`.
+    #[must_use]
+    pub fn file(&self) -> &str {
+        &self.file
+    }
+}
+
+/// What a capability report says of the project's frame list, which applies
+/// to the one program a build compiles and to no other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameReport {
+    /// The built program is among the analysed ones: the list gives its
+    /// pages `reach`, and applies to none of `not_applicable`.
+    Applies {
+        /// The reach the list gives the built program's pages.
+        reach: FrameReach,
+        /// The program a build compiles.
+        built: FrameProgram,
+        /// Every other analysed program, in declared order.
+        not_applicable: Vec<FrameProgram>,
+    },
+    /// No analysed program is the built one, so the list applies to none.
+    NotApplicable {
+        /// The program a build compiles.
+        built: FrameProgram,
+        /// The analysed programs, in declared order.
+        analysed: crate::project_root::NonEmpty<FrameProgram>,
+    },
+}
+
+impl FrameReport {
+    /// The report of `reach` over the `analysed` programs when a build
+    /// compiles `built`; `None` when nothing is analysed.
+    #[must_use]
+    pub fn of(reach: FrameReach, built: FrameProgram, analysed: Vec<FrameProgram>) -> Option<Self> {
+        if analysed.contains(&built) {
+            let not_applicable = analysed
+                .into_iter()
+                .filter(|program| *program != built)
+                .collect();
+            return Some(Self::Applies {
+                reach,
+                built,
+                not_applicable,
+            });
+        }
+        crate::project_root::NonEmpty::from_vec(analysed)
+            .map(|analysed| Self::NotApplicable { built, analysed })
+    }
+
+    /// The reach the list gives an analysed program; `None` when it applies
+    /// to none of them.
+    #[must_use]
+    pub const fn reach(&self) -> Option<&FrameReach> {
+        match self {
+            Self::Applies { reach, .. } => Some(reach),
+            Self::NotApplicable { .. } => None,
+        }
+    }
+
+    /// The program a build compiles, the one the list applies to.
+    #[must_use]
+    pub const fn built(&self) -> &FrameProgram {
+        match self {
+            Self::Applies { built, .. } | Self::NotApplicable { built, .. } => built,
+        }
+    }
+
+    /// The analysed programs the list does not apply to, in declared order.
+    #[must_use]
+    pub fn not_applicable(&self) -> Vec<&FrameProgram> {
+        match self {
+            Self::Applies { not_applicable, .. } => not_applicable.iter().collect(),
+            Self::NotApplicable { analysed, .. } => analysed.iter().collect(),
+        }
+    }
+}
+
 /// The written form of `entry`.
 fn written(entry: &FrameOriginEntry) -> String {
     let mut out = String::with_capacity(entry.written_len());
@@ -146,6 +250,34 @@ mod tests {
             );
         }
         assert!(!notice.contains("pure"), "{notice}");
+    }
+
+    /// DP-12: the list applies to the built program only. An analysed set
+    /// holding it carries the reach and marks every other program not
+    /// applicable; a set without it carries no reach at all; an empty set
+    /// has no report.
+    #[test]
+    fn frame_report_applies_to_the_built_program_only() {
+        let reach = FrameReach::of(&entries(&["https://player.example"]));
+        assert!(reach.is_some());
+        let Some(reach) = reach else { return };
+        let module = |path: &[&str]| path.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        let web = FrameProgram::new("web", &module(&["Web", "Main"]));
+        let cli = FrameProgram::new("cli", &module(&["Cli"]));
+        assert_eq!(web.file(), "src/Web/Main.ipe");
+        let both = FrameReport::of(reach.clone(), web.clone(), vec![web.clone(), cli.clone()]);
+        assert!(both.is_some());
+        let Some(both) = both else { return };
+        assert_eq!(both.reach(), Some(&reach));
+        assert_eq!(both.built(), &web);
+        assert_eq!(both.not_applicable(), vec![&cli]);
+        let only_cli = FrameReport::of(reach.clone(), web.clone(), vec![cli.clone()]);
+        assert!(only_cli.is_some());
+        let Some(only_cli) = only_cli else { return };
+        assert_eq!(only_cli.reach(), None);
+        assert_eq!(only_cli.built(), &web);
+        assert_eq!(only_cli.not_applicable(), vec![&cli]);
+        assert_eq!(FrameReport::of(reach, web, Vec::new()), None);
     }
 
     /// The repository root this crate was built from.

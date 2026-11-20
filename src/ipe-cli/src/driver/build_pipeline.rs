@@ -421,6 +421,16 @@ pub(super) fn served_frame_site_step(
     frame_site_step(program, &settings)
 }
 
+/// The refusal of a frame list, `entry` its first origin, on a project no
+/// build compiles a program of: no page would trust the list.
+pub(super) fn no_web_leaf_refusal(
+    entry: &ipe_runtime_rust::encoding::FrameOriginEntry,
+) -> CliError {
+    frame_refusal(&ipe_backend_rust::FrameListRefused::NoWebLeaf {
+        entry: entry.clone(),
+    })
+}
+
 /// The CLI error of a frame-list refusal.
 ///
 /// A loopback refusal names the command whose intent refused it; a list with

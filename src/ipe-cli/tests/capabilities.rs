@@ -1995,6 +1995,119 @@ fn capabilities_command_refuses_a_frame_list_without_a_web_leaf() -> TestResult 
     Ok(())
 }
 
+/// A project named `tag` listing one trusted frame origin with two
+/// programs: `web` (`src/Main.ipe`, a `Web.tea` page) and `cli`
+/// (`src/Cli.ipe`, a pure CLI program), the CLI one first when `cli_first`.
+/// The caller removes the returned dir.
+fn web_and_cli_project(tag: &str, cli_first: bool) -> Result<PathBuf, Box<dyn Error>> {
+    let web = "{ name = \"web\", entry = \"Main.ipe\" }";
+    let cli = "{ name = \"cli\", entry = \"Cli.ipe\" }";
+    let (first, second) = if cli_first { (cli, web) } else { (web, cli) };
+    let dir = frame_project(
+        tag,
+        &format!(", programs = [ {first}, {second} ]{LISTED}"),
+        WEB_TEA_PAGE,
+    )?;
+    let cli_source = std::fs::read_to_string(fixture("pure_string.ipe"))?.replacen(
+        "module Main exposing",
+        "module Cli exposing",
+        1,
+    );
+    std::fs::write(dir.join("src/Cli.ipe"), cli_source)?;
+    Ok(dir)
+}
+
+/// DP-12: a frame list applies to the program a build compiles (the first
+/// of `programs`), never to the others. A web page first and a CLI program
+/// second pass `ipe capabilities`: the report names `web` as the program the
+/// list applies to and marks `cli` not applicable. Naming the CLI entry alone
+/// reports no reach and calls it pure; naming the web entry reports the reach.
+#[test]
+fn capabilities_command_reports_an_unbuilt_program_not_applicable() -> TestResult {
+    let dir = web_and_cli_project("web-first", false)?;
+    let human = run_ipe_in(&dir, &["capabilities"]);
+    let plain = run_ipe_in(&dir, &["capabilities", "--plain"]);
+    let cli_plain = run_ipe_in(&dir, &["capabilities", "--plain", "src/Cli.ipe"]);
+    let cli_human = run_ipe_in(&dir, &["capabilities", "src/Cli.ipe"]);
+    let web_plain = run_ipe_in(&dir, &["capabilities", "--plain", "src/Main.ipe"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, human) = human?;
+    assert!(ok, "web first: `ipe capabilities` succeeds:\n{human}");
+    assert!(human.contains("trusted frame origins"), "{human}");
+    assert!(
+        human.contains("apply to program `web` (src/Main.ipe), the one a build compiles"),
+        "{human}"
+    );
+    assert!(
+        human.contains("do not apply to program `cli` (src/Cli.ipe)"),
+        "{human}"
+    );
+    let frame_lines = |plain: &str| -> Vec<String> {
+        plain
+            .lines()
+            .filter(|line| line.starts_with("frame"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let (ok, plain) = plain?;
+    assert!(ok, "{plain}");
+    assert_eq!(
+        frame_lines(&plain),
+        [
+            "frame:https://player.example",
+            "frame-program:src/Main.ipe",
+            "frame-not-applicable:src/Cli.ipe"
+        ],
+        "{plain}"
+    );
+    let (ok, cli_plain) = cli_plain?;
+    assert!(ok, "{cli_plain}");
+    assert_eq!(
+        frame_lines(&cli_plain),
+        [
+            "frame-program:src/Main.ipe",
+            "frame-not-applicable:src/Cli.ipe"
+        ],
+        "{cli_plain}"
+    );
+    let (ok, cli_human) = cli_human?;
+    assert!(ok, "{cli_human}");
+    assert!(cli_human.contains("pure"), "{cli_human}");
+    assert!(
+        !cli_human.contains("trusted frame origins ("),
+        "{cli_human}"
+    );
+    let (ok, web_plain) = web_plain?;
+    assert!(ok, "{web_plain}");
+    assert_eq!(
+        frame_lines(&web_plain),
+        ["frame:https://player.example", "frame-program:src/Main.ipe"],
+        "{web_plain}"
+    );
+    Ok(())
+}
+
+/// DP-12: with the CLI program first, the build compiles a program with no
+/// web leaf and refuses the list, so `ipe capabilities` refuses it too, with
+/// or without a file argument naming the web entry.
+#[test]
+fn capabilities_command_refuses_a_frame_list_when_the_built_program_has_no_web_leaf() -> TestResult
+{
+    let dir = web_and_cli_project("cli-first", true)?;
+    let whole = run_ipe_in(&dir, &["capabilities", "--plain"]);
+    let web = run_ipe_in(&dir, &["capabilities", "--plain", "src/Main.ipe"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    for (what, run) in [("whole project", whole), ("web entry", web)] {
+        let (ok, plain) = run?;
+        assert!(
+            !ok,
+            "cli first, {what}: `ipe capabilities` must refuse:\n{plain}"
+        );
+        assert!(!plain.contains("frame"), "{what}: {plain}");
+    }
+    Ok(())
+}
+
 /// A served page rendered through `Html.render`, with no `Web.tea` or `Web.embed` leaf.
 const SERVED_HTML: &str = r#"module Main exposing (main)
 
