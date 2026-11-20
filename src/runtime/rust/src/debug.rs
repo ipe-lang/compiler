@@ -260,7 +260,7 @@ mod tests {
                 &crate::http_client::HttpRequest {
                     body: String::new(),
                     headers: vec![("Accept".to_owned(), "text/html".to_owned())],
-                    method: crate::http_client::HttpMethod::Get,
+                    method: crate::http_method::HttpMethod::Get,
                     redirects: crate::http_client::RedirectPolicy::NoRedirects,
                     timeout: 30,
                     url: "https://example.com/a".to_owned(),
@@ -442,7 +442,7 @@ mod tests {
             dev(&crate::http_client::HttpRequest {
                 body: String::new(),
                 headers: vec![header("AUTHORIZATION"), header("X-Api-Key")],
-                method: crate::http_client::HttpMethod::Get,
+                method: crate::http_method::HttpMethod::Get,
                 redirects: crate::http_client::RedirectPolicy::NoRedirects,
                 timeout: 30,
                 url: String::new(),

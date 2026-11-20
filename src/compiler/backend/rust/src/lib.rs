@@ -1122,9 +1122,10 @@ pub(crate) struct EmitCtx<'a> {
     ///   (`http_stream` is declared separately under `reaches_http_client`.)
     pub(crate) uses_server: bool,
     /// `true` when the program uses at least one outbound `Ipe.Http` client
-    /// kernel (`Http.get` / `post` / `request`, the pure request/method
-    /// builders, `Http.parseQuery`) or mentions an `HttpRequest` / `HttpMethod`
-    /// in a signature. When set, [`crate::project::assemble_project_files`]:
+    /// kernel (`Http.get` / `post` / `request`, the pure request builders,
+    /// `Http.parseQuery`) or mentions an `HttpRequest` in a signature. An
+    /// `HttpMethod` mention or method converter sets nothing: they live in the
+    /// ungated `http_method` module every module set declares. When set, [`crate::project::assemble_project_files`]:
     ///
     /// * declares `pub mod http_client; pub use http_client::*;` in the emitted
     ///   `ipe_runtime/mod.rs` (shared with `uses_email` via `reaches_http_client`);

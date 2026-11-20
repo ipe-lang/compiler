@@ -147,7 +147,7 @@ pub const BUILTIN_UNIONS: &[BuiltinUnion] = &[
     // The closed set of HTTP verbs — make-invalid-states-unrepresentable for
     // the request method. `Http.methodToString` recovers the canonical
     // uppercase string; `Http.methodFromString` is the inbound parse boundary.
-    // Index order matches the `HttpMethod` enum in `ipe_runtime::http_client`.
+    // Index order matches the `HttpMethod` enum in `ipe_runtime::http_method`.
     BuiltinUnion {
         type_name: "HttpMethod",
         ctors: &[
