@@ -28,7 +28,6 @@
 
 #![allow(clippy::type_complexity)] // TEA fn-quadruples are inherent here
 
-use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
@@ -45,9 +44,12 @@ use crate::dom::{
     },
     keep::{AUTHORITY_ATTRS, Control, Field, Keep, is_authority_attr, keep},
 };
+use crate::frames::{EscapedPopups, PageAuthority};
+use crate::html::frame_patch::{
+    FrameFence, FrameWrite, fence_frame, frame_patch_key, plan_frame_patch,
+};
 use crate::html::{
-    FormData, Html, IFRAME_TAG, RenderCtx, SANDBOX_ATTR, STAMPED_ID_ATTR, SandboxTokens,
-    assign_ipe_ids, frame_loader_key, render_html,
+    ClientMarks, FormData, Html, RenderCtx, STAMPED_ID_ATTR, assign_ipe_ids, render_html_in,
 };
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
@@ -103,14 +105,35 @@ pub fn console_warn(detail: &str) {
 /// entry never judged the environment, and the program does not start.
 static STARTUP_ACCEPTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Install `console_error_panic_hook` so a residual trap (e.g. stack
-/// exhaustion from a non-TCO fold — the documented reachable residual)
-/// dies with a classified `console.error`, never a silent white screen.
-/// Then judge the environment and fix the values read once per process,
-/// before the program's first line, as a native `main` does.
-pub fn install_panic_hook() {
-    console_error_panic_hook::set_once();
-    let accepted = match crate::env_registry::startup_check() {
+/// What the entry's frame-origin registration came to.
+///
+/// `Registered` and `Refused` are reachable only through
+/// [`install_panic_hook_trusting_frames`]; an entry with no list judges `NoList`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameAdmission {
+    /// The program declares no frame origins.
+    NoList,
+    /// The declared origins re-parsed and are the program's frame policy.
+    Registered,
+    /// The declared origins did not re-parse; the program must not start.
+    Refused,
+}
+
+/// Whether the program may start, from the environment verdict and the frame admission.
+const fn startup_accepted(env_clean: bool, frames: FrameAdmission) -> bool {
+    match frames {
+        FrameAdmission::NoList | FrameAdmission::Registered => env_clean,
+        FrameAdmission::Refused => false,
+    }
+}
+
+/// The one startup judge every entry form calls, setting [`STARTUP_ACCEPTED`] once.
+///
+/// It judges the environment and fixes the values read once per process,
+/// before the program's first line, as a native `main` does, then folds in
+/// `frames`.
+fn judge_startup(frames: FrameAdmission) {
+    let env_clean = match crate::env_registry::startup_check() {
         Ok(()) => true,
         Err(refusals) => {
             for refusal in &refusals {
@@ -119,7 +142,36 @@ pub fn install_panic_hook() {
             false
         }
     };
+    let accepted = startup_accepted(env_clean, frames);
     let _ = STARTUP_ACCEPTED.set(accepted);
+}
+
+/// Install the panic hook, then judge startup for a program with no frame origins.
+///
+/// `console_error_panic_hook` makes a residual trap (e.g. stack exhaustion
+/// from a non-TCO fold — the documented reachable residual) die with a
+/// classified `console.error`, never a silent white screen.
+pub fn install_panic_hook() {
+    console_error_panic_hook::set_once();
+    judge_startup(FrameAdmission::NoList);
+}
+
+/// [`install_panic_hook`] for a program that declares trusted frame origins.
+///
+/// `origins` are re-parsed and registered with the granted web-capability
+/// suffixes `granted` as the program's frame policy. A list that does not
+/// re-parse is a classified `console.error`, and the program never starts.
+#[cfg(feature = "encoding")]
+pub fn install_panic_hook_trusting_frames(origins: &[&str], granted: &[&str]) {
+    console_error_panic_hook::set_once();
+    let frames = match crate::frames::try_register(origins, granted) {
+        Ok(()) => FrameAdmission::Registered,
+        Err(refusal) => {
+            console_fatal("StartupRefused", &refusal.to_string());
+            FrameAdmission::Refused
+        }
+    };
+    judge_startup(frames);
 }
 
 /// Drive the program's entry task on the browser microtask queue.
@@ -562,6 +614,8 @@ fn focus_mark() -> FocusMark<web_sys::Element> {
 }
 
 struct App<Model, Msg> {
+    /// The page this client shows, as every paint and diff reads it.
+    marks: ClientMarks,
     model: RefCell<Model>,
     tree: RefCell<Html<Msg>>,
     index: RefCell<HandlerIndex<Msg>>,
@@ -643,9 +697,14 @@ where
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
-    // One renderer: the DOM starts as exactly the bytes `render_html`
+    // One renderer: the DOM starts as exactly the bytes the render sink
     // produces, so every later `diff` runs against known ground truth.
-    paint_first(&document, &body, &render_html(&tree))?;
+    let marks = client_marks();
+    paint_first(
+        &document,
+        &body,
+        &render_html_in(&tree, &RenderCtx::Client(&marks)),
+    )?;
 
     let index = build_index(&tree);
     // Under the `debugger` feature the recorder seeds from the initial model, so
@@ -655,6 +714,7 @@ where
     #[cfg(feature = "debugger")]
     let overlay = debugger_overlay::mount_overlay();
     let app = Rc::new(App {
+        marks,
         model: RefCell::new(model),
         tree: RefCell::new(tree),
         index: RefCell::new(index),
@@ -729,14 +789,15 @@ where
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
 
-    // Dev-mode empty-first-diff assertion: `diff(&tree, &tree)` must be empty
+    // Dev-mode empty-first-diff assertion: the self-diff of `tree` must be empty
     // (the virtual tree IS the diff engine's ground truth; any non-empty result
     // means the ipe-id assignment is non-deterministic — a determinism
     // violation). Log a warning and continue: production falls back to a full
     // diff-and-replace on the first real update, never white-screens.
+    let marks = client_marks();
     {
         use crate::dom::diff::diff;
-        let self_patches = diff(&tree, &tree, &RenderCtx::Unstamped);
+        let self_patches = diff(&tree, &tree, &RenderCtx::Client(&marks));
         if !self_patches.is_empty() {
             console_warn(&format!(
                 "hydration-mismatch: self-diff produced {} patch(es) — \
@@ -753,6 +814,7 @@ where
     #[cfg(feature = "debugger")]
     let overlay = debugger_overlay::mount_overlay();
     let app = Rc::new(App {
+        marks,
         model: RefCell::new(model),
         tree: RefCell::new(tree),
         index: RefCell::new(index),
@@ -857,7 +919,12 @@ where
 
     let mut tree = view(model.clone());
     assign_ipe_ids(&mut tree, ROOT_IPE_ID);
-    paint_first(&document, &body, &render_html(&tree))?;
+    let marks = client_marks();
+    paint_first(
+        &document,
+        &body,
+        &render_html_in(&tree, &RenderCtx::Client(&marks)),
+    )?;
 
     let index = build_index(&tree);
 
@@ -894,6 +961,7 @@ where
     #[cfg(feature = "debugger")]
     let overlay = debugger_overlay::mount_overlay();
     let app = Rc::new(App {
+        marks,
         model: RefCell::new(model),
         tree: RefCell::new(tree),
         index: RefCell::new(index),
@@ -1676,60 +1744,80 @@ fn ipe_id_selector(id: &str) -> String {
     out
 }
 
-/// How a patch writes one attribute.
+/// How a patch writes one attribute that is not a frame key.
 #[derive(Debug, PartialEq, Eq)]
 enum AttrWrite<'v> {
     /// Set the attribute to this value.
-    Set(Cow<'v, str>),
+    Set(&'v str),
     /// Remove the attribute.
     Remove,
-    /// Write nothing.
-    Keep,
-    /// Set the empty `sandbox` first, then the attribute to this value: the
-    /// sandbox binds when the frame navigates.
-    SandboxThenSet(&'v str),
 }
 
-/// The write for attribute `key` of an element `tag` patched to `value`, where
-/// `sandboxed` says whether the element holds a `sandbox` now.
+/// The write for attribute `key`, not a frame key, patched to `value`.
 ///
 /// `None` removes and a value sets, the empty one included. `autofocus` never
-/// reaches a live node, where a later move would focus it. The frame rule of
-/// `html.rs` holds on the live node: an `iframe`'s `sandbox` is never removed
-/// and is set canonical, a `src` or `srcdoc` on an unsandboxed `iframe` is
-/// preceded by the empty sandbox, and a frame loader never gains the
-/// attribute it loads from.
-fn attr_write<'v>(tag: &str, key: &str, value: Option<&'v str>, sandboxed: bool) -> AttrWrite<'v> {
+/// reaches a live node, where a later move would focus it.
+fn attr_write<'v>(key: &str, value: Option<&'v str>) -> AttrWrite<'v> {
     if key.eq_ignore_ascii_case("autofocus") {
         return AttrWrite::Remove;
     }
-    if tag.eq_ignore_ascii_case(IFRAME_TAG) {
-        if key.eq_ignore_ascii_case(SANDBOX_ATTR) {
-            return value.map_or(AttrWrite::Keep, |v| {
-                AttrWrite::Set(Cow::Owned(SandboxTokens::parse(v).canonical()))
-            });
-        }
-        if let Some(v) = value
-            && !sandboxed
-            && (key.eq_ignore_ascii_case("src") || key.eq_ignore_ascii_case("srcdoc"))
-        {
-            return AttrWrite::SandboxThenSet(v);
-        }
-    } else if value.is_some()
-        && frame_loader_key(tag).is_some_and(|loads| key.eq_ignore_ascii_case(loads))
-    {
-        return AttrWrite::Keep;
+    value.map_or(AttrWrite::Remove, AttrWrite::Set)
+}
+
+/// The marks of the page this client shows: the authority its location
+/// names, `Unknown` when there is no window or the host does not parse.
+/// Popups never leave a trusted frame's sandbox here: a browser-built page
+/// has no served `Cross-Origin-Opener-Policy` to bind them.
+fn client_marks() -> ClientMarks {
+    client_marks_of(web_sys::window().and_then(|window| window.location().host().ok()))
+}
+
+/// The client marks of a page whose location host is `host`.
+fn client_marks_of(host: Option<String>) -> ClientMarks {
+    ClientMarks {
+        page: host.map_or(PageAuthority::Unknown, |host| {
+            PageAuthority::of_location_host(&host)
+        }),
+        popups: EscapedPopups::Dropped,
     }
-    value.map_or(AttrWrite::Remove, |v| AttrWrite::Set(Cow::Borrowed(v)))
+}
+
+/// The ordered frame writes that patch the live frame `el` by `delta`, under
+/// the program's frame policy and this client's marks.
+fn frame_plan(el: &web_sys::Element, delta: &[(&str, Option<&str>)]) -> Vec<FrameWrite> {
+    let marks = client_marks();
+    plan_frame_patch(
+        &el.local_name(),
+        delta,
+        |key| el.get_attribute(key),
+        crate::frames::policy(),
+        &marks.page,
+        marks.popups,
+    )
+}
+
+/// Apply `writes` to `el` in order, stopping at the first write the browser
+/// refuses: a grant write that fails leaves every later navigation unwritten.
+fn write_frame_plan(el: &web_sys::Element, writes: &[FrameWrite]) {
+    for (key, value) in writes {
+        let written = match value {
+            Some(value) => el.set_attribute(key, value),
+            None => el.remove_attribute(key),
+        };
+        if written.is_err() {
+            return;
+        }
+    }
 }
 
 /// The frame-loading elements a detached holder is fenced on.
 const FRAME_SELECTOR: &str = "iframe, embed, object, frame";
 
 /// Fence every frame `frames` of a detached holder before its nodes connect:
-/// an `iframe` gets the canonical sandbox, and an `embed`, `object` or `frame`
-/// holding the attribute it loads from is removed.
+/// each gets the grant its target earns ([`fence_frame`]), and an `embed`,
+/// `object` or `frame` loading anything but a trusted origin is removed.
 fn fence_frames(frames: &web_sys::NodeList) -> Result<(), &'static str> {
+    let marks = client_marks();
     for i in 0..frames.length() {
         let Some(element) = frames
             .item(i)
@@ -1737,14 +1825,26 @@ fn fence_frames(frames: &web_sys::NodeList) -> Result<(), &'static str> {
         else {
             continue;
         };
-        let tag = element.local_name();
-        if tag.eq_ignore_ascii_case(IFRAME_TAG) {
-            let held = element.get_attribute(SANDBOX_ATTR).unwrap_or_default();
-            element
-                .set_attribute(SANDBOX_ATTR, &SandboxTokens::parse(&held).canonical())
-                .map_err(|_| "frame sandbox could not be set")?;
-        } else if frame_loader_key(&tag).is_some_and(|loads| element.has_attribute(loads)) {
-            element.remove();
+        match fence_frame(
+            &element.local_name(),
+            |key| element.get_attribute(key),
+            crate::frames::policy(),
+            &marks.page,
+            marks.popups,
+        ) {
+            FrameFence::Remove => element.remove(),
+            FrameFence::Write(writes) => {
+                for (key, value) in writes {
+                    let written = match value {
+                        Some(value) => element.set_attribute(key, &value),
+                        None => element.remove_attribute(key),
+                    };
+                    if written.is_err() {
+                        element.remove();
+                        break;
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -2144,7 +2244,11 @@ fn commit_view<Model, Msg: Clone>(
         tree: new_tree,
         url,
     } = frame;
-    let patches = diff(&app.tree.borrow(), &new_tree, &RenderCtx::Unstamped);
+    let patches = diff(
+        &app.tree.borrow(),
+        &new_tree,
+        &RenderCtx::Client(&app.marks),
+    );
     *app.index.borrow_mut() = build_index(&new_tree);
     *app.tree.borrow_mut() = new_tree;
     commit_frame(&patches, target, &app.cause);
@@ -2240,7 +2344,20 @@ pub fn apply_frame(
                 // `render_html` over the new subtree.
                 replace_children_html(document, &el, html);
             }
+            let tag = el.local_name();
+            let delta: Vec<(&str, Option<&str>)> = p
+                .attrs
+                .iter()
+                .filter(|(k, _)| frame_patch_key(&tag, k).is_some())
+                .map(|(k, v)| (k.as_str(), v.as_deref()))
+                .collect();
+            if !delta.is_empty() {
+                write_frame_plan(&el, &frame_plan(&el, &delta));
+            }
             for (k, v) in &p.attrs {
+                if frame_patch_key(&tag, k).is_some() {
+                    continue;
+                }
                 // `CustomElement.node` down-state: on a compiler-generated `ipe-ce-*` node the
                 // `state` value crosses as a DECODED PROPERTY (the wasm-client
                 // adapter), never the escaped attribute the server path writes. The
@@ -2342,25 +2459,23 @@ fn settle_later(chain: Vec<FocusLink>, rec: Recorded, queued: QueuedCause) {
 }
 
 /// Write one patched attribute onto the live `el`: `Some` sets, `None`
-/// removes, both through the frame rule of `attr_write` — an iframe holds a
-/// sandbox before it holds a URL, and a frame loader never gains its URL.
+/// removes. A frame key goes through the element's frame plan, so an iframe
+/// holds its grant before it holds a URL and a frame loader gains its URL only
+/// toward a trusted origin; any other key through `attr_write`.
 pub fn write_patched_attr(el: &web_sys::Element, key: &str, value: Option<&str>) {
-    let sandboxed = el.has_attribute(SANDBOX_ATTR);
-    match attr_write(&el.local_name(), key, value, sandboxed) {
+    if frame_patch_key(&el.local_name(), key).is_some() {
+        write_frame_plan(el, &frame_plan(el, &[(key, value)]));
+        return;
+    }
+    match attr_write(key, value) {
         AttrWrite::Set(v) => {
-            let _ = el.set_attribute(key, &v);
-            sync_dom_property(el, key, &v);
-        }
-        AttrWrite::SandboxThenSet(v) => {
-            if el.set_attribute(SANDBOX_ATTR, "").is_ok() {
-                let _ = el.set_attribute(key, v);
-            }
+            let _ = el.set_attribute(key, v);
+            sync_dom_property(el, key, v);
         }
         AttrWrite::Remove => {
             let _ = el.remove_attribute(key);
             clear_dom_property(el, key);
         }
-        AttrWrite::Keep => {}
     }
 }
 
@@ -2405,6 +2520,39 @@ fn clear_dom_property(el: &web_sys::Element, key: &str) {
 mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
+
+    #[wasm_bindgen_test]
+    fn startup_accepted_folds_the_frame_admission() {
+        let table = [
+            (true, FrameAdmission::NoList, true),
+            (true, FrameAdmission::Registered, true),
+            (true, FrameAdmission::Refused, false),
+            (false, FrameAdmission::NoList, false),
+            (false, FrameAdmission::Registered, false),
+            (false, FrameAdmission::Refused, false),
+        ];
+        for (env_clean, frames, accepted) in table {
+            assert_eq!(
+                startup_accepted(env_clean, frames),
+                accepted,
+                "({env_clean}, {frames:?})"
+            );
+        }
+    }
+
+    #[wasm_bindgen_test]
+    fn wasm_runtime_refuses_a_loopback_frame_origin() {
+        let loopback = crate::frames::policy_of(&["http://localhost:3000"], &[]);
+        assert!(
+            matches!(
+                loopback,
+                Err(crate::frames::FrameRegisterRefusal::Origin { index: 0, .. })
+            ),
+            "{loopback:?}"
+        );
+        let listed = crate::frames::policy_of(&["https://player.example"], &["camera"]);
+        assert!(listed.is_ok(), "{listed:?}");
+    }
 
     const TRUSTED: Arrival = Arrival {
         trusted: true,
@@ -2550,81 +2698,499 @@ mod tests {
         assert_eq!(ipe_id_selector("a\nb\0"), "[ipe-id=\"a\\a b\u{FFFD}\"]");
     }
 
-    /// The write of a set to `v`, borrowed.
-    const fn set(v: &str) -> AttrWrite<'_> {
-        AttrWrite::Set(Cow::Borrowed(v))
-    }
-
     #[wasm_bindgen_test]
     fn a_patch_never_writes_autofocus() {
-        let write = |key, value| attr_write("div", key, value, false);
-        assert_eq!(write("autofocus", Some("")), AttrWrite::Remove);
-        assert_eq!(write("autofocus", Some("autofocus")), AttrWrite::Remove);
-        assert_eq!(write("AutoFocus", Some("true")), AttrWrite::Remove);
-        assert_eq!(write("class", Some("a")), set("a"));
-        assert_eq!(write("class", Some("")), set(""));
-        assert_eq!(write("class", None), AttrWrite::Remove);
+        assert_eq!(attr_write("autofocus", Some("")), AttrWrite::Remove);
+        assert_eq!(
+            attr_write("autofocus", Some("autofocus")),
+            AttrWrite::Remove
+        );
+        assert_eq!(attr_write("AutoFocus", Some("true")), AttrWrite::Remove);
+        assert_eq!(attr_write("class", Some("a")), AttrWrite::Set("a"));
+        assert_eq!(attr_write("class", Some("")), AttrWrite::Set(""));
+        assert_eq!(attr_write("class", None), AttrWrite::Remove);
     }
 
-    /// An `iframe`'s `sandbox` is never removed, and a set is canonical.
+    /// The frame writes that patch a `tag` whose live attributes are `live` by
+    /// `delta`, under `policy` on a page with no known authority.
+    fn plan(
+        tag: &str,
+        live: &[(&str, &str)],
+        delta: &[(&str, Option<&str>)],
+        policy: &crate::frames::FramePolicy,
+    ) -> Vec<FrameWrite> {
+        let marks = client_marks_of(Some("other.example".to_owned()));
+        plan_frame_patch(
+            tag,
+            delta,
+            |key| {
+                live.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                    .map(|(_, v)| (*v).to_owned())
+            },
+            policy,
+            &marks.page,
+            marks.popups,
+        )
+    }
+
+    /// The value `writes` leaves on `key`, when it writes `key`.
+    fn written<'w>(writes: &'w [FrameWrite], key: &str) -> Option<Option<&'w str>> {
+        writes
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_deref())
+    }
+
+    /// An `iframe`'s `sandbox` is never removed, a set is canonical, and an
+    /// unlisted frame never keeps a widening token.
     #[wasm_bindgen_test]
     fn a_patch_never_removes_an_iframe_sandbox() {
+        let none = crate::frames::FramePolicy::none();
         for (tag, key) in [("iframe", "sandbox"), ("IFRAME", "SandBox")] {
-            assert_eq!(attr_write(tag, key, None, true), AttrWrite::Keep);
+            let removed = plan(tag, &[("sandbox", "allow-forms")], &[(key, None)], &none);
+            assert_eq!(written(&removed, "sandbox"), Some(Some("")));
+            let wide = Some("ALLOW-SCRIPTS allow-same-origin allow-forms");
+            let set = plan(tag, &[], &[(key, wide)], &none);
             assert_eq!(
-                attr_write(
-                    tag,
-                    key,
-                    Some("ALLOW-SCRIPTS allow-same-origin allow-forms"),
-                    true
-                ),
-                set("allow-forms allow-scripts")
+                written(&set, "sandbox"),
+                Some(Some("allow-forms allow-scripts"))
             );
-            assert_eq!(
-                attr_write(tag, key, Some("allow-popups-to-escape-sandbox"), true),
-                set("")
-            );
+            let escape = Some("allow-popups-to-escape-sandbox");
+            let set = plan(tag, &[], &[(key, escape)], &none);
+            assert_eq!(written(&set, "sandbox"), Some(Some("")));
         }
-        assert_eq!(attr_write("div", "sandbox", None, false), AttrWrite::Remove);
+        assert_eq!(frame_patch_key("div", "sandbox"), None);
     }
 
-    /// A frame loader never gains the attribute it loads from, in any case.
+    /// A frame loader never gains the attribute it loads from toward an
+    /// unlisted URL, in any case.
     #[wasm_bindgen_test]
     fn a_patch_never_gives_a_frame_loader_its_url() {
-        for (tag, key) in [
-            ("embed", "src"),
-            ("EMBED", "SRC"),
-            ("object", "data"),
-            ("frame", "Src"),
+        let none = crate::frames::FramePolicy::none();
+        for (tag, key, stored) in [
+            ("embed", "src", "src"),
+            ("EMBED", "SRC", "src"),
+            ("object", "data", "data"),
+            ("frame", "Src", "src"),
         ] {
             for value in ["", " ", "/"] {
-                assert_eq!(
-                    attr_write(tag, key, Some(value), false),
-                    AttrWrite::Keep,
-                    "{tag} {key}"
-                );
+                let writes = plan(tag, &[], &[(key, Some(value))], &none);
+                assert_eq!(written(&writes, stored), Some(None), "{tag} {key}");
             }
-            assert_eq!(attr_write(tag, key, None, false), AttrWrite::Remove);
+            let writes = plan(tag, &[], &[(key, None)], &none);
+            assert_eq!(written(&writes, stored), Some(None));
         }
-        assert_eq!(attr_write("embed", "type", Some("x"), false), set("x"));
-        assert_eq!(attr_write("object", "src", Some("/"), false), set("/"));
+        assert_eq!(frame_patch_key("embed", "type"), None);
+        assert_eq!(frame_patch_key("object", "src"), None);
     }
 
-    /// A `src` patched onto an `iframe` with no sandbox writes the empty
-    /// sandbox first; one already sandboxed only sets the `src`.
+    /// A `src` patched onto an `iframe` writes the sandbox first, whether or
+    /// not one was held.
     #[wasm_bindgen_test]
     fn an_iframe_src_patch_sandboxes_first() {
+        let none = crate::frames::FramePolicy::none();
+        for live in [&[][..], &[("sandbox", "allow-forms")][..]] {
+            for (key, value) in [("src", Some("/")), ("SRC", Some("")), ("src", None)] {
+                let writes = plan("iframe", live, &[(key, value)], &none);
+                assert_eq!(writes.first().map(|(k, _)| *k), Some("sandbox"));
+                assert_eq!(writes.last(), Some(&("src", value.map(str::to_owned))));
+            }
+        }
+        assert_eq!(frame_patch_key("div", "src"), None);
+    }
+
+    /// R10g: the client's marks read its location's host, and a page with no
+    /// window or an unparsable host trusts no frame.
+    #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
+    fn wasm_client_marks_read_the_location() {
+        let page = crate::inbound_authority::Authority::parse("app.example:8443")
+            .expect("a well-formed vector");
         assert_eq!(
-            attr_write("iframe", "src", Some("/"), false),
-            AttrWrite::SandboxThenSet("/")
+            client_marks_of(Some("app.example:8443".to_owned())).page,
+            PageAuthority::Known(page)
+        );
+        for host in [None, Some(String::new()), Some("app.example.".to_owned())] {
+            assert_eq!(client_marks_of(host).page, PageAuthority::Unknown);
+        }
+        if web_sys::window().is_none() {
+            assert_eq!(client_marks().page, PageAuthority::Unknown);
+        }
+    }
+
+    /// R13, client half: under a listed policy every grant write precedes the
+    /// navigation, and leaving the listed origin withdraws the grant first.
+    #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
+    fn a_wasm_patch_writes_grants_before_navigation() {
+        let policy = crate::frames::policy_of(&["https://frames.example"], &[])
+            .expect("a well-formed vector");
+        let live = [
+            ("src", "https://frames.example/a"),
+            ("sandbox", "allow-same-origin allow-scripts"),
+        ];
+        let away = plan("iframe", &live, &[("src", Some("/b"))], &policy);
+        assert_eq!(written(&away, "sandbox"), Some(Some("allow-scripts")));
+        assert_eq!(away.last(), Some(&("src", Some("/b".to_owned()))));
+        let stay = plan(
+            "iframe",
+            &live,
+            &[("src", Some("https://frames.example/b"))],
+            &policy,
         );
         assert_eq!(
-            attr_write("iframe", "SRC", Some(""), false),
-            AttrWrite::SandboxThenSet("")
+            written(&stay, "sandbox"),
+            Some(Some("allow-same-origin allow-scripts"))
         );
-        assert_eq!(attr_write("iframe", "src", Some("/"), true), set("/"));
-        assert_eq!(attr_write("iframe", "src", None, false), AttrWrite::Remove);
-        assert_eq!(attr_write("div", "src", Some("/"), false), set("/"));
+        let embed = plan(
+            "embed",
+            &[],
+            &[("src", Some("https://frames.example"))],
+            &policy,
+        );
+        assert_eq!(
+            embed.last(),
+            Some(&("src", Some("https://frames.example".to_owned())))
+        );
+    }
+
+    /// R27, client half: a browser-built page never holds escaped popups, so
+    /// a trusted frame's escape token is dropped.
+    #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
+    fn wasm_popups_are_always_dropped() {
+        for host in [None, Some("other.example".to_owned())] {
+            assert_eq!(client_marks_of(host).popups, EscapedPopups::Dropped);
+        }
+        assert_eq!(client_marks().popups, EscapedPopups::Dropped);
+        let policy = crate::frames::policy_of(&["https://frames.example"], &[])
+            .expect("a well-formed vector");
+        let escape = Some("allow-popups allow-popups-to-escape-sandbox");
+        let writes = plan(
+            "iframe",
+            &[("src", "https://frames.example")],
+            &[("sandbox", escape)],
+            &policy,
+        );
+        assert_eq!(written(&writes, "sandbox"), Some(Some("allow-popups")));
+    }
+
+    /// The browser client's script, whose frame rules R14 runs here.
+    const CLIENT_JS: &str = include_str!("../web/client.js");
+
+    /// The one top-level item of `client.js` that starts with `head` and ends
+    /// at the first `tail` after it, `tail` included.
+    #[allow(clippy::expect_used)] // the script holds each named item once
+    fn client_js_item(head: &str, tail: &str) -> &'static str {
+        assert_eq!(CLIENT_JS.matches(head).count(), 1, "one {head}");
+        let start = CLIENT_JS.find(head).expect("the item");
+        let rest = CLIENT_JS.get(start..).expect("the item");
+        let len = rest.find(tail).expect("the item's end") + tail.len();
+        rest.get(..len).expect("the item")
+    }
+
+    /// The `client.js` frame rules as one function of the boot block, the
+    /// page's host and a frame's live and patched attributes, returning the
+    /// JSON of `__ipeFramePlan`'s writes. The DOM reads it makes go through a
+    /// stand-in node.
+    fn client_js_frame_plan() -> js_sys::Function {
+        let mut body = String::from(
+            "var __ipeBoot = JSON.parse(boot);\n\
+             var window = { top: 1, self: 1 };\n\
+             var location = { host: host };\n\
+             var __ipeNode = {\n\
+               local: function(el) { return el.tag; },\n\
+               attr: function(el, k) {\n\
+                 return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null;\n\
+               }\n\
+             };\n",
+        );
+        for table in [
+            "__IPE_SANDBOX_TOKENS",
+            "__IPE_FRAME_LOADERS",
+            "__IPE_TRUSTED_SANDBOX_TOKENS",
+            "__IPE_FRAME_PERMISSIONS",
+            "__IPE_DELEGATION_FEATURES",
+        ] {
+            body.push_str(client_js_item(&format!("var {table} = "), ";\n"));
+        }
+        for function in [
+            "__ipeAsciiLower",
+            "__ipeSandbox",
+            "__ipeFrameLoaderKey",
+            "__ipeFrameList",
+            "__ipeEscapePopups",
+            "__ipeListedOrigin",
+            "__ipeServedOn",
+            "__ipeFrameTarget",
+            "__ipeTrustedSandbox",
+            "__ipeAllow",
+            "__ipeFrameGrant",
+            "__ipeFramePatchKeys",
+            "__ipeFramePlan",
+        ] {
+            body.push_str(client_js_item(&format!("\nfunction {function}("), "\n}\n"));
+        }
+        body.push_str("return JSON.stringify(__ipeFramePlan(JSON.parse(el), JSON.parse(attrs)));");
+        js_sys::Function::new_with_args("boot, host, el, attrs", &body)
+    }
+
+    /// `pairs` as a JSON object, in order; `None` is `null`.
+    #[allow(clippy::expect_used)] // a string always serializes
+    fn json_object(pairs: &[(&str, Option<&str>)]) -> String {
+        let fields: Vec<String> = pairs
+            .iter()
+            .map(|(key, value)| {
+                format!(
+                    "{}:{}",
+                    serde_json::to_string(key).expect("a key"),
+                    serde_json::to_string(value).expect("a value")
+                )
+            })
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    }
+
+    /// The frame origins R14 lists, two loopback names among them.
+    const R14_ORIGINS: [&str; 4] = [
+        "https://app.example",
+        "https://frames.example:8443",
+        "https://localhost:8443",
+        "https://a.localhost",
+    ];
+
+    /// Every sandbox token a trusted frame may keep.
+    const R14_WIDE: &str =
+        "allow-same-origin allow-scripts allow-popups allow-popups-to-escape-sandbox";
+
+    /// An `allow` naming a gated, a granted, a never, a cross-origin and an
+    /// undisclosed feature.
+    const R14_ALLOW: &str =
+        "camera; geolocation 'src'; payment; fullscreen https://frames.example:8443; usb";
+
+    /// One R14 vector: a frame's tag, its live attributes and a patch.
+    type R14Vector = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        &'static [(&'static str, Option<&'static str>)],
+    );
+
+    /// The frames and patches R14 runs on every page.
+    const R14_VECTORS: &[R14Vector] = &[
+        (
+            "iframe",
+            &[],
+            &[
+                ("src", Some("https://frames.example:8443/x")),
+                ("sandbox", Some(R14_WIDE)),
+                ("allow", Some(R14_ALLOW)),
+            ],
+        ),
+        (
+            "iframe",
+            &[
+                ("src", "https://frames.example:8443/a"),
+                ("sandbox", "allow-same-origin allow-scripts"),
+                ("allow", "camera"),
+            ],
+            &[("src", Some("/b"))],
+        ),
+        (
+            "iframe",
+            &[
+                ("src", "https://frames.example:8443"),
+                ("sandbox", R14_WIDE),
+            ],
+            &[("srcdoc", Some("<p>"))],
+        ),
+        (
+            "iframe",
+            &[("srcdoc", "<p>"), ("sandbox", R14_WIDE)],
+            &[("srcdoc", None), ("src", Some("https://app.example/"))],
+        ),
+        (
+            "IFRAME",
+            &[],
+            &[
+                ("SRC", Some("https://localhost:8443")),
+                ("Sandbox", Some("ALLOW-SAME-ORIGIN allow-scripts")),
+                ("AllowFullScreen", Some("")),
+            ],
+        ),
+        (
+            "iframe",
+            &[("sandbox", R14_WIDE)],
+            &[
+                ("src", Some("https://evil.example")),
+                ("SRC", Some("https://a.localhost/p?q#f")),
+            ],
+        ),
+        (
+            "iframe",
+            &[
+                ("src", "https://frames.example:8443"),
+                ("sandbox", R14_WIDE),
+            ],
+            &[("sandbox", None), ("allowpaymentrequest", Some(""))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("https://frames.example:8443.evil/"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("https://frames.example:84430"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("https://frames.example:8443\\@evil"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some(" https://frames.example:8443"))],
+        ),
+        (
+            "iframe",
+            &[],
+            &[("src", Some("HTTPS://frames.example:8443"))],
+        ),
+        (
+            "embed",
+            &[],
+            &[
+                ("src", Some("https://a.localhost/x")),
+                ("allowfullscreen", Some("")),
+            ],
+        ),
+        (
+            "embed",
+            &[("src", "https://frames.example:8443")],
+            &[("src", Some("/"))],
+        ),
+        (
+            "object",
+            &[],
+            &[("data", Some("https://frames.example:8443?q"))],
+        ),
+        ("OBJECT", &[], &[("DATA", Some("https://evil.example"))]),
+        (
+            "frame",
+            &[],
+            &[("src", Some("https://frames.example:8443"))],
+        ),
+        ("div", &[], &[("src", Some("https://frames.example:8443"))]),
+    ];
+
+    /// The page hosts R14 runs every vector on: the listed hosts at and off
+    /// their ports and in another case, a subdomain, loopback names, IP
+    /// literals and a numeric last label, and hosts `Authority::parse`
+    /// refuses (a trailing dot, an edge hyphen, a 64-byte label, a 254-byte
+    /// name, a non-canonical or out-of-range port, an empty host).
+    const R14_HOSTS: [&str; 25] = [
+        "app.example",
+        "app.example:8443",
+        "APP.Example:8443",
+        "sub.app.example",
+        "frames.example",
+        "frames.example:8443",
+        "localhost:8443",
+        "localhost",
+        "a.localhost:3000",
+        "b.localhost",
+        "B.LocalHost",
+        "other.example",
+        "127.0.0.1:3000",
+        "203.0.113.7",
+        "a.123",
+        "[::1]:3000",
+        "app.example.",
+        "localhost.",
+        "-a.example",
+        "a-.localhost",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example",
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "app.example:0443",
+        "app.example:65536",
+        "",
+    ];
+
+    /// The JSON of `client.js`'s frame plan for `vector` on a page at `host`
+    /// under the boot block `boot`.
+    #[allow(clippy::expect_used)] // the client plan returns its JSON string
+    fn client_js_plan(
+        client: &js_sys::Function,
+        boot: &str,
+        host: &str,
+        (tag, live, delta): &R14Vector,
+    ) -> String {
+        let live: Vec<(&str, Option<&str>)> = live.iter().map(|(k, v)| (*k, Some(*v))).collect();
+        let el = format!(
+            "{{\"tag\":{},\"attrs\":{}}}",
+            serde_json::to_string(tag).expect("a tag"),
+            json_object(&live)
+        );
+        let args = js_sys::Array::of4(
+            &boot.into(),
+            &host.into(),
+            &el.as_str().into(),
+            &json_object(delta).as_str().into(),
+        );
+        client
+            .apply(&wasm_bindgen::JsValue::NULL, &args)
+            .expect("the client plan runs")
+            .as_string()
+            .expect("the client plan's JSON")
+    }
+
+    /// R14, executed: on every page host, popup mark, frame and patch of the
+    /// vector table, `client.js`'s `__ipeFramePlan` writes exactly what the
+    /// runtime's `plan_frame_patch` writes, in the same order.
+    #[wasm_bindgen_test]
+    #[allow(clippy::expect_used)] // the vector table is well-formed
+    fn client_js_frame_plan_matches_the_runtime() {
+        let policy = crate::frames::policy_of(&R14_ORIGINS, &["camera"]).expect("the policy");
+        let grants: Vec<&str> = policy
+            .grants()
+            .suffixes()
+            .map(crate::frames::GrantSuffix::as_str)
+            .collect();
+        let client = client_js_frame_plan();
+        for popups in [EscapedPopups::Held, EscapedPopups::Dropped] {
+            let boot = serde_json::json!({
+                "frameOrigins": R14_ORIGINS,
+                "frameGrants": grants,
+                "escapePopups": popups.is_held(),
+            })
+            .to_string();
+            for host in R14_HOSTS {
+                let page = PageAuthority::of_location_host(host);
+                for vector in R14_VECTORS {
+                    let (tag, live, delta) = vector;
+                    let runtime = plan_frame_patch(
+                        tag,
+                        delta,
+                        |key| {
+                            live.iter()
+                                .find(|(k, _)| *k == key)
+                                .map(|(_, v)| (*v).to_owned())
+                        },
+                        &policy,
+                        &page,
+                        popups,
+                    );
+                    assert_eq!(
+                        client_js_plan(&client, &boot, host, vector),
+                        serde_json::to_string(&runtime).expect("the runtime plan's JSON"),
+                        "{popups:?} on {host:?}: {tag} {live:?} {delta:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A `Decode.index` past the 32-bit `usize` is out of range here, never

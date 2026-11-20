@@ -102,7 +102,7 @@ pub fn emit_web_call(
                         .into(),
                 });
             };
-            let mountable = matches!(k, KernelFn::WebEmbed);
+            let mountable = crate::emit_settings::mounts_into_server(*k);
             emit_web_app_inner(ctx, fields, indent, child, generics, mountable)
         }
 
@@ -129,7 +129,8 @@ pub fn emit_web_call(
                         .into(),
                 });
             };
-            emit_web_app_inner(ctx, fields, indent, child, generics, false)
+            let mountable = crate::emit_settings::mounts_into_server(KernelFn::WebAppRouted);
+            emit_web_app_inner(ctx, fields, indent, child, generics, mountable)
         }
 
         // ── Web.appWith settings cfg ─────────────────────────────────────
@@ -157,7 +158,8 @@ pub fn emit_web_call(
                 });
             };
             let settings_s = emit_expr_at(ctx, settings_e, indent, child, generics)?;
-            let Some(app_s) = emit_web_app_inner(ctx, fields, indent, child, generics, false)?
+            let mountable = crate::emit_settings::mounts_into_server(KernelFn::WebAppWith);
+            let Some(app_s) = emit_web_app_inner(ctx, fields, indent, child, generics, mountable)?
             else {
                 return Ok(None);
             };
@@ -304,6 +306,54 @@ fn emit_web_route(
     )))
 }
 
+/// The one-time registration statements a NATIVE served web app emits.
+///
+/// Without a listed frame origin this is
+/// [`granted_web_features_register_stmt`] alone, byte for byte. With one, the
+/// granted suffixes are one emitted binding that feeds both the
+/// `Permissions-Policy` registry and `frames::register`, so the header and
+/// the frame sink read one grant set.
+fn served_register_stmts(ctx: &EmitCtx) -> String {
+    let origins = frame_origin_literals(&ctx.frame_origins);
+    if origins.is_empty() {
+        return granted_web_features_register_stmt(ctx);
+    }
+    format!(
+        "let __ipe_granted: &[&str] = &[{}]; \
+         ipe_runtime::telemetry::register_granted_web_features(__ipe_granted); \
+         ipe_runtime::frames::register(&[{}], __ipe_granted); ",
+        granted_suffix_literals(ctx).join(", "),
+        origins.join(", ")
+    )
+}
+
+/// The listed frame origins as Rust string literals, each its written form,
+/// in the list's sorted order.
+pub fn frame_origin_literals(
+    frames: &ipe_runtime_rust::encoding::FrameOriginEntries,
+) -> Vec<String> {
+    let mut written = String::new();
+    frames
+        .entries()
+        .map(|entry| {
+            written.clear();
+            entry.write(&mut written);
+            rust_str_lit(&written)
+        })
+        .collect()
+}
+
+/// The program's granted web-capability suffixes as Rust string literals, in
+/// sorted order.
+pub fn granted_suffix_literals(ctx: &EmitCtx) -> Vec<String> {
+    // Deterministic order (BTreeSet iteration is sorted); `rust_str_lit` renders
+    // each `&'static str` suffix as a valid Rust string literal.
+    ctx.web_capabilities
+        .iter()
+        .map(|c| rust_str_lit(c.as_str()))
+        .collect()
+}
+
 /// The one-time registration statement a NATIVE served web app emits so the
 /// runtime's `Permissions-Policy` opens exactly the GRANTED `Ipe.Browser.*`
 /// axes' directives (`geolocation` / `camera` / `microphone`) to `(self)` and
@@ -322,13 +372,7 @@ fn granted_web_features_register_stmt(ctx: &EmitCtx) -> String {
     if ctx.web_capabilities.is_empty() {
         return String::new();
     }
-    // Deterministic order (BTreeSet iteration is sorted); `rust_str_lit` renders
-    // each `&'static str` suffix as a valid Rust string literal.
-    let suffixes: Vec<String> = ctx
-        .web_capabilities
-        .iter()
-        .map(|c| rust_str_lit(c.as_str()))
-        .collect();
+    let suffixes = granted_suffix_literals(ctx);
     format!(
         "ipe_runtime::telemetry::register_granted_web_features(&[{}]); ",
         suffixes.join(", ")
@@ -418,55 +462,56 @@ fn emit_web_app_inner(
     // `web_app`. The window is a delivery-host decision (threaded from the CLI's
     // `delivery.desktop`), never a source `main` field. Native only — a webview
     // build never targets wasm, and a mountable `Web.embed` is a server-nested
-    // handle with no webview host.
-    if ctx.uses_webview && ctx.target != ipe_ir::Target::WasmClient && !mountable {
-        // The webview executor takes init/update/view/subs only — it has no
-        // client-side router. A routed `Web.tea` (a `page` field in the Model)
-        // under a webview host has no honoured routing, so reject it fail-closed
-        // rather than silently drop the routes.
-        if routed_page_field(ctx, view_e).is_some() {
-            return Err(ipe_diagnostics::Diagnostic::CompilerBug {
-                where_: "ipe_backend_rust::emit_web_app_inner::webview_routed",
-                detail: "a routed `Web.tea` (a `page` field in the Model) has no \
+    // handle with no webview host. The frame-list gate reads the same judge.
+    match crate::emit_settings::leaf_host(ctx.target, ctx.uses_webview, mountable) {
+        crate::emit_settings::LeafHost::WebView => {
+            // The webview executor takes init/update/view/subs only — it has no
+            // client-side router. A routed `Web.tea` (a `page` field in the Model)
+            // under a webview host has no honoured routing, so reject it fail-closed
+            // rather than silently drop the routes.
+            if routed_page_field(ctx, view_e).is_some() {
+                return Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::emit_web_app_inner::webview_routed",
+                    detail: "a routed `Web.tea` (a `page` field in the Model) has no \
                          client-side router under a webview-native `web desktop` \
                          delivery; drop the routing or serve it as `web`"
-                    .into(),
-            });
+                        .into(),
+                });
+            }
+            return Ok(Some(crate::emit_webview::emit_web_app_as_webview(
+                ctx, &init_s, &update_s, &view_s, &subs_s,
+            )));
         }
-        return Ok(Some(crate::emit_webview::emit_web_app_as_webview(
-            ctx, &init_s, &update_s, &view_s, &subs_s,
-        )));
-    }
 
-    // Browser target: the same cfg drives the client sink. No session store
-    // (the model lives in the tab), so no store args and no schema tag.
-    if ctx.target == ipe_ir::Target::WasmClient {
-        if let Some((model_ty, page_ty)) = routed_page_field(ctx, view_e) {
-            // Routed app: emit `wasm_app_routed` with routes, notFound, and
-            // a generated `set_page` closure. The History-API `popstate`
-            // listener is installed by the runtime entry point.
-            let routes_e = lookup_field(ctx, fields, "routes")?;
-            let not_found_e = lookup_field(ctx, fields, "notFound")?;
-            let routes_s = emit_expr_at(ctx, routes_e, indent, child, generics)?;
-            let not_found_s = emit_expr_at(ctx, not_found_e, indent, child, generics)?;
-            let model_ty_s = render_type(ctx, model_ty, generics)?;
-            let page_ty_s = render_type(ctx, page_ty, generics)?;
-            let render_s = emit_route_render(ctx, routes_e, &routes_s, page_ty, &page_ty_s)?;
-            let update = UpdateEmission::new(ctx, fields, &update_s)?;
-            let set_page = set_page_closure(
-                ctx,
-                fields,
-                &update.set_page,
-                &page_ty_s,
-                &model_ty_s,
-                indent,
-                child,
-                generics,
-            )?;
-            let handler = &update.handler;
-            let page_of = page_of_closure(&model_ty_s);
-            let call = format!(
-                "ipe_runtime::wasm::wasm_app_routed(\
+        // Browser target: the same cfg drives the client sink. No session store
+        // (the model lives in the tab), so no store args and no schema tag.
+        crate::emit_settings::LeafHost::Browser => {
+            if let Some((model_ty, page_ty)) = routed_page_field(ctx, view_e) {
+                // Routed app: emit `wasm_app_routed` with routes, notFound, and
+                // a generated `set_page` closure. The History-API `popstate`
+                // listener is installed by the runtime entry point.
+                let routes_e = lookup_field(ctx, fields, "routes")?;
+                let not_found_e = lookup_field(ctx, fields, "notFound")?;
+                let routes_s = emit_expr_at(ctx, routes_e, indent, child, generics)?;
+                let not_found_s = emit_expr_at(ctx, not_found_e, indent, child, generics)?;
+                let model_ty_s = render_type(ctx, model_ty, generics)?;
+                let page_ty_s = render_type(ctx, page_ty, generics)?;
+                let render_s = emit_route_render(ctx, routes_e, &routes_s, page_ty, &page_ty_s)?;
+                let update = UpdateEmission::new(ctx, fields, &update_s)?;
+                let set_page = set_page_closure(
+                    ctx,
+                    fields,
+                    &update.set_page,
+                    &page_ty_s,
+                    &model_ty_s,
+                    indent,
+                    child,
+                    generics,
+                )?;
+                let handler = &update.handler;
+                let page_of = page_of_closure(&model_ty_s);
+                let call = format!(
+                    "ipe_runtime::wasm::wasm_app_routed(\
                  {init_s}, \
                  {handler}, \
                  {view_s}, \
@@ -479,16 +524,18 @@ fn emit_web_app_inner(
                  render: {render_s} \
                  }}\
                  )"
-            );
-            return Ok(Some(if update.prelude.is_empty() {
-                call
-            } else {
-                format!("{{ {}{call} }}", update.prelude)
-            }));
+                );
+                return Ok(Some(if update.prelude.is_empty() {
+                    call
+                } else {
+                    format!("{{ {}{call} }}", update.prelude)
+                }));
+            }
+            return Ok(Some(format!(
+                "ipe_runtime::wasm::wasm_app({init_s}, {update_s}, {view_s}, {subs_s})"
+            )));
         }
-        return Ok(Some(format!(
-            "ipe_runtime::wasm::wasm_app({init_s}, {update_s}, {view_s}, {subs_s})"
-        )));
+        crate::emit_settings::LeafHost::Served => {}
     }
 
     // T5 emit branch — parity with ExprEmitter.hs:1670.
@@ -573,7 +620,7 @@ fn emit_routed_web_leaf(
     let register = format!(
         "{}{}",
         crate::served_install::register_stmt(&ctx.served_install),
-        granted_web_features_register_stmt(ctx)
+        served_register_stmts(ctx)
     );
     let handler = &update.handler;
     let page_of = page_of_closure(&model_ty_s);
@@ -638,7 +685,7 @@ fn emit_single_page_web_leaf(
     let register = format!(
         "{}{}",
         crate::served_install::register_stmt(&ctx.served_install),
-        granted_web_features_register_stmt(ctx)
+        served_register_stmts(ctx)
     );
     format!("{{ {register}{tag_const} {msg_set_item}{handle} }}")
 }
@@ -4127,6 +4174,36 @@ mod hot_appearance_tests {
         assert!(
             out.is_none(),
             "flag-off: no wiring composition, the arm stays byte-identical"
+        );
+        Ok(())
+    }
+
+    /// R20: the frame registration is emitted only for a listed origin. An
+    /// empty list leaves the served statements byte-identical; a listed origin
+    /// feeds one granted binding to both the `Permissions-Policy` registry and
+    /// `frames::register`.
+    #[test]
+    #[allow(clippy::expect_used)] // the planted origin is well-formed
+    fn register_emitted_only_for_a_listed_origin() -> DResult<()> {
+        use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
+        let mut interner = Interner::new();
+        let (program, _) = one_view_program(&mut interner, Expr::Int(0))?;
+        let settings = crate::EmitSettings::unconfigured();
+        let mut ctx = RustBackend::configured(&interner, &settings).emit_ctx_for_tests(&program)?;
+        ctx.web_capabilities
+            .insert(ipe_kernels::WebCapability::Geolocation);
+        let empty = super::served_register_stmts(&ctx);
+        assert_eq!(empty, super::granted_web_features_register_stmt(&ctx));
+        assert!(!empty.contains("frames::register"), "{empty}");
+
+        let entry = FrameOriginEntry::parse("https://player.example").expect("a frame origin");
+        ctx.frame_origins = FrameOriginEntries::new([entry]).expect("a frame list");
+        let served = super::served_register_stmts(&ctx);
+        assert_eq!(
+            served,
+            "let __ipe_granted: &[&str] = &[\"geolocation\"]; \
+             ipe_runtime::telemetry::register_granted_web_features(__ipe_granted); \
+             ipe_runtime::frames::register(&[\"https://player.example\"], __ipe_granted); "
         );
         Ok(())
     }

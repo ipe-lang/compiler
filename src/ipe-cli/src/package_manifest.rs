@@ -57,6 +57,7 @@ use ipe_syntax::{Expr, Expr_, Module};
 use ipe_backend_rust::static_build::StaticTriple;
 use ipe_kernels::WebCapability;
 use ipe_runtime_rust::encoding::{
+    FrameOriginEntries, FrameOriginEntry, FrameOriginRefusal, MAX_FRAME_ORIGINS,
     MAX_MOUNT_BASE_LEN, MAX_SERVER_ORIGINS, MountBase, MountBaseRefusal, ServerOrigin,
     ServerOriginRefusal, ServerOrigins,
 };
@@ -257,6 +258,49 @@ fn icon_refusal(raw: &str, refusal: &PwaIconRefusal) -> text::Message {
     }
 }
 
+/// One field of the `delivery` record.
+#[derive(Clone, Copy)]
+enum DeliveryField {
+    /// `ships`: the deliveries `ipe release` produces.
+    Ships,
+    /// `desktop`: the desktop host section.
+    Desktop,
+    /// `mobile`: the mobile host section.
+    Mobile,
+    /// `browser`: the browser host section.
+    Browser,
+    /// `servers`: the origins a client bundle may reach.
+    Servers,
+    /// `frameOrigins`: the origins a served page may frame.
+    FrameOrigins,
+}
+
+/// The `delivery` fields [`Reader::read_delivery`] accepts, by name.
+///
+/// The reader dispatches only through this table, so its accepted names are
+/// exactly these; a unit test pins them to the `Delivery` schema.
+const DELIVERY_FIELDS: [(&str, DeliveryField); 6] = [
+    ("ships", DeliveryField::Ships),
+    ("desktop", DeliveryField::Desktop),
+    ("mobile", DeliveryField::Mobile),
+    ("browser", DeliveryField::Browser),
+    ("servers", DeliveryField::Servers),
+    ("frameOrigins", DeliveryField::FrameOrigins),
+];
+
+/// The accepted `delivery` field names, quoted, as one English list.
+fn delivery_field_names() -> String {
+    let quoted: Vec<String> = DELIVERY_FIELDS
+        .iter()
+        .map(|(known, _)| format!("`{known}`"))
+        .collect();
+    match quoted.split_last() {
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
+        None => String::new(),
+    }
+}
+
 /// One field of the `delivery.browser` record.
 #[derive(Clone, Copy)]
 enum BrowserField {
@@ -310,6 +354,29 @@ fn server_origin_refusal(raw: &str, refusal: ServerOriginRefusal) -> String {
             format!("a `delivery.servers` entry is refused: {refusal}")
         }
         _ => format!("`delivery.servers` entry {raw:?} is refused: {refusal}"),
+    }
+}
+
+/// The refusal of `delivery.frameOrigins` entry `raw`; a too-long entry is
+/// not echoed.
+fn frame_origin_refusal(raw: &str, refusal: FrameOriginRefusal) -> String {
+    match refusal {
+        FrameOriginRefusal::TooLong { .. }
+        | FrameOriginRefusal::Https(ServerOriginRefusal::TooLong { .. }) => {
+            format!("a `delivery.frameOrigins` entry is refused: {refusal}")
+        }
+        _ => format!("`delivery.frameOrigins` entry {raw:?} is refused: {refusal}"),
+    }
+}
+
+/// The shell a declared delivery runs in, or `None` for one a web server
+/// serves or a binary.
+const fn shell_of(entry: ShipEntry) -> Option<&'static str> {
+    match entry {
+        ShipEntry::Desktop | ShipEntry::ClientDesktop => Some("desktop"),
+        ShipEntry::ClientAndroid => Some("Android"),
+        ShipEntry::ClientIos => Some("iOS"),
+        ShipEntry::Binary(_) | ShipEntry::Client => None,
     }
 }
 
@@ -1071,23 +1138,43 @@ impl Reader<'_> {
     ) -> Result<(DeliveryConfig, Option<InstallRequest>), CliError> {
         let mut config = DeliveryConfig::default();
         let mut install_request = None;
+        let mut frames_span = None;
         for (fname, value) in self.expect_record(expr)? {
-            match self.text(fname.value) {
-                "ships" => config.set_ships(self.read_ships(value)?),
-                "desktop" => config.desktop = self.read_desktop(value)?,
-                "mobile" => config.mobile = self.read_mobile(value)?,
-                "browser" => (config.browser, install_request) = self.read_browser(value)?,
-                "servers" => config.servers = self.read_servers(value)?,
-                other => {
-                    return Err(self.reject(
-                        fname.span,
-                        &format!(
-                            "`{other}` is not a delivery field — expected `ships`, `desktop`, \
-                             `mobile`, `browser`, or `servers`"
-                        ),
-                    ));
+            let name = self.text(fname.value);
+            let Some((_, field)) = DELIVERY_FIELDS.iter().find(|(known, _)| *known == name) else {
+                return Err(self.reject(
+                    fname.span,
+                    &format!(
+                        "`{name}` is not a delivery field — expected {}",
+                        delivery_field_names()
+                    ),
+                ));
+            };
+            match field {
+                DeliveryField::Ships => config.set_ships(self.read_ships(value)?),
+                DeliveryField::Desktop => config.desktop = self.read_desktop(value)?,
+                DeliveryField::Mobile => config.mobile = self.read_mobile(value)?,
+                DeliveryField::Browser => {
+                    (config.browser, install_request) = self.read_browser(value)?;
+                }
+                DeliveryField::Servers => config.servers = self.read_servers(value)?,
+                DeliveryField::FrameOrigins => {
+                    config.frame_origins = self.read_frame_origins(value)?;
+                    frames_span = Some(value.span);
                 }
             }
+        }
+        if let Some(span) = frames_span
+            && !config.frame_origins.is_empty()
+            && let Some(shell) = config.ships_for_render().iter().copied().find_map(shell_of)
+        {
+            return Err(self.reject(
+                span,
+                &format!(
+                    "`delivery.frameOrigins` is for served web pages only, but `ships` names a \
+                     {shell} shell — remove the shell from `ships` or the `frameOrigins` field"
+                ),
+            ));
         }
         Ok((config, install_request))
     }
@@ -1203,6 +1290,49 @@ impl Reader<'_> {
             origins.push(origin);
         }
         ServerOrigins::new(origins).map_err(|refusal| self.reject(expr.span, &refusal.to_string()))
+    }
+
+    /// Read `delivery.frameOrigins = [ "https://…", … ]`: each entry parses
+    /// once into a [`FrameOriginEntry`], and the list into
+    /// [`FrameOriginEntries`].
+    ///
+    /// A refused entry, a repeated one, a list past [`MAX_FRAME_ORIGINS`] or
+    /// one past the served header budget is a located rejection; an empty
+    /// list trusts no frame.
+    fn read_frame_origins(&self, expr: &Expr) -> Result<FrameOriginEntries, CliError> {
+        let items = self.expect_list(expr)?;
+        if items.len() > MAX_FRAME_ORIGINS {
+            return Err(self.reject(
+                expr.span,
+                &format!(
+                    "`delivery.frameOrigins` lists {} origins — a page trusts at most \
+                     {MAX_FRAME_ORIGINS}",
+                    items.len()
+                ),
+            ));
+        }
+        let mut entries: Vec<FrameOriginEntry> = Vec::with_capacity(items.len());
+        for item in items {
+            let raw = self.expect_string(item)?;
+            let entry = FrameOriginEntry::parse(&raw)
+                .map_err(|refusal| self.reject(item.span, &frame_origin_refusal(&raw, refusal)))?;
+            if entries.contains(&entry) {
+                return Err(self.reject(
+                    item.span,
+                    &format!(
+                        "`delivery.frameOrigins` lists {raw:?} twice — an origin is listed once. \
+                         Remove the repeat."
+                    ),
+                ));
+            }
+            entries.push(entry);
+        }
+        FrameOriginEntries::new(entries).map_err(|refusal| {
+            self.reject(
+                expr.span,
+                &format!("`delivery.frameOrigins` is refused: {refusal}"),
+            )
+        })
     }
 
     /// Read `delivery.desktop = { title, width, height }`.
@@ -3064,6 +3194,24 @@ mod tests {
         assert_eq!(schema_fields, reader_fields);
     }
 
+    /// The field names of `Delivery` in the `Ipe.Package` schema are the fields the reader accepts.
+    #[test]
+    fn delivery_fields_match_the_package_schema() {
+        let schema_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../stdlib/Ipe/Package.ipe");
+        let schema = std::fs::read_to_string(&schema_path).expect("read Ipe.Package schema");
+        let (_, alias) = schema
+            .split_once("type alias Delivery =")
+            .expect("Delivery alias in the schema");
+        let (record, _) = alias.split_once('}').expect("Delivery record closes");
+        let schema_fields: Vec<&str> = record
+            .split(['{', ','])
+            .filter_map(|field| field.split_once(':'))
+            .map(|(name, _)| name.trim())
+            .collect();
+        let reader_fields: Vec<&str> = DELIVERY_FIELDS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(schema_fields, reader_fields);
+    }
+
     /// Read a manifest whose `delivery.browser.basePath` is the string `raw`.
     ///
     /// `raw` is printable ASCII without `"` or `\`, so its Rust `{:?}` form is
@@ -3494,6 +3642,133 @@ mod tests {
         assert!(
             refusal.as_deref().is_some_and(|msg| msg.contains("twice")),
             "a repeated origin is refused: {refusal:?}"
+        );
+    }
+
+    /// The `delivery` record listing `frames` (each already written as a
+    /// manifest expression).
+    fn frames_delivery(frames: &[String]) -> String {
+        format!("{{ frameOrigins = [ {} ] }}", frames.join(", "))
+    }
+
+    /// R5: every refused `frameOrigins` shape is a located refusal naming the
+    /// key; a non-list, a non-string entry, a repeat, one entry past the cap
+    /// and a too-long entry are each refused, and the long one is not echoed.
+    #[test]
+    fn manifest_frame_origins_refusals_are_located() {
+        let located = |test_name: &str, delivery: &str, also: &str| {
+            let refusal = refusal_text(test_name, &delivery_manifest(delivery, ""));
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|msg| msg.contains("package.ipe:") && msg.contains(also)),
+                "{test_name}: {refusal:?}"
+            );
+            refusal.unwrap_or_default()
+        };
+        let accepted = read(
+            "frames_parse_once",
+            &delivery_manifest(
+                &frames_delivery(&[
+                    "\"https://player.example\"".to_owned(),
+                    "\"https://a.example:8443\"".to_owned(),
+                ]),
+                "",
+            ),
+        );
+        assert!(
+            accepted.is_ok_and(|m| m.delivery.frame_origins.len() == 2),
+            "two legal origins parse"
+        );
+        let bare = read(
+            "frames_absent_is_none",
+            &format!("{HEADER}package =\n    {{ name = \"x\" }}\n"),
+        );
+        assert!(
+            bare.is_ok_and(|m| m.delivery.frame_origins.is_empty()),
+            "no `frameOrigins` trusts no frame"
+        );
+        located(
+            "frames_not_a_list",
+            "{ frameOrigins = \"https://a.example\" }",
+            "list",
+        );
+        located(
+            "frames_not_a_string",
+            &frames_delivery(&["Production".to_owned()]),
+            "string",
+        );
+        let shown = located(
+            "frames_bad_entry",
+            &frames_delivery(&["\"http://a.example\"".to_owned()]),
+            "delivery.frameOrigins",
+        );
+        assert!(shown.contains("\"http://a.example\""), "{shown}");
+        located(
+            "frames_repeat",
+            &frames_delivery(&[
+                "\"https://a.example\"".to_owned(),
+                "\"https://a.example\"".to_owned(),
+            ]),
+            "twice",
+        );
+        let over: Vec<String> = (0..=MAX_FRAME_ORIGINS)
+            .map(|n| format!("\"https://f{n}.example\""))
+            .collect();
+        located("frames_over_cap", &frames_delivery(&over), "at most");
+        let too_long = format!("https://{}.example", "a".repeat(300));
+        let hidden = located(
+            "frames_too_long",
+            &frames_delivery(&[format!("{too_long:?}")]),
+            "delivery.frameOrigins",
+        );
+        assert!(!hidden.contains(&too_long), "{hidden}");
+        located(
+            "frames_unknown_field",
+            "{ frameOrigin = [] }",
+            "`frameOrigins`",
+        );
+    }
+
+    /// R6: a non-empty `frameOrigins` beside a `ships` entry that runs in a
+    /// desktop, Android or iOS shell is refused at the list, naming the
+    /// shell; a served entry or an empty list is accepted.
+    #[test]
+    fn manifest_refuses_frame_origins_with_a_shell() {
+        let manifest = |ships: ShipEntry, frames: &str| {
+            format!(
+                "{HEADER}package =\n    {{ name = \"x\", delivery = {{ ships = [ {} ], frameOrigins = [ {frames} ] }} }}\n",
+                ships.builder_word()
+            )
+        };
+        let listed = "\"https://player.example\"";
+        for (entry, shell) in [
+            (ShipEntry::Desktop, "desktop"),
+            (ShipEntry::ClientDesktop, "desktop"),
+            (ShipEntry::ClientAndroid, "Android"),
+            (ShipEntry::ClientIos, "iOS"),
+        ] {
+            let refusal = refusal_text("frames_on_shell", &manifest(entry, listed));
+            assert!(
+                refusal
+                    .as_deref()
+                    .is_some_and(|msg| msg.contains("package.ipe:")
+                        && msg.contains("delivery.frameOrigins")
+                        && msg.contains(&format!("a {shell} shell"))),
+                "{entry:?}: {refusal:?}"
+            );
+            assert!(
+                read("frames_empty_on_shell", &manifest(entry, "")).is_ok(),
+                "{entry:?}: an empty list trusts no frame and is accepted"
+            );
+        }
+        assert!(
+            read("frames_on_served", &manifest(ShipEntry::Client, listed)).is_ok_and(|m| m
+                .delivery
+                .frame_origins
+                .len()
+                == 1),
+            "a served client may frame"
         );
     }
 

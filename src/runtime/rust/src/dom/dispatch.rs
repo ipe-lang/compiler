@@ -1,9 +1,11 @@
 use crate::csp::{STYLE_NONCE_BYTES, StyleNonce};
 use crate::dom::diff::{Patch, diff};
 use crate::entropy::{EntropyError, fill_entropy};
+use crate::frames::{EscapedPopups, PageAuthority};
 use crate::html::{
     Attribute, Event, FormData, Html, RenderCtx, SessionMarks, StampedHtml, render_stamped,
 };
+use crate::inbound_authority::Authority;
 use crate::retained::{Bytes, RetainedBytes, hash_table};
 use std::collections::{HashMap, VecDeque};
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -156,13 +158,17 @@ pub struct Incarnation(u128);
 /// stamped with. [`Self::mint`] is the one place either is drawn, and it draws
 /// them separately, so neither value says anything about the other. The keys
 /// also carry the mount base the history's page links are joined to, the root
-/// unless [`Self::under`] names another.
+/// unless [`Self::under`] names another, the authority its page is served on,
+/// unknown unless [`Self::serving`] names it, and whether a trusted frame's
+/// popups may leave its sandbox, dropped unless [`Self::escaping`] holds them.
 #[derive(Debug)]
 pub struct SessionKeys {
     incarnation: Incarnation,
     style_nonce: StyleNonce,
     #[cfg(feature = "web-core")]
     base: crate::encoding::EncodedBase,
+    page: PageAuthority,
+    popups: EscapedPopups,
 }
 
 impl SessionKeys {
@@ -189,6 +195,8 @@ impl SessionKeys {
             style_nonce: StyleNonce::from_random_bytes(style_nonce),
             #[cfg(feature = "web-core")]
             base: crate::encoding::MountBase::root().encoded(),
+            page: PageAuthority::Unknown,
+            popups: EscapedPopups::Dropped,
         })
     }
 
@@ -199,9 +207,21 @@ impl SessionKeys {
         Self { base, ..self }
     }
 
+    /// These keys, with the history's page served on `page`.
+    #[must_use]
+    pub fn serving(self, page: PageAuthority) -> Self {
+        Self { page, ..self }
+    }
+
+    /// These keys, with a trusted frame's popups held or dropped.
+    #[must_use]
+    pub fn escaping(self, popups: EscapedPopups) -> Self {
+        Self { popups, ..self }
+    }
+
     /// The marks every render of the history carries.
     fn marks(self) -> (Incarnation, SessionMarks) {
-        let marks = SessionMarks::new(self.style_nonce);
+        let marks = SessionMarks::new(self.style_nonce).serving(self.page, self.popups);
         #[cfg(feature = "web-core")]
         let marks = marks.under(self.base);
         (self.incarnation, marks)
@@ -221,6 +241,8 @@ impl SessionKeys {
             ),
             #[cfg(feature = "web-core")]
             base: crate::encoding::MountBase::root().encoded(),
+            page: PageAuthority::Unknown,
+            popups: EscapedPopups::Dropped,
         }
     }
 }
@@ -593,6 +615,12 @@ impl<M: Clone> Rendered<M> {
     #[must_use]
     pub fn page(&self) -> StampedHtml {
         render_stamped(&self.last_view, &self.marks)
+    }
+
+    /// Withdraw the history's page authority unless `admitted`, the
+    /// authority a rejoin was admitted under, names it; never widens.
+    pub fn narrow_page(&mut self, admitted: Option<&Authority>) {
+        self.marks.narrow_page(admitted);
     }
 
     /// The patches from the current view to `tree`, stamped for this session.
@@ -988,6 +1016,8 @@ mod tests {
             style_nonce: StyleNonce::from_random_bytes([0x5c; STYLE_NONCE_BYTES]),
             #[cfg(feature = "web-core")]
             base: crate::encoding::MountBase::root().encoded(),
+            page: PageAuthority::Unknown,
+            popups: EscapedPopups::Dropped,
         }
     }
 

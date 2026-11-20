@@ -40,6 +40,7 @@
 
 import { writeFileSync } from "node:fs";
 import { test, expect } from "@playwright/test";
+import { untilRoutesLive } from "./routes-live.mjs";
 
 const PORT = process.env.IPE_FOCUS_ACROSS_PATCH_PORT ?? "18082";
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -573,6 +574,7 @@ test("focus-across-patch: a render another tab's key caused never moves focus", 
     },
     { times: 1 },
   );
+  await untilRoutesLive(a);
   await a.keyboard.press("j");
   await expect.poll(() => a.evaluate(() => window.__ipeFocusSends.map((r) => r.seq))).toEqual([1]);
   await holdPatches(a);
@@ -870,6 +872,7 @@ test("focus-across-patch: an event no frame answers never withholds focus from a
     },
     { times: 1 },
   );
+  await untilRoutesLive(page);
   await page.keyboard.press("j");
   await expect.poll(() => abandoned).toBe(true);
   // Focus moves after that event was sent, then comes back to the root.
@@ -929,6 +932,7 @@ async function holdEvents(page) {
     await held;
     await route.continue().catch(() => {});
   });
+  await untilRoutesLive(page);
   return { posts, release };
 }
 

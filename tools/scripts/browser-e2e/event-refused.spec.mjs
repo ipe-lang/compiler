@@ -26,6 +26,7 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { untilRoutesLive } from "./routes-live.mjs";
 
 const PORT = process.env.IPE_GEO_CLIPBOARD_PORT ?? "18080";
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -169,6 +170,7 @@ for (const row of ROWS) {
       answered += 1;
       return route.fulfill({ status: row.status, contentType: "text/plain", body: "e2e" });
     });
+    await untilRoutesLive(page);
     await page.getByRole("button", { name: "Locate" }).click();
     if (row.refused) {
       await expect(refusedBanner(page, row.refused)).toBeVisible({ timeout: 10000 });
@@ -188,6 +190,7 @@ test("an unmarked 200 text/html is the proxy wedge and is retried", async ({ pag
     answered += 1;
     return route.fulfill({ status: 200, contentType: "text/html", body: "<p>edge</p>" });
   });
+  await untilRoutesLive(page);
   await page.getByRole("button", { name: "Locate" }).click();
   await expect.poll(() => answered, { timeout: 10000 }).toBeGreaterThanOrEqual(2);
   await expect(page.locator("#__ipe-status[data-ipe-refused]")).toHaveCount(0);
@@ -207,6 +210,7 @@ test("events queued while the server is unreachable reach it in order", async ({
     delivered.push(msg);
     return route.continue();
   });
+  await untilRoutesLive(page);
   const queued = () => page.evaluate(() => window.__ipeEventQueue.map((b) => b.msg));
 
   await page.evaluate(() => window.__ipeSend("e2e-A", []));
@@ -232,12 +236,14 @@ test("a dropped connection replaces a standing refusal, which returns once it re
   await page.route("**/_ipe/event", (route) =>
     route.fulfill({ status: 400, contentType: "text/plain", body: "e2e" }),
   );
+  await untilRoutesLive(page);
   await page.getByRole("button", { name: "Locate" }).click();
   await expect(refusedBanner(page, "refused")).toBeVisible({ timeout: 10000 });
   await page.unroute("**/_ipe/event");
 
   // The stream drops: the banner says so, over the refusal notice.
   await page.route("**/_ipe/sse**", (route) => route.abort());
+  await untilRoutesLive(page);
   await page.evaluate(() => window.__ipeForceReopenSSE());
   const banner = page.locator("#__ipe-status");
   await expect(banner).toHaveClass(/ipe-status--reconnecting/, { timeout: 10000 });

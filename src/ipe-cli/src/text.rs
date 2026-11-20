@@ -134,6 +134,7 @@ relayable!(
     ipe_sandbox::run_jail::FloorRefusal,
     ipe_ffi::diag::Diagnostic,
     ipe_ffi::diag::WireDefect,
+    ipe_backend_rust::FrameListRefused,
 );
 
 impl fmt::Display for Message {
@@ -738,6 +739,10 @@ messages! {
     library_package_no_entry = "library-package-no-entry";
     /// `ipe capabilities` named a file that is not one of the project's entries.
     capabilities_not_an_entry(arg, entries) = "capabilities-not-an-entry";
+    /// `ipe capabilities` names the built program a frame list applies to.
+    capabilities_frame_program(name, file) = "capabilities-frame-program";
+    /// `ipe capabilities` names an analysed program a frame list does not apply to.
+    capabilities_frame_not_applicable(name, file) = "capabilities-frame-not-applicable";
     /// A `--debugger` build under the vendored emit model.
     debugger_needs_runtime_dep = "debugger-needs-runtime-dep";
     /// A packager could not find a `package.ipe` from the given root.

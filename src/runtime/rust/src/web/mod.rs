@@ -460,6 +460,50 @@ struct BootConfig<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     route: Option<&'a str>,
     cfg: ClientConfig<'a>,
+    /// The listed frame origins, as the server's verdict reads them; absent
+    /// when none is listed.
+    #[serde(rename = "frameOrigins", skip_serializing_if = "Vec::is_empty")]
+    frame_origins: Vec<String>,
+    /// The granted capability suffixes a trusted frame's gated features
+    /// need; absent when none is granted.
+    #[serde(rename = "frameGrants", skip_serializing_if = "Vec::is_empty")]
+    frame_grants: Vec<&'static str>,
+    /// Whether a trusted frame's popups may leave its sandbox; absent when
+    /// they may not.
+    #[serde(rename = "escapePopups", skip_serializing_if = "std::ops::Not::not")]
+    escape_popups: bool,
+}
+
+/// Whether a served page holds escaped popups: only when an origin is
+/// `listed` and the page is not `framed` by another site, so its
+/// `Cross-Origin-Opener-Policy: same-origin` binds.
+#[cfg(feature = "web")]
+const fn escaped_popups(listed: bool, framed: bool) -> crate::frames::EscapedPopups {
+    crate::frames::EscapedPopups::when(listed && !framed)
+}
+
+/// The escaped-popup mark of every page this process serves.
+#[cfg(feature = "web")]
+fn served_popups() -> crate::frames::EscapedPopups {
+    escaped_popups(
+        !crate::frames::policy().origins().is_empty(),
+        csrf::frame_ancestors().is_some(),
+    )
+}
+
+/// The authority a served page's frame verdict reads: the one the host
+/// admission judged, or `Unknown` when none was, or when the origin check
+/// is `Off` (the operator has declared that `Host` does not name the public
+/// origin).
+#[cfg(feature = "web")]
+const fn served_page_authority(
+    admitted: Option<&crate::inbound_authority::Authority>,
+    origin_check: crate::env_grammar::EnvFlag,
+) -> Option<&crate::inbound_authority::Authority> {
+    match origin_check {
+        crate::env_grammar::EnvFlag::On => admitted,
+        crate::env_grammar::EnvFlag::Off => None,
+    }
 }
 
 /// The `id` of the boot data block; `client.js` reads the element by it.
@@ -593,6 +637,17 @@ fn render_live_page(
         csrf: csrf_token,
         route: route.path(),
         cfg: ClientConfig::from_env(tuning),
+        frame_origins: crate::frames::policy()
+            .origins()
+            .iter()
+            .map(crate::frames::ListedOrigin::written)
+            .collect(),
+        frame_grants: crate::frames::policy()
+            .grants()
+            .suffixes()
+            .map(crate::frames::GrantSuffix::as_str)
+            .collect(),
+        escape_popups: served_popups().is_held(),
     })?;
     let dev_banner = dev_console_banner(prefix);
     // Content-addressed client asset URL and SRI hash — computed once at first call.
@@ -5361,6 +5416,7 @@ mod handlers {
         method: axum::http::Method,
         uri: axum::http::Uri,
         strict: Option<axum::Extension<crate::server::StrictUrl>>,
+        admitted: Option<axum::Extension<crate::inbound_authority::AdmittedAuthority>>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -5376,16 +5432,26 @@ mod handlers {
         FView: Fn(Model) -> Html<Msg> + Send + Sync + 'static,
         FSubs: Fn(Model) -> IpeSub<Msg> + Send + Sync + 'static,
     {
-        let mut resp = serve_page(state, method, uri, strict, headers).await;
+        let admitted = served_page_authority(
+            admitted
+                .as_deref()
+                .map(crate::inbound_authority::AdmittedAuthority::authority),
+            crate::env_registry::security::security_posture().csrf_origin_check,
+        )
+        .cloned();
+        let mut resp = serve_page(state, method, uri, strict, admitted, headers).await;
         mint_proof::vary_on_mint_inputs(resp.headers_mut());
         resp
     }
 
+    /// Serve a page whose frame verdicts read `page_host`, the authority the
+    /// host admission judged under the security posture.
     async fn serve_page<Model, Msg, FInit, FUpdate, FView, FSubs>(
         State(st): State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
         method: axum::http::Method,
         uri: axum::http::Uri,
         strict: Option<axum::Extension<crate::server::StrictUrl>>,
+        page_host: Option<crate::inbound_authority::Authority>,
         headers: axum::http::HeaderMap,
     ) -> Response
     where
@@ -5625,6 +5691,13 @@ mod handlers {
             Some((sid, store::Rejoin::Live(handle))) => {
                 // The live driver already holds this session's slot and bytes.
                 drop(admission.take());
+                // A rejoin keeps the session's marks, narrowed to the
+                // authority it was admitted under before anything renders.
+                handle
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .rendered
+                    .narrow_page(page_host.as_ref());
                 // sid is carried from the cookie lookup; the "hit but no sid"
                 // state is unrepresentable. The live driver enters the path,
                 // serialised with its `update`s, commits, touches the store and
@@ -5751,8 +5824,14 @@ mod handlers {
         let Ok(keys) = SessionKeys::mint() else {
             return entry_unavailable();
         };
+        let page_authority = page_host.map_or(
+            crate::frames::PageAuthority::Unknown,
+            crate::frames::PageAuthority::Known,
+        );
         let rendered = Rendered::first(
-            keys.under(mount.base().encoded()),
+            keys.under(mount.base().encoded())
+                .serving(page_authority)
+                .escaping(served_popups()),
             tree,
             (st.page_url)(&model),
         );
@@ -9342,6 +9421,9 @@ mod base_path_tests {
                 msg_updated: HOSTILE,
                 msg_offline: HOSTILE,
             },
+            frame_origins: vec![HOSTILE.to_owned()],
+            frame_grants: Vec::new(),
+            escape_popups: true,
         })
         .expect("the block serializes");
         let body = block
@@ -18003,6 +18085,187 @@ mod route_entry_cmd_tests {
         });
     }
 
+    /// A served page's frame verdicts read the authority its host admission
+    /// judged, never one a rejoin or a missing admission could widen.
+    mod frame_page_authority {
+        use super::*;
+        use crate::html::Attribute;
+        use crate::inbound_authority::{DeclaredNames, HostAdmission, HostAdmissionLayer};
+
+        /// The listed origins: `app.example` is the page's own when the page is
+        /// served on it.
+        const LISTED: [&str; 2] = ["https://app.example", "https://frames.example"];
+
+        /// The opaque sandbox of the written `allow-same-origin allow-scripts`.
+        const OPAQUE: &str = "sandbox=\"allow-scripts\"";
+
+        /// The trusted sandbox of the written `allow-same-origin allow-scripts`.
+        const TRUSTED: &str = "sandbox=\"allow-same-origin allow-scripts\"";
+
+        /// One framed document per listed origin, each asking for the same origin.
+        fn framed(_model: Model) -> Html<Msg> {
+            let frame = |src: &str| {
+                Html::HElement(
+                    "iframe".to_owned(),
+                    vec![
+                        Attribute::Attr("src".to_owned(), src.to_owned()),
+                        Attribute::Attr(
+                            "sandbox".to_owned(),
+                            "allow-same-origin allow-scripts".to_owned(),
+                        ),
+                    ],
+                    vec![],
+                )
+            };
+            Html::HElement(
+                "div".to_owned(),
+                vec![],
+                LISTED.iter().map(|src| frame(src)).collect(),
+            )
+        }
+
+        /// The sandbox the page `body` paints on the frame of `origin`.
+        fn sandbox_of<'b>(body: &'b str, origin: &str) -> Option<&'b str> {
+            let at = body.find(&format!("src=\"{origin}\""))?;
+            let open = body.get(..at)?.rfind("<iframe")?;
+            let tag = body.get(open..)?;
+            let tag = tag.get(..tag.find('>')?)?;
+            let start = tag.find("sandbox=\"")?;
+            let rest = tag.get(start..)?;
+            let end = rest.get(9..)?.find('"')?;
+            rest.get(..end + 10)
+        }
+
+        /// The fixture router painting [`framed`], behind a host admission
+        /// declaring `declared` when given.
+        #[allow(clippy::expect_used)] // test helper: the fixture table and base are well-formed
+        fn framed_router(store: Store, declared: Option<&str>) -> axum::Router {
+            crate::frames::register(&LISTED, &["camera"]);
+            let mut state = fixture_state(store, Arc::new(AtomicUsize::new(0)));
+            state.view = Arc::new(framed);
+            let app = build_web_router(state, false)
+                .map(crate::server::behind_listener)
+                .expect("the fixture route table and base are well-formed");
+            match declared {
+                Some(declared) => app.layer(HostAdmissionLayer::new(
+                    HostAdmission::new(DeclaredNames::parse(declared).expect("declared names")),
+                    "test",
+                )),
+                None => app,
+            }
+        }
+
+        /// GET `/` through `app` with `Host: host` and an optional session
+        /// cookie → (status, minted sid, body).
+        #[allow(clippy::expect_used)] // test helper: request build / router failure is a test environment issue
+        async fn get_on(
+            app: axum::Router,
+            host: &str,
+            cookie: Option<&str>,
+        ) -> (StatusCode, String, String) {
+            let name = super::super::cookie_name_for(&crate::encoding::MountBase::root());
+            let prefix = format!("{name}=");
+            let mut b = Request::builder()
+                .method("GET")
+                .uri("/")
+                .header(header::HOST, host);
+            if let Some(c) = cookie {
+                b = b.header(header::COOKIE, format!("{name}={c}"));
+            }
+            let resp = app
+                .oneshot(b.body(Body::empty()).expect("build GET"))
+                .await
+                .expect("router responds");
+            let status = resp.status();
+            let sid = resp
+                .headers()
+                .get_all(header::SET_COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .find_map(|c| c.strip_prefix(prefix.as_str()))
+                .and_then(|rest| rest.split(';').next())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            (
+                status,
+                sid,
+                String::from_utf8(bytes.to_vec()).expect("a UTF-8 page"),
+            )
+        }
+
+        /// R10a: a page served on `app.example` withdraws its own origin and
+        /// keeps every other listed one.
+        #[test]
+        fn a_served_page_withdraws_its_own_origin() {
+            run(false, || async {
+                let app = framed_router(memory(), Some("app.example"));
+                let (status, _, body) = get_on(app, "app.example", None).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(sandbox_of(&body, LISTED[0]), Some(OPAQUE), "{body}");
+                assert_eq!(sandbox_of(&body, LISTED[1]), Some(TRUSTED), "{body}");
+            });
+        }
+
+        /// R10c: a page no host admission judged serves, and trusts no frame.
+        #[test]
+        fn an_unadmitted_page_trusts_no_frame() {
+            run(false, || async {
+                let app = framed_router(memory(), None);
+                let (status, _, body) = get_on(app, "other.example", None).await;
+                assert_eq!(status, StatusCode::OK);
+                for origin in LISTED {
+                    assert_eq!(sandbox_of(&body, origin), Some(OPAQUE), "{origin}: {body}");
+                }
+            });
+        }
+
+        /// R10d: a live rejoin under another admitted authority narrows the
+        /// session to `Unknown`, and a later rejoin under the minting one never
+        /// widens it back.
+        #[test]
+        fn a_live_rejoin_narrows_and_never_widens() {
+            run(false, || async {
+                let store = memory();
+                let declared = Some("app.example, other.example");
+                let (_, sid, body) = get_on(
+                    framed_router(store.clone(), declared),
+                    "other.example",
+                    None,
+                )
+                .await;
+                assert!(!sid.is_empty(), "the first GET mints a session");
+                for origin in LISTED {
+                    assert_eq!(sandbox_of(&body, origin), Some(TRUSTED), "{origin}: {body}");
+                }
+                assert!(settled(&store, &sid, 2).await.is_some());
+                let (status, _, body) = get_on(
+                    framed_router(store.clone(), declared),
+                    "other.example",
+                    Some(&sid),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(sandbox_of(&body, LISTED[1]), Some(TRUSTED), "{body}");
+                for host in ["app.example", "other.example"] {
+                    let (status, _, body) =
+                        get_on(framed_router(store.clone(), declared), host, Some(&sid)).await;
+                    assert_eq!(status, StatusCode::OK);
+                    for origin in LISTED {
+                        assert_eq!(
+                            sandbox_of(&body, origin),
+                            Some(OPAQUE),
+                            "{host} {origin}: {body}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
     /// A GET on a live session enters through its driver and runs the entry Cmd.
     #[test]
     fn web_hit_runs_entry_cmd_through_the_driver() {
@@ -19642,6 +19905,44 @@ mod route_entry_cmd_tests {
                 );
             }
         });
+    }
+}
+
+#[cfg(all(test, feature = "web"))]
+mod frame_mark_tests {
+    use super::{escaped_popups, served_page_authority};
+    use crate::env_grammar::EnvFlag;
+    use crate::frames::EscapedPopups;
+    use crate::inbound_authority::Authority;
+
+    /// R10h: a page's frame verdict reads the admitted authority only while
+    /// the origin check is on; with it off, or with no admission, the page
+    /// authority is `Unknown`.
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is well-formed
+    fn served_page_authority_follows_the_origin_check() {
+        let authority = Authority::parse("app.example").expect("a well-formed vector");
+        assert_eq!(
+            served_page_authority(Some(&authority), EnvFlag::On),
+            Some(&authority)
+        );
+        assert_eq!(served_page_authority(Some(&authority), EnvFlag::Off), None);
+        assert_eq!(served_page_authority(None, EnvFlag::On), None);
+        assert_eq!(served_page_authority(None, EnvFlag::Off), None);
+    }
+
+    /// R27: a served page holds escaped popups only with a listed origin and
+    /// no frame ancestor allowed.
+    #[test]
+    fn escaped_popups_need_a_list_and_no_framing() {
+        for (listed, framed, held) in [
+            (true, false, EscapedPopups::Held),
+            (true, true, EscapedPopups::Dropped),
+            (false, false, EscapedPopups::Dropped),
+            (false, true, EscapedPopups::Dropped),
+        ] {
+            assert_eq!(escaped_popups(listed, framed), held, "{listed} {framed}");
+        }
     }
 }
 

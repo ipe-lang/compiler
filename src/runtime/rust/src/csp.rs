@@ -14,7 +14,10 @@
 use crate::telemetry::FrameAncestors;
 
 #[cfg(feature = "encoding")]
-use crate::encoding::{ServerOrigin, ServerOrigins};
+use crate::encoding::{
+    FrameOrigin, FrameOriginEntries, FrameOriginEntry, ServerOrigin, ServerOrigins,
+};
+use crate::frames::FramePolicy;
 
 #[cfg(feature = "web")]
 use crate::web::console::{CONSOLE_CSS, CONSOLE_JS};
@@ -138,6 +141,17 @@ pub enum BundleHost {
 }
 
 impl BundleHost {
+    /// The host as a refusal names it.
+    #[must_use]
+    pub const fn shell_name(self) -> &'static str {
+        match self {
+            Self::Served => "web server",
+            Self::AndroidAssets => "Android",
+            Self::IosScheme => "iOS",
+            Self::DesktopScheme(_) => "desktop",
+        }
+    }
+
     /// Every host, in declaration order.
     pub const ALL: [Self; 5] = [
         Self::Served,
@@ -372,6 +386,12 @@ pub enum Source<'a> {
     /// One parsed server origin in its `wss` form.
     #[cfg(feature = "encoding")]
     WsOrigin(&'a ServerOrigin),
+    /// One trusted frame origin a manifest lists, in its written form.
+    #[cfg(feature = "encoding")]
+    FrameEntry(&'a FrameOriginEntry),
+    /// One trusted frame origin the runtime registered, in its written form.
+    #[cfg(feature = "encoding")]
+    FrameOrigin(&'a FrameOrigin),
 }
 
 impl Source<'_> {
@@ -402,6 +422,16 @@ impl Source<'_> {
             #[cfg(feature = "encoding")]
             Self::WsOrigin(origin) => {
                 origin.write_wss(out);
+                return;
+            }
+            #[cfg(feature = "encoding")]
+            Self::FrameEntry(entry) => {
+                entry.write(out);
+                return;
+            }
+            #[cfg(feature = "encoding")]
+            Self::FrameOrigin(origin) => {
+                origin.write(out);
                 return;
             }
         };
@@ -467,6 +497,12 @@ pub enum ReachRefusal {
         /// The refused server origin.
         origin: ServerOrigin,
     },
+    /// The bundle lists trusted frame origins, but `host` is a shell: trusted
+    /// frames are for served web pages only.
+    FramesOnShell {
+        /// The refused shell host.
+        host: BundleHost,
+    },
 }
 
 #[cfg(feature = "encoding")]
@@ -478,6 +514,11 @@ impl std::fmt::Display for ReachRefusal {
                 "server origin {} names the shell's local origin",
                 origin.https()
             ),
+            Self::FramesOnShell { host } => write!(
+                f,
+                "`delivery.frameOrigins` is for served web pages only; the {} shell refuses it",
+                host.shell_name()
+            ),
         }
     }
 }
@@ -487,28 +528,43 @@ impl std::error::Error for ReachRefusal {}
 
 /// What a bundle on one host may reach.
 ///
-/// That is its local origin and the pinned servers' `https` and `wss` forms.
-/// Built only by [`BundleReach::new`] or [`BundleReach::served`], it is the
-/// one input to a bundle's `connect-src`.
+/// That is its local origin, the pinned servers' `https` and `wss` forms, and
+/// the trusted frame origins. Built only by [`BundleReach::new`] or
+/// [`BundleReach::served`], it is the one input to a bundle's `connect-src`,
+/// `frame-src` and `object-src`.
 #[cfg(feature = "encoding")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BundleReach<'a> {
     host: BundleHost,
     servers: &'a ServerOrigins,
+    frames: &'a FrameOriginEntries,
 }
 
 #[cfg(feature = "encoding")]
 impl<'a> BundleReach<'a> {
-    /// The reach of a bundle on `host` pinned to `servers`.
+    /// The reach of a bundle on `host` pinned to `servers`, trusting `frames`.
     ///
     /// # Errors
     ///
-    /// `LocalOriginListed` when `host` is [`BundleHost::AndroidAssets`] and a
-    /// server's host is [`ANDROID_ASSET_HOST`], or `host` is
-    /// [`BundleHost::DesktopScheme`] and a server's host is `localhost`, a
-    /// `*.localhost` name or an IP literal, at any port. Under every other
-    /// host the reach is always built.
-    pub fn new(host: BundleHost, servers: &'a ServerOrigins) -> Result<Self, ReachRefusal> {
+    /// `FramesOnShell` when `frames` is not empty and `host` is not
+    /// [`BundleHost::Served`]. `LocalOriginListed` when `host` is
+    /// [`BundleHost::AndroidAssets`] and a server's host is
+    /// [`ANDROID_ASSET_HOST`], or `host` is [`BundleHost::DesktopScheme`] and a
+    /// server's host is `localhost`, a `*.localhost` name or an IP literal, at
+    /// any port.
+    pub fn new(
+        host: BundleHost,
+        servers: &'a ServerOrigins,
+        frames: &'a FrameOriginEntries,
+    ) -> Result<Self, ReachRefusal> {
+        match host {
+            BundleHost::Served => {}
+            BundleHost::AndroidAssets | BundleHost::IosScheme | BundleHost::DesktopScheme(_) => {
+                if !frames.is_empty() {
+                    return Err(ReachRefusal::FramesOnShell { host });
+                }
+            }
+        }
         let names_local: fn(&str) -> bool = match host {
             BundleHost::Served | BundleHost::IosScheme => |_| false,
             BundleHost::AndroidAssets => names_asset_host,
@@ -522,15 +578,21 @@ impl<'a> BundleReach<'a> {
                 origin: origin.clone(),
             });
         }
-        Ok(Self { host, servers })
+        Ok(Self {
+            host,
+            servers,
+            frames,
+        })
     }
 
-    /// The reach of a bundle a web server serves, pinned to `servers`.
+    /// The reach of a bundle a web server serves, pinned to `servers`,
+    /// trusting `frames`.
     #[must_use]
-    pub const fn served(servers: &'a ServerOrigins) -> Self {
+    pub const fn served(servers: &'a ServerOrigins, frames: &'a FrameOriginEntries) -> Self {
         Self {
             host: BundleHost::Served,
             servers,
+            frames,
         }
     }
 
@@ -559,6 +621,16 @@ impl<'a> BundleReach<'a> {
                 .origins()
                 .flat_map(|origin| [ConnectSource::Https(origin), ConnectSource::Wss(origin)]),
         )
+    }
+
+    /// The `frame-src` and `object-src` sources: the trusted frame origins,
+    /// or `fallback` when none is trusted.
+    fn frame_sources(&self, fallback: Source<'a>) -> Vec<Source<'a>> {
+        if self.frames.is_empty() {
+            vec![fallback]
+        } else {
+            self.frames.entries().map(Source::FrameEntry).collect()
+        }
     }
 
     /// The pinned server origins: the one list a shell's request gate reads.
@@ -781,9 +853,22 @@ pub struct ContentSecurityPolicy<'a> {
 }
 
 impl<'a> ContentSecurityPolicy<'a> {
-    /// The policy of `guard` under the operator's embed list `framing`.
+    /// The policy of `guard` under the operator's embed list `framing` and
+    /// the program's registered frame policy.
     #[must_use]
     pub fn for_guard(guard: &'a Guarded, framing: Option<&'a FrameAncestors>) -> Self {
+        Self::for_guard_trusting(guard, framing, crate::frames::policy())
+    }
+
+    /// The policy of `guard` under `framing`, a web page trusting the frame
+    /// origins of `frames`.
+    #[must_use]
+    #[cfg_attr(not(feature = "web"), allow(unused_variables))] // only a web page reads the frame policy
+    pub fn for_guard_trusting(
+        guard: &'a Guarded,
+        framing: Option<&'a FrameAncestors>,
+        frames: &'a FramePolicy,
+    ) -> Self {
         let ancestors = guard
             .kind()
             .embed_list(framing)
@@ -793,17 +878,24 @@ impl<'a> ContentSecurityPolicy<'a> {
             #[cfg(feature = "web")]
             Guarded::Console => Self::console(ancestors),
             #[cfg(feature = "web")]
-            Guarded::WebPage { style_nonce } => Self::web_page(ancestors, style_nonce),
+            Guarded::WebPage { style_nonce } => {
+                Self::web_page(ancestors, style_nonce, frames.origins())
+            }
         }
     }
 
     /// The policy a static browser bundle a web server serves carries.
     ///
-    /// It is [`Self::for_bundle`] of [`BundleReach::served`] of `servers`.
+    /// It is [`Self::for_bundle`] of [`BundleReach::served`] of `servers`
+    /// and `frames`.
     #[cfg(feature = "encoding")]
     #[must_use]
-    pub fn bundle(servers: &'a ServerOrigins, worker: BundleWorker) -> Self {
-        Self::for_bundle(&BundleReach::served(servers), worker)
+    pub fn bundle(
+        servers: &'a ServerOrigins,
+        frames: &'a FrameOriginEntries,
+        worker: BundleWorker,
+    ) -> Self {
+        Self::for_bundle(&BundleReach::served(servers, frames), worker)
     }
 
     /// The policy of a static browser bundle with `reach`.
@@ -811,7 +903,9 @@ impl<'a> ContentSecurityPolicy<'a> {
     /// The bundle loads its own script, styles and WebAssembly; its
     /// `connect-src` is exactly `reach`'s connect sources; and, when `worker`
     /// is [`BundleWorker::Push`], it registers a same-origin service worker.
-    /// An empty server list is an offline bundle.
+    /// `frame-src` and `object-src` are exactly `reach`'s trusted frame
+    /// origins, or `'self'` and `'none'` when it trusts none. An empty server
+    /// list is an offline bundle.
     #[cfg(feature = "encoding")]
     #[must_use]
     pub fn for_bundle(reach: &BundleReach<'a>, worker: BundleWorker) -> Self {
@@ -823,10 +917,13 @@ impl<'a> ContentSecurityPolicy<'a> {
             .with(D::ScriptSrc, vec![S::SelfOrigin, S::WasmUnsafeEval])
             .with(D::StyleSrc, vec![S::SelfOrigin, S::UnsafeInline])
             .with(D::ConnectSrc, reachable);
-        match worker {
+        let policy = match worker {
             BundleWorker::None => policy,
             BundleWorker::Push => policy.with(D::WorkerSrc, vec![S::SelfOrigin]),
-        }
+        };
+        policy
+            .with(D::FrameSrc, reach.frame_sources(S::SelfOrigin))
+            .with(D::ObjectSrc, reach.frame_sources(S::None))
     }
 
     /// The `Response` profile with `frame-ancestors` set to `ancestors`.
@@ -873,12 +970,23 @@ impl<'a> ContentSecurityPolicy<'a> {
     }
 
     /// The `WebPage` profile of the page stamped with `nonce`, with
-    /// `frame-ancestors` set to `ancestors`.
+    /// `frame-ancestors` set to `ancestors`, trusting the frame origins
+    /// `frames`.
+    ///
+    /// `frame-src` and `object-src` are exactly `frames`, never `'self'`
+    /// beside them, or `'self'` and `'none'` when `frames` is empty.
     #[cfg(feature = "web")]
-    fn web_page(ancestors: Source<'a>, nonce: &'a StyleNonce) -> Self {
+    fn web_page(ancestors: Source<'a>, nonce: &'a StyleNonce, frames: &'a [FrameOrigin]) -> Self {
         use Directive as D;
         use Source as S;
         let shell = page_style_hashes();
+        let framed = |fallback: Source<'a>| {
+            if frames.is_empty() {
+                vec![fallback]
+            } else {
+                frames.iter().map(S::FrameOrigin).collect()
+            }
+        };
         let styles = || {
             vec![
                 S::SelfOrigin,
@@ -900,8 +1008,8 @@ impl<'a> ContentSecurityPolicy<'a> {
             .with(D::ConnectSrc, vec![S::SelfOrigin])
             .with(D::ManifestSrc, vec![S::SelfOrigin])
             .with(D::WorkerSrc, vec![S::SelfOrigin])
-            .with(D::FrameSrc, vec![S::SelfOrigin])
-            .with(D::ObjectSrc, vec![S::None])
+            .with(D::FrameSrc, framed(S::SelfOrigin))
+            .with(D::ObjectSrc, framed(S::None))
             .with(D::BaseUri, vec![S::None])
             .with(D::FormAction, vec![S::SelfOrigin])
             .with(D::FrameAncestors, vec![ancestors])
@@ -1418,9 +1526,15 @@ mod bundle_tests {
     use super::*;
     use crate::encoding::ServerOriginRefusal;
 
-    /// The offline bundle's policy: today's shell, byte for byte.
+    /// The offline bundle's policy before its frame and object directives.
     const OFFLINE: &str = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
         style-src 'self' 'unsafe-inline'; connect-src 'self'";
+
+    /// The frame and object directives of a bundle that trusts no frame origin.
+    const UNFRAMED: &str = "frame-src 'self'; object-src 'none'";
+
+    /// No trusted frame origin.
+    static NO_FRAMES: FrameOriginEntries = FrameOriginEntries::none();
 
     #[allow(clippy::expect_used)] // both origins are well-formed
     fn two() -> ServerOrigins {
@@ -1434,8 +1548,8 @@ mod bundle_tests {
     #[test]
     fn an_offline_bundle_reaches_only_its_own_origin() {
         let none = ServerOrigins::none();
-        let policy = ContentSecurityPolicy::bundle(&none, BundleWorker::None);
-        assert_eq!(policy.header_value(), OFFLINE);
+        let policy = ContentSecurityPolicy::bundle(&none, &NO_FRAMES, BundleWorker::None);
+        assert_eq!(policy.header_value(), format!("{OFFLINE}; {UNFRAMED}"));
         assert_eq!(policy.sources(Directive::WorkerSrc), None);
     }
 
@@ -1444,13 +1558,15 @@ mod bundle_tests {
     #[test]
     fn server_origins_widen_connect_src_only() {
         let servers = two();
-        let value = ContentSecurityPolicy::bundle(&servers, BundleWorker::None).header_value();
+        let value =
+            ContentSecurityPolicy::bundle(&servers, &NO_FRAMES, BundleWorker::None).header_value();
         assert_eq!(
             value,
             "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
              style-src 'self' 'unsafe-inline'; connect-src 'self' \
              https://api.example wss://api.example \
-             https://media.example:8443 wss://media.example:8443"
+             https://media.example:8443 wss://media.example:8443; \
+             frame-src 'self'; object-src 'none'"
         );
         assert_ne!(value, OFFLINE);
     }
@@ -1460,12 +1576,15 @@ mod bundle_tests {
     #[test]
     fn push_adds_a_same_origin_worker_src() {
         let none = ServerOrigins::none();
-        let push = ContentSecurityPolicy::bundle(&none, BundleWorker::Push);
+        let push = ContentSecurityPolicy::bundle(&none, &NO_FRAMES, BundleWorker::Push);
         assert_eq!(
             push.sources(Directive::WorkerSrc),
             Some([Source::SelfOrigin].as_slice())
         );
-        assert_eq!(push.header_value(), format!("{OFFLINE}; worker-src 'self'"));
+        assert_eq!(
+            push.header_value(),
+            format!("{OFFLINE}; worker-src 'self'; {UNFRAMED}")
+        );
     }
 
     #[allow(clippy::expect_used)] // the origin is well-formed
@@ -1483,7 +1602,7 @@ mod bundle_tests {
     /// constructor.
     #[allow(clippy::expect_used)] // no list here names the asset host
     fn reach(host: BundleHost, servers: &ServerOrigins) -> BundleReach<'_> {
-        BundleReach::new(host, servers).expect("reach")
+        BundleReach::new(host, servers, &NO_FRAMES).expect("reach")
     }
 
     /// The `connect-src` tokens of a rendered header value, split at the
@@ -1607,20 +1726,25 @@ mod bundle_tests {
     #[test]
     fn served_bundle_bytes_are_unchanged() {
         let servers = two();
-        let push = ContentSecurityPolicy::bundle(&servers, BundleWorker::Push).header_value();
+        let push =
+            ContentSecurityPolicy::bundle(&servers, &NO_FRAMES, BundleWorker::Push).header_value();
         assert_eq!(
             push,
             "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; \
              style-src 'self' 'unsafe-inline'; connect-src 'self' \
              https://api.example wss://api.example \
-             https://media.example:8443 wss://media.example:8443; worker-src 'self'"
+             https://media.example:8443 wss://media.example:8443; worker-src 'self'; \
+             frame-src 'self'; object-src 'none'"
         );
         for servers in &server_lists() {
             for worker in [BundleWorker::None, BundleWorker::Push] {
-                let bundled = ContentSecurityPolicy::bundle(servers, worker);
+                let bundled = ContentSecurityPolicy::bundle(servers, &NO_FRAMES, worker);
                 assert_eq!(
                     bundled,
-                    ContentSecurityPolicy::for_bundle(&BundleReach::served(servers), worker)
+                    ContentSecurityPolicy::for_bundle(
+                        &BundleReach::served(servers, &NO_FRAMES),
+                        worker
+                    )
                 );
                 assert_eq!(
                     bundled,
@@ -1630,10 +1754,10 @@ mod bundle_tests {
         }
         let none = ServerOrigins::none();
         assert_eq!(
-            ContentSecurityPolicy::bundle(&none, BundleWorker::None).meta_element(),
+            ContentSecurityPolicy::bundle(&none, &NO_FRAMES, BundleWorker::None).meta_element(),
             format!(
                 "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
-                crate::escape::html_attr(OFFLINE)
+                crate::escape::html_attr(&format!("{OFFLINE}; {UNFRAMED}"))
             )
         );
     }
@@ -1652,13 +1776,13 @@ mod bundle_tests {
             let servers =
                 ServerOrigins::new([parse("https://api.example"), origin.clone()]).expect("list");
             assert_eq!(
-                BundleReach::new(BundleHost::AndroidAssets, &servers),
+                BundleReach::new(BundleHost::AndroidAssets, &servers, &NO_FRAMES),
                 Err(ReachRefusal::LocalOriginListed { origin }),
                 "{refused}"
             );
             for host in [BundleHost::Served, BundleHost::IosScheme] {
                 assert!(
-                    BundleReach::new(host, &servers).is_ok(),
+                    BundleReach::new(host, &servers, &NO_FRAMES).is_ok(),
                     "{host:?} {refused}"
                 );
             }
@@ -1671,7 +1795,7 @@ mod bundle_tests {
             let servers = ServerOrigins::new([parse(admitted)]).expect("list");
             for host in BundleHost::ALL {
                 assert!(
-                    BundleReach::new(host, &servers).is_ok(),
+                    BundleReach::new(host, &servers, &NO_FRAMES).is_ok(),
                     "{host:?} {admitted}"
                 );
             }
@@ -1744,7 +1868,7 @@ mod bundle_tests {
                 ServerOrigins::new([parse("https://api.example"), origin.clone()]).expect("list");
             for spelling in SchemeSpelling::ALL {
                 assert_eq!(
-                    BundleReach::new(BundleHost::DesktopScheme(spelling), &servers),
+                    BundleReach::new(BundleHost::DesktopScheme(spelling), &servers, &NO_FRAMES),
                     Err(ReachRefusal::LocalOriginListed {
                         origin: origin.clone()
                     }),
@@ -1845,6 +1969,242 @@ mod bundle_tests {
             "https://appassets.androidplatform.net:1:2",
         ] {
             assert!(ServerOrigin::parse(unparsed).is_err(), "{unparsed}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "encoding", not(target_arch = "wasm32")))]
+mod frame_tests {
+    use super::*;
+    use crate::encoding::FrameOrigins;
+
+    /// No trusted frame origin.
+    static NO_FRAMES: FrameOriginEntries = FrameOriginEntries::none();
+
+    /// The `https` origins every frame test walks.
+    const HTTPS_VECTORS: [&str; 4] = [
+        "https://a.example",
+        "https://player.example.com",
+        "https://maps.example.org:8443",
+        "https://x-1.b.example",
+    ];
+
+    /// The manifest list of `texts`.
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn entries(texts: &[&str]) -> FrameOriginEntries {
+        FrameOriginEntries::new(
+            texts
+                .iter()
+                .map(|text| FrameOriginEntry::parse(text).expect("entry")),
+        )
+        .expect("entries")
+    }
+
+    /// The runtime list of `texts`.
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn origins(texts: &[&str]) -> FrameOrigins {
+        FrameOrigins::new(
+            texts
+                .iter()
+                .map(|text| FrameOrigin::parse(text).expect("origin")),
+        )
+        .expect("origins")
+    }
+
+    /// The sources of `directive` in `value`, split at the token boundaries.
+    fn directive_tokens<'v>(value: &'v str, directive: &str) -> Option<Vec<&'v str>> {
+        value
+            .split(';')
+            .map(str::trim)
+            .find_map(|d| d.strip_prefix(directive)?.strip_prefix(' '))
+            .map(|rest| rest.split(' ').collect())
+    }
+
+    /// The `frame-src` and `object-src` sources a policy writes.
+    fn frame_and_object(policy: &ContentSecurityPolicy<'_>) -> (Vec<String>, Vec<String>) {
+        let spelled = |directive| -> Vec<String> {
+            policy
+                .sources(directive)
+                .unwrap_or_default()
+                .iter()
+                .map(|source| {
+                    let mut out = String::new();
+                    source.write_to(&mut out);
+                    out
+                })
+                .collect()
+        };
+        (spelled(Directive::FrameSrc), spelled(Directive::ObjectSrc))
+    }
+
+    /// R16: a bundle writes `frame-src 'self'` and `object-src 'none'` with no
+    /// trusted origin, exactly the sorted list in both with one, and its meta
+    /// carries the header value.
+    #[test]
+    fn bundle_csp_writes_frames_and_objects() {
+        let servers = ServerOrigins::none();
+        let listed = entries(&["https://b.example", "https://a.example:8443"]);
+        for worker in [BundleWorker::None, BundleWorker::Push] {
+            let unframed = ContentSecurityPolicy::bundle(&servers, &NO_FRAMES, worker);
+            let value = unframed.header_value();
+            assert_eq!(directive_tokens(&value, "frame-src"), Some(vec!["'self'"]));
+            assert_eq!(directive_tokens(&value, "object-src"), Some(vec!["'none'"]));
+
+            let framed = ContentSecurityPolicy::bundle(&servers, &listed, worker);
+            let value = framed.header_value();
+            let want = vec!["https://a.example:8443", "https://b.example"];
+            assert_eq!(directive_tokens(&value, "frame-src"), Some(want.clone()));
+            assert_eq!(directive_tokens(&value, "object-src"), Some(want));
+            assert!(!value.contains("'self' https://"), "{value}");
+            assert_eq!(
+                framed.meta_element(),
+                format!(
+                    "<meta http-equiv=\"Content-Security-Policy\" content=\"{}\">\n",
+                    crate::escape::html_attr(&value)
+                )
+            );
+            assert_eq!(
+                framed,
+                ContentSecurityPolicy::for_bundle(&BundleReach::served(&servers, &listed), worker)
+            );
+        }
+    }
+
+    /// R17: every shell host refuses a non-empty frame list, naming the host;
+    /// the served host admits it, and every host admits an empty list.
+    #[test]
+    fn bundle_reach_refuses_frames_on_a_shell_host() {
+        let servers = ServerOrigins::none();
+        for listed in [
+            entries(&["https://a.example"]),
+            entries(&["https://appassets.androidplatform.net"]),
+            entries(&["https://ipe-app.localhost"]),
+        ] {
+            for host in BundleHost::ALL {
+                let reach = BundleReach::new(host, &servers, &listed);
+                match host {
+                    BundleHost::Served => assert!(reach.is_ok(), "{host:?}"),
+                    BundleHost::AndroidAssets
+                    | BundleHost::IosScheme
+                    | BundleHost::DesktopScheme(_) => {
+                        assert_eq!(reach, Err(ReachRefusal::FramesOnShell { host }));
+                        let refusal = ReachRefusal::FramesOnShell { host }.to_string();
+                        assert!(refusal.contains(host.shell_name()), "{refusal}");
+                        assert!(refusal.contains("frameOrigins"), "{refusal}");
+                    }
+                }
+            }
+        }
+        for host in BundleHost::ALL {
+            assert!(
+                BundleReach::new(host, &servers, &NO_FRAMES).is_ok(),
+                "{host:?}"
+            );
+        }
+    }
+
+    /// R16b: the manifest's and the runtime's writers agree byte for byte on
+    /// every `https` origin, and a bundle and a web page built over one list
+    /// write the same `frame-src` and `object-src` sources.
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn frame_entry_and_origin_write_the_same_bytes() {
+        for text in HTTPS_VECTORS {
+            let mut entry = String::new();
+            FrameOriginEntry::parse(text)
+                .expect("entry")
+                .write(&mut entry);
+            let origin = FrameOrigin::parse(text).expect("origin").written();
+            assert_eq!(entry, origin);
+            assert_eq!(entry, text);
+        }
+        let listed = entries(&HTTPS_VECTORS);
+        let trusted = origins(&HTTPS_VECTORS);
+        let servers = ServerOrigins::none();
+        let bundle = ContentSecurityPolicy::bundle(&servers, &listed, BundleWorker::None);
+        let want = frame_and_object(&bundle);
+        assert_eq!(want.0.len(), HTTPS_VECTORS.len());
+        let written: Vec<String> = trusted.origins().iter().map(FrameOrigin::written).collect();
+        assert_eq!(written, want.0);
+        #[cfg(feature = "web")]
+        {
+            let page = Guarded::sample(Profile::WebPage, 7);
+            let policy =
+                crate::frames::FramePolicy::trusting(trusted, crate::frames::FrameGrants::none());
+            let served = ContentSecurityPolicy::for_guard_trusting(&page, None, &policy);
+            assert_eq!(frame_and_object(&served), want);
+        }
+    }
+
+    /// R16b under `dev-posture`: the loopback entry the manifest admits and
+    /// the loopback origin a dev runtime parses write the same bytes.
+    #[cfg(feature = "dev-posture")]
+    #[test]
+    #[allow(clippy::expect_used)] // the loopback vector is well-formed
+    fn dev_posture_pin_frame_entry_and_origin_write_the_same_bytes() {
+        let text = "http://localhost:3000";
+        let mut entry = String::new();
+        FrameOriginEntry::parse(text)
+            .expect("entry")
+            .write(&mut entry);
+        assert_eq!(entry, FrameOrigin::parse(text).expect("origin").written());
+        let texts = [text, "https://a.example"];
+        let listed = entries(&texts);
+        let servers = ServerOrigins::none();
+        let bundle = ContentSecurityPolicy::bundle(&servers, &listed, BundleWorker::None);
+        let want = frame_and_object(&bundle);
+        assert!(want.0.iter().any(|source| source == text), "{want:?}");
+        let written: Vec<String> = origins(&texts)
+            .origins()
+            .iter()
+            .map(FrameOrigin::written)
+            .collect();
+        assert_eq!(written, want.0);
+    }
+
+    /// R15: a web page trusting origins writes exactly the list in
+    /// `frame-src` and `object-src`, never `'self'` there; trusting none, it
+    /// is the unframed page byte for byte, and no other profile reads it.
+    #[cfg(feature = "web")]
+    #[test]
+    fn web_page_csp_drops_self_when_frames_trusted() {
+        let page = Guarded::sample(Profile::WebPage, 0x3c);
+        let none = crate::frames::FramePolicy::none();
+        let unframed = ContentSecurityPolicy::for_guard_trusting(&page, None, &none).header_value();
+        assert_eq!(
+            directive_tokens(&unframed, "frame-src"),
+            Some(vec!["'self'"])
+        );
+        assert_eq!(
+            directive_tokens(&unframed, "object-src"),
+            Some(vec!["'none'"])
+        );
+
+        let policy = crate::frames::FramePolicy::trusting(
+            origins(&["https://b.example", "https://a.example"]),
+            crate::frames::FrameGrants::none(),
+        );
+        let framed = ContentSecurityPolicy::for_guard_trusting(&page, None, &policy).header_value();
+        let want = vec!["https://a.example", "https://b.example"];
+        assert_eq!(directive_tokens(&framed, "frame-src"), Some(want.clone()));
+        assert_eq!(directive_tokens(&framed, "object-src"), Some(want));
+        assert_eq!(
+            framed.replace("https://a.example https://b.example", "_"),
+            unframed
+                .replace("frame-src 'self'", "frame-src _")
+                .replace("object-src 'none'", "object-src _"),
+            "only frame-src and object-src change"
+        );
+        for guard in [
+            Guarded::sample(Profile::Response, 0),
+            Guarded::sample(Profile::Console, 0),
+        ] {
+            assert_eq!(
+                ContentSecurityPolicy::for_guard_trusting(&guard, None, &policy),
+                ContentSecurityPolicy::for_guard_trusting(&guard, None, &none),
+                "{:?} never reads the frame policy",
+                guard.kind()
+            );
         }
     }
 }

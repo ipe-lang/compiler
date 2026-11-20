@@ -8,11 +8,12 @@ edition = "2024"
 # manifest augmenters (`async_runtime_cargo_toml` restores `"tokio"`, the
 # server/db/… steps insert their feature, the static path splices the allocator)
 # — it must stay byte-exact, and every augmenter finds it as the line-initial
-# occurrence, so no comment here may open a bracketed list. The vendored fallback
-# leaves `encoding` OFF: the vendored `encoding.rs` / `bytes.rs` modules are
-# declared on demand by `ipe_runtime/mod.rs`, never through this feature, so a
-# source gate on the feature cannot name a module the program did not declare.
-# The `base64` / `hex` / `percent-encoding` deps below stay non-optional in the
+# occurrence, so no comment here may open a bracketed list. The last augmenter
+# promotes every declared feature the runtime crate turns on for the program
+# (`RuntimeFeature::vendored_projection`), so the vendored tree compiles a
+# selection the runtime crate can make. `encoding` is on exactly when the
+# vendored `ipe_runtime/mod.rs` declares the `encoding` / `bytes` modules; the
+# `base64` / `hex` / `percent-encoding` deps below stay non-optional in the
 # vendored escape hatch.
 default = ["json"]
 tokio = []

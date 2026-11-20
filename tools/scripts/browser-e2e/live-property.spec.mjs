@@ -164,8 +164,14 @@ test("frame patch: an iframe sandbox is never removed and keeps only known token
   await load(page);
   await addToRoot(page, '<iframe id="ipe-e2e-boxed" ipe-id="e2e-boxed" sandbox="allow-forms"></iframe>');
   const frame = page.locator("#ipe-e2e-boxed");
+  // A removal leaves the frame's final state holding no sandbox token: the
+  // patch writes the strictest sandbox, present and empty, never removing it
+  // and never keeping a token the final state does not hold.
   await pushPatches(page, [{ id: "e2e-boxed", attrs: { sandbox: null } }]);
-  expect(await frame.evaluate((el) => el.getAttribute("sandbox"))).toBe("allow-forms");
+  expect(await frame.evaluate((el) => [el.hasAttribute("sandbox"), el.getAttribute("sandbox")])).toEqual([
+    true,
+    "",
+  ]);
   await pushPatches(page, [
     { id: "e2e-boxed", attrs: { Sandbox: "ALLOW-SAME-ORIGIN\tallow-scripts allow-popups-to-escape-sandbox x" } },
   ]);

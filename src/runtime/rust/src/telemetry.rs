@@ -922,7 +922,10 @@ pub fn frame_ancestors() -> Option<&'static FrameAncestors> {
 /// compiler's `WebCapability::POLICY_DIRECTIVES` by an equality test
 /// (`policy_directive_vocabulary_matches_kernels`, native-only where
 /// `ipe_kernels` is in scope). The instant either drifts, that test breaks.
-const POLICY_DIRECTIVES: &[&str] = &["geolocation", "microphone", "camera", "payment"];
+pub(crate) const POLICY_DIRECTIVES: &[&str] = &["geolocation", "microphone", "camera", "payment"];
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the served `Permissions-Policy` vocabulary is not exactly the delegation table's `Gated` and `Never` rows [ledger #boundary]
+const _: () = assert!(crate::frames::agrees_with_header(POLICY_DIRECTIVES));
 
 /// The `Permissions-Policy` directive(s) a GRANTED web-capability wire suffix
 /// (`WebCapability::as_str`, e.g. `"geolocation"`) opens to `(self)`. Empty for
@@ -981,16 +984,77 @@ pub fn register_granted_web_features(suffixes: &[&str]) {
 /// document's policy permits — so an ungranted feature stays denied even if
 /// this derivation were bypassed.
 #[must_use]
-fn permissions_policy_value() -> String {
-    permissions_policy_from(GRANTED_WEB_FEATURES.get())
+fn permissions_policy_value(frames: &FrameAllowlist) -> String {
+    permissions_policy_from(GRANTED_WEB_FEATURES.get(), frames)
+}
+
+/// The trusted frame origins a widened `Permissions-Policy` directive lists.
+///
+/// It holds the written allowlist suffix, each origin as ` "<origin>"` in the
+/// trusted list's sorted order; empty when no origin is trusted, which leaves
+/// every directive as it is without frames.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameAllowlist(String);
+
+impl FrameAllowlist {
+    /// No trusted frame origin.
+    #[must_use]
+    pub(crate) const fn none() -> Self {
+        Self(String::new())
+    }
+
+    /// The allowlist of `origins`, in their order.
+    #[cfg(feature = "web")]
+    #[must_use]
+    pub(crate) fn of(origins: &[crate::encoding::FrameOrigin]) -> Self {
+        let mut out = String::new();
+        for origin in origins {
+            out.push_str(" \"");
+            origin.write(&mut out);
+            out.push('"');
+        }
+        Self(out)
+    }
+
+    /// The allowlist `guard`'s response sends: a web page lists `frames`'
+    /// trusted origins, every other profile none.
+    #[cfg(feature = "web")]
+    #[must_use]
+    fn of_guard(guard: &crate::csp::Guarded, frames: &crate::frames::FramePolicy) -> Self {
+        use crate::csp::Guarded;
+        match guard {
+            Guarded::WebPage { .. } => Self::of(frames.origins()),
+            Guarded::Response | Guarded::Console => Self::none(),
+        }
+    }
+
+    /// The allowlist `guard`'s response sends: without `web` no profile is a
+    /// web page, so none.
+    #[cfg(not(feature = "web"))]
+    #[must_use]
+    const fn of_guard(_guard: &crate::csp::Guarded, _frames: &crate::frames::FramePolicy) -> Self {
+        Self::none()
+    }
+
+    /// Whether no origin is listed.
+    const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// Pure derivation of the `Permissions-Policy` value from a granted suffix set
-/// (or `None` = never registered). Split out from [`permissions_policy_value`]
-/// so the grant / no-grant / partial-grant derivations are unit-testable
-/// without touching the process-global registry.
+/// (or `None` = never registered) and the trusted frame allowlist.
+///
+/// A granted directive opens to `(self)`, widened to `(self "<o1>" ...)`
+/// when `frames` lists origins; an ungranted one and `payment` stay `()`.
+/// With origins listed, each `Undisclosed` row of
+/// [`crate::frames::DELEGATION_FEATURES`] follows in table order as
+/// `<feature>=(self "<o1>" ...)`. With none, the value is the unframed one.
 #[must_use]
-fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>) -> String {
+pub(crate) fn permissions_policy_from(
+    granted: Option<&std::collections::BTreeSet<String>>,
+    frames: &FrameAllowlist,
+) -> String {
     let allowed: std::collections::BTreeSet<&'static str> = granted
         .map(|set| {
             set.iter()
@@ -998,13 +1062,22 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
                 .collect()
         })
         .unwrap_or_default();
+    let suffix = frames.0.as_str();
     let mut parts: Vec<String> = Vec::with_capacity(POLICY_DIRECTIVES.len());
     for &dir in POLICY_DIRECTIVES {
         if allowed.contains(dir) {
-            parts.push(format!("{dir}=(self)"));
+            parts.push(format!("{dir}=(self{suffix})"));
         } else {
             parts.push(format!("{dir}=()"));
         }
+    }
+    if !frames.is_empty() {
+        parts.extend(
+            crate::frames::DELEGATION_FEATURES
+                .iter()
+                .filter(|row| matches!(row.class, crate::frames::FeatureClass::Undisclosed))
+                .map(|row| format!("{}=(self{suffix})", row.name)),
+        );
     }
     parts.join(", ")
 }
@@ -1023,17 +1096,24 @@ fn permissions_policy_from(granted: Option<&std::collections::BTreeSet<String>>)
 pub fn security_headers(
     guard: &crate::csp::Guarded,
 ) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
-    security_headers_with(guard, frame_ancestors_config())
+    security_headers_with(guard, frame_ancestors_config(), crate::frames::policy())
 }
 
-/// [`security_headers`] under an explicit framing configuration.
+/// [`security_headers`] under an explicit framing configuration and frame
+/// policy.
+///
+/// A web page trusting frame origins also carries
+/// `Cross-Origin-Opener-Policy: same-origin`; with no trusted origin, or on
+/// any other profile, the set is the unframed one.
 fn security_headers_with(
     guard: &crate::csp::Guarded,
     framing: Result<Option<&FrameAncestors>, FrameAncestorsRefusal>,
+    frames: &crate::frames::FramePolicy,
 ) -> Result<Vec<(&'static str, String)>, FrameAncestorsRefusal> {
     use crate::csp::ContentSecurityPolicy;
     let framing = framing?;
     let profile = guard.kind();
+    let allowlist = FrameAllowlist::of_guard(guard, frames);
     let mut h: Vec<(&'static str, String)> = vec![
         //
         ("x-content-type-options", "nosniff".to_string()),
@@ -1046,12 +1126,16 @@ fn security_headers_with(
         // from the registered grant so the served policy matches the proven
         // capability set — never a blanket deny that also kills legitimate
         // granted use, never a widened allow.
-        ("permissions-policy", permissions_policy_value()),
+        ("permissions-policy", permissions_policy_value(&allowlist)),
     ];
     h.push((
         "content-security-policy",
-        ContentSecurityPolicy::for_guard(guard, framing).header_value(),
+        ContentSecurityPolicy::for_guard_trusting(guard, framing, frames).header_value(),
     ));
+    // A page that frames trusted origins severs every cross-origin opener.
+    if !allowlist.is_empty() {
+        h.push(("cross-origin-opener-policy", "same-origin".to_string()));
+    }
     // A response framed same-origin only also carries `X-Frame-Options` for
     // browsers without `frame-ancestors`.
     if profile.embed_list(framing).is_none() {
@@ -1471,6 +1555,7 @@ pub fn entries_json(entries: &[LogEntry]) -> String {
 mod tests {
     use super::*;
 
+    use crate::frames::FramePolicy;
     use std::collections::BTreeSet;
 
     // A raw environment read's `{:?}` keeps its shape and hides the value.
@@ -1560,7 +1645,7 @@ mod tests {
         let guard = Guarded::sample(Profile::WebPage, 7);
         let page = &guard;
         let embed = FrameAncestors::parse("https://a.example").ok().flatten();
-        let framed = security_headers_with(page, Ok(embed.as_ref()));
+        let framed = security_headers_with(page, Ok(embed.as_ref()), &FramePolicy::none());
         assert!(
             framed.as_ref().is_ok_and(|h| {
                 header(h, "content-security-policy").is_some_and(|v| {
@@ -1570,7 +1655,7 @@ mod tests {
             }),
             "{framed:?}"
         );
-        let same_origin = security_headers_with(page, Ok(None));
+        let same_origin = security_headers_with(page, Ok(None), &FramePolicy::none());
         let want = ContentSecurityPolicy::for_guard(page, None).header_value();
         assert!(
             same_origin.as_ref().is_ok_and(|h| {
@@ -1591,7 +1676,11 @@ mod tests {
             "{want}"
         );
         assert_eq!(
-            security_headers_with(page, Err(FrameAncestorsRefusal::Blank)),
+            security_headers_with(
+                page,
+                Err(FrameAncestorsRefusal::Blank),
+                &FramePolicy::none()
+            ),
             Err(FrameAncestorsRefusal::Blank)
         );
     }
@@ -1605,7 +1694,7 @@ mod tests {
         for &profile in Profile::ALL {
             let guard = Guarded::sample(profile, 9);
             for framing in [None, embed.as_ref()] {
-                let set = security_headers_with(&guard, Ok(framing));
+                let set = security_headers_with(&guard, Ok(framing), &FramePolicy::none());
                 let want = ContentSecurityPolicy::for_guard(&guard, framing).header_value();
                 let xfo = profile
                     .embed_list(framing)
@@ -1643,7 +1732,7 @@ mod tests {
             };
             let guard = Guarded::sample(profile, 9);
             for framing in [None, embed.as_ref()] {
-                let set = security_headers_with(&guard, Ok(framing));
+                let set = security_headers_with(&guard, Ok(framing), &FramePolicy::none());
                 assert!(
                     set.as_ref()
                         .is_ok_and(|h| header(h, "cache-control") == want),
@@ -1664,7 +1753,11 @@ mod tests {
             if let Err(refusal) = parsed {
                 for &profile in Profile::ALL {
                     assert_eq!(
-                        security_headers_with(&Guarded::sample(profile, 9), Err(refusal)),
+                        security_headers_with(
+                            &Guarded::sample(profile, 9),
+                            Err(refusal),
+                            &FramePolicy::none()
+                        ),
                         Err(refusal),
                         "{raw:?} {profile:?}"
                     );
@@ -2075,7 +2168,7 @@ mod tests {
         // powerful directive keeps its empty `()` deny — the fail-closed
         // default. A regression that widened this to `*` or dropped a directive
         // would silently permit a feature no capability granted.
-        let denied = permissions_policy_from(None);
+        let denied = permissions_policy_from(None, &FrameAllowlist::none());
         assert_eq!(
             denied,
             "geolocation=(), microphone=(), camera=(), payment=()"
@@ -2086,7 +2179,10 @@ mod tests {
         );
 
         // An explicit empty grant is identical to the unset default.
-        assert_eq!(permissions_policy_from(Some(&granted(&[]))), denied);
+        assert_eq!(
+            permissions_policy_from(Some(&granted(&[])), &FrameAllowlist::none()),
+            denied
+        );
     }
 
     #[test]
@@ -2095,7 +2191,7 @@ mod tests {
         // every other powerful directive stays denied (least privilege — the
         // grant does not leak into camera / microphone / payment).
         assert_eq!(
-            permissions_policy_from(Some(&granted(&["geolocation"]))),
+            permissions_policy_from(Some(&granted(&["geolocation"])), &FrameAllowlist::none()),
             "geolocation=(self), microphone=(), camera=(), payment=()"
         );
     }
@@ -2105,7 +2201,7 @@ mod tests {
         // Recorder reaches both camera and microphone via getUserMedia, so a
         // single grant opens BOTH directives — but never geolocation/payment.
         assert_eq!(
-            permissions_policy_from(Some(&granted(&["recorder"]))),
+            permissions_policy_from(Some(&granted(&["recorder"])), &FrameAllowlist::none()),
             "geolocation=(), microphone=(self), camera=(self), payment=()"
         );
     }
@@ -2116,7 +2212,7 @@ mod tests {
         // NO Permissions-Policy directive — a grant of it must not open any of
         // the header's directives (fail-closed: only mapped axes open).
         assert_eq!(
-            permissions_policy_from(Some(&granted(&["clipboard"]))),
+            permissions_policy_from(Some(&granted(&["clipboard"])), &FrameAllowlist::none()),
             "geolocation=(), microphone=(), camera=(), payment=()"
         );
     }
@@ -2127,18 +2223,144 @@ mod tests {
         // suffix maps to it, so no grant can open it. Even a `"payment"` suffix
         // (which no capability produces) opens nothing, since it is not a mapped
         // axis. Proves the directive stays `()` under any registered set.
-        let policy = permissions_policy_from(Some(&granted(&[
-            "geolocation",
-            "camera",
-            "microphone",
-            "recorder",
-            "payment",
-        ])));
+        let policy = permissions_policy_from(
+            Some(&granted(&[
+                "geolocation",
+                "camera",
+                "microphone",
+                "recorder",
+                "payment",
+            ])),
+            &FrameAllowlist::none(),
+        );
         assert!(
             policy.contains("payment=()"),
             "payment must stay denied under any grant: {policy}"
         );
         assert!(!policy.contains("payment=(self)"));
+    }
+
+    /// R25: a trusted list widens each granted `Gated` directive and every
+    /// `Undisclosed` row to the list after `self`, in list order; ungranted
+    /// directives and `payment` stay `()`, no `Plain` row is written, and an
+    /// empty list is the unframed value byte for byte.
+    #[cfg(feature = "web")]
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn permissions_policy_widens_only_granted_directives() {
+        use crate::encoding::{FrameOrigin, FrameOrigins};
+        use crate::frames::{DELEGATION_FEATURES, FeatureClass};
+        let list = |texts: &[&str]| {
+            let origins = FrameOrigins::new(
+                texts
+                    .iter()
+                    .map(|text| FrameOrigin::parse(text).expect("origin")),
+            )
+            .expect("origins");
+            FrameAllowlist::of(origins.origins())
+        };
+        let camera = granted(&["camera"]);
+        let one = permissions_policy_from(Some(&camera), &list(&["https://x.example"]));
+        let undisclosed: Vec<&str> = DELEGATION_FEATURES
+            .iter()
+            .filter(|row| matches!(row.class, FeatureClass::Undisclosed))
+            .map(|row| row.name)
+            .collect();
+        let mut want = vec![
+            "geolocation=()".to_string(),
+            "microphone=()".to_string(),
+            "camera=(self \"https://x.example\")".to_string(),
+            "payment=()".to_string(),
+        ];
+        want.extend(
+            undisclosed
+                .iter()
+                .map(|name| format!("{name}=(self \"https://x.example\")")),
+        );
+        assert_eq!(one, want.join(", "));
+        for row in DELEGATION_FEATURES {
+            let written = one.contains(&format!("{}=", row.name));
+            match row.class {
+                FeatureClass::Plain => assert!(!written, "{}", row.name),
+                FeatureClass::Gated(_) | FeatureClass::Undisclosed | FeatureClass::Never => {
+                    assert!(written, "{}", row.name);
+                }
+            }
+        }
+
+        let two = permissions_policy_from(
+            Some(&camera),
+            &list(&["https://z.example", "https://a.example:8443"]),
+        );
+        assert!(
+            two.contains("camera=(self \"https://a.example:8443\" \"https://z.example\")"),
+            "{two}"
+        );
+        assert!(
+            two.contains("microphone=()") && two.contains("payment=()"),
+            "{two}"
+        );
+
+        for set in [
+            None,
+            Some(granted(&[])),
+            Some(camera),
+            Some(granted(&["recorder"])),
+        ] {
+            assert_eq!(
+                permissions_policy_from(set.as_ref(), &list(&[])),
+                permissions_policy_from(set.as_ref(), &FrameAllowlist::none()),
+            );
+        }
+        assert_eq!(
+            permissions_policy_from(Some(&granted(&["camera"])), &FrameAllowlist::none()),
+            "geolocation=(), microphone=(), camera=(self), payment=()"
+        );
+    }
+
+    /// R26: a web page trusting frame origins carries COOP `same-origin` and
+    /// the widened policy; no other profile does, and with no trusted origin
+    /// the set is the unframed one.
+    #[cfg(feature = "web")]
+    #[test]
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn web_page_sends_coop_when_frames_trusted() {
+        use crate::csp::{Guarded, Profile};
+        use crate::encoding::{FrameOrigin, FrameOrigins};
+        use crate::frames::FrameGrants;
+        let trusted = FramePolicy::trusting(
+            FrameOrigins::new([FrameOrigin::parse("https://x.example").expect("origin")])
+                .expect("origins"),
+            FrameGrants::none(),
+        );
+        let coop = |set: &[(&'static str, String)]| {
+            set.iter()
+                .filter(|(name, _)| *name == "cross-origin-opener-policy")
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>()
+        };
+        for profile in Profile::ALL {
+            let guard = Guarded::sample(*profile, 4);
+            let framed = security_headers_with(&guard, Ok(None), &trusted).expect("set");
+            let unframed =
+                security_headers_with(&guard, Ok(None), &FramePolicy::none()).expect("set");
+            assert!(coop(&unframed).is_empty(), "{profile:?}");
+            match profile {
+                Profile::WebPage => {
+                    assert_eq!(coop(&framed), vec!["same-origin".to_string()]);
+                    let policy = framed
+                        .iter()
+                        .find(|(name, _)| *name == "permissions-policy")
+                        .map(|(_, value)| value.as_str())
+                        .unwrap_or_default();
+                    assert!(
+                        policy.contains("usb=(self \"https://x.example\")"),
+                        "{policy}"
+                    );
+                }
+                Profile::Response | Profile::Console => assert_eq!(framed, unframed),
+            }
+        }
     }
 
     #[test]
@@ -2147,7 +2369,10 @@ mod tests {
         // only fail to open a feature, never open an unintended one).
         assert_eq!(directives_for_suffix("not-a-real-axis"), &[] as &[&str]);
         assert_eq!(
-            permissions_policy_from(Some(&granted(&["not-a-real-axis"]))),
+            permissions_policy_from(
+                Some(&granted(&["not-a-real-axis"])),
+                &FrameAllowlist::none()
+            ),
             "geolocation=(), microphone=(), camera=(), payment=()"
         );
     }

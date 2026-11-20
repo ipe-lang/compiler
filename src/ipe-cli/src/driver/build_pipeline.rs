@@ -254,6 +254,7 @@ fn loose_emit_settings(
         wasm_public_env: Vec::new(),
         mount_base: MountBase::root(),
         server_origins: ipe_backend_rust::ServerOrigins::none(),
+        frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
         wasm_hydrate_mode: false,
         runtime_dep: None,
         debugger: *debugger,
@@ -339,6 +340,11 @@ fn manifest_emit_settings(
         },
         mount_base: manifest.delivery.browser.base.clone(),
         server_origins: manifest.delivery.servers.clone(),
+        // The test runner serves no page, so it trusts no frame origin.
+        frame_origins: match role {
+            runtime_embed::BundleRole::Out => manifest.delivery.frame_origins.clone(),
+            runtime_embed::BundleRole::Scratch => ipe_backend_rust::FrameOriginEntries::none(),
+        },
         wasm_hydrate_mode: matches!(
             &manifest.wasm,
             project::WasmConfig::On(bundle) if bundle.mode == project::WasmMode::Hydrate
@@ -349,6 +355,145 @@ fn manifest_emit_settings(
         hot_appearance: *hot_appearance,
         host,
         intent: *intent,
+    }
+}
+
+/// The trusted-frames reach a build of `settings` reports.
+///
+/// Every intent and target reports a listed origin; a release build and a
+/// development browser client refuse a loopback origin first, since only a
+/// served `ipe dev` trusts one.
+///
+/// # Errors
+///
+/// [`CliError::ProjectRefused`] naming the loopback origin, under the verb of
+/// the command that refused it.
+pub fn frame_step(
+    settings: &ipe_backend_rust::EmitSettings,
+) -> Result<Option<crate::frame_reach::FrameReach>, CliError> {
+    ipe_backend_rust::frame_origins_for(&settings.frame_origins, settings.intent, settings.target)
+        .map(crate::frame_reach::FrameReach::of)
+        .map_err(|refusal| frame_refusal(&refusal))
+}
+
+/// Refuse a frame list `program` built under `settings` would drop.
+///
+/// # Errors
+///
+/// [`CliError::ProjectRefused`] naming the first listed origin when the
+/// program serves no `Web.tea`/`Web.embed` page and builds no browser client.
+fn frame_site_step(
+    program: &ipe_ir::Program,
+    settings: &ipe_backend_rust::EmitSettings,
+) -> Result<(), CliError> {
+    ipe_backend_rust::frame_origins_of(program, settings)
+        .map(|_| ())
+        .map_err(|refusal| frame_refusal(&refusal))
+}
+
+/// Refuse a frame list the served native development build of `program`, an
+/// entry of `root`, would drop: the judge `ipe dev build` applies, for a
+/// command that reports the list without building.
+///
+/// # Errors
+///
+/// [`CliError::ProjectRefused`] naming the first listed origin when the
+/// program registers no frame list.
+pub(super) fn served_frame_site_step(
+    root: &ProjectRoot,
+    program: &ipe_ir::Program,
+) -> Result<(), CliError> {
+    frame_site_step(
+        program,
+        &served_dev_settings(root, &BuildOptions::default()),
+    )
+}
+
+/// The settings of the native development build of `root`'s served host,
+/// the build `ipe dev build` runs, with every other option from `base`.
+///
+/// A command that judges that build without writing an artifact or opening a
+/// window (the front check, the capability report's frame judge) reads these,
+/// so it judges the program the served build compiles.
+pub(super) fn served_dev_settings(
+    root: &ProjectRoot,
+    base: &BuildOptions,
+) -> ipe_backend_rust::EmitSettings {
+    let manifest_path = root.path().join(crate::package_manifest::PACKAGE_IPE);
+    let options = BuildOptions {
+        target: ipe_ir::Target::Native,
+        intent: ipe_backend_rust::BuildIntent::Development,
+        ..base.clone()
+    };
+    emit_settings(
+        &SettingsSource::Manifest {
+            manifest: root.manifest(),
+            manifest_path: &manifest_path,
+            host: crate::delivery::HostIntent::Served,
+        },
+        &options,
+        runtime_embed::BundleRole::Out,
+    )
+}
+
+/// The refusal of a frame list, `entry` its first origin, on a project no
+/// build compiles a program of: no page would trust the list.
+pub(super) fn no_web_leaf_refusal(
+    entry: &ipe_runtime_rust::encoding::FrameOriginEntry,
+) -> CliError {
+    frame_refusal(&ipe_backend_rust::FrameListRefused::NoWebLeaf {
+        entry: entry.clone(),
+    })
+}
+
+/// The CLI error of a frame-list refusal.
+///
+/// A loopback refusal names the command whose intent refused it; a list with
+/// no web leaf is refused by every command alike.
+fn frame_refusal(refusal: &ipe_backend_rust::FrameListRefused) -> CliError {
+    let command = match refusal {
+        ipe_backend_rust::FrameListRefused::LoopbackAtRelease { .. } => "release",
+        ipe_backend_rust::FrameListRefused::LoopbackInBrowserClient { .. } => "dev",
+        ipe_backend_rust::FrameListRefused::NoWebLeaf { .. } => {
+            return CliError::ProjectRefused(text::Message::relay(refusal));
+        }
+    };
+    CliError::ProjectRefused(text::msg::command_refusal(&command, refusal))
+}
+
+/// Set once the trusted-frames notice is shown, so an invocation shows it
+/// once, however many builds it runs.
+static FRAME_NOTICE_SHOWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The reach whose notice is due: `reach` the first time `shown` is claimed.
+fn claim_frame_notice(
+    reach: Option<crate::frame_reach::FrameReach>,
+    shown: &std::sync::atomic::AtomicBool,
+) -> Option<crate::frame_reach::FrameReach> {
+    let reach = reach?;
+    (!shown.swap(true, std::sync::atomic::Ordering::Relaxed)).then_some(reach)
+}
+
+/// The notice of `reach`, written on `screen` in the prose tone.
+fn frame_notice_screen(
+    mut screen: crate::screen::Screen,
+    reach: &crate::frame_reach::FrameReach,
+) -> crate::screen::Screen {
+    screen.line(crate::screen::Tone::Text, &reach.notice());
+    screen
+}
+
+/// Write the trusted-frames notice of `reach` to stderr, once per invocation.
+///
+/// It is a notice, never a refusal, so a build's exit status is unchanged.
+pub fn show_frame_reach(reach: Option<crate::frame_reach::FrameReach>) {
+    if let Some(reach) = claim_frame_notice(reach, &FRAME_NOTICE_SHOWN) {
+        frame_notice_screen(
+            crate::screen::Screen::new(crate::screen::Stream::Stderr),
+            &reach,
+        )
+        .emit_chatter();
     }
 }
 
@@ -1115,13 +1260,23 @@ fn compile_source_set_observed(
     cache_site: Option<&cache::CacheSite>,
     options: &BuildOptions,
 ) -> (Result<EmittedCrate, CliError>, CacheOutcome) {
+    let reach = match frame_step(&settings) {
+        Ok(reach) => reach,
+        Err(refusal) => return (Err(refusal), CacheOutcome::Miss),
+    };
     let front = front.on_compile_thread();
-    crate::threads::run_compile(move || {
+    let compiled = crate::threads::run_compile(move || {
         compile_source_set_here(
             &front, entry_path, target, runtime, blame_path, settings, cache_site, options,
         )
     })
-    .unwrap_or_else(|refused| (Err(refused), CacheOutcome::Miss))
+    .unwrap_or_else(|refused| (Err(refused), CacheOutcome::Miss));
+    // The notice follows the compile, which refuses a list the program
+    // registers nowhere, so a refused list is never reported as trusted.
+    if compiled.0.is_ok() {
+        show_frame_reach(reach);
+    }
+    compiled
 }
 
 /// [`compile_source_set_observed`] on the calling thread.
@@ -2263,6 +2418,15 @@ pub fn compile_prepared(
         })?;
     }
 
+    // Frame-list shape gate: a listed origin on a program that registers no
+    // frame list (no served `Web.tea`/`Web.embed` leaf, no browser client) is
+    // refused before emission, never dropped. The emitter re-judges the same
+    // fact as its own boundary.
+    let folded = ipe_db::folded_program(db, source_root, entry_file)
+        .clone()
+        .map_err(span_attributed_err)?;
+    frame_site_step(&folded, config.settings(db))?;
+
     // `ipe_db::emit_manifest` (design doc §4.4) — the top-level
     // emit demand, assembled from the per-`RustFileId` query graph:
     // `program_rust_file_ids` + `emit_spine_file` + one `emit_rust_file` per
@@ -3403,6 +3567,142 @@ mod tests {
     use super::*;
     use crate::output_dir::OutputRefusal;
 
+    /// A bare served emit under `intent` trusting `frame_origins` to frame.
+    fn frame_settings(
+        frame_origins: ipe_backend_rust::FrameOriginEntries,
+        intent: ipe_backend_rust::BuildIntent,
+    ) -> ipe_backend_rust::EmitSettings {
+        frame_settings_for(frame_origins, intent, ipe_ir::Target::Native)
+    }
+
+    /// A bare emit for `target` under `intent` trusting `frame_origins` to frame.
+    fn frame_settings_for(
+        frame_origins: ipe_backend_rust::FrameOriginEntries,
+        intent: ipe_backend_rust::BuildIntent,
+        target: ipe_ir::Target,
+    ) -> ipe_backend_rust::EmitSettings {
+        ipe_backend_rust::EmitSettings {
+            db_driver: ipe_backend_rust::DbDriver::Sqlite,
+            ffi: None,
+            target,
+            wasm_public_env: Vec::new(),
+            mount_base: MountBase::root(),
+            server_origins: ipe_backend_rust::ServerOrigins::none(),
+            frame_origins,
+            wasm_hydrate_mode: false,
+            runtime_dep: None,
+            debugger: false,
+            crate_name: ipe_backend_rust::CrateName::SingleFile,
+            hot_appearance: false,
+            host: ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off),
+            intent,
+        }
+    }
+
+    /// The build step of a release refuses a loopback frame origin and names
+    /// it; a development build of the same list reports its reach.
+    #[test]
+    #[allow(clippy::expect_used)] // the planted origin is well-formed
+    fn release_step_refuses_a_loopback_frame_origin() {
+        let entry = ipe_backend_rust::FrameOriginEntry::parse("http://localhost:3000")
+            .expect("a frame origin");
+        let frames = ipe_backend_rust::FrameOriginEntries::new([entry]).expect("a frame list");
+        let at = |intent| frame_settings(frames.clone(), intent);
+        let refused = frame_step(&at(ipe_backend_rust::BuildIntent::Release));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(text))
+                if text.starts_with("ipe release:")
+                    && text.contains("`http://localhost:3000`")
+                    && text.contains("served `ipe dev` only")),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            frame_step(&at(ipe_backend_rust::BuildIntent::Development)),
+            Ok(Some(_))
+        ));
+    }
+
+    /// R38, the CLI half: a development browser client refuses a loopback
+    /// frame origin under `ipe dev`, never `ipe release`, and names it; a
+    /// development WASI build admits it.
+    #[test]
+    #[allow(clippy::expect_used)] // the planted origin is well-formed
+    fn wasm_client_refuses_a_loopback_frame_origin() {
+        let entry = ipe_backend_rust::FrameOriginEntry::parse("http://localhost:3000")
+            .expect("a frame origin");
+        let frames = ipe_backend_rust::FrameOriginEntries::new([entry]).expect("a frame list");
+        let development = ipe_backend_rust::BuildIntent::Development;
+        let refused = frame_step(&frame_settings_for(
+            frames.clone(),
+            development,
+            ipe_ir::Target::WasmClient,
+        ));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(text))
+                if text.starts_with("ipe dev:")
+                    && !text.contains("ipe release")
+                    && text.contains("`http://localhost:3000`")
+                    && text.contains("a browser-built client")),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            frame_step(&frame_settings_for(
+                frames,
+                development,
+                ipe_ir::Target::WasmWasi
+            )),
+            Ok(Some(_))
+        ));
+    }
+
+    /// R33: the manifest step reports a listed origin under every intent and
+    /// nothing for an empty list; the notice renders through `ipe::screen`
+    /// once per invocation.
+    #[test]
+    #[allow(clippy::expect_used)] // the planted origin is well-formed
+    fn build_output_shows_frame_reach_once() {
+        let entry = ipe_backend_rust::FrameOriginEntry::parse("https://player.example")
+            .expect("a frame origin");
+        let frames = ipe_backend_rust::FrameOriginEntries::new([entry]).expect("a frame list");
+        for intent in [
+            ipe_backend_rust::BuildIntent::Development,
+            ipe_backend_rust::BuildIntent::Release,
+        ] {
+            let listed = frame_settings(frames.clone(), intent);
+            let reach = frame_step(&listed);
+            assert!(
+                matches!(&reach, Ok(Some(reach)) if reach.origins() == ["https://player.example"]),
+                "{reach:?}"
+            );
+            let empty = frame_settings(ipe_backend_rust::FrameOriginEntries::none(), intent);
+            assert!(matches!(frame_step(&empty), Ok(None)));
+        }
+
+        let shown = std::sync::atomic::AtomicBool::new(false);
+        let reach = crate::frame_reach::FrameReach::of(&frames);
+        assert_eq!(
+            claim_frame_notice(None, &shown),
+            None,
+            "an empty list shows nothing"
+        );
+        let Some(first) = claim_frame_notice(reach.clone(), &shown) else {
+            assert!(reach.is_none(), "the first listed build shows the notice");
+            return;
+        };
+        assert_eq!(
+            claim_frame_notice(reach, &shown),
+            None,
+            "a second build stays quiet"
+        );
+        let rendered = frame_notice_screen(
+            crate::screen::Screen::with_color(crate::screen::Stream::Stderr, false),
+            &first,
+        )
+        .render_chatter(crate::screen::Header::Omitted);
+        assert!(rendered.contains("`https://player.example`"), "{rendered}");
+        assert_eq!(rendered.lines().count(), 1, "{rendered}");
+    }
+
     /// A widget's JS reaches the emitted `main.rs` with every bidi override and
     /// lone CR escaped, since rustc refuses either raw inside any string literal.
     #[test]
@@ -4476,6 +4776,36 @@ main =
             renamed, project,
             "a manifest setting is dropped on the test path"
         );
+    }
+
+    /// T16: the test runner serves no page, so a test build of a project
+    /// listing frame origins trusts none and its entry is admitted, while the
+    /// project build keeps the list.
+    #[test]
+    fn a_test_build_trusts_no_frame_origin() {
+        let tree =
+            crate::project_root::SourceTree::main("module Main exposing (main)\n\nmain = 1\n")
+                .field(r#"delivery = { frameOrigins = [ "https://player.example" ] }"#);
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let manifest_path = fixture.manifest_path();
+        let manifest = project::parse_manifest(&manifest_path).expect("manifest parses");
+        let source = served_manifest(&manifest, &manifest_path);
+        let options = test_runner_options();
+        let test = emit_settings(&source, &options, runtime_embed::BundleRole::Scratch);
+        let project = emit_settings(&source, &options, runtime_embed::BundleRole::Out);
+        assert!(test.frame_origins.is_empty());
+        assert_eq!(project.frame_origins, manifest.delivery.frame_origins);
+        assert!(!project.frame_origins.is_empty());
+        let runner = ipe_ir::Program {
+            modules: Vec::new(),
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: std::collections::BTreeSet::new(),
+        };
+        assert!(matches!(frame_site_step(&runner, &test), Ok(())));
+        assert!(matches!(
+            frame_site_step(&runner, &project),
+            Err(CliError::ProjectRefused(_))
+        ));
     }
 
     /// A build without a manifest links the undeclared driver, and its test

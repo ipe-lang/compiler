@@ -24,7 +24,9 @@ pub use emit_expr::rust_str_lit;
 /// The typed mount base the emitted browser shell is served under.
 pub use ipe_runtime_rust::encoding::MountBase;
 /// The parsed `delivery.servers` origins a browser bundle may reach.
-pub use ipe_runtime_rust::encoding::{ServerOrigin, ServerOrigins};
+pub use ipe_runtime_rust::encoding::{
+    FrameOriginEntries, FrameOriginEntry, ServerOrigin, ServerOrigins,
+};
 pub mod crate_specs;
 pub mod golden_form;
 #[macro_use]
@@ -33,7 +35,8 @@ mod emit_console;
 mod emit_doc;
 mod emit_settings;
 pub use emit_settings::{
-    CrateName, EmitHost, EmitSettings, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME, TEST_RUN_KEY_ENV,
+    CrateName, EmitHost, EmitSettings, FrameListRefused, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
+    TEST_RUN_KEY_ENV, frame_origins_for, frame_origins_of,
 };
 mod emit_expr;
 mod emit_model_gate;
@@ -550,6 +553,7 @@ impl<'a> RustBackend<'a> {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -567,6 +571,7 @@ impl<'a> RustBackend<'a> {
                 wasm_public_env: wasm_public_env.clone(),
                 mount_base: mount_base.clone(),
                 server_origins: server_origins.clone(),
+                frame_origins: frame_origins.clone(),
                 wasm_hydrate_mode: *wasm_hydrate_mode,
                 runtime_dep: runtime_dep.clone(),
                 debugger: *debugger,
@@ -1417,6 +1422,10 @@ pub(crate) struct EmitCtx<'a> {
     pub(crate) mount_base: MountBase,
     /// The `delivery.servers` origins the browser shell's policy admits.
     pub(crate) server_origins: ServerOrigins,
+    /// The `delivery.frameOrigins` the program's pages trust to frame: the
+    /// browser shell's policy lists them, and a served program and the wasm
+    /// client register them.
+    pub(crate) frame_origins: ipe_runtime_rust::encoding::FrameOriginEntries,
     /// `true` when `[wasm] mode = "hydrate"` was set in `package.ipe`. When set,
     /// the emitted wasm epilogue includes a `#[wasm_bindgen] pub fn hydrate(…)`
     /// export in addition to the `#[wasm_bindgen(start)] ipe_start` entry —
@@ -1695,6 +1704,21 @@ impl<'a> EmitCtx<'a> {
     #[allow(clippy::too_many_lines)]
     #[allow(clippy::similar_names)] // `uses_ui` / `uses_tui` are intentionally similar
     fn build(interner: &'a Interner, program: &Program, settings: EmitSettings) -> DResult<Self> {
+        // The driver refuses a frame list the program registers nowhere
+        // (`frame_origins_of`); one reaching emission is a disagreement
+        // between that gate and this emitter, never a list to drop.
+        if let Some(entry) = emit_settings::dropped_frame_origin(program, &settings) {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::EmitCtx::build::frame_origins",
+                detail: format!(
+                    "{}; the driver's frame-list gate should have refused it",
+                    FrameListRefused::NoWebLeaf {
+                        entry: entry.clone()
+                    }
+                ),
+            });
+        }
+        let uses_webview = emit_settings::drives_webview(program, &settings.host);
         let EmitSettings {
             db_driver,
             ffi,
@@ -1702,6 +1726,7 @@ impl<'a> EmitCtx<'a> {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -1710,9 +1735,9 @@ impl<'a> EmitCtx<'a> {
             host,
             intent: build_intent,
         } = settings;
-        let (webview_host, webview_window, served_install) = match host {
-            EmitHost::Served(install) => (false, None, install),
-            EmitHost::WebView(window) => (true, Some(window), ServedInstall::Off),
+        let (webview_window, served_install) = match host {
+            EmitHost::Served(install) => (None, install),
+            EmitHost::WebView(window) => (Some(window), ServedInstall::Off),
         };
         // Every emission entry builds its context here, so a malformed literal
         // route path or a runtime-owned literal attribute name is refused
@@ -2184,7 +2209,7 @@ impl<'a> EmitCtx<'a> {
         let uses_url = program.modules.iter().any(|m| m.uses_url);
 
         // detect Ipe.Ui / Ipe.Html / Ipe.Web / Ipe.Tui / Ipe.Console / Ipe.WebView usage.
-        // `uses_webview` is the webview-native delivery signal: the resolved
+        // `uses_webview` (`drives_webview`) is the webview-native delivery signal: the resolved
         // `web desktop` host (`EmitHost::WebView`) OR a source module
         // that still carries the leaf. A webview-native delivery renders the
         // server-free `web-core` core over a local IPC bridge; it does NOT run the
@@ -2192,7 +2217,6 @@ impl<'a> EmitCtx<'a> {
         // `uses_webview && !uses_web` path selects the lean render shell
         // (`RUNTIME_MOD_RS_WEBVIEW_CORE_APPEND`) and the `web-core`/`webview` Cargo
         // features; a program that reaches BOTH keeps the full `web` module.
-        let uses_webview = webview_host || program.modules.iter().any(|m| m.uses_webview);
         let entry_surface = entry_app_surface(program, uses_webview);
         let (uses_ui, uses_web, uses_tui, uses_console) = (
             program.modules.iter().any(|m| m.uses_ui),
@@ -2378,6 +2402,7 @@ impl<'a> EmitCtx<'a> {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -2721,10 +2746,11 @@ impl<'a> EmitCtx<'a> {
     }
 
     /// `true` when the emitted crate reaches the `base64` / `hex` /
-    /// `percent-encoding` crates — so `project::assemble_project_files` selects
-    /// the `encoding` feature, declares `pub mod encoding;` + `pub mod bytes;`,
-    /// and adds the three codec deps. The single source of truth shared by the
-    /// manifest augmenter and the `mod.rs` append; they can never disagree.
+    /// `percent-encoding` crates — so the runtime feature set selects
+    /// `encoding`. The vendored manifest and its `pub mod encoding;` +
+    /// `pub mod bytes;` append both follow that set's runtime-crate closure
+    /// (`RuntimeFeatureSet::vendors`), which also turns `encoding` on for every
+    /// feature the runtime crate makes imply it.
     ///
     /// Reached directly by an `Ipe.Encoding` / `Ipe.Bytes` kernel
     /// ([`Self::uses_encoding`]), OR transitively by every

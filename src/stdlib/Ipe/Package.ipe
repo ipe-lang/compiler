@@ -101,12 +101,24 @@ type alias Package =
 -- 65535, no leading zero, never `:443`), with nothing after it. An IP address,
 -- a `user@` part, a `*` wildcard, uppercase and non-ASCII are refused. At most
 -- 16 origins are listed, each once.
+--
+-- `frameOrigins` lists the origins a served web page trusts to frame: a frame
+-- of a listed origin keeps that origin, a frame of any other origin stays
+-- sandboxed. Each entry is written like a `servers` entry; during development
+-- an entry may also be `http://localhost:PORT`, which `ipe release` refuses.
+-- Listing any origin makes `frame-src` and `object-src` exactly the list, adds
+-- `Cross-Origin-Opener-Policy: same-origin`, and opens the delegable
+-- `Permissions-Policy` features to the listed origins. At most 16 origins are
+-- listed, each once, within a 6144-byte header budget. An omitted or empty
+-- list trusts no frame. A non-empty list is refused when `ships` names a
+-- desktop, Android or iOS shell.
 type alias Delivery =
     { ships : List Ship
     , desktop : DesktopConfig
     , mobile : MobileConfig
     , browser : BrowserConfig
     , servers : List String
+    , frameOrigins : List String
     }
 
 

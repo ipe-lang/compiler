@@ -11,6 +11,7 @@ use crate::{
     BuildIntent, CargoPackageName, CrateIdentity, DbDriver, FfiEmit, MountBase, RuntimeDep,
     ServedInstall, ServerOrigins, WebViewWindow,
 };
+use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
 
 /// The emitted crate's `[package] name`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -84,6 +85,8 @@ pub struct EmitSettings {
     pub mount_base: MountBase,
     /// The `delivery.servers` origins the browser bundle may reach.
     pub server_origins: ServerOrigins,
+    /// The `delivery.frameOrigins` a page of the program trusts to frame.
+    pub frame_origins: FrameOriginEntries,
     /// `true` when the wasm bundle emits the hydrate export.
     pub wasm_hydrate_mode: bool,
     /// The dependency-model selector; `None` emits the vendored project.
@@ -112,6 +115,7 @@ impl EmitSettings {
             wasm_public_env: Vec::new(),
             mount_base: MountBase::root(),
             server_origins: ServerOrigins::none(),
+            frame_origins: FrameOriginEntries::none(),
             wasm_hydrate_mode: false,
             runtime_dep: None,
             debugger: false,
@@ -135,6 +139,7 @@ impl EmitSettings {
             wasm_public_env,
             mount_base,
             server_origins,
+            frame_origins,
             wasm_hydrate_mode,
             runtime_dep,
             debugger,
@@ -182,6 +187,16 @@ impl EmitSettings {
             push_framed(&mut payload, origin.authority().as_bytes());
         }
         emit_field(sink, FieldTag::ServerOrigins, &payload);
+
+        let mut payload = Vec::new();
+        push_len(&mut payload, frame_origins.len());
+        let mut written = String::new();
+        for entry in frame_origins.entries() {
+            written.clear();
+            entry.write(&mut written);
+            push_framed(&mut payload, written.as_bytes());
+        }
+        emit_field(sink, FieldTag::FrameOrigins, &payload);
 
         emit_field(
             sink,
@@ -231,6 +246,198 @@ impl EmitSettings {
     }
 }
 
+/// A frame-origin list a build of one intent, target, and program shape cannot emit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameListRefused {
+    /// A release build lists a loopback entry, which only `ipe dev` trusts.
+    LoopbackAtRelease {
+        /// The refused loopback entry.
+        entry: FrameOriginEntry,
+    },
+    /// A browser-built development client lists a loopback entry, which its
+    /// runtime cannot represent.
+    LoopbackInBrowserClient {
+        /// The refused loopback entry.
+        entry: FrameOriginEntry,
+    },
+    /// The program registers no frame list, so a listed entry would be dropped.
+    ///
+    /// Only a `Web.tea` or `Web.embed` page a server serves, or a browser
+    /// client, trusts the listed origins; any other program frames nothing.
+    NoWebLeaf {
+        /// The first listed entry.
+        entry: FrameOriginEntry,
+    },
+}
+
+impl std::fmt::Display for FrameListRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (entry, why) = match self {
+            Self::LoopbackAtRelease { entry } => (
+                entry,
+                "a loopback origin that is for served `ipe dev` only; a release build trusts \
+                 `https://` origins",
+            ),
+            Self::LoopbackInBrowserClient { entry } => (
+                entry,
+                "a loopback origin that is for served `ipe dev` only; a browser-built client \
+                 trusts `https://` origins",
+            ),
+            Self::NoWebLeaf { entry } => (
+                entry,
+                "but this program serves no page through `Web.tea` or `Web.embed` and builds \
+                 no browser client, so no page would trust it; remove `frameOrigins` from \
+                 `package.ipe`, or serve the page through `Web.tea` or `Web.embed`",
+            ),
+        };
+        let mut written = String::with_capacity(entry.written_len());
+        entry.write(&mut written);
+        write!(f, "`delivery.frameOrigins` lists `{written}`, {why}")
+    }
+}
+
+/// The frame origins a build of `intent` for `target` may emit.
+///
+/// A development build for `Native` or `WasmWasi` emits every entry (both
+/// promote `dev-posture`, so their runtime represents a loopback origin);
+/// every other build only `https://` entries.
+///
+/// # Errors
+///
+/// [`FrameListRefused`] naming the first loopback entry a release build or a
+/// development browser client lists.
+pub fn frame_origins_for(
+    entries: &FrameOriginEntries,
+    intent: BuildIntent,
+    target: ipe_ir::Target,
+) -> Result<&FrameOriginEntries, FrameListRefused> {
+    let refusal: fn(FrameOriginEntry) -> FrameListRefused = match (intent, target) {
+        (BuildIntent::Development, ipe_ir::Target::Native | ipe_ir::Target::WasmWasi) => {
+            return Ok(entries);
+        }
+        (BuildIntent::Development, ipe_ir::Target::WasmClient) => {
+            |entry| FrameListRefused::LoopbackInBrowserClient { entry }
+        }
+        (
+            BuildIntent::Release,
+            ipe_ir::Target::Native | ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi,
+        ) => |entry| FrameListRefused::LoopbackAtRelease { entry },
+    };
+    entries
+        .entries()
+        .find(|entry| matches!(entry, FrameOriginEntry::Loopback(_)))
+        .map_or(Ok(entries), |entry| Err(refusal(entry.clone())))
+}
+
+/// The frame origins `program` built under `settings` may emit.
+///
+/// It is [`frame_origins_for`] over the settings' intent and target, plus the
+/// program's shape: a listed entry on a program that registers no frame list
+/// is refused rather than dropped.
+///
+/// # Errors
+///
+/// [`FrameListRefused`] naming the first entry the build refuses.
+pub fn frame_origins_of<'s>(
+    program: &ipe_ir::Program,
+    settings: &'s EmitSettings,
+) -> Result<&'s FrameOriginEntries, FrameListRefused> {
+    let entries = frame_origins_for(&settings.frame_origins, settings.intent, settings.target)?;
+    dropped_frame_origin(program, settings).map_or(Ok(entries), |entry| {
+        Err(FrameListRefused::NoWebLeaf {
+            entry: entry.clone(),
+        })
+    })
+}
+
+/// The first listed frame origin `program` built under `settings` would drop.
+///
+/// `None` for an empty list or a program that registers its list.
+pub fn dropped_frame_origin<'s>(
+    program: &ipe_ir::Program,
+    settings: &'s EmitSettings,
+) -> Option<&'s FrameOriginEntry> {
+    let first = settings.frame_origins.entries().next()?;
+    (!registers_frame_list(program, settings)).then_some(first)
+}
+
+/// Whether `program` built under `settings` emits a frame-list registration.
+///
+/// A browser client registers the list at its entry. A served build
+/// registers it at each web leaf [`leaf_host`] delivers as
+/// [`LeafHost::Served`] that the entry's `main` reaches: a leaf in a module
+/// the entry never imports, or in a function it never calls, never runs.
+fn registers_frame_list(program: &ipe_ir::Program, settings: &EmitSettings) -> bool {
+    if settings.target == ipe_ir::Target::WasmClient {
+        return true;
+    }
+    let Some(entry) = crate::kernel_walk::program_entry(program) else {
+        return false;
+    };
+    let webview = drives_webview(program, &settings.host);
+    let mut registers = false;
+    let walked = crate::kernel_walk::each_reachable_kernel_site(program, entry, &mut |site| {
+        if let crate::kernel_walk::KernelSite::Call { kernel, .. } = site
+            && kernel.app_entry_surface() == Some(ipe_ir::AppSurface::Web)
+            && leaf_host(settings.target, webview, mounts_into_server(kernel)) == LeafHost::Served
+        {
+            registers = true;
+        }
+        Ok(())
+    });
+    walked.is_ok() && registers
+}
+
+/// Who drives a web app-entry leaf (`Web.tea`, `Web.embed`, and their aliases).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeafHost {
+    /// The browser client: the leaf is the client sink, and the entry
+    /// registers the frame list.
+    Browser,
+    /// The webview-native executor: the leaf serves no page and registers
+    /// nothing.
+    WebView,
+    /// The served runtime: the leaf registers the frame list where it is
+    /// evaluated.
+    Served,
+}
+
+/// Who drives a web leaf built for `target`, under a webview driver when
+/// `webview`, that a server mounts when `mountable`.
+///
+/// A mountable leaf is nested in a server's router, so a webview host never
+/// drives it. The emitter's leaf branch and the frame-list gate both read
+/// this one judge.
+pub const fn leaf_host(target: ipe_ir::Target, webview: bool, mountable: bool) -> LeafHost {
+    match target {
+        ipe_ir::Target::WasmClient => LeafHost::Browser,
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => {
+            if webview && !mountable {
+                LeafHost::WebView
+            } else {
+                LeafHost::Served
+            }
+        }
+    }
+}
+
+/// Whether web app-entry `kernel` builds a leaf a server mounts (`Web.embed`).
+pub const fn mounts_into_server(kernel: ipe_ir::KernelFn) -> bool {
+    matches!(kernel, ipe_ir::KernelFn::WebEmbed)
+}
+
+/// Whether `program` built for `host` is driven by the webview-native executor.
+///
+/// The `web desktop` host drives it, and so does a source module that carries
+/// the webview leaf.
+pub fn drives_webview(program: &ipe_ir::Program, host: &EmitHost) -> bool {
+    let host_drives = match host {
+        EmitHost::WebView(_) => true,
+        EmitHost::Served(_) => false,
+    };
+    host_drives || program.modules.iter().any(|m| m.uses_webview)
+}
+
 /// The [`FieldTag::Host`] payload of `host`.
 fn host_payload(host: &EmitHost) -> Vec<u8> {
     let mut payload = Vec::new();
@@ -276,6 +483,7 @@ enum FieldTag {
     Host = 11,
     Intent = 12,
     ServerOrigins = 13,
+    FrameOrigins = 14,
 }
 
 /// Write one field record: tag, payload length, payload.
@@ -382,6 +590,129 @@ mod tests {
         );
     }
 
+    /// The entries of `texts`, each a well-formed frame origin.
+    #[allow(clippy::expect_used)] // every vector is a well-formed origin
+    fn frames(texts: &[&str]) -> FrameOriginEntries {
+        FrameOriginEntries::new(
+            texts
+                .iter()
+                .map(|text| FrameOriginEntry::parse(text).expect("a frame origin")),
+        )
+        .expect("a frame list")
+    }
+
+    /// R28: a release build refuses a loopback frame origin and names it; a
+    /// development native build admits it; a release build admits `https://` entries.
+    #[test]
+    fn release_refuses_a_loopback_frame_origin() {
+        let loopback = frames(&["https://player.example", "http://localhost:3000"]);
+        let refused = frame_origins_for(&loopback, BuildIntent::Release, ipe_ir::Target::Native);
+        assert!(
+            matches!(&refused, Err(FrameListRefused::LoopbackAtRelease { entry }) if matches!(entry, FrameOriginEntry::Loopback(_))),
+            "{refused:?}"
+        );
+        let Err(refusal) = refused else { return };
+        let text = refusal.to_string();
+        assert!(text.contains("`http://localhost:3000`"), "{text}");
+        assert!(text.contains("served `ipe dev` only"), "{text}");
+        assert!(text.contains("a release build"), "{text}");
+        assert_eq!(
+            frame_origins_for(&loopback, BuildIntent::Development, ipe_ir::Target::Native),
+            Ok(&loopback)
+        );
+        let https = frames(&["https://player.example"]);
+        assert_eq!(
+            frame_origins_for(&https, BuildIntent::Release, ipe_ir::Target::Native),
+            Ok(&https)
+        );
+        let none = FrameOriginEntries::none();
+        assert_eq!(
+            frame_origins_for(&none, BuildIntent::Release, ipe_ir::Target::Native),
+            Ok(&none)
+        );
+    }
+
+    /// The verdict a refusal row expects.
+    #[derive(Clone, Copy, Debug)]
+    enum Row {
+        Admits,
+        AtRelease,
+        InBrowserClient,
+    }
+
+    /// R38: one row per `(BuildIntent, Target)`; a loopback entry is admitted
+    /// only by a development native or WASI build, and an `https://`-only list
+    /// by every build.
+    #[test]
+    fn frame_list_refusal_table() {
+        use ipe_ir::Target;
+        let loopback = frames(&["https://player.example", "http://localhost:3000"]);
+        let https = frames(&["https://player.example"]);
+        let table = [
+            (BuildIntent::Development, Target::Native, Row::Admits),
+            (BuildIntent::Development, Target::WasmWasi, Row::Admits),
+            (
+                BuildIntent::Development,
+                Target::WasmClient,
+                Row::InBrowserClient,
+            ),
+            (BuildIntent::Release, Target::Native, Row::AtRelease),
+            (BuildIntent::Release, Target::WasmClient, Row::AtRelease),
+            (BuildIntent::Release, Target::WasmWasi, Row::AtRelease),
+        ];
+        for (intent, target, row) in table {
+            let verdict = frame_origins_for(&loopback, intent, target);
+            let held = match row {
+                Row::Admits => verdict == Ok(&loopback),
+                Row::AtRelease => matches!(
+                    &verdict,
+                    Err(FrameListRefused::LoopbackAtRelease { entry })
+                        if matches!(entry, FrameOriginEntry::Loopback(_))
+                ),
+                Row::InBrowserClient => matches!(
+                    &verdict,
+                    Err(FrameListRefused::LoopbackInBrowserClient { entry })
+                        if matches!(entry, FrameOriginEntry::Loopback(_))
+                ),
+            };
+            assert!(held, "{intent:?} {target:?}: {verdict:?}, expected {row:?}");
+            if let Err(refusal) = &verdict {
+                let text = refusal.to_string();
+                assert!(text.contains("`http://localhost:3000`"), "{text}");
+            }
+            assert_eq!(
+                frame_origins_for(&https, intent, target),
+                Ok(&https),
+                "{intent:?} {target:?}"
+            );
+        }
+        let browser = frame_origins_for(&loopback, BuildIntent::Development, Target::WasmClient);
+        let Err(refusal) = browser else { return };
+        let text = refusal.to_string();
+        assert!(text.contains("a browser-built client"), "{text}");
+    }
+
+    /// The listed frame origins split the key, and an empty list keeps a
+    /// record of its own.
+    #[test]
+    fn the_frame_origins_split_the_key() {
+        let with = |entries| EmitSettings {
+            frame_origins: entries,
+            ..EmitSettings::unconfigured()
+        };
+        let none = records(&EmitSettings::unconfigured());
+        let one = records(&with(frames(&["https://a.example"])));
+        assert_ne!(none, one);
+        assert_ne!(one, records(&with(frames(&["https://b.example"]))));
+        assert_eq!(one, records(&with(frames(&["https://a.example"]))));
+        assert!(
+            none.chunks(3)
+                .any(|record| record.first().map(Vec::as_slice)
+                    == Some(&[FieldTag::FrameOrigins as u8])),
+            "the empty list writes its record"
+        );
+    }
+
     #[test]
     fn a_served_build_without_install_keeps_its_host_payload() {
         let chunks = records(&served(ServedInstall::Off));
@@ -390,5 +721,442 @@ mod tests {
             .find(|record| record.first().map(Vec::as_slice) == Some(&[FieldTag::Host as u8]))
             .and_then(|record| record.get(2));
         assert_eq!(host.map(Vec::as_slice), Some(&[0_u8][..]));
+    }
+
+    /// The frame-shape tests: programs, kernel calls, and settings.
+    mod frame_shape {
+        use super::{EmitSettings, FrameListRefused, FrameOriginEntries, frame_origins_of, frames};
+        use ipe_ir::{CallPin, Callee, Expr, IrType, KernelFn, OnFormKind, Program};
+
+        /// The written form of `entry`.
+        fn entry_text(entry: &ipe_runtime_rust::encoding::FrameOriginEntry) -> String {
+            let mut text = String::new();
+            entry.write(&mut text);
+            text
+        }
+
+        /// A call of kernel `kernel` with `args`.
+        fn call(kernel: KernelFn, args: Vec<Expr>) -> Expr {
+            Expr::Call {
+                callee: Callee::Kernel(kernel),
+                args,
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            }
+        }
+
+        /// A `Server.listen` on port 8000 serving `routes`.
+        fn listen(routes: Vec<Expr>) -> Expr {
+            call(
+                KernelFn::ServerListen,
+                vec![
+                    Expr::Int(8000),
+                    Expr::List {
+                        elem: IrType::Unit,
+                        items: routes,
+                    },
+                ],
+            )
+        }
+
+        /// A server serving `Server.html (Html.render page)`, which has no web leaf.
+        fn served_html() -> Expr {
+            listen(vec![call(
+                KernelFn::ServerHtml,
+                vec![call(KernelFn::HtmlRender, vec![Expr::Unit])],
+            )])
+        }
+
+        /// A server mounting a `Web.embed` leaf at `/app`.
+        fn mounted_embed() -> Expr {
+            listen(vec![call(
+                KernelFn::ServerMountApp,
+                vec![
+                    Expr::Str("/app".to_owned()),
+                    call(KernelFn::WebEmbed, vec![Expr::Unit]),
+                ],
+            )])
+        }
+
+        /// A one-module program whose `main` body is `body`, under `names`.
+        fn program_in(names: &mut ipe_intern::Interner, body: Expr, webview: bool) -> Program {
+            linked_in(names, "Main", &[("Main", "main", body)], Some(0), webview)
+        }
+
+        /// A linked program whose entry module is `entry_module`, holding one
+        /// function per `(home, name, body)` in `funcs` with ids in order,
+        /// and whose lowered entry is the function at `entry`.
+        fn linked_in(
+            names: &mut ipe_intern::Interner,
+            entry_module: &str,
+            funcs: &[(&str, &str, Expr)],
+            entry: Option<u32>,
+            webview: bool,
+        ) -> Program {
+            #[allow(clippy::expect_used)] // short ASCII names always intern
+            let mut sym = |name: &str| names.intern(name).expect("intern");
+            let module = ipe_ir::ModPath(vec![sym(entry_module)]);
+            let funcs = funcs
+                .iter()
+                .zip(0..)
+                .map(|((home, name, body), id)| ipe_ir::Func {
+                    id: ipe_ir::FuncId::from_raw(id),
+                    name: sym(name),
+                    home: ipe_ir::ModPath(vec![sym(home)]),
+                    type_params: vec![],
+                    row_params: vec![],
+                    params: vec![],
+                    ret: IrType::Unit,
+                    body: body.clone(),
+                })
+                .collect();
+            Program {
+                imports_unsafe_submodule: false,
+                imported_web_capabilities: std::collections::BTreeSet::new(),
+                modules: vec![ipe_ir::Module {
+                    name: module,
+                    types: vec![],
+                    funcs,
+                    entry: entry.map(ipe_ir::FuncId::from_raw),
+                    records: vec![],
+                    uses_tea: false,
+                    uses_server: false,
+                    uses_http: false,
+                    uses_config: false,
+                    uses_compression: false,
+                    uses_csv: false,
+                    uses_cache: false,
+                    uses_encoding: false,
+                    uses_regex: false,
+                    uses_uuid: false,
+                    uses_random: false,
+                    uses_log: false,
+                    uses_decimal: false,
+                    uses_char_category: false,
+                    uses_crypto_core: false,
+                    uses_secret: false,
+                    uses_json: false,
+                    uses_crypto: false,
+                    uses_jwt: false,
+                    uses_url: false,
+                    uses_ui: false,
+                    uses_web: false,
+                    uses_tui: false,
+                    uses_console: false,
+                    uses_css: false,
+                    uses_auth: false,
+                    uses_principal: false,
+                    uses_websocket: false,
+                    uses_email: false,
+                    uses_locale: false,
+                    uses_time: false,
+                    uses_env_public: false,
+                    uses_debug: false,
+                    uses_ffi: false,
+                    uses_async_runtime: false,
+                    uses_webview: webview,
+                }],
+            }
+        }
+
+        /// [`program_in`] under a fresh interner.
+        fn program(body: Expr, webview: bool) -> Program {
+            program_in(&mut ipe_intern::Interner::new(), body, webview)
+        }
+
+        /// Settings for `target` listing `entries`.
+        fn settings(entries: FrameOriginEntries, target: ipe_ir::Target) -> EmitSettings {
+            EmitSettings {
+                target,
+                frame_origins: entries,
+                ..EmitSettings::unconfigured()
+            }
+        }
+
+        /// The listed settings under a native served build.
+        fn listed() -> EmitSettings {
+            settings(
+                frames(&["https://player.example", "https://video.example"]),
+                ipe_ir::Target::Native,
+            )
+        }
+
+        /// T16: a listed origin on a program with no web leaf is refused,
+        /// naming the first entry, the problem, and both fixes.
+        #[test]
+        fn a_list_without_a_web_leaf_is_refused() {
+            let listed = listed();
+            for body in [
+                served_html(),
+                call(KernelFn::WebRenderStatic, vec![Expr::Unit]),
+                Expr::FuncValue {
+                    callee: Callee::Kernel(KernelFn::WebApp),
+                    ty: IrType::Unit,
+                },
+            ] {
+                let refused = frame_origins_of(&program(body, false), &listed);
+                assert!(
+                    matches!(&refused, Err(FrameListRefused::NoWebLeaf { entry })
+                        if frames(&[entry_text(entry).as_str()]) == frames(&["https://player.example"])),
+                    "{refused:?}"
+                );
+                let Err(refusal) = refused else { return };
+                let text = refusal.to_string();
+                assert!(
+                    text.contains("`delivery.frameOrigins` lists `https://player.example`"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("serves no page through `Web.tea` or `Web.embed`"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains("remove `frameOrigins` from `package.ipe`"),
+                    "{text}"
+                );
+            }
+        }
+
+        /// T16: an empty list on a program with no web leaf is admitted.
+        #[test]
+        fn an_empty_list_without_a_web_leaf_is_admitted() {
+            let none = settings(FrameOriginEntries::none(), ipe_ir::Target::Native);
+            for body in [
+                served_html(),
+                call(KernelFn::WebRenderStatic, vec![Expr::Unit]),
+            ] {
+                assert_eq!(
+                    frame_origins_of(&program(body, false), &none),
+                    Ok(&FrameOriginEntries::none())
+                );
+            }
+        }
+
+        /// T16: a served `Web.tea`/`Web.embed` leaf and a browser client each
+        /// register the list, so each is admitted.
+        #[test]
+        fn a_list_with_a_web_leaf_is_admitted() {
+            let listed = listed();
+            for kernel in [
+                KernelFn::WebApp,
+                KernelFn::WebAppRouted,
+                KernelFn::WebAppWith,
+                KernelFn::WebEmbed,
+            ] {
+                let leaf = program(call(kernel, vec![Expr::Unit]), false);
+                assert_eq!(
+                    frame_origins_of(&leaf, &listed),
+                    Ok(&listed.frame_origins),
+                    "{kernel:?}"
+                );
+            }
+            let client = settings(listed.frame_origins, ipe_ir::Target::WasmClient);
+            for body in [Expr::Unit, served_html()] {
+                assert_eq!(
+                    frame_origins_of(&program(body, false), &client),
+                    Ok(&client.frame_origins)
+                );
+            }
+        }
+
+        /// T16: a webview host drives a `Web.tea` leaf without serving it, so
+        /// the list is refused; a mounted `Web.embed` is still served.
+        #[test]
+        fn a_webview_driven_leaf_registers_no_list() {
+            let listed = listed();
+            let driven = program(call(KernelFn::WebApp, vec![Expr::Unit]), true);
+            assert!(matches!(
+                frame_origins_of(&driven, &listed),
+                Err(FrameListRefused::NoWebLeaf { .. })
+            ));
+            assert_eq!(
+                frame_origins_of(&program(mounted_embed(), true), &listed),
+                Ok(&listed.frame_origins)
+            );
+        }
+
+        /// T16: the frame-list gate and the emitter's leaf branch read one
+        /// judge. Every web app-entry kernel, on every target, under a
+        /// webview driver or not, registers a list exactly when the judge
+        /// delivers its leaf as served, and only `Web.embed` mounts.
+        #[test]
+        fn the_frame_gate_reads_the_leaf_judge() {
+            use super::super::{LeafHost, leaf_host, mounts_into_server};
+            let web: Vec<KernelFn> = KernelFn::ALL
+                .iter()
+                .copied()
+                .filter(|k| k.app_entry_surface() == Some(ipe_ir::AppSurface::Web))
+                .collect();
+            assert!(web.contains(&KernelFn::WebEmbed) && web.contains(&KernelFn::WebApp));
+            for kernel in web {
+                assert_eq!(mounts_into_server(kernel), kernel == KernelFn::WebEmbed);
+                for target in [
+                    ipe_ir::Target::Native,
+                    ipe_ir::Target::WasmWasi,
+                    ipe_ir::Target::WasmClient,
+                ] {
+                    for webview in [false, true] {
+                        let host = leaf_host(target, webview, mounts_into_server(kernel));
+                        let expected = match target {
+                            ipe_ir::Target::WasmClient => LeafHost::Browser,
+                            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
+                                if webview && kernel != KernelFn::WebEmbed =>
+                            {
+                                LeafHost::WebView
+                            }
+                            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi => LeafHost::Served,
+                        };
+                        assert_eq!(host, expected, "{kernel:?} {target:?} webview={webview}");
+                        let leaf = program(call(kernel, vec![Expr::Unit]), webview);
+                        let admitted =
+                            frame_origins_of(&leaf, &settings(listed().frame_origins, target))
+                                .is_ok();
+                        assert_eq!(
+                            admitted,
+                            host != LeafHost::WebView,
+                            "{kernel:?} {target:?} webview={webview}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The loopback refusal of the intent and target precedes the shape.
+        #[test]
+        fn the_loopback_refusal_precedes_the_shape() {
+            let loopback = EmitSettings {
+                frame_origins: frames(&["http://localhost:3000"]),
+                ..EmitSettings::unconfigured()
+            };
+            assert!(matches!(
+                frame_origins_of(&program(served_html(), false), &loopback),
+                Err(FrameListRefused::LoopbackAtRelease { .. })
+            ));
+        }
+
+        /// T16, the emitter's own boundary: a listed origin on a program
+        /// with no web leaf never reaches emission, whichever chain asks.
+        #[test]
+        fn emission_refuses_a_list_without_a_web_leaf() {
+            const WHERE: &str = "ipe_backend_rust::EmitCtx::build::frame_origins";
+            let mut names = ipe_intern::Interner::new();
+            let served = program_in(&mut names, served_html(), false);
+            let refused = crate::EmitCtx::build(&names, &served, listed());
+            assert!(
+                matches!(&refused, Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, detail })
+                    if *where_ == WHERE && detail.contains("`https://player.example`")),
+                "the frame backstop must refuse"
+            );
+            let none = settings(FrameOriginEntries::none(), ipe_ir::Target::Native);
+            let admitted = crate::EmitCtx::build(&names, &served, none);
+            assert!(
+                !matches!(&admitted, Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, .. })
+                    if *where_ == WHERE),
+                "an empty list never reaches the frame backstop"
+            );
+            let mut names = ipe_intern::Interner::new();
+            let leaf = program_in(&mut names, call(KernelFn::WebApp, vec![Expr::Unit]), false);
+            let admitted = crate::EmitCtx::build(&names, &leaf, listed());
+            assert!(
+                !matches!(&admitted, Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, .. })
+                    if *where_ == WHERE),
+                "a web leaf registers its list"
+            );
+        }
+
+        /// A call of top-level function `id` with no arguments.
+        fn call_func(id: u32) -> Expr {
+            Expr::Call {
+                callee: Callee::Func(ipe_ir::FuncId::from_raw(id)),
+                args: vec![],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            }
+        }
+
+        /// The frame judge reads the leaves the entry's `main` reaches, never
+        /// the linked set: a `Web.tea` page in a module the entry never
+        /// imports registers nothing, whether or not the lowered entry names
+        /// that module's `main` (a CLI program built first beside a web one).
+        #[test]
+        fn an_unreachable_web_leaf_registers_no_list() {
+            let listed = listed();
+            let page = || call(KernelFn::WebApp, vec![Expr::Unit]);
+            for lowered_entry in [0, 1] {
+                let orphan = linked_in(
+                    &mut ipe_intern::Interner::new(),
+                    "Cli",
+                    &[("Cli", "main", Expr::Unit), ("Main", "main", page())],
+                    Some(lowered_entry),
+                    false,
+                );
+                assert!(
+                    matches!(
+                        frame_origins_of(&orphan, &listed),
+                        Err(FrameListRefused::NoWebLeaf { .. })
+                    ),
+                    "lowered entry {lowered_entry}"
+                );
+            }
+            let uncalled = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Main",
+                &[("Main", "main", Expr::Unit), ("Main", "page", page())],
+                Some(0),
+                false,
+            );
+            assert!(matches!(
+                frame_origins_of(&uncalled, &listed),
+                Err(FrameListRefused::NoWebLeaf { .. })
+            ));
+            let library = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Lib",
+                &[("Lib", "page", page())],
+                None,
+                false,
+            );
+            assert!(matches!(
+                frame_origins_of(&library, &listed),
+                Err(FrameListRefused::NoWebLeaf { .. })
+            ));
+        }
+
+        /// A web leaf the entry's `main` reaches registers the list: called
+        /// from an imported module, used as a function value, or written in
+        /// the entry beside an unimported program's `main`.
+        #[test]
+        fn a_reachable_web_leaf_registers_the_list() {
+            let listed = listed();
+            let page = || call(KernelFn::WebApp, vec![Expr::Unit]);
+            let as_value = Expr::FuncValue {
+                callee: Callee::Func(ipe_ir::FuncId::from_raw(1)),
+                ty: IrType::Unit,
+            };
+            for main in [call_func(1), as_value] {
+                let imported = linked_in(
+                    &mut ipe_intern::Interner::new(),
+                    "Main",
+                    &[("Main", "main", main), ("Page", "page", page())],
+                    Some(0),
+                    false,
+                );
+                assert_eq!(
+                    frame_origins_of(&imported, &listed),
+                    Ok(&listed.frame_origins)
+                );
+            }
+            let beside_cli = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Main",
+                &[("Main", "main", page()), ("Cli", "main", Expr::Unit)],
+                Some(1),
+                false,
+            );
+            assert_eq!(
+                frame_origins_of(&beside_cli, &listed),
+                Ok(&listed.frame_origins)
+            );
+        }
     }
 }

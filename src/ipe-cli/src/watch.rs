@@ -822,6 +822,18 @@ enum CompileOutcome {
     Cancelled,
 }
 
+/// The trusted-frames `reach` a compile `outcome` shows: a red or cancelled
+/// compile built nothing that trusts a frame, so only a green one shows it.
+fn reach_after(
+    outcome: &CompileOutcome,
+    reach: Option<crate::frame_reach::FrameReach>,
+) -> Option<crate::frame_reach::FrameReach> {
+    match outcome {
+        CompileOutcome::Green(_) => reach,
+        CompileOutcome::Red(_) | CompileOutcome::Cancelled => None,
+    }
+}
+
 enum CargoOutcome {
     Green(PathBuf),
     Red(CargoRed),
@@ -1177,6 +1189,9 @@ fn run_inner(
     // a red build). A superseding batch simply overwrites it — the stale
     // cycle's partial timing is discarded exactly like its stale events.
     let mut timings = RebuildTimings::default();
+    // The trusted-frames reach of the current cycle's settings, shown once
+    // that cycle compiles green.
+    let mut cycle_reach: Option<crate::frame_reach::FrameReach> = None;
 
     // Kick off the first build immediately — don't wait for a file event.
     if evt_tx
@@ -1243,6 +1258,20 @@ fn run_inner(
                     opts.hot_appearance,
                     opts.runtime_emit,
                 );
+                // The notice is shown once, by the first green build of the
+                // session. A refused list is a manifest the next save must
+                // fix, so no retry is scheduled.
+                match crate::driver::frame_step(&settings) {
+                    Ok(reach) => cycle_reach = reach,
+                    Err(e) => {
+                        cycle_reach = None;
+                        emit_watch_line(
+                            &crate::style::TerminalSafe::sanitize(&format!("[ipe dev watch] {e}")),
+                            WatchRole::Failure,
+                        );
+                        continue;
+                    }
+                }
                 // Borrow each module's text from the snapshot:
                 // `sync_source_root` clones only at the real mutation points
                 // (a new input, or an actually-changed set), so the database
@@ -1348,6 +1377,7 @@ fn run_inner(
                     continue; // stale — a newer cycle already superseded this one.
                 }
                 timings.compile = Some(compile);
+                crate::driver::show_frame_reach(reach_after(&outcome, cycle_reach.take()));
                 match outcome {
                     CompileOutcome::Cancelled => {
                         emit(opts, WatchEvent::CompileCancelled { generation: g });
@@ -3379,6 +3409,31 @@ mod tests {
         assert_eq!(
             settings.host,
             ipe_backend_rust::EmitHost::Served(ipe_backend_rust::ServedInstall::Off)
+        );
+    }
+
+    /// T16: a watch cycle shows its trusted-frames notice only once its
+    /// compile is green; a red compile (the refused frame list among them)
+    /// or a cancelled one shows nothing.
+    #[test]
+    #[allow(clippy::panic)] // a malformed fixture origin is a test bug
+    fn the_frame_notice_waits_for_a_green_compile() {
+        use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
+        let Ok(entry) = FrameOriginEntry::parse("https://player.example") else {
+            panic!("a frame origin");
+        };
+        let Ok(entries) = FrameOriginEntries::new([entry]) else {
+            panic!("a frame list");
+        };
+        let reach = crate::frame_reach::FrameReach::of(&entries);
+        assert!(reach.is_some());
+        let green = super::CompileOutcome::Green(std::sync::Arc::new(emitted_with_main("")));
+        assert_eq!(super::reach_after(&green, reach.clone()), reach);
+        let red = super::CompileOutcome::Red("refused".to_owned());
+        assert_eq!(super::reach_after(&red, reach.clone()), None);
+        assert_eq!(
+            super::reach_after(&super::CompileOutcome::Cancelled, reach),
+            None
         );
     }
 

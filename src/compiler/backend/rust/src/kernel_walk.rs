@@ -6,10 +6,17 @@
 //! visitor over the [`KernelSite`]s this walk yields, so every refusal sees
 //! every child position of every body, and a new IR node is covered by all of
 //! them the moment this exhaustive match names it.
+//!
+//! A judge of what the program does (the frame-list gate) visits only the
+//! sites of the functions its entry reaches ([`each_reachable_kernel_site`]):
+//! the linked program also holds modules the entry never imports, and a site
+//! there never runs.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_diagnostics::DResult;
 use ipe_intern::Symbol;
-use ipe_ir::{Callee, Expr, FuncId, KernelFn, Program};
+use ipe_ir::{Callee, Expr, Func, FuncId, KernelFn, Program};
 
 /// One binder in scope at a kernel site.
 #[derive(Clone, Copy)]
@@ -134,6 +141,139 @@ pub fn each_kernel_site(
         .iter()
         .flat_map(|module| &module.funcs)
         .try_for_each(|func| each_kernel_site_in(&func.body, visit))
+}
+
+/// The program's entry: the `main` its entry module itself defines.
+///
+/// The lowered entry names the last linked `main`, which is an unimported
+/// module's when the project holds several programs, so the entry is read as
+/// the function of that name whose home is the entry module. `None` when the
+/// entry module defines no `main` (a library).
+#[must_use]
+pub fn program_entry(program: &Program) -> Option<FuncId> {
+    program.modules.iter().find_map(|module| {
+        let lowered = module.entry?;
+        let name = module.funcs.iter().find(|f| f.id == lowered)?.name;
+        module
+            .funcs
+            .iter()
+            .find(|f| f.name == name && f.home == module.name)
+            .map(|f| f.id)
+    })
+}
+
+/// Visit every kernel site of every function `entry` reaches in `program`.
+///
+/// The walk follows each `Callee::Func` call and function value from `entry`
+/// and visits each function once, so it is bounded by the function count.
+///
+/// # Errors
+///
+/// The first refusal `visit` returns.
+pub fn each_reachable_kernel_site(
+    program: &Program,
+    entry: FuncId,
+    visit: &mut impl FnMut(KernelSite<'_, '_>) -> DResult<()>,
+) -> DResult<()> {
+    let by_id: BTreeMap<FuncId, &Func> = program
+        .modules
+        .iter()
+        .flat_map(|module| &module.funcs)
+        .map(|func| (func.id, func))
+        .collect();
+    let mut reached: BTreeSet<FuncId> = BTreeSet::new();
+    let mut worklist = vec![entry];
+    while let Some(id) = worklist.pop() {
+        if !reached.insert(id) {
+            continue;
+        }
+        let Some(func) = by_id.get(&id) else {
+            continue;
+        };
+        each_kernel_site_in(&func.body, visit)?;
+        push_func_refs(&func.body, &mut worklist);
+    }
+    Ok(())
+}
+
+/// Push every function `expr` calls or uses as a value onto `out`.
+fn push_func_refs(expr: &Expr, out: &mut Vec<FuncId>) {
+    let mut pending: Vec<&Expr> = vec![expr];
+    while let Some(expr) = pending.pop() {
+        match expr {
+            Expr::Int(_)
+            | Expr::Bool(_)
+            | Expr::Float(_)
+            | Expr::Str(_)
+            | Expr::CustomElementRef { .. }
+            | Expr::Char(_)
+            | Expr::Unit
+            | Expr::Var(_)
+            | Expr::CloneVar(_) => {}
+            Expr::FuncValue { callee, .. } => match callee {
+                Callee::Func(id) => out.push(*id),
+                Callee::Kernel(_) | Callee::Ffi { .. } => {}
+            },
+            Expr::Call { callee, args, .. } => {
+                match callee {
+                    Callee::Func(id) => out.push(*id),
+                    Callee::Kernel(_) | Callee::Ffi { .. } => {}
+                }
+                pending.extend(args);
+            }
+            Expr::Ctor { args, .. } | Expr::TailRecur { args } => pending.extend(args),
+            Expr::Tuple(items) | Expr::List { items, .. } => pending.extend(items),
+            Expr::BinOp { lhs, rhs, .. }
+            | Expr::Cons {
+                head: lhs,
+                tail: rhs,
+            }
+            | Expr::Let {
+                value: lhs,
+                body: rhs,
+                ..
+            }
+            | Expr::Destructure {
+                value: lhs,
+                body: rhs,
+                ..
+            }
+            | Expr::TaskSeq {
+                effect: lhs,
+                rest: rhs,
+            } => pending.extend([lhs.as_ref(), rhs.as_ref()]),
+            Expr::If { cond, then_, else_ } => {
+                pending.extend([cond.as_ref(), then_.as_ref(), else_.as_ref()]);
+            }
+            Expr::Match(m) => {
+                pending.push(m.scrutinee());
+                for arm in m.arms() {
+                    if let Some(guard) = &arm.guard {
+                        pending.push(guard);
+                    }
+                    pending.push(&arm.body);
+                }
+            }
+            Expr::ListIndexClone { list, .. } | Expr::ListLenCheck { list, .. } => {
+                pending.push(list);
+            }
+            Expr::Record { fields, .. } => pending.extend(fields.iter().map(|(_, e)| e)),
+            Expr::Access { record, .. } => pending.push(record),
+            Expr::Update { record, fields } => {
+                pending.push(record);
+                pending.extend(fields.iter().map(|(_, e)| e));
+            }
+            Expr::Lambda { body, .. }
+            | Expr::SharedLambda { body, .. }
+            | Expr::OnceLambda { body, .. }
+            | Expr::TailLoop { body, .. }
+            | Expr::CaptureClones { body, .. } => pending.push(body),
+            Expr::Apply { func, args } => {
+                pending.push(func);
+                pending.extend(args);
+            }
+        }
+    }
 }
 
 /// Visit every kernel site inside `expr`, parents before their children.

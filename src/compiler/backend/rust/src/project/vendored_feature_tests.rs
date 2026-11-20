@@ -1304,8 +1304,8 @@ const MIRRORED: &[MirroredSurface] = &[(
     webview_cargo_toml,
     &[(
         "encoding",
-        "the vendored manifest keeps `encoding` off; the vendored module tree \
-         declares `encoding` / `bundle_route` by append for every webview program",
+        "the webview augmenter leaves `encoding` to the runtime projection, \
+         which promotes it with the `encoding` / `bundle_route` module append",
     )],
 )];
 

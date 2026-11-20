@@ -51,13 +51,20 @@ var __ipeDoc = (function(doc) {
 // `form.addEventListener` that input, so a listener bound or an attribute read
 // through the form's own lookup throws before the submit is intercepted and
 // the browser submits the form natively, its fields in the URL.
-// The frame tables of the runtime (`html.rs` `SANDBOX_TOKENS` and
-// `FRAME_LOADERS`); a native test asserts this copy equals them. A framed
-// document never shares the app's origin: an `iframe` holds only these
-// sandbox tokens, `allow-same-origin` never among them, and an `embed`,
-// `object` or `frame` never holds the attribute it loads a document from.
+// The frame tables of the runtime (`html.rs` `SANDBOX_TOKENS`,
+// `TRUSTED_SANDBOX_TOKENS`, `FRAME_LOADERS` and `FRAME_PERMISSIONS`, and
+// `frames.rs` `DELEGATION_FEATURES` as `[name, class, grant suffixes]`); a
+// native test asserts this copy equals them. A framed document gets more than
+// an opaque origin only when its one loading URL starts with a listed origin
+// that is not the page's own: an untrusted `iframe` holds only the
+// `__IPE_SANDBOX_TOKENS`, `allow-same-origin` never among them, and no
+// permission attribute; an untrusted `embed`, `object` or `frame` never holds
+// the attribute it loads a document from.
 var __IPE_SANDBOX_TOKENS = ["allow-downloads", "allow-forms", "allow-modals", "allow-orientation-lock", "allow-pointer-lock", "allow-popups", "allow-presentation", "allow-scripts", "allow-storage-access-by-user-activation", "allow-top-navigation", "allow-top-navigation-by-user-activation", "allow-top-navigation-to-custom-protocols"];
 var __IPE_FRAME_LOADERS = [["embed", "src"], ["object", "data"], ["frame", "src"]];
+var __IPE_TRUSTED_SANDBOX_TOKENS = ["allow-downloads", "allow-forms", "allow-modals", "allow-orientation-lock", "allow-pointer-lock", "allow-popups", "allow-popups-to-escape-sandbox", "allow-presentation", "allow-same-origin", "allow-scripts", "allow-storage-access-by-user-activation", "allow-top-navigation", "allow-top-navigation-by-user-activation", "allow-top-navigation-to-custom-protocols"];
+var __IPE_FRAME_PERMISSIONS = ["allow", "allowfullscreen", "allowpaymentrequest", "allowusermedia"];
+var __IPE_DELEGATION_FEATURES = [["accelerometer", "undisclosed", []], ["ambient-light-sensor", "undisclosed", []], ["autoplay", "plain", []], ["bluetooth", "undisclosed", []], ["camera", "gated", ["camera", "recorder"]], ["clipboard-read", "undisclosed", []], ["clipboard-write", "plain", []], ["compute-pressure", "undisclosed", []], ["display-capture", "undisclosed", []], ["encrypted-media", "plain", []], ["fullscreen", "plain", []], ["gamepad", "plain", []], ["geolocation", "gated", ["geolocation"]], ["gyroscope", "undisclosed", []], ["hid", "undisclosed", []], ["identity-credentials-get", "undisclosed", []], ["idle-detection", "undisclosed", []], ["local-fonts", "undisclosed", []], ["magnetometer", "undisclosed", []], ["microphone", "gated", ["microphone", "recorder"]], ["midi", "undisclosed", []], ["otp-credentials", "undisclosed", []], ["payment", "never", []], ["picture-in-picture", "plain", []], ["publickey-credentials-create", "undisclosed", []], ["publickey-credentials-get", "undisclosed", []], ["screen-wake-lock", "plain", []], ["serial", "undisclosed", []], ["storage-access", "undisclosed", []], ["usb", "undisclosed", []], ["web-share", "plain", []], ["window-management", "undisclosed", []], ["xr-spatial-tracking", "undisclosed", []]];
 // `s` with its ASCII letters lowercased and every other character kept, as
 // the runtime compares tags, keys and tokens.
 function __ipeAsciiLower(s) {
@@ -77,6 +84,124 @@ function __ipeFrameLoaderKey(tag) {
     if (__IPE_FRAME_LOADERS[i][0] === name) return __IPE_FRAME_LOADERS[i][1];
   }
   return null;
+}
+// The boot block's frame list `key` (written origins or granted suffixes);
+// empty when the page has no boot block or lists none.
+function __ipeFrameList(key) {
+  var boot = typeof __ipeBoot === "object" && __ipeBoot !== null ? __ipeBoot : null;
+  return boot && Array.isArray(boot[key]) ? boot[key] : [];
+}
+// Whether a trusted frame's popups may leave its sandbox: the server holds
+// them, and this page is the top-level document its opener policy binds.
+function __ipeEscapePopups() {
+  var boot = typeof __ipeBoot === "object" && __ipeBoot !== null ? __ipeBoot : null;
+  return !!boot && boot["escapePopups"] === true && window.top === window.self;
+}
+// The listed origin `url` loads from, by its exact characters: no character
+// at or below U+0020, no U+007F and no `\`, then a listed origin followed by
+// the end, `/`, `?` or `#`. Null when it names none.
+function __ipeListedOrigin(url) {
+  if (typeof url !== "string" || /[\x00-\x20\x7f\\]/.test(url)) return null;
+  var list = __ipeFrameList("frameOrigins");
+  for (var i = 0; i < list.length; i++) {
+    var o = list[i];
+    if (typeof o === "string" && o !== "" && url.indexOf(o) === 0) {
+      var next = url.charAt(o.length);
+      if (next === "" || next === "/" || next === "?" || next === "#") return o;
+    }
+  }
+  return null;
+}
+// Whether the listed `origin` may be the page's own on a page at `pageHost`
+// (`location.host`), so its frame is untrusted (`frames.rs` `served_on`): an
+// `https` origin on the page's host at any port, an `https` loopback-name
+// origin (last label `localhost`) on any loopback-name page, a loopback
+// `http` origin on a loopback-name page at its port, and every origin when the
+// host does not read as `Authority::parse` reads one (labels of at most 63
+// bytes with no edge `-`, at most 253 bytes, a port in `1..=65535` with no
+// leading zero). An IP-literal page host is never a listed origin's.
+function __ipeServedOn(origin, pageHost) {
+  if (typeof pageHost !== "string") return true;
+  if (pageHost.charAt(0) === "[") return false;
+  var page = /^([a-z0-9-]+(?:\.[a-z0-9-]+)*)(?::([1-9][0-9]{0,4}))?$/.exec(__ipeAsciiLower(pageHost));
+  var o = /^(https?):\/\/([a-z0-9.-]+)(?::([0-9]+))?$/.exec(origin);
+  if (!page || !o || page[1].length > 253 || +page[2] > 65535) return true;
+  var odd = function(l) { return l.length > 63 || l.charAt(0) === "-" || l.charAt(l.length - 1) === "-"; };
+  if (page[1].split(".").some(odd)) return true;
+  var loopback = function(name) { return /(^|\.)localhost$/.test(name); };
+  if (o[1] === "https") return o[2] === page[1] || (loopback(o[2]) && loopback(page[1]));
+  return loopback(page[1]) && o[3] === page[2];
+}
+// The listed origin a frame element `tag` whose attribute reader is `get`
+// (a value, or null when absent) loads from, on a page at `pageHost`; null
+// when the frame is untrusted. A `frame`, an `iframe` with a `srcdoc`, and an
+// origin that is the page's own are never trusted.
+function __ipeFrameTarget(tag, get, pageHost) {
+  var name = __ipeAsciiLower(tag);
+  var loads = name === "iframe" ? "src" : name === "frame" ? null : __ipeFrameLoaderKey(name);
+  if (loads === null) return null;
+  if (name === "iframe" && get("srcdoc") !== null) return null;
+  var origin = __ipeListedOrigin(get(loads));
+  return origin === null || __ipeServedOn(origin, pageHost) ? null : origin;
+}
+// A trusted frame's canonical sandbox: the trusted tokens `v` holds, the
+// escape token only beside `allow-popups` and when `popups` are held.
+function __ipeTrustedSandbox(v, popups) {
+  var held = typeof v === "string" ? v.split(/[\t\n\f\r ]+/).map(__ipeAsciiLower) : [];
+  var escape = popups && held.indexOf("allow-popups") !== -1;
+  return __IPE_TRUSTED_SANDBOX_TOKENS.filter(function(t) {
+    return held.indexOf(t) !== -1 && (t !== "allow-popups-to-escape-sandbox" || escape);
+  }).join(" ");
+}
+// A trusted frame's canonical `allow` (`frames.rs` `Delegation`), or null when
+// it delegates nothing: each directive of `v` whose feature is a table row,
+// whose tokens are each `'src'` or `origin`, and whose class the `grants`
+// open, as `<feature> 'src'` in table order; `fullscreen` when
+// `allowfullscreen` is present. A value over 1024 characters or 64
+// directives, or holding a character outside U+0021..U+007E and `allow`
+// whitespace, delegates nothing; a feature written twice is delegated only
+// when no occurrence is dropped.
+function __ipeAllow(v, fullscreen, origin, grants) {
+  var admitted = {}, refused = {};
+  if (typeof v === "string") {
+    if (v.length > 1024 || !/^[\x21-\x7e\t\n\f\r ]*$/.test(v) || v.split(";").length > 64) {
+      return null;
+    }
+    v.split(";").forEach(function(d) {
+      var words = d.split(/[\t\n\f\r ]+/).filter(function(w) { return w !== ""; });
+      var row = null;
+      for (var i = 0; i < __IPE_DELEGATION_FEATURES.length && words.length > 0; i++) {
+        if (__IPE_DELEGATION_FEATURES[i][0] === words[0]) row = __IPE_DELEGATION_FEATURES[i];
+      }
+      if (row === null) return;
+      var scoped = words.slice(1).every(function(t) { return t === "'src'" || t === origin; });
+      var delegable = row[1] === "plain" || row[1] === "undisclosed" ||
+          (row[1] === "gated" && row[2].some(function(g) { return grants.indexOf(g) !== -1; }));
+      if (scoped && delegable) admitted[row[0]] = true; else refused[row[0]] = true;
+    });
+  }
+  if (fullscreen) admitted["fullscreen"] = true;
+  var out = __IPE_DELEGATION_FEATURES.filter(function(r) {
+    return admitted[r[0]] === true && refused[r[0]] !== true;
+  }).map(function(r) { return r[0] + " 'src'"; });
+  return out.length > 0 ? out.join("; ") : null;
+}
+// The grant of an `iframe` aimed at `origin` (null when untrusted) whose
+// attribute reader is `get`: `[sandbox, allow]`, `allow` null when absent.
+function __ipeFrameGrant(origin, get) {
+  if (origin === null) return [__ipeSandbox(get("sandbox")), null];
+  return [
+    __ipeTrustedSandbox(get("sandbox"), __ipeEscapePopups()),
+    __ipeAllow(get("allow"), get("allowfullscreen") !== null, origin, __ipeFrameList("frameGrants"))
+  ];
+}
+// The keys a patch of a frame element `tag` plans as one, grant keys first;
+// empty for every other tag.
+function __ipeFramePatchKeys(tag) {
+  var name = __ipeAsciiLower(tag);
+  if (name === "iframe") return ["sandbox"].concat(__IPE_FRAME_PERMISSIONS, ["src", "srcdoc"]);
+  var loads = __ipeFrameLoaderKey(name);
+  return loads === null ? [] : __IPE_FRAME_PERMISSIONS.concat([loads]);
 }
 var __ipeNode = (function() {
   // A member the browser lacks is a function that refuses every call: boot
@@ -175,18 +300,31 @@ var __ipeNode = (function() {
       return stripped;
     },
     // Fences every frame below the detached holder `tmp` (an element or a
-    // fragment) before its nodes connect: an `iframe` gets the canonical
-    // sandbox, and an `embed`, `object` or `frame` holding the attribute it
-    // loads from is removed.
+    // fragment) before its nodes connect: an `iframe` gets the grant of its
+    // target and no other permission attribute, an `embed`, `object` or
+    // `frame` loses every permission attribute, and one holding the
+    // attribute it loads from toward an untrusted target is removed.
     fenceFrames: function(tmp) {
       var found = (tmp instanceof DocumentFragment ? fragmentQueryAll : queryAll).call(tmp, "iframe, embed, object, frame");
       for (var i = 0; i < found.length; i++) {
-        var tag = __ipeAsciiLower(localName.call(found[i]));
+        var el = found[i];
+        var tag = __ipeAsciiLower(localName.call(el));
         var loads = __ipeFrameLoaderKey(tag);
+        var get = function(k) { return getAttribute.call(el, k); };
+        var origin = __ipeFrameTarget(tag, get, location.host);
         if (tag === "iframe") {
-          setAttribute.call(found[i], "sandbox", __ipeSandbox(getAttribute.call(found[i], "sandbox")));
-        } else if (loads !== null && getAttribute.call(found[i], loads) !== null) {
-          remove.call(found[i]);
+          var grant = __ipeFrameGrant(origin, get);
+          for (var j = 1; j < __IPE_FRAME_PERMISSIONS.length; j++) {
+            removeAttribute.call(el, __IPE_FRAME_PERMISSIONS[j]);
+          }
+          setAttribute.call(el, "sandbox", grant[0]);
+          if (grant[1] === null) removeAttribute.call(el, "allow");
+          else setAttribute.call(el, "allow", grant[1]);
+        } else {
+          for (var m = 0; m < __IPE_FRAME_PERMISSIONS.length; m++) {
+            removeAttribute.call(el, __IPE_FRAME_PERMISSIONS[m]);
+          }
+          if (loads !== null && get(loads) !== null && origin === null) remove.call(el);
         }
       }
     },
@@ -234,6 +372,15 @@ var __ipeBoot = (function() {
   try { data = JSON.parse(node.textContent); } catch (_) { refuse("block is not JSON"); }
   if (!isObject(data)) refuse("block is not an object");
   __IPE_BOOT_STRINGS.forEach(function(k) { requireType(data, k, "string", ""); });
+  ["frameOrigins", "frameGrants"].forEach(function(k) {
+    if (Object.prototype.hasOwnProperty.call(data, k) && (!Array.isArray(data[k]) ||
+        data[k].some(function(x) { return typeof x !== "string"; }))) {
+      refuse(k + " is not a list of strings");
+    }
+  });
+  if (Object.prototype.hasOwnProperty.call(data, "escapePopups")) {
+    requireType(data, "escapePopups", "boolean", "");
+  }
   if (!__ipeEpochParts(data["epoch"])) refuse("epoch is not an epoch token");
   requireType(data, "cfg", "object", "");
   var cfg = data["cfg"];
@@ -799,24 +946,41 @@ function __ipeParseFor(container, html, stripped) {
   return tmp;
 }
 
-// What the attribute patch `k` = `v` writes on `el` under the frame rule: the
-// value to write (a string, or null to remove), or false to drop the write.
-// An iframe's sandbox is never removed and is always written canonical, and a
-// `src` or `srcdoc` set on an iframe without a sandbox writes the empty one
-// first, as the sandbox binds when the frame navigates; a frame loader never
-// gains the attribute it loads from.
-function __ipeFramePatch(el, k, v) {
+// The ordered writes (`[key, value]`, null removes) that patch the frame
+// element `el` by the patch attributes `attrs` (`html.rs`
+// `plan_frame_patch`). The final state is read first: each frame key from
+// `attrs` (the last of any key case; a string sets, null removes), else from
+// `el`. Its target and grant decide every grant key, written first: the
+// sandbox always, `allow` set or removed, every other permission attribute
+// removed. Then each navigation key `attrs` names, a loader's only toward a
+// trusted target. So a patch moving a frame off a trusted origin withdraws
+// its grant before it navigates. Empty for every other element.
+function __ipeFramePlan(el, attrs) {
   var tag = __ipeAsciiLower(__ipeNode.local(el));
-  var key = __ipeAsciiLower(k);
-  if (tag === "iframe") {
-    if (key === "sandbox") return typeof v === "string" ? __ipeSandbox(v) : false;
-    if ((key === "src" || key === "srcdoc") && typeof v === "string" &&
-        __ipeNode.attr(el, "sandbox") === null) {
-      __ipeNode.setAttr(el, "sandbox", "");
-    }
-    return v;
+  var keys = __ipeFramePatchKeys(tag);
+  if (keys.length === 0) return [];
+  var asked = {};
+  Object.keys(attrs).forEach(function(k) {
+    var key = __ipeAsciiLower(k), v = attrs[k];
+    if (keys.indexOf(key) !== -1 && (v === null || typeof v === "string")) asked[key] = v;
+  });
+  var has = function(k) { return Object.prototype.hasOwnProperty.call(asked, k); };
+  var get = function(k) { return has(k) ? asked[k] : __ipeNode.attr(el, k); };
+  var origin = __ipeFrameTarget(tag, get, location.host);
+  var iframe = tag === "iframe";
+  var writes = [];
+  if (iframe) {
+    var grant = __ipeFrameGrant(origin, get);
+    writes.push(["sandbox", grant[0]], ["allow", grant[1]]);
   }
-  return key === __ipeFrameLoaderKey(tag) && v !== null ? false : v;
+  __IPE_FRAME_PERMISSIONS.forEach(function(p) {
+    if (!(iframe && p === "allow")) writes.push([p, null]);
+  });
+  keys.forEach(function(k) {
+    if (k === "sandbox" || __IPE_FRAME_PERMISSIONS.indexOf(k) !== -1 || !has(k)) return;
+    writes.push([k, iframe || origin !== null ? asked[k] : null]);
+  });
+  return writes;
 }
 
 // Replace `container`'s children with the parsed holder `tmp`'s, splicing the
@@ -1937,6 +2101,12 @@ function __ipeApplyPatches(patches) {
         savedScrollTop = el.scrollTop;
       }
       var valueChanged = false;
+      var framePlan = __ipeFramePlan(el, p.attrs);
+      for (var f = 0; f < framePlan.length; f++) {
+        if (framePlan[f][1] === null) __ipeNode.removeAttr(el, framePlan[f][0]);
+        else __ipeNode.setAttr(el, framePlan[f][0], framePlan[f][1]);
+      }
+      var frameKeys = __ipeFramePatchKeys(elTag);
       for (var j = 0; j < keys.length; j++) {
         var k = keys[j], v = p.attrs[k];
         // No `autofocus` reaches a live node: a later move would focus it.
@@ -1944,8 +2114,8 @@ function __ipeApplyPatches(patches) {
           __ipeNode.removeAttr(el, k);
           continue;
         }
-        v = __ipeFramePatch(el, k, v);
-        if (v === false) continue;
+        // A frame key is written by the frame plan above, never alone.
+        if (frameKeys.indexOf(__ipeAsciiLower(k)) !== -1) continue;
         // Authority filter: the user is currently editing this
         // field, so the server's proposed value/checked/selected
         // would stomp in-flight keystrokes. Drop them and let the

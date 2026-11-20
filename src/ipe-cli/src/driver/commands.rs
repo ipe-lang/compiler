@@ -3,8 +3,8 @@ use super::{
     RuntimeContext, RuntimeEmit, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
     attribute_post_link_error, bluegreen_enabled, build_held_into, build_root_into,
     bundle_delivery, compile_prepared, create_source_root, emit_machine_error, emit_permissions,
-    emit_settings, find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines,
-    home_to_source_map, io_err, run_version,
+    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
+    io_err, run_version,
 };
 use crate::runtime_embed::{RuntimeRemedy, RuntimeSource};
 use std::num::NonZeroU8;
@@ -2930,33 +2930,28 @@ fn serve_client_bundle(
     port: crate::loopback_http::BundlePort,
 ) -> Result<(), CliError> {
     use crate::loopback_http::{BundleSite, IO_BUDGET, announce, bind_bundle, serve_site};
-    use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
     let (published, snapshot) = bundle_wasm_with(
         crate_dir,
         &crate::bundle_www::BundleHome::Dev(output),
         BuildPosture::Dev,
         publish_served,
     )?;
-    let policies: Vec<(String, String)> = [BundleWorker::None, BundleWorker::Push]
-        .into_iter()
-        .map(|worker| {
-            let policy = ContentSecurityPolicy::bundle(&manifest.delivery.servers, worker);
-            (policy.header_value(), policy.meta_element())
-        })
-        .collect();
     let page = snapshot
         .index_html()
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .unwrap_or_default();
-    let csp = crate::bundle_www::sole_policy(page, &policies, |(_, meta)| meta.as_str())
-        .map(|(header, _)| header.clone())
-        .ok_or_else(|| {
-            CliError::ProjectRefused(text::Message::relay(
-                &crate::bundle_www::BundleError::PolicyMismatch {
-                    path: published.join("index.html"),
-                },
-            ))
-        })?;
+    let csp = served_bundle_policy(
+        page,
+        &manifest.delivery.servers,
+        &manifest.delivery.frame_origins,
+    )
+    .ok_or_else(|| {
+        CliError::ProjectRefused(text::Message::relay(
+            &crate::bundle_www::BundleError::PolicyMismatch {
+                path: published.join("index.html"),
+            },
+        ))
+    })?;
     let listener = bind_bundle(port)?;
     let base = manifest.delivery.browser.base.clone();
     announce(
@@ -2975,6 +2970,27 @@ fn serve_client_bundle(
         IO_BUDGET,
     );
     Ok(())
+}
+
+/// The `Content-Security-Policy` header of the one policy `page` carries.
+///
+/// The candidates are the bundle policies of `servers` and `frames`; a page
+/// carrying none of them, or more than one, has no policy.
+fn served_bundle_policy(
+    page: &str,
+    servers: &ipe_runtime_rust::encoding::ServerOrigins,
+    frames: &ipe_runtime_rust::encoding::FrameOriginEntries,
+) -> Option<String> {
+    use ipe_runtime_rust::csp::{BundleWorker, ContentSecurityPolicy};
+    let policies: Vec<(String, String)> = [BundleWorker::None, BundleWorker::Push]
+        .into_iter()
+        .map(|worker| {
+            let policy = ContentSecurityPolicy::bundle(servers, frames, worker);
+            (policy.header_value(), policy.meta_element())
+        })
+        .collect();
+    crate::bundle_www::sole_policy(page, &policies, |(_, meta)| meta.as_str())
+        .map(|(header, _)| header.clone())
 }
 
 /// The note naming the published bundle at `www` and its wasm's size.
@@ -4622,24 +4638,12 @@ pub fn lowering_check_query(
 /// [`CliError::Pipeline`] carrying the first compiler diagnostic; every
 /// refusal of [`analysis_graphs`].
 pub fn front_check(root: &ProjectRoot) -> Result<(), CliError> {
-    let manifest_path = root.path().join(package_manifest::PACKAGE_IPE);
-    let source = SettingsSource::Manifest {
-        manifest: root.manifest(),
-        manifest_path: &manifest_path,
-        // A front check writes no artifact and opens no window: it judges the
-        // program the served build compiles.
-        host: HostIntent::Served,
-    };
-    let options = BuildOptions {
-        target: ipe_ir::Target::Native,
-        intent: ipe_backend_rust::BuildIntent::Development,
-        ..BuildOptions::from_env()?
-    };
+    let base = BuildOptions::from_env()?;
     crate::threads::run_compile(|| {
         for graph in analysis_graphs(&AnalysisTarget::Project(root))? {
             let config = ipe_db::BuildConfig::new(
                 &graph.db,
-                emit_settings(&source, &options, runtime_embed::BundleRole::Out),
+                super::build_pipeline::served_dev_settings(root, &base),
             );
             compile_prepared(
                 &graph.db,
@@ -4701,12 +4705,30 @@ pub fn analysis_target<'r>(
 /// [`CliError::Io`] (`NotFound`) when the snapshot holds no module the target
 /// names.
 pub fn analysis_graphs(target: &AnalysisTarget<'_>) -> Result<Vec<SourceGraph>, CliError> {
+    Ok(entry_graphs(target)?
+        .into_iter()
+        .map(|(_, graph)| graph)
+        .collect())
+}
+
+/// [`analysis_graphs`], each graph paired with the entry module it is rooted
+/// at.
+///
+/// # Errors
+///
+/// Every refusal of [`analysis_graphs`].
+pub(super) fn entry_graphs<'t>(
+    target: &'t AnalysisTarget<'_>,
+) -> Result<Vec<(&'t [String], SourceGraph)>, CliError> {
     match target {
         AnalysisTarget::Project(root) => {
             let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
             entry_modules(root.entries())
                 .into_iter()
-                .map(|module| graph_over(root, snapshot.modules(), SourceDir::Src, module))
+                .map(|module| {
+                    graph_over(root, snapshot.modules(), SourceDir::Src, module)
+                        .map(|graph| (module, graph))
+                })
                 .collect()
         }
         AnalysisTarget::Module { root, dir, module } => {
@@ -4714,7 +4736,10 @@ pub fn analysis_graphs(target: &AnalysisTarget<'_>) -> Result<Vec<SourceGraph>, 
             let Some(view) = snapshot.view(*dir, module)? else {
                 return Err(module_missing(root, *dir, module));
             };
-            Ok(vec![graph_over(root, view.modules(), *dir, view.entry())?])
+            Ok(vec![(
+                module.as_slice(),
+                graph_over(root, view.modules(), *dir, view.entry())?,
+            )])
         }
     }
 }
@@ -6188,6 +6213,96 @@ mod parsed_manifest_tests {
         assert!(
             cargo_toml.contains("\"db-sqlite\"") && !cargo_toml.contains("\"db-postgres\""),
             "the emit re-read the edited manifest:\n{cargo_toml}"
+        );
+    }
+
+    /// R34: a manifest listing a frame origin emits a shell whose meta lists
+    /// it, and the served-bundle policy is the one built from that list; the
+    /// same page against a manifest with another list carries no policy that
+    /// manifest renders.
+    #[test]
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn served_bundle_policy_carries_the_declared_frames() {
+        const APP: &str = "module Main exposing (main)\n\
+             import Ipe.String as String\n\
+             import Ipe.Tea.Web exposing (tea)\n\
+             import Ipe.Tea.Web.Cmd as Cmd\n\
+             import Ipe.Tea.Web.Sub as Sub\n\
+             import Ipe.Ui as Ui\n\
+             \n\
+             type Page = CounterPage\n\
+             type Msg = Increment\n\
+             type alias Model = { count : Int }\n\
+             \n\
+             init : WebReq -> ( Model, Cmd Msg )\n\
+             init _req = ( { count = 0 }, Cmd.none )\n\
+             \n\
+             update : Msg -> Model -> ( Model, Cmd Msg )\n\
+             update msg model =\n\
+             \x20   case msg of\n\
+             \x20       Increment -> ( { model | count = model.count + 1 }, Cmd.none )\n\
+             \n\
+             subscriptions : Model -> Sub Msg\n\
+             subscriptions _model = Sub.none\n\
+             \n\
+             view : Model -> Element Msg\n\
+             view model =\n\
+             \x20   Ui.button [] { onPress = Just Increment, label = Ui.text (String.fromInt model.count) }\n\
+             \n\
+             main =\n\
+             \x20   tea\n\
+             \x20       { init = init\n\
+             \x20       , update = update\n\
+             \x20       , view = view\n\
+             \x20       , subscriptions = subscriptions\n\
+             \x20       , routes = []\n\
+             \x20       , notFound = CounterPage\n\
+             \x20       }\n";
+        let tree = crate::project_root::SourceTree::main(APP)
+            .field("delivery = { frameOrigins = [ \"https://player.example\" ] }");
+        let fixture = crate::RootFixture::from_tree(&tree).expect("fixture");
+        let held = HeldBuild::read(
+            ProjectRoot::resolve(RootArg::at(fixture.path())).expect("the root resolves"),
+        )
+        .expect("the project reads");
+        let base =
+            ipe_test_temp::temp_root().join(format!("ipe-served-frames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch base");
+        let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+        let emitted = held
+            .emit(
+                &EmitTarget::Claimed(crate_dir),
+                &crate::runtime_embed::RuntimeSource::Embedded,
+                &BuildOptions {
+                    target: ipe_ir::Target::WasmClient,
+                    runtime_emit: RuntimeEmit::Linked,
+                    ..BuildOptions::default()
+                },
+                HostIntent::Served,
+            )
+            .expect("the project emits");
+        let page = std::fs::read_to_string(emitted.path().join("www").join("index.html"))
+            .expect("the emitted shell");
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(page.contains("https://player.example"), "{page}");
+
+        let delivery = &fixture.root().manifest().delivery;
+        assert!(
+            super::served_bundle_policy(&page, &delivery.servers, &delivery.frame_origins)
+                .is_some(),
+            "the shell carries the policy of the declared frames:\n{page}"
+        );
+        let other =
+            ipe_backend_rust::FrameOriginEntries::new([ipe_backend_rust::FrameOriginEntry::parse(
+                "https://other.example",
+            )
+            .expect("a frame origin")])
+            .expect("a frame list");
+        assert_eq!(
+            super::served_bundle_policy(&page, &delivery.servers, &other),
+            None,
+            "a page built for another list is a policy mismatch"
         );
     }
 

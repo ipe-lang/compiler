@@ -203,6 +203,7 @@ fn compile_inner(source: &str) -> Result<ipe_backend::EmittedProject, Playground
             wasm_public_env: Vec::new(),
             mount_base: ipe_backend_rust::MountBase::root(),
             server_origins: ipe_backend_rust::ServerOrigins::none(),
+            frame_origins: ipe_backend_rust::FrameOriginEntries::none(),
             wasm_hydrate_mode: false,
             // Wasm always vendors its runtime (closed template); dep model is a no-op.
             runtime_dep: None,
