@@ -365,14 +365,18 @@ pub fn dropped_frame_origin<'s>(
 ///
 /// A browser client registers the list at its entry. A served build
 /// registers it at each web leaf [`leaf_host`] delivers as
-/// [`LeafHost::Served`].
+/// [`LeafHost::Served`] that the entry's `main` reaches: a leaf in a module
+/// the entry never imports, or in a function it never calls, never runs.
 fn registers_frame_list(program: &ipe_ir::Program, settings: &EmitSettings) -> bool {
     if settings.target == ipe_ir::Target::WasmClient {
         return true;
     }
+    let Some(entry) = crate::kernel_walk::program_entry(program) else {
+        return false;
+    };
     let webview = drives_webview(program, &settings.host);
     let mut registers = false;
-    let walked = crate::kernel_walk::each_kernel_site(program, &mut |site| {
+    let walked = crate::kernel_walk::each_reachable_kernel_site(program, entry, &mut |site| {
         if let crate::kernel_walk::KernelSite::Call { kernel, .. } = site
             && kernel.app_entry_surface() == Some(ipe_ir::AppSurface::Web)
             && leaf_host(settings.target, webview, mounts_into_server(kernel)) == LeafHost::Served
@@ -776,28 +780,44 @@ mod tests {
 
         /// A one-module program whose `main` body is `body`, under `names`.
         fn program_in(names: &mut ipe_intern::Interner, body: Expr, webview: bool) -> Program {
-            #[allow(clippy::expect_used)] // two short ASCII names always intern
-            let (module, main) = (
-                names.intern("Main").expect("intern"),
-                names.intern("main").expect("intern"),
-            );
+            linked_in(names, "Main", &[("Main", "main", body)], Some(0), webview)
+        }
+
+        /// A linked program whose entry module is `entry_module`, holding one
+        /// function per `(home, name, body)` in `funcs` with ids in order,
+        /// and whose lowered entry is the function at `entry`.
+        fn linked_in(
+            names: &mut ipe_intern::Interner,
+            entry_module: &str,
+            funcs: &[(&str, &str, Expr)],
+            entry: Option<u32>,
+            webview: bool,
+        ) -> Program {
+            #[allow(clippy::expect_used)] // short ASCII names always intern
+            let mut sym = |name: &str| names.intern(name).expect("intern");
+            let module = ipe_ir::ModPath(vec![sym(entry_module)]);
+            let funcs = funcs
+                .iter()
+                .zip(0..)
+                .map(|((home, name, body), id)| ipe_ir::Func {
+                    id: ipe_ir::FuncId::from_raw(id),
+                    name: sym(name),
+                    home: ipe_ir::ModPath(vec![sym(home)]),
+                    type_params: vec![],
+                    row_params: vec![],
+                    params: vec![],
+                    ret: IrType::Unit,
+                    body: body.clone(),
+                })
+                .collect();
             Program {
                 imports_unsafe_submodule: false,
                 imported_web_capabilities: std::collections::BTreeSet::new(),
                 modules: vec![ipe_ir::Module {
-                    name: ipe_ir::ModPath(vec![module]),
+                    name: module,
                     types: vec![],
-                    funcs: vec![ipe_ir::Func {
-                        id: ipe_ir::FuncId::from_raw(0),
-                        name: main,
-                        home: ipe_ir::ModPath(vec![module]),
-                        type_params: vec![],
-                        row_params: vec![],
-                        params: vec![],
-                        ret: IrType::Unit,
-                        body,
-                    }],
-                    entry: Some(ipe_ir::FuncId::from_raw(0)),
+                    funcs,
+                    entry: entry.map(ipe_ir::FuncId::from_raw),
                     records: vec![],
                     uses_tea: false,
                     uses_server: false,
@@ -1041,6 +1061,101 @@ mod tests {
                 !matches!(&admitted, Err(ipe_diagnostics::Diagnostic::CompilerBug { where_, .. })
                     if *where_ == WHERE),
                 "a web leaf registers its list"
+            );
+        }
+
+        /// A call of top-level function `id` with no arguments.
+        fn call_func(id: u32) -> Expr {
+            Expr::Call {
+                callee: Callee::Func(ipe_ir::FuncId::from_raw(id)),
+                args: vec![],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            }
+        }
+
+        /// The frame judge reads the leaves the entry's `main` reaches, never
+        /// the linked set: a `Web.tea` page in a module the entry never
+        /// imports registers nothing, whether or not the lowered entry names
+        /// that module's `main` (a CLI program built first beside a web one).
+        #[test]
+        fn an_unreachable_web_leaf_registers_no_list() {
+            let listed = listed();
+            let page = || call(KernelFn::WebApp, vec![Expr::Unit]);
+            for lowered_entry in [0, 1] {
+                let orphan = linked_in(
+                    &mut ipe_intern::Interner::new(),
+                    "Cli",
+                    &[("Cli", "main", Expr::Unit), ("Main", "main", page())],
+                    Some(lowered_entry),
+                    false,
+                );
+                assert!(
+                    matches!(
+                        frame_origins_of(&orphan, &listed),
+                        Err(FrameListRefused::NoWebLeaf { .. })
+                    ),
+                    "lowered entry {lowered_entry}"
+                );
+            }
+            let uncalled = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Main",
+                &[("Main", "main", Expr::Unit), ("Main", "page", page())],
+                Some(0),
+                false,
+            );
+            assert!(matches!(
+                frame_origins_of(&uncalled, &listed),
+                Err(FrameListRefused::NoWebLeaf { .. })
+            ));
+            let library = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Lib",
+                &[("Lib", "page", page())],
+                None,
+                false,
+            );
+            assert!(matches!(
+                frame_origins_of(&library, &listed),
+                Err(FrameListRefused::NoWebLeaf { .. })
+            ));
+        }
+
+        /// A web leaf the entry's `main` reaches registers the list: called
+        /// from an imported module, used as a function value, or written in
+        /// the entry beside an unimported program's `main`.
+        #[test]
+        fn a_reachable_web_leaf_registers_the_list() {
+            let listed = listed();
+            let page = || call(KernelFn::WebApp, vec![Expr::Unit]);
+            let as_value = Expr::FuncValue {
+                callee: Callee::Func(ipe_ir::FuncId::from_raw(1)),
+                ty: IrType::Unit,
+            };
+            for main in [call_func(1), as_value] {
+                let imported = linked_in(
+                    &mut ipe_intern::Interner::new(),
+                    "Main",
+                    &[("Main", "main", main), ("Page", "page", page())],
+                    Some(0),
+                    false,
+                );
+                assert_eq!(
+                    frame_origins_of(&imported, &listed),
+                    Ok(&listed.frame_origins)
+                );
+            }
+            let beside_cli = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Main",
+                &[("Main", "main", page()), ("Cli", "main", Expr::Unit)],
+                Some(1),
+                false,
+            );
+            assert_eq!(
+                frame_origins_of(&beside_cli, &listed),
+                Ok(&listed.frame_origins)
             );
         }
     }

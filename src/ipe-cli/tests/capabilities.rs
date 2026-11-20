@@ -2108,6 +2108,52 @@ fn capabilities_command_refuses_a_frame_list_when_the_built_program_has_no_web_l
     Ok(())
 }
 
+/// A one-program CLI project with a stray `Web.tea` module in `src/` that
+/// its entry never imports registers no frame list: the leaf is linked but
+/// never runs, so `ipe capabilities`, `ipe dev build` and `ipe release
+/// eject` all refuse the listed origin and never report it trusted.
+#[test]
+fn a_stray_unimported_web_module_registers_no_frame_list() -> TestResult {
+    let cli = std::fs::read_to_string(fixture("pure_string.ipe"))?;
+    let dir = frame_project("stray-web", LISTED, &cli)?;
+    std::fs::write(
+        dir.join("src/Page.ipe"),
+        WEB_TEA_PAGE.replacen("module Main exposing", "module Page exposing", 1),
+    )?;
+    let capabilities = run_ipe_in(&dir, &["capabilities", "--plain"]);
+    let built = [["dev", "build"], ["release", "eject"]]
+        .iter()
+        .map(|verb| {
+            Command::new(support::ipe_bin())
+                .args(verb)
+                .arg("--out")
+                .arg(dir.join(format!("out-{}", verb.join("-"))))
+                .current_dir(dir.as_path())
+                .env("NO_COLOR", "1")
+                .output()
+                .map(|output| (verb.join(" "), output))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let _ = std::fs::remove_dir_all(&dir);
+    let (ok, plain) = capabilities?;
+    assert!(!ok, "`ipe capabilities` must refuse:\n{plain}");
+    assert!(!plain.contains("frame"), "{plain}");
+    for (verb, output) in built? {
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!output.status.success(), "{verb} must refuse: {said}");
+        assert!(
+            said.contains("`delivery.frameOrigins` lists `https://player.example`"),
+            "{verb}: {said}"
+        );
+        assert!(!said.contains("trusted frame origins"), "{verb}: {said}");
+    }
+    Ok(())
+}
+
 /// A library project (only `exposedModules`) compiles no program, so no page
 /// trusts its frame list: `ipe capabilities` refuses the list, and reports
 /// the same library without it.
