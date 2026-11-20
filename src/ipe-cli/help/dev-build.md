@@ -1,7 +1,7 @@
 Compile a program to a native or WebAssembly development artifact, with Debug.* on.
 
 ```
-ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
+ipe dev build [<dir>] [<shape>] [<runtime>] [<host>]
 ```
 
 ## Arguments
@@ -10,7 +10,6 @@ ipe dev build [<dir>] [<shape>] [<runtime>] [<host>] [<target>]
 - `[<shape>]` — derived from `main` and, if written, only cross-checked
 - `[<runtime>]` — web only: `web` = served (served is the unnamed default, never written), `web client` = self-contained browser client (it derives the wasm target)
 - `[<host>]` — web only: desktop/ios/android; a `desktop`/`ios`/`android` host lays out the app bundle for that host (a fast dev bundle; `release build` with the same delivery words produces the production distributable); `web client desktop` packs the wasm client into a native desktop shell that serves it from memory, with no server process
-- `[<target>]` — not a parsed delivery word; choose a cross-compilation target with `--target` instead (`wasm`, `wasi`, or a musl-static native triple)
 
 ## Notes
 
