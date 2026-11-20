@@ -798,10 +798,10 @@ fn inferred_function_type_in_value_position_lowers_to_fun() -> DResult<()> {
 }
 
 #[test]
-fn bare_function_reference_lowers_to_func_value() -> DResult<()> {
-    // A kernel named as a bare *value* (not called) reifies into a first-class
-    // `Expr::FuncValue` carrying its callee and boxed function type — the M1
-    // first-class-function value path, not an unsupported-feature diagnostic.
+fn bare_kernel_reference_lowers_to_a_saturated_eta_closure() -> DResult<()> {
+    // A kernel named as a bare *value* (not called) is eta-expanded into
+    // `\x -> kernel x`: its saturated emit arm is what makes the runtime agree
+    // with its Ipê arrow, so it never reifies into a bare `Expr::FuncValue`.
     let mut i = Interner::new();
     let f = i.intern("f")?;
     let module = i.intern("String")?;
@@ -849,13 +849,24 @@ fn bare_function_reference_lowers_to_func_value() -> DResult<()> {
 
     let res = run_with_regions(Vec::new(), vec![def], BTreeMap::new(), regions, &mut i);
     let body = single_func(&res).map(|fc| &fc.body);
-    assert_eq!(
+    let saturated = matches!(
         body,
-        Some(&Expr::FuncValue {
-            callee: Callee::Kernel(KernelFn::StringFromInt),
-            ty: IrType::Fun(vec![IrType::Int], Box::new(IrType::Str)),
-        }),
-        "a bare kernel reference must lower to FuncValue: {res:?}"
+        Some(Expr::Lambda { params, ret: IrType::Str, body })
+            if matches!(
+                (params.as_slice(), body.as_ref()),
+                (
+                    [(param, IrType::Int)],
+                    Expr::Call {
+                        callee: Callee::Kernel(KernelFn::StringFromInt),
+                        args,
+                        ..
+                    },
+                ) if args.as_slice() == [Expr::Var(*param)]
+            )
+    );
+    assert!(
+        saturated,
+        "a bare kernel reference must lower to `\\x -> String.fromInt x`: {res:?}"
     );
     Ok(())
 }
