@@ -64,7 +64,8 @@ const RUNTIME_ROOT: &str = "src/runtime/rust/";
 /// script, the recursion-limit trip, the temp-root owner and its test reader,
 /// the environment accessor's readers, two integration tests with no
 /// crate-private accessor, the ban proofs, the one blocking-pool start, the task funnel's
-/// starts and joins, the one process exit, the one app serve site and its test fixture, the one OS
+/// starts and joins and its raw start for unit tests, the FFI async bridge
+/// test that models the emitted wrapper's raw task start, the one process exit, the one app serve site and its test fixture, the one OS
 /// entropy source, the non-Unicode
 /// environ probe test, and the
 /// audited lossy-UTF-8 sites that render bytes already refused or never parsed.
@@ -76,7 +77,7 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/compiler/db/src/clippy_paths_resolve.rs", 40),
     ("tools/test-temp/src/lib.rs", 1),
     ("src/runtime/rust/build.rs", 1),
-    ("src/runtime/rust/src/clippy_paths_resolve.rs", 31),
+    ("src/runtime/rust/src/clippy_paths_resolve.rs", 33),
     ("src/runtime/rust/src/core.rs", 1),
     ("src/runtime/rust/src/entropy.rs", 1),
     ("src/runtime/rust/src/csv.rs", 1),
@@ -89,10 +90,11 @@ const ESCAPE_HATCH_SITES: &[(&str, usize)] = &[
     ("src/runtime/rust/src/ssrf.rs", 1),
     ("src/runtime/rust/src/system.rs", 12),
     ("src/runtime/rust/src/terminal_access.rs", 1),
-    ("src/runtime/rust/src/threads.rs", 4),
+    ("src/runtime/rust/src/threads.rs", 5),
     ("src/runtime/rust/src/tui/key.rs", 1),
     ("src/runtime/rust/src/url.rs", 1),
     ("src/runtime/rust/tests/debug_behavior.rs", 1),
+    ("src/runtime/rust/tests/ffi_async_bridge.rs", 3),
     ("src/runtime/rust/tests/parent_death_spawner.rs", 1),
 ];
 
