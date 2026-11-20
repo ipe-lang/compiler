@@ -1779,9 +1779,10 @@ impl From<PipelineError> for (Diagnostic, Vec<Symbol>) {
 /// against [`typecheck`]'s solved types into the backend-agnostic IR.
 pub type LowerResult = Result<Arc<ipe_ir::Program>, PipelineError>;
 
-/// Lower the linked whole-program module.
+/// Lower the linked whole-program module as the program its entry runs.
 ///
-/// Admission runs in build order: link, type-check, the IPE-N0040
+/// The program is cut down to what the entry module's own `main` reaches
+/// ([`ipe_lower::Roots::Entry`]). Admission runs in build order: link, type-check, the IPE-N0040
 /// decoder-direction gate, then lowering; the first refusal is the result.
 ///
 /// Keyed on `(root, entry)` over [`linked_program`] and [`typecheck`], so it
@@ -1796,6 +1797,28 @@ pub type LowerResult = Result<Arc<ipe_ir::Program>, PipelineError>;
 /// (`lower::max_def_arity_per_module`).
 #[salsa::tracked]
 pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerResult {
+    lower_rooted(db, root, entry, ipe_lower::Roots::Entry)
+}
+
+/// Lower the linked whole-program module as an API, every function a root.
+///
+/// The package-capability audit's view of a module
+/// ([`ipe_lower::Roots::WholeApi`]): no function is pruned, no entry is
+/// named, and no `main` is gated as a program entry, so an exposed function
+/// no local `main` calls still discloses its capabilities. Admission is
+/// [`lower_program`]'s otherwise, keyed on the same `(root, entry)`.
+#[salsa::tracked]
+pub fn lower_package_api(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerResult {
+    lower_rooted(db, root, entry, ipe_lower::Roots::WholeApi)
+}
+
+/// The body of [`lower_program`] and [`lower_package_api`], lowered from `roots`.
+fn lower_rooted(
+    db: &dyn Db,
+    root: SourceRoot,
+    entry: SourceFile,
+    roots: ipe_lower::Roots,
+) -> LowerResult {
     let linked = linked_program(db, root, entry)
         .clone()
         .map_err(|d| PipelineError::Lower(d, Vec::new()))?;
@@ -1815,8 +1838,15 @@ pub fn lower_program(db: &dyn Db, root: SourceRoot, entry: SourceFile) -> LowerR
         let src_path = entry.module_path(db).join(".");
         let src_path = format!("{src_path}.ipe");
         let src_text = entry.text(db).clone();
-        ipe_lower::lower(&linked.module, &types, &mut interner, &src_path, &src_text)
-            .map_err(|(diag, home)| PipelineError::Lower(diag, home))?
+        ipe_lower::lower(
+            &linked.module,
+            &types,
+            &mut interner,
+            &src_path,
+            &src_text,
+            roots,
+        )
+        .map_err(|(diag, home)| PipelineError::Lower(diag, home))?
     };
     // The IPE-L0147 widget-placement gate rides the same admission, so every
     // consumer refuses a browser custom element in a program that links no

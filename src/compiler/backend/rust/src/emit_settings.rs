@@ -1150,13 +1150,32 @@ mod tests {
                 &mut ipe_intern::Interner::new(),
                 "Main",
                 &[("Main", "main", page()), ("Cli", "main", Expr::Unit)],
-                Some(1),
+                Some(0),
                 false,
             );
             assert_eq!(
                 frame_origins_of(&beside_cli, &listed),
                 Ok(&listed.frame_origins)
             );
+        }
+
+        /// A lowered entry whose home is not its module is no entry: the
+        /// judge never re-selects another function by its name.
+        #[test]
+        fn a_foreign_lowered_entry_is_no_entry() {
+            let page = || call(KernelFn::WebApp, vec![Expr::Unit]);
+            let foreign = linked_in(
+                &mut ipe_intern::Interner::new(),
+                "Main",
+                &[("Main", "main", page()), ("Cli", "main", Expr::Unit)],
+                Some(1),
+                false,
+            );
+            assert_eq!(crate::kernel_walk::program_entry(&foreign), None);
+            assert!(matches!(
+                frame_origins_of(&foreign, &listed()),
+                Err(FrameListRefused::NoWebLeaf { .. })
+            ));
         }
     }
 }

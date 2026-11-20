@@ -18,6 +18,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ipe_canon::ast as canon;
+use ipe_canon::reach::Roots;
 use ipe_diagnostics::{
     CalleeDemand, DResult, Diagnostic, Feature, GenericAppEntryReach, InterceptContext, Located,
     LowerError, MainRetName, NameError, Span, StoreEqAccessorDefect, StoreSelectProjectionDefect,
@@ -16948,7 +16949,7 @@ impl<'a> Lowerer<'a> {
     /// the one site that attaches a non-empty home.
     #[allow(clippy::similar_names)] // `uses_ui` / `uses_tui_shape` are intentionally similar
     #[allow(clippy::too_many_lines)] // the module-assembly tail is one linear pass
-    pub fn run(mut self) -> Result<Program, (Diagnostic, Vec<Symbol>)> {
+    pub fn run(mut self, roots: Roots) -> Result<Program, (Diagnostic, Vec<Symbol>)> {
         let mut types_ir: Vec<TypeDef> = Vec::with_capacity(self.m.unions.len());
         for u in &self.m.unions {
             // `Ipe.Cache`'s opaque `type Cache k v = Cache Int` is backed
@@ -17016,6 +17017,10 @@ impl<'a> Lowerer<'a> {
         self.enum_derivable = ipe_ir::enum_derivable_fixpoint(self.interner, &self.enum_payloads);
 
         let mut funcs = Vec::with_capacity(self.m.defs.len());
+        // The program entry is the def `roots` names — the demanded module's
+        // own `main`, chosen by home by the one selector canon's entry
+        // closure shares — never the last def spelled `main`.
+        let entry_def = roots.entry_def(self.m, self.interner);
         let mut entry = None;
         // The `main` def's name span, for a source-anchored entry-admissibility
         // diagnostic (`IPE-L0136`). Captured from the canonical def alongside the
@@ -17080,7 +17085,7 @@ impl<'a> Lowerer<'a> {
             refuse_select_to_edges(std::slice::from_ref(&func), &select_to_ids, def.name().span)
                 .map_err(|d| (d, def.home().to_vec()))?;
             callee_instances.insert(func.id, self.callee_instances.take());
-            if self.interner.resolve(func.name) == Some(ipe_canon::reach::ENTRY_NAME) {
+            if entry_def == Some(idx) {
                 entry = Some(func.id);
                 entry_span = Some(def.name().span);
             }
@@ -17155,22 +17160,25 @@ impl<'a> Lowerer<'a> {
         // valid (a reference INTO a pruned function can only come from another
         // pruned — unreachable — function).
         //
-        // Pruning is the EMITTED-BINARY model: it is applied only for a program
-        // whose entry is the demanded entry module itself (a real `main` whose
-        // home is the module being lowered). When several root modules are merged
-        // and lowered with a DIFFERENT demanded entry — the package-capability
-        // audit lowers every sibling this way, and the merged `main` is not the
-        // demanded module — pruning from that unrelated `main` would drop a
-        // sibling's exposed effect (a `Db`/`Http`/… capability reachable only
-        // from an exposed-but-locally-uncalled function). The audit's honest
-        // root set is the whole merged API, so in that case every function is
-        // kept — the fail-closed direction (never under-report a capability).
-        let prune_dead = entry.is_some_and(|e| {
-            funcs
-                .iter()
-                .find(|f| f.id == e)
-                .is_some_and(|main_fn| main_fn.home == ModPath(self.m.name.clone()))
-        });
+        // Pruning is the EMITTED-BINARY model: it is applied exactly when the
+        // roots name an entry (`Roots::Entry` over a module with its own
+        // `main`). The package-capability audit lowers under
+        // `Roots::WholeApi`: its honest root set is the whole merged API, so
+        // every function is kept — the fail-closed direction (never
+        // under-report a capability reachable only from an exposed but
+        // locally uncalled function).
+        let prune_dead = entry.is_some();
+        if let Some(main_fn) = entry.and_then(|e| funcs.iter().find(|f| f.id == e))
+            && main_fn.home != ModPath(self.m.name.clone())
+        {
+            return Err((
+                bug(
+                    "ipe_lower::Lowerer::run::entry_home",
+                    "the selected program entry is not the demanded module's own `main`",
+                ),
+                self.m.name.clone(),
+            ));
+        }
         if prune_dead {
             let reachable = reachable_func_ids(&funcs, entry, &export_roots);
             funcs.retain(|f| reachable.contains(&f.id));
@@ -17183,10 +17191,9 @@ impl<'a> Lowerer<'a> {
         // whose type has no run form (an `Int`, a `String`, a function, …)
         // would ship a crate that cannot build — the cardinal SEAL breach. Reject
         // it here, before emission, with a friendly teaching diagnostic. Applied
-        // only when this is the real demanded entry (`prune_dead` — `main`'s home
-        // is the module being built): the package-capability audit lowers sibling
-        // modules under a merged `main` that is not the demanded entry, and must
-        // not be gated on its shape.
+        // whenever the roots name an entry, whatever other program's `main` is
+        // linked beside it; the whole-API audit runs no program and is not
+        // gated on any `main`'s shape.
         if prune_dead
             && let Some(main_fn) = entry.and_then(|e| funcs.iter().find(|f| f.id == e))
             && (!main_fn.params.is_empty() || !main_ret_is_runnable_entry(&main_fn.ret))

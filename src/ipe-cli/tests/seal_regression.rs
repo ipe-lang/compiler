@@ -780,3 +780,68 @@ fn accessor_applied_to_a_local_named_like_its_param_compiles() {
     );
     assert_accepted("accessor_param_named_local", &src, "7\n");
 }
+
+// ===========================================================================
+// Program entry selection — the entry is the demanded module's own `main`.
+// ===========================================================================
+
+/// A web page `Main`, built beside a sibling CLI program.
+const WEB_PAGE_MAIN: &str = "module Main exposing (main)\n\n\
+import Ipe.Tea.Web as Web\nimport Ipe.Ui as Ui\nimport Ipe.Tea.Web.Cmd as Cmd\n\
+import Ipe.Tea.Web.Sub as Sub\nimport Ipe.String as String\n\n\
+type Msg = Noop\n\ntype alias Model = { count : Int }\n\n\
+init : WebReq -> ( Model, Cmd.Cmd Msg )\ninit _req =\n    ( { count = 0 }, Cmd.none )\n\n\
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )\nupdate msg model =\n    case msg of\n        \
+Noop ->\n            ( model, Cmd.none )\n\n\
+view : Model -> Element Msg\nview model =\n    Ui.column [] [ Ui.text (String.fromInt model.count) ]\n\n\
+subscriptions : Model -> Sub.Sub Msg\nsubscriptions _model =\n    Sub.none\n\n\
+main =\n    Web.tea\n        { init = init, update = update, view = view, subscriptions = subscriptions\n        \
+, routes = [], notFound = Noop\n        }\n";
+
+/// The sibling CLI program of [`WEB_PAGE_MAIN`], with its own task `main`.
+const CLI_TASK_MAIN: &str = "module Cli exposing (main)\n\nimport Ipe.Io as Io\n\n\
+main : Task ()\nmain =\n    Io.println \"cli\"\n";
+
+/// A web-first two-program project builds its web entry.
+///
+/// The run form and the `ipe_main` call both name `Main.main`, never the CLI
+/// program's `main` that links last, so the crate drives
+/// `run_blocking_entry(ipe_main)` and, under `IPE_E2E`, `cargo build`s.
+#[test]
+fn a_web_first_two_program_project_builds_its_web_entry() {
+    let name = "web_first_two_program";
+    let tree = ipe::project_root::SourceTree::new()
+        .field(
+            "programs = [ { name = \"web\", entry = \"Main.ipe\" }, \
+             { name = \"cli\", entry = \"Cli.ipe\" } ]",
+        )
+        .module("Main", WEB_PAGE_MAIN)
+        .module("Cli", CLI_TASK_MAIN);
+    let fixture = ipe::RootFixture::from_tree(&tree);
+    assert!(
+        fixture.is_ok(),
+        "{name}: scratch fixture setup failed: {:?}",
+        fixture.as_ref().err()
+    );
+    let Ok(fixture) = fixture else {
+        return;
+    };
+    let out = out_dir(name);
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let built = ipe::build_fixture(&fixture, &out, &runtime).map(drop);
+    assert!(built.is_ok(), "{name}: ipe refused the project: {built:?}");
+    let main_rs = std::fs::read_to_string(out.join("src").join("main.rs")).unwrap_or_default();
+    assert!(
+        main_rs.contains("match run_blocking_entry(ipe_main) {")
+            && !main_rs.contains("match block_on_entry(ipe_main) {"),
+        "{name}: the web entry must run through `run_blocking_entry`:\n{main_rs}"
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let cargo = e2e_support::build_rust_binary(name, &out).map(drop);
+    assert!(
+        cargo.is_ok(),
+        "{name}: ipe accepted (exit 0) but the emitted crate FAILED to build, a SEAL break: {cargo:?}"
+    );
+}

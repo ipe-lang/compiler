@@ -3934,9 +3934,13 @@ const fn refusal_rank(provenance: project::ModuleProvenance) -> u8 {
     }
 }
 
-/// Lower one package module as its own entry and infer its capabilities.
+/// Lower one package module and infer its capabilities.
 ///
-/// A lowering failure is a refusal framed against the module that owns it; an
+/// The program entry (`Main`) is lowered as the program a build compiles
+/// ([`ipe_db::lower_program`], the memo the build's emit reads); every other
+/// module is lowered as a whole API ([`ipe_db::lower_package_api`]), so an
+/// exposed function its own `main`, if any, never calls still discloses its
+/// capabilities. A lowering failure is a refusal framed against the module that owns it; an
 /// entry with no source file in the root is a refusal too, never a skip.
 fn infer_entry(
     db: &ipe_db::IpeDatabase,
@@ -3961,7 +3965,16 @@ fn infer_entry(
             }),
         });
     };
-    match ipe_db::lower_program(db, source_root, entry_file) {
+    let lowered = match module.provenance() {
+        project::ModuleProvenance::User(project::EntryRole::Main) => {
+            ipe_db::lower_program(db, source_root, entry_file)
+        }
+        project::ModuleProvenance::User(project::EntryRole::Library)
+        | project::ModuleProvenance::EmbeddedStdlib => {
+            ipe_db::lower_package_api(db, source_root, entry_file)
+        }
+    };
+    match lowered {
         Ok(program) => Ok(package_reached_capabilities(
             db,
             source_root,

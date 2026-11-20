@@ -22,7 +22,7 @@ use ipe_intern::{Interner, Symbol};
 use ipe_kernels::Target;
 
 use crate::ast::Module;
-use crate::reach::{EntryClosure, def_body, module_display_name};
+use crate::reach::{EntryClosure, Roots, def_body, module_display_name};
 use crate::target_gate::{Denied, first_denied};
 
 /// Reject a wasm client entry whose closure reaches a server-only def in
@@ -42,7 +42,7 @@ pub fn check_client_reachability(
     entry: &[Symbol],
     interner: &Interner,
 ) -> DResult<()> {
-    let closure = EntryClosure::of(linked, interner);
+    let closure = EntryClosure::of(linked, interner, Roots::Entry);
     for i in closure.breadth_first() {
         let Some(def) = linked.defs.get(i) else {
             continue;
