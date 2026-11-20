@@ -516,7 +516,7 @@ pub fn run_audit_over(
     );
 
     match options.format {
-        OutputFormat::Json => emit_audit_json(&name, &version, outcome),
+        OutputFormat::Json => emit_audit_json(name.as_str(), &version, outcome),
         // `--plain` and the default share the human renderer; the audit verdict
         // has no separate flush-left line form, so `--plain` is the human report
         // (the format parse already rejected `--plain --json` together).
@@ -525,7 +525,7 @@ pub fn run_audit_over(
             crate::screen::Screen::new(crate::screen::Stream::Stdout)
                 .line(
                     crate::screen::Tone::Text,
-                    &passing_summary(&name, &version, &audited.tier2, &audited.disclosure),
+                    &passing_summary(name.as_str(), &version, &audited.tier2, &audited.disclosure),
                 )
                 .emit();
             Ok(audited)
@@ -620,7 +620,7 @@ fn reprove_tree(snapshot: &PackageSnapshot) -> Result<Sha256Hex, CliError> {
         Ok(judged)
     } else {
         Err(CliError::HashMismatch {
-            package: snapshot.manifest().name.clone(),
+            package: snapshot.manifest().name.to_string(),
             expected: judged.as_str().to_owned(),
             actual: now.as_str().to_owned(),
         })
