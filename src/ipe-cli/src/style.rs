@@ -269,7 +269,7 @@ pub fn use_color(stream: &impl IsTerminal) -> bool {
 ///
 /// A leading blank line, then `Ipê language - vN.N.N - <repo>` in the gutter,
 /// then a trailing blank line so the banner is set off from whatever chatter
-/// follows it — the name light yellow, the version light green, the URL dim
+/// follows it — the name soft yellow, the version light green, the URL dim
 /// gray. Never shown under `--plain`, `--json`, or `--quiet`.
 ///
 /// Coloured when `use_color` is true; plain otherwise. [`crate::screen`] owns
@@ -280,7 +280,7 @@ pub fn command_header(use_color: bool) -> String {
     let p = Palette::select(use_color);
     format!(
         "\n{GUTTER}{y}Ipê language{r} - {g}v{version}{r} - {d}{REPO_URL}{r}\n\n",
-        y = p.bright_yellow,
+        y = p.yellow,
         g = p.green,
         d = p.dim,
         r = p.reset,
@@ -416,8 +416,12 @@ mod tests {
         let c = &Palette::COLOR;
         let version = env!("CARGO_PKG_VERSION");
         assert!(
-            h.contains(&format!("{}Ipê language{}", c.bright_yellow, c.reset)),
-            "name is light yellow: {h:?}"
+            h.contains(&format!("{}Ipê language{}", c.yellow, c.reset)),
+            "name is soft yellow: {h:?}"
+        );
+        assert!(
+            !h.contains(&format!("{}Ipê language{}", c.bright_yellow, c.reset)),
+            "name must not be the strong bright_yellow: {h:?}"
         );
         assert!(
             h.contains(&format!("{}v{version}{}", c.green, c.reset)),
