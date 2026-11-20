@@ -39,6 +39,7 @@
  */
 
 import { test, expect } from "@playwright/test";
+import { untilRoutesLive } from "./routes-live.mjs";
 
 const PORT = process.env.IPE_GEO_CLIPBOARD_PORT ?? "18080";
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -385,6 +386,7 @@ test("render history: patches in an event answer never apply", async ({ page }) 
       });
     },
   );
+  await untilRoutesLive(page);
   await page.locator("#show").click();
   await expect.poll(() => answered, { timeout: 10000 }).toBeGreaterThan(0);
   await page.waitForTimeout(1500);
@@ -410,6 +412,7 @@ test("navigation: a superseded navigation's older answer moves neither the DOM n
       return route.fulfill(navAnswer(later, '<div id="e2e-second">later render</div>'));
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "first", "/e2e-first");
   await addNavLink(page, "second", "/e2e-second");
   await page.locator("#e2e-link-first").click();
@@ -436,6 +439,7 @@ test("navigation: a popstate whose fetch fails loads the popped entry", async ({
       return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "away", "/e2e-away");
   await page.locator("#e2e-link-away").click();
   await page.waitForSelector("#e2e-away", { timeout: 10000 });
@@ -481,6 +485,7 @@ test("navigation: a popstate answer applied after a link's answer names the URL"
       return route.fulfill(navAnswer(at(2), '<div id="e2e-home">home</div>'));
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "away", "/e2e-away");
   await page.locator("#e2e-link-away").click();
   await page.waitForSelector("#e2e-away", { timeout: 10000 });
@@ -523,6 +528,7 @@ test("navigation: an answer older than one already applied leaves the URL on the
       answered += 1;
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "first", "/e2e-first");
   await addNavLink(page, "second", "/e2e-second");
   await page.locator("#e2e-link-first").click();
@@ -556,6 +562,7 @@ test("navigation: a render's route is one history entry, and Back leaves it", as
       return route.fulfill(navAnswer(at(2), '<div id="e2e-home">home</div>'));
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "path", "/e2e-path");
   await page.locator("#e2e-link-path").click();
   await page.waitForSelector("#e2e-path", { timeout: 10000 });
@@ -586,6 +593,7 @@ test("navigation: a popstate answer of no history loads the popped entry", async
       return route.fulfill(navAnswer(later, '<div id="e2e-away">away</div>'));
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "away", "/e2e-away");
   await page.locator("#e2e-link-away").click();
   await page.waitForSelector("#e2e-away", { timeout: 10000 });
@@ -629,6 +637,7 @@ test("navigation: a popstate whose fetch fails after a link's answer moved the U
       return route.abort();
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "away", "/e2e-away");
   await page.locator("#e2e-link-away").click();
   await page.waitForSelector("#e2e-away", { timeout: 10000 });
@@ -675,6 +684,7 @@ test("navigation: a popstate whose fetch fails after a later link's answer loads
       return route.abort();
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "away", "/e2e-away");
   await addNavLink(page, "link", "/e2e-link");
   await page.locator("#e2e-link-away").click();
@@ -734,6 +744,7 @@ async function holdPendingNav(page, answer, body) {
       return route.fulfill(body()).catch(() => {});
     },
   );
+  await untilRoutesLive(page);
 }
 
 test("render history: a document gone stale while a link's answer is pending loads the link", async ({
@@ -788,6 +799,7 @@ test("render history: a document gone stale while a link to its own fragment is 
       return route.fulfill({ status: 503, body: "" }).catch(() => {});
     },
   );
+  await untilRoutesLive(page);
   await addNavLink(page, "frag", "/#e2e-frag");
   const entries = await page.evaluate(() => {
     window.__e2eOldDocument = true;
