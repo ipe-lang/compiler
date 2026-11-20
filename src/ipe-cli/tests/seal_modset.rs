@@ -806,7 +806,8 @@ fn server_http_method_builds() {
     );
 }
 
-/// The same server cargo-builds under the vendored emit model.
+/// The same server cargo-builds under the vendored emit model and links no
+/// outbound client there either.
 #[test]
 fn server_http_method_vendored_builds() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
@@ -814,6 +815,11 @@ fn server_http_method_vendored_builds() {
     }
     emit_and_build_vendored("server_http_method_vendored", SERVER_HTTP_METHOD)
         .expect("a server naming HttpMethod must cargo-build under the vendored emit model");
+    let manifest = emitted_manifest("server_http_method_vendored");
+    assert!(
+        !manifest.contains("reqwest"),
+        "a vendored server naming HttpMethod must link no outbound client;\ngot:\n{manifest}"
+    );
 }
 
 /// A web `Model` holding a `HttpMethod` cargo-builds in the dependency model:

@@ -1916,27 +1916,38 @@ fn links_web_runtime_is_the_widget_registration_target() {
 
 // ── each type's feature row against its defining module's gate ──────────────
 
-/// Every leaf whose feature row disagrees with its defining module's gate.
+/// Every disagreement between a leaf's feature row and its defining module's
+/// gate, as the exact `(leaf, reason)` pair [`row_disagreements`] reports.
 ///
 /// Each entry is an open defect, pinned so a new disagreement or a closed one
-/// fails [`every_type_feature_row_matches_its_module_gate`]. `Db`, `Principal`,
-/// the shape apps, `Cmd`/`Sub` and the terminal `Ui` constructors render into a
-/// gated module while their row requires nothing; `WebReq` requires `web`
-/// while its `dom` module is ungated.
-const ROW_GATE_DISAGREEMENTS: &[&str] = &[
-    "CliApp",
-    "CliAttribute",
-    "CliLines",
-    "Cells",
-    "Cmd",
-    "Db",
-    "Principal",
-    "Sub",
-    "TuiApp",
-    "TuiAttribute",
-    "WebApp",
-    "WebReq",
-    "WorkerApp",
+/// fails [`every_type_feature_row_matches_its_module_gate`]. An entry names the
+/// reason as well as the leaf, so a second disagreement on an already pinned
+/// leaf is new too. `Db`, `Principal`, the shape apps, `Cmd`/`Sub` and the
+/// terminal `Ui` constructors render into a gated module while their row
+/// requires nothing; `WebReq` requires `web` while its `dom` module is ungated.
+const ROW_GATE_DISAGREEMENTS: &[(&str, &str)] = &[
+    ("Cells", "the row requires nothing, yet `tui` is gated"),
+    ("CliApp", "the row requires nothing, yet `tea` is gated"),
+    (
+        "CliAttribute",
+        "the row requires nothing, yet `tui` is gated",
+    ),
+    ("CliLines", "the row requires nothing, yet `tui` is gated"),
+    ("Cmd", "the row requires nothing, yet `tea` is gated"),
+    ("Db", "the row requires nothing, yet `db` is gated"),
+    (
+        "Principal",
+        "the row requires nothing, yet `principal` is gated",
+    ),
+    ("Sub", "the row requires nothing, yet `tea` is gated"),
+    ("TuiApp", "the row requires nothing, yet `tea` is gated"),
+    (
+        "TuiAttribute",
+        "the row requires nothing, yet `tui` is gated",
+    ),
+    ("WebApp", "the row requires nothing, yet `tea` is gated"),
+    ("WebReq", "`dom` is ungated, yet the row requires `web`"),
+    ("WorkerApp", "the row requires nothing, yet `tea` is gated"),
 ];
 
 /// One sample per leaf `IrType` whose node renders its own runtime type.
@@ -2101,8 +2112,8 @@ fn pinned_module(path: &str) -> Option<&str> {
 ///
 /// A row naming a feature must compile the module under that feature's closure
 /// and must not name a module that compiles with no feature at all; a row
-/// naming none must name an ungated module (or a std type). A gated row whose
-/// leaf has no pinned type disagrees too.
+/// naming none must name an ungated module (or a std type). A leaf with no
+/// pinned type disagrees too, whatever its row: its module is unknown.
 fn row_disagreements(
     rows: &[(&'static str, Option<RuntimeFeatureId>)],
     pins: &[(&str, &str)],
@@ -2117,7 +2128,7 @@ fn row_disagreements(
             .filter(|(name, _)| *name == leaf)
             .map(|(_, path)| pinned_module(path))
             .collect();
-        if modules.is_empty() && row.is_some() {
+        if modules.is_empty() {
             found.push((leaf, format!("row {row:?} has no pinned runtime type")));
         }
         for module in modules.into_iter().flatten() {
@@ -2182,8 +2193,11 @@ fn every_type_feature_row_matches_its_module_gate() {
     }
 
     let found = row_disagreements(&rows, &pins, &gates, &table);
-    let disagreeing: BTreeSet<&str> = found.iter().map(|(leaf, _)| *leaf).collect();
-    let pinned: BTreeSet<&str> = ROW_GATE_DISAGREEMENTS.iter().copied().collect();
+    let disagreeing: BTreeSet<(&str, &str)> = found
+        .iter()
+        .map(|(leaf, reason)| (*leaf, reason.as_str()))
+        .collect();
+    let pinned: BTreeSet<(&str, &str)> = ROW_GATE_DISAGREEMENTS.iter().copied().collect();
     assert_eq!(
         disagreeing, pinned,
         "feature rows disagree with their module gates: {found:#?}"
@@ -2206,4 +2220,40 @@ fn every_type_feature_row_matches_its_module_gate() {
             .any(|(leaf, _)| *leaf == "HttpMethod"),
         "an `HttpMethod` row requiring `http_client` must disagree with its ungated module"
     );
+
+    // A second disagreement on an already pinned leaf is new: `Db` keeps
+    // disagreeing, for another reason, so only the exact pair catches it.
+    let reasons_moved = row_disagreements(
+        &with_row(&rows, "Db", Some(RuntimeFeatureId::Csv)),
+        &pins,
+        &gates,
+        &table,
+    );
+    let leaves = |found: &[(&'static str, String)]| -> BTreeSet<&'static str> {
+        found.iter().map(|(leaf, _)| *leaf).collect()
+    };
+    assert_eq!(
+        leaves(&reasons_moved),
+        leaves(&found),
+        "the `Db` mutation must keep the same leaves disagreeing"
+    );
+    let moved: BTreeSet<(&str, &str)> = reasons_moved
+        .iter()
+        .map(|(leaf, reason)| (*leaf, reason.as_str()))
+        .collect();
+    assert_ne!(
+        moved, pinned,
+        "a new reason on a pinned leaf must not hide behind the leaf's pin"
+    );
+}
+
+/// `rows` with `leaf`'s feature row replaced by `row`.
+fn with_row(
+    rows: &[(&'static str, Option<RuntimeFeatureId>)],
+    leaf: &str,
+    row: Option<RuntimeFeatureId>,
+) -> Vec<(&'static str, Option<RuntimeFeatureId>)> {
+    rows.iter()
+        .map(|&(name, old)| (name, if name == leaf { row } else { old }))
+        .collect()
 }
