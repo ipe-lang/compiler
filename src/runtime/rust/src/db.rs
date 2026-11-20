@@ -12765,36 +12765,39 @@ mod tests {
                 .expect("seed row");
             let reads = std::sync::Arc::new(AtomicUsize::new(0));
             let bump = |db: Db, reads: std::sync::Arc<AtomicUsize>| {
-                tokio::spawn(db_with_transaction::<String, i64>(db, move |c| {
-                    Box::pin(async move {
-                        let row = fetch_one_routed(
-                            &c,
-                            sqlx::query("SELECT done FROM todos WHERE id = 1"),
-                        )
-                        .await;
-                        let seen: i64 = match row.and_then(|row| row.try_get(0_usize)) {
-                            Ok(n) => n,
-                            Err(e) => return IpeResult::Err(e.to_string()),
-                        };
-                        reads.fetch_add(1, Ordering::SeqCst);
-                        // Hold the read open until the other body has read too (the
-                        // deferred race), or a short wait passes (the second writer
-                        // is parked at its begin).
-                        let deadline =
-                            tokio::time::Instant::now() + std::time::Duration::from_millis(300);
-                        while reads.load(Ordering::SeqCst) < 2
-                            && tokio::time::Instant::now() < deadline
-                        {
-                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-                        }
-                        let write =
-                            sqlx::query("UPDATE todos SET done = ? WHERE id = 1").bind(seen + 1);
-                        match exec_routed(&c, write).await {
-                            Ok(_) => IpeResult::Ok(seen + 1),
-                            Err(e) => IpeResult::Err(e.to_string()),
-                        }
-                    })
-                }))
+                crate::threads::raw_for_tests::spawn(db_with_transaction::<String, i64>(
+                    db,
+                    move |c| {
+                        Box::pin(async move {
+                            let row = fetch_one_routed(
+                                &c,
+                                sqlx::query("SELECT done FROM todos WHERE id = 1"),
+                            )
+                            .await;
+                            let seen: i64 = match row.and_then(|row| row.try_get(0_usize)) {
+                                Ok(n) => n,
+                                Err(e) => return IpeResult::Err(e.to_string()),
+                            };
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            // Hold the read open until the other body has read too (the
+                            // deferred race), or a short wait passes (the second writer
+                            // is parked at its begin).
+                            let deadline =
+                                tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+                            while reads.load(Ordering::SeqCst) < 2
+                                && tokio::time::Instant::now() < deadline
+                            {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                            let write = sqlx::query("UPDATE todos SET done = ? WHERE id = 1")
+                                .bind(seen + 1);
+                            match exec_routed(&c, write).await {
+                                Ok(_) => IpeResult::Ok(seen + 1),
+                                Err(e) => IpeResult::Err(e.to_string()),
+                            }
+                        })
+                    },
+                ))
             };
             let first = bump(db.clone(), reads.clone());
             let second = bump(db.clone(), reads.clone());
@@ -13018,7 +13021,7 @@ mod tests {
             let started = std::sync::Arc::new(tokio::sync::Notify::new());
             let started2 = started.clone();
             let dbc = db.clone();
-            let handle = tokio::spawn(async move {
+            let handle = crate::threads::raw_for_tests::spawn(async move {
                 let _: IpeResult<String, i64> = db_with_transaction(dbc, move |c| {
                     let started2 = started2.clone();
                     Box::pin(async move {
@@ -15827,7 +15830,10 @@ mod tests {
             );
             armed.store(true, std::sync::atomic::Ordering::SeqCst);
             let cut_pool = pool.clone();
-            let cut = tokio::spawn(async move { checkout(&cut_pool).await.map(drop) });
+            let cut =
+                crate::threads::raw_for_tests::spawn(
+                    async move { checkout(&cut_pool).await.map(drop) },
+                );
             in_hook.notified().await;
             cut.abort();
             let cut = cut.await;

@@ -260,7 +260,9 @@ mod tests {
             match admit(body, &cmds) {
                 Admit::Run(cmd) => {
                     let tx = tx.clone();
-                    tasks.push(tokio::spawn(async move { cmd.finish(&tx).await.is_ok() }));
+                    tasks.push(crate::threads::raw_for_tests::spawn(async move {
+                        cmd.finish(&tx).await.is_ok()
+                    }));
                 }
                 Admit::Refused(msg) => refused.push(msg),
             }
@@ -389,7 +391,8 @@ mod tests {
         let Some(Admit::Run(cmd)) = admitted else {
             return;
         };
-        let running = tokio::spawn(async move { cmd.finish(&tx).await.ok() });
+        let running =
+            crate::threads::raw_for_tests::spawn(async move { cmd.finish(&tx).await.ok() });
         until_started(&started, 1).await;
         assert_eq!(started.load(Ordering::SeqCst), 1, "the body runs");
         let _settled = armed.cancel_work().await;
@@ -495,7 +498,9 @@ mod tests {
                 })
                 .map(|cmd| {
                     let tx = tx.clone();
-                    tokio::spawn(async move { cmd.finish(&tx).await.is_err() })
+                    crate::threads::raw_for_tests::spawn(
+                        async move { cmd.finish(&tx).await.is_err() },
+                    )
                 })
                 .collect();
             assert_eq!(tasks.len(), 4);
@@ -524,7 +529,7 @@ mod tests {
             for body in (0..4).filter_map(|_| gated(&restarted, &never)) {
                 if let Admit::Run(cmd) = admit(body, &cmds) {
                     let tx = tx.clone();
-                    tokio::spawn(async move {
+                    crate::threads::raw_for_tests::spawn(async move {
                         let _ = cmd.finish(&tx).await;
                     });
                 }

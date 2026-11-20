@@ -5618,7 +5618,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         // Answers the connection setup and `PING`, then closes on the next command.
-        let server = tokio::spawn(async move {
+        let server = crate::threads::raw_for_tests::spawn(async move {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };

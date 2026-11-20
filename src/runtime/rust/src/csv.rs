@@ -600,7 +600,7 @@ mod stream_from_file_spawn_blocking_tests {
         let ticks = rt.block_on(async move {
             let counter = Arc::new(AtomicU64::new(0));
             let counter2 = counter.clone();
-            let ticker = tokio::spawn(async move {
+            let ticker = crate::threads::raw_for_tests::spawn(async move {
                 loop {
                     counter2.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;

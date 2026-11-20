@@ -4783,10 +4783,12 @@ pub(crate) mod exit_signals {
     /// The relay thread: register the listeners on its own runtime, report
     /// them, then decide every request.
     fn run_relay(listen: Listen, ready: &std::sync::mpsc::SyncSender<Result<(), RelayRefused>>) {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-        else {
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        // Unix signal listeners register with the IO driver; Windows console
+        // events need no driver, and tokio builds none there without `net`.
+        #[cfg(unix)]
+        builder.enable_io();
+        let Ok(runtime) = builder.build() else {
             let _ = ready.send(Err(RelayRefused::Runtime));
             return;
         };
@@ -4874,22 +4876,28 @@ pub(crate) mod exit_signals {
     }
 
     /// Forward each delivery of `listener` into `tx` as `signal`, on its own
-    /// task; a full queue drops the copy.
+    /// service task; a full queue drops the copy. Yields
+    /// `Err(RelayRefused::Runtime)` when the task cannot start.
     macro_rules! forward {
         ($listener:expr, $tx:expr, $signal:expr) => {{
             let mut listener = $listener;
             let tx = $tx.clone();
             let signal = $signal;
-            tokio::spawn(async move {
-                while listener.recv().await.is_some() {
-                    if matches!(
-                        tx.try_send(signal),
-                        Err(mpsc::error::TrySendError::Closed(_))
-                    ) {
-                        return;
+            crate::threads::spawn_service(
+                "stop-signal forward",
+                "forwards OS stop signals into the relay queue",
+                async move {
+                    while listener.recv().await.is_some() {
+                        if matches!(
+                            tx.try_send(signal),
+                            Err(mpsc::error::TrySendError::Closed(_))
+                        ) {
+                            return;
+                        }
                     }
-                }
-            });
+                },
+            )
+            .map_err(|_| RelayRefused::Runtime)
         }};
     }
 
@@ -4919,10 +4927,11 @@ pub(crate) mod exit_signals {
             if !takes(which) || ignored.contains(kind.as_raw_value()) {
                 continue;
             }
-            match signal(kind) {
-                Ok(listener) => forward!(listener, tx, which),
-                Err(e) if refused.is_none() => refused = Some(RelayRefused::Listen(e.kind())),
-                Err(_) => {}
+            let forwarded = signal(kind)
+                .map_err(|e| RelayRefused::Listen(e.kind()))
+                .and_then(|listener| forward!(listener, tx, which));
+            if let Err(why) = forwarded {
+                refused.get_or_insert(why);
             }
         }
         refused.map_or(Ok(()), Err)
@@ -4939,20 +4948,20 @@ pub(crate) mod exit_signals {
             windows::ctrl_c().map_err(refused)?,
             tx,
             ConsoleEvent::CtrlC.signal()
-        );
+        )?;
         forward!(
             windows::ctrl_break().map_err(refused)?,
             tx,
             ConsoleEvent::CtrlBreak.signal()
-        );
+        )?;
         if let Ok(close) = windows::ctrl_close() {
-            forward!(close, tx, ConsoleEvent::Close.signal());
+            forward!(close, tx, ConsoleEvent::Close.signal())?;
         }
         if let Ok(logoff) = windows::ctrl_logoff() {
-            forward!(logoff, tx, ConsoleEvent::Logoff.signal());
+            forward!(logoff, tx, ConsoleEvent::Logoff.signal())?;
         }
         if let Ok(shutdown) = windows::ctrl_shutdown() {
-            forward!(shutdown, tx, ConsoleEvent::Shutdown.signal());
+            forward!(shutdown, tx, ConsoleEvent::Shutdown.signal())?;
         }
         Ok(())
     }
@@ -8632,7 +8641,7 @@ mod process_run_spawn_blocking_tests {
         let ticks = rt.block_on(async move {
             let counter = Arc::new(AtomicU64::new(0));
             let counter2 = counter.clone();
-            let ticker = tokio::spawn(async move {
+            let ticker = crate::threads::raw_for_tests::spawn(async move {
                 loop {
                     counter2.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;
@@ -8717,7 +8726,7 @@ mod system_load_env_spawn_blocking_tests {
         let ticks = rt.block_on(async move {
             let counter = Arc::new(AtomicU64::new(0));
             let counter2 = counter.clone();
-            let ticker = tokio::spawn(async move {
+            let ticker = crate::threads::raw_for_tests::spawn(async move {
                 loop {
                     counter2.fetch_add(1, Ordering::Relaxed);
                     tokio::task::yield_now().await;

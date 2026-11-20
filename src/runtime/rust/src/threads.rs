@@ -171,7 +171,7 @@ mod blocking {
     ///
     /// No runtime is running on the calling thread, or the pool could not
     /// start a thread for `f`.
-    #[allow(clippy::disallowed_methods)] // the one blocking-pool start; its thread-start panic is caught here
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)] // the one blocking-pool start; its thread-start panic is caught here
     pub fn offload_blocking<F, R>(
         role: &'static str,
         f: F,
@@ -320,6 +320,11 @@ mod tasks {
         }
     }
 
+    /// The bare handle a [`TaskHandle`] owns; it leaves this module only
+    /// behind a typed join.
+    #[allow(clippy::disallowed_types)] // the funnel's own handle
+    type RawHandle<T> = tokio::task::JoinHandle<T>;
+
     /// Who answers for a detached task once nothing joins it.
     #[derive(Debug)]
     pub enum Detached {
@@ -335,7 +340,7 @@ mod tasks {
     #[must_use = "a dropped handle aborts its task; join it or detach it"]
     pub struct TaskHandle<T> {
         role: &'static str,
-        handle: tokio::task::JoinHandle<T>,
+        handle: RawHandle<T>,
         guard: AbortOnDrop,
         runtime: tokio::runtime::Handle,
     }
@@ -427,7 +432,7 @@ mod tasks {
     /// Leaves `handle` running unjoined, its end delivered to `owner`.
     fn leave_to<T: Send + 'static>(
         role: &'static str,
-        handle: tokio::task::JoinHandle<T>,
+        handle: RawHandle<T>,
         owner: Detached,
         runtime: &tokio::runtime::Handle,
     ) {
@@ -451,7 +456,7 @@ mod tasks {
     #[must_use = "a dropped shielded join detaches its task to its owner"]
     pub struct ShieldedJoin<T: Send + 'static> {
         role: &'static str,
-        handle: Option<tokio::task::JoinHandle<T>>,
+        handle: Option<RawHandle<T>>,
         if_dropped: Option<Detached>,
         runtime: tokio::runtime::Handle,
     }
@@ -554,18 +559,6 @@ mod tasks {
         Ok(())
     }
 
-    /// Starts `task` in its caller's scopes as a bare tokio handle.
-    ///
-    /// The start of the callers not yet behind [`TaskHandle`]; it panics
-    /// with no runtime running.
-    pub fn spawn_unmigrated<F>(task: F) -> tokio::task::JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        tokio::spawn(crate::task::on_behalf_of_caller(task))
-    }
-
     /// A set of tasks joined in completion order, each join resuming a trip.
     #[allow(clippy::disallowed_types)] // the one `JoinSet`: its joins resume trips
     pub struct IpeJoinSet<T> {
@@ -636,6 +629,8 @@ mod tasks {
             /// The correlation id the payload is logged under.
             reference: String,
         },
+        /// A task the owner's run needed could not start.
+        Refused(ThreadRefused),
     }
 
     impl OwnerEnd {
@@ -650,6 +645,7 @@ mod tasks {
                 Self::Panicked { role, reference } => {
                     crate::IpeError::unexpected(format!("{role}: task panicked (ref {reference})"))
                 }
+                Self::Refused(refused) => crate::IpeError::unavailable(refused.to_string()),
             }
         }
     }
@@ -706,6 +702,11 @@ mod tasks {
                 },
                 Unjoined::Ended(TaskEnded::Cancelled(_)) => return,
             };
+            self.end(end);
+        }
+
+        /// Records `end` for the owner, unless an end is recorded already.
+        pub fn end(&self, end: OwnerEnd) {
             if self.0.end.set(end).is_ok() {
                 self.0.ended.notify_waiters();
             }
@@ -729,14 +730,42 @@ mod tasks {
                 notified.await;
             }
         }
+
+        /// The end a detached task delivered, if one has by now.
+        #[must_use]
+        pub fn recorded(&self) -> Option<OwnerEnd> {
+            self.0.end.get().cloned()
+        }
     }
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub use tasks::{
     Detached, IpeJoinSet, OwnerEnd, ShieldedJoin, TaskEnded, TaskHandle, TaskScope, TripOwner,
-    TripSink, TripSinkTaken, Unjoined, spawn_service, spawn_task, spawn_task_on, spawn_unmigrated,
+    TripSink, TripSinkTaken, Unjoined, spawn_service, spawn_task, spawn_task_on,
 };
+
+/// Raw task starts for tests, which await, abort or race a bare handle.
+///
+/// Test code only: production starts every task through [`spawn_task`].
+#[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
+pub mod raw_for_tests {
+    use std::future::Future;
+
+    /// A bare tokio join handle a test awaits or aborts.
+    #[allow(clippy::disallowed_types)] // tests drive bare handles; production joins `TaskHandle`
+    pub type RawJoin<T> = tokio::task::JoinHandle<T>;
+
+    /// Starts `task` on the running runtime as a bare handle.
+    #[allow(clippy::disallowed_methods)] // tests drive bare handles; production starts through `spawn_task`
+    pub fn spawn<F>(task: F) -> RawJoin<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::spawn(task)
+    }
+}
 
 /// Runs `f` inline: without a blocking pool there is no thread to start.
 ///
@@ -872,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn a_trip_in_blocking_work_resumes_on_the_awaiting_task() {
         use crate::core::{RuntimeTrip, runtime_trip, trip};
-        let awaiting = tokio::spawn(async {
+        let awaiting = crate::threads::raw_for_tests::spawn(async {
             join_blocking("ipe-test-trip", || -> i64 {
                 trip(RuntimeTrip::RecursionLimit)
             })

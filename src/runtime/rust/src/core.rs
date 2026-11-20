@@ -1794,7 +1794,14 @@ pub fn classify_and_log_panic(payload: &(dyn std::any::Any + Send)) -> String {
 /// rest is a fixed literal. A panic message (free-form, may carry secrets / PII /
 /// paths) never reaches this body.
 pub fn panic_500_body(payload: &(dyn std::any::Any + Send)) -> String {
-    let err_id = classify_and_log_panic(payload);
+    internal_error_body(&classify_and_log_panic(payload))
+}
+
+/// The JSON body of a 500 whose fault is already logged under `err_id`.
+///
+/// SECURITY: `err_id` is the only value interpolated.
+#[must_use]
+pub fn internal_error_body(err_id: &str) -> String {
     format!("{{\"error\":\"internal server error\",\"ref\":\"{err_id}\"}}")
 }
 

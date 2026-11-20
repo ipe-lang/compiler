@@ -29,6 +29,12 @@ allow-expect-in-tests = true
 # call tokio's `spawn_blocking` (whose thread-start panic it catches). `tokio` is
 # an optional dependency, so its entries tolerate a build without it.
 #
+# Async work starts only through the `threads` task funnel (`spawn_task`,
+# `spawn_service`, `IpeJoinSet`), so a refused start is typed and a trip or
+# panic reaches its joiner or its run's owner. A raw `tokio::spawn` and its
+# `JoinHandle` are denied everywhere else; test code reaches them through
+# `threads::raw_for_tests`.
+#
 # The process ends only through `system::exit_process`, which runs the pre-exit
 # stages Drop would have run (terminal restore, telemetry exporter flush) before
 # its `std::process::exit`. The one other exit is `system::force_exit`, taken by
@@ -60,6 +66,8 @@ disallowed-methods = [
     { path = "std::thread::Scope::spawn", reason = "panics when the OS refuses a thread; use `std::thread::Builder::spawn_scoped` and route the `io::Error`" },
     { path = "tokio::task::spawn_blocking", reason = "panics when the blocking pool cannot start a thread; use `threads::offload_blocking`", allow-invalid = true },
     { path = "tokio::runtime::Handle::spawn_blocking", reason = "panics when the blocking pool cannot start a thread; use `threads::offload_blocking`", allow-invalid = true },
+    { path = "tokio::spawn", reason = "start async work through `threads::spawn_task` or `threads::spawn_service`, whose start refuses typed and whose trip reaches a joiner or owner", allow-invalid = true },
+    { path = "tokio::task::spawn", reason = "start async work through `threads::spawn_task` or `threads::spawn_service`, whose start refuses typed and whose trip reaches a joiner or owner", allow-invalid = true },
     { path = "tokio::runtime::Handle::spawn", reason = "start async work through `threads::spawn_task`, whose handle aborts on drop and resumes a trip on join", allow-invalid = true },
     { path = "tokio::runtime::Runtime::spawn", reason = "start async work through `threads::spawn_task`, whose handle aborts on drop and resumes a trip on join", allow-invalid = true },
     { path = "tokio::task::spawn_local", reason = "start async work through `threads::spawn_task`, whose handle aborts on drop and resumes a trip on join", allow-invalid = true },
@@ -92,5 +100,6 @@ disallowed-types = [
     { path = "axum::extract::Query", reason = "lenient; read the request query through `server::strict_url_query`", allow-invalid = true },
     { path = "axum::extract::Form", reason = "lenient; decode a form body through `encoding::decode_form_query`", allow-invalid = true },
     { path = "rand_core::OsRng", reason = "panics when the OS source fails; draw entropy through `entropy::fill_entropy`", allow-invalid = true },
+    { path = "tokio::task::JoinHandle", reason = "start async work through `threads::spawn_task` or `threads::spawn_service`, whose start refuses typed and whose trip reaches a joiner or owner", allow-invalid = true },
     { path = "tokio::task::JoinSet", reason = "join a set of tasks through `threads::IpeJoinSet`, whose joins resume a trip", allow-invalid = true },
 ]

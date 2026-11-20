@@ -1123,7 +1123,7 @@ pub mod tests {
     async fn past_the_grace_the_cancel_ends_the_work_still_running() {
         let (armed, _tx) = quiet_owner(Duration::ZERO);
         let mut guard = armed.work_count().guard().expect("one unit fits");
-        let unit = tokio::spawn(async move { guard.cancelled().await });
+        let unit = crate::threads::raw_for_tests::spawn(async move { guard.cancelled().await });
         armed.settle_live().await;
         let started = Instant::now();
         let mut lines = Vec::new();

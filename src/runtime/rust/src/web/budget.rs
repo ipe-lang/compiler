@@ -534,7 +534,7 @@ mod tests {
         let cmds = SessionCmds::with_limits(&process, Cmds::new(4));
         let permit = cmds.try_permit();
         assert!(permit.is_ok());
-        let holder = tokio::spawn(async move {
+        let holder = crate::threads::raw_for_tests::spawn(async move {
             let _permit = permit;
             std::future::pending::<()>().await;
         });
@@ -676,7 +676,7 @@ mod tests {
     async fn a_cancelled_holder_returns_its_bytes() {
         let (process, session) = chain(100, 40);
         let held = session.try_charge(Bytes::new(30));
-        let holder = tokio::spawn(async move {
+        let holder = crate::threads::raw_for_tests::spawn(async move {
             let _held = held;
             std::future::pending::<()>().await;
         });
@@ -720,7 +720,7 @@ mod tests {
             for _ in 0..TASKS {
                 let process = Arc::clone(&process);
                 let barrier = Arc::clone(&barrier);
-                tasks.push(tokio::spawn(async move {
+                tasks.push(crate::threads::raw_for_tests::spawn(async move {
                     let session = SessionBudget::session(&process, Bytes::new(LIMIT));
                     barrier.wait().await;
                     session.try_charge(Bytes::new(CHUNK)).ok()

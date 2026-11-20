@@ -133,9 +133,9 @@ const DENIED_PATHS: &[&str] = &[
 
 /// The paths the runtime `clippy.toml` denies for its other rules (abrupt
 /// failure, a process exit outside its funnel, environment and temp-root
-/// reads, panicking thread starts, an app listener served outside its Host
-/// admission, a random draw outside `entropy::fill_entropy`), which this scan
-/// does not own.
+/// reads, panicking thread starts, a task started outside the task funnel, an
+/// app listener served outside its Host admission, a random draw outside
+/// `entropy::fill_entropy`), which this scan does not own.
 const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "core::option::Option::unwrap_unchecked",
     "core::result::Result::unwrap_unchecked",
@@ -152,6 +152,8 @@ const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "std::thread::Scope::spawn",
     "tokio::task::spawn_blocking",
     "tokio::runtime::Handle::spawn_blocking",
+    "tokio::spawn",
+    "tokio::task::spawn",
     "tokio::runtime::Handle::spawn",
     "tokio::runtime::Runtime::spawn",
     "tokio::task::spawn_local",
@@ -166,6 +168,7 @@ const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "tokio::task::JoinSet::try_join_next",
     "tokio::task::JoinSet::join_next_with_id",
     "tokio::task::JoinSet::join_all",
+    "tokio::task::JoinHandle",
     "tokio::task::JoinSet",
     "axum::serve::serve",
     "getrandom::getrandom",

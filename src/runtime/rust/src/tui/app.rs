@@ -14,12 +14,13 @@
 //! no controlling terminal) is a typed, `Unavailable`-kinded refusal from
 //! `terminal_access::probe()`, checked before raw mode is ever entered.
 
-use super::super::core::{IpeResult, IpeTask, ok_res};
+use super::super::core::{IpeResult, IpeTask};
 #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
 use super::super::debugger::tui::TuiDebugger;
 use super::super::stringify::IpeStringify;
 use super::super::tea::{
-    CliEvent, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager, cli_run_cmd,
+    CliEvent, InputBudget, IpeCmd, IpeSub, MAX_QUEUED_INPUT, SubManager, cli_run_cmd, loop_ends,
+    next_cli_event, run_result,
 };
 use super::CellsView;
 use super::cell::sanitize_frame;
@@ -559,7 +560,7 @@ pub fn tui_app<Model, Msg, E, FInit, FUpdate, FView, FSubs>(
     subscriptions: FSubs,
 ) -> IpeTask<E, ()>
 where
-    E: Send + From<String> + crate::FromUnavailable + 'static,
+    E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
     Model: Clone + Send + 'static,
     Msg: Clone + Send + IpeStringify + 'static,
     FInit: Fn(()) -> (Model, IpeCmd<Msg>) + Send + 'static,
@@ -592,9 +593,15 @@ where
             );
         }
 
+        // The app's tasks deliver a trip, a panic or a refused start here.
+        let (ends, owner) = match loop_ends() {
+            Ok(pair) => pair,
+            Err(taken) => return IpeResult::Err(E::from_ipe_error(taken)),
+        };
+
         let (mut model, cmd0) = init(());
-        cli_run_cmd(cmd0, &tx);
-        let mut submgr = SubManager::new(tx.clone());
+        cli_run_cmd(cmd0, &tx, &ends);
+        let mut submgr = SubManager::new(tx.clone(), ends.clone());
         submgr.update(subscriptions(model.clone()));
 
         #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
@@ -618,8 +625,13 @@ where
         #[cfg(not(all(feature = "debugger", not(target_arch = "wasm32"))))]
         paint(&render_frame(&model));
 
-        while let Some(ev) = rx.recv().await {
+        let mut ended = None;
+        while let Some(ev) = next_cli_event(&mut rx, &owner).await {
             let msgs: Vec<Msg> = match ev {
+                CliEvent::Ended(end) => {
+                    ended = Some(end);
+                    break;
+                }
                 // The permit returns to the reader's budget as the key is taken.
                 CliEvent::Key(kind, value, _permit) => {
                     #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
@@ -684,7 +696,7 @@ where
                 #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
                 dbg.record(msg, model.clone());
 
-                cli_run_cmd(cmd, &tx);
+                cli_run_cmd(cmd, &tx, &ends);
                 submgr.update(subscriptions(model.clone()));
             }
 
@@ -702,7 +714,7 @@ where
             paint(&render_frame(&model));
         }
         submgr.stop_all();
-        ok_res(())
+        run_result(ended, &owner)
     })
 }
 
@@ -1172,7 +1184,7 @@ pub fn tui_app_ui<Model, Msg, E, FInit, FUpdate, FView, FSubs>(
     subscriptions: FSubs,
 ) -> IpeTask<E, ()>
 where
-    E: Send + From<String> + crate::FromUnavailable + 'static,
+    E: Send + From<String> + crate::FromUnavailable + crate::FromIpeError + 'static,
     Model: Clone + Send + 'static,
     Msg: Clone + Send + IpeStringify + 'static,
     FInit: Fn(()) -> (Model, IpeCmd<Msg>) + Send + 'static,
@@ -1200,9 +1212,15 @@ where
             );
         }
 
+        // The app's tasks deliver a trip, a panic or a refused start here.
+        let (ends, owner) = match loop_ends() {
+            Ok(pair) => pair,
+            Err(taken) => return IpeResult::Err(E::from_ipe_error(taken)),
+        };
+
         let (mut model, cmd0) = init(());
-        cli_run_cmd(cmd0, &tx);
-        let mut submgr = SubManager::new(tx.clone());
+        cli_run_cmd(cmd0, &tx, &ends);
+        let mut submgr = SubManager::new(tx.clone(), ends.clone());
         submgr.update(subscriptions(model.clone()));
 
         #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
@@ -1226,6 +1244,7 @@ where
         let mut focusables: Vec<Focusable<Msg>> =
             render_and_paint(&view, &model, &mut inputs, &mut focus_idx, &mut scroll_y);
 
+        let mut ended = None;
         loop {
             // Fold the control channel into the run loop's event select so an
             // incoming frame is applied on THIS thread — the only writer of
@@ -1257,12 +1276,12 @@ where
                     }
                     // The bridge sender was dropped (accept loop gone): stop
                     // draining control frames but keep serving app events.
-                    None => match rx.recv().await {
+                    None => match next_cli_event(&mut rx, &owner).await {
                         Some(ev) => ev,
                         None => break,
                     },
                 },
-                ev = rx.recv() => match ev {
+                ev = next_cli_event(&mut rx, &owner) => match ev {
                     Some(ev) => ev,
                     None => break,
                 },
@@ -1301,12 +1320,12 @@ where
                     }
                     // The bridge sender was dropped (accept loop gone): stop
                     // draining control frames but keep serving app events.
-                    None => match rx.recv().await {
+                    None => match next_cli_event(&mut rx, &owner).await {
                         Some(ev) => ev,
                         None => break,
                     },
                 },
-                ev = rx.recv() => match ev {
+                ev = next_cli_event(&mut rx, &owner) => match ev {
                     Some(ev) => ev,
                     None => break,
                 },
@@ -1316,14 +1335,14 @@ where
                 not(feature = "control-wire"),
                 not(all(feature = "debugger", not(target_arch = "wasm32")))
             ))]
-            let ev = match rx.recv().await {
+            let ev = match next_cli_event(&mut rx, &owner).await {
                 Some(ev) => ev,
                 None => break,
             };
             // A wasm target under control-wire has no native control socket; the
             // control_rx binding is native-only, so serve app events directly.
             #[cfg(all(feature = "control-wire", target_arch = "wasm32"))]
-            let ev = match rx.recv().await {
+            let ev = match next_cli_event(&mut rx, &owner).await {
                 Some(ev) => ev,
                 None => break,
             };
@@ -1332,6 +1351,10 @@ where
             // … or the messages the active `Tui.Sub.onKey` handlers map a key to.
             let mut from_keys: Vec<Msg> = Vec::new();
             match ev {
+                CliEvent::Ended(end) => {
+                    ended = Some(end);
+                    break;
+                }
                 CliEvent::Msg(m) | CliEvent::PerformDone(m) => produced = Some(m),
                 CliEvent::Eof => break,
                 CliEvent::Line(..) | CliEvent::LineClosed(..) => continue,
@@ -1596,7 +1619,7 @@ where
                 #[cfg(all(feature = "debugger", not(target_arch = "wasm32")))]
                 dbg.record(msg, model.clone());
 
-                cli_run_cmd(cmd, &tx);
+                cli_run_cmd(cmd, &tx, &ends);
                 submgr.update(subscriptions(model.clone()));
             }
 
@@ -1626,7 +1649,7 @@ where
             }
         }
         submgr.stop_all();
-        ok_res(())
+        run_result(ended, &owner)
     })
 }
 
@@ -1906,7 +1929,7 @@ mod apply_seam_tests {
         // The run-loop side: own the seam state, drain one request, apply it via
         // `apply_control_frame`, and reply on the request's one-shot — mirroring
         // the `tui_app_ui` select arm.
-        let run_loop = tokio::spawn(async move {
+        let run_loop = crate::threads::raw_for_tests::spawn(async move {
             let (mut dbg, live) = seeded(&[10, 5, 3]); // steps 10,15,18
             let mut surface = TuiSurface::new(InputRegistry::new(), 0, 0);
             let req = req_rx.recv().await.expect("the bridge delivers the frame");
@@ -2013,7 +2036,7 @@ mod apply_seam_tests {
         // The run-loop drain: owns the single-writer seam state and applies every
         // delivered frame through `apply_control_frame`, mirroring the `tui_app_ui`
         // select arm. Seed a recorded Msg-log so the replay path has history.
-        let run_loop = tokio::spawn(async move {
+        let run_loop = crate::threads::raw_for_tests::spawn(async move {
             let (mut dbg, live) = seeded(&[10, 5, 3]); // steps 10, 15, 18
             let mut surface = TuiSurface::new(InputRegistry::new(), 4, 9);
             let mut cursors = Vec::new();
@@ -2032,7 +2055,7 @@ mod apply_seam_tests {
         // per delivered frame, exactly as `spawn_conn` does per accepted peer.
         let handler = std::sync::Arc::new(handler);
         let accept_handler = std::sync::Arc::clone(&handler);
-        let accept = tokio::spawn(async move {
+        let accept = crate::threads::raw_for_tests::spawn(async move {
             for _ in 0..2 {
                 let (stream, _) = listener.accept().await.expect("accept a client");
                 let _ = serve_conn(stream, &*accept_handler).await;
@@ -2327,7 +2350,8 @@ mod key_reader_tests {
                 CliEvent::Line(..)
                 | CliEvent::LineClosed(..)
                 | CliEvent::Msg(())
-                | CliEvent::PerformDone(()) => ("other".to_owned(), String::new()),
+                | CliEvent::PerformDone(())
+                | CliEvent::Ended(_) => ("other".to_owned(), String::new()),
             });
         }
         events
