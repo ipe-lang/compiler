@@ -2825,7 +2825,13 @@ struct ModAppend {
 /// dependencies require — not a hand-edit in a second walk.
 const MOD_APPENDS: &[ModAppend] = &[
     ModAppend {
-        gate: |ctx| ctx.reaches_encoding(),
+        // The `encoding` feature's own fact: the module is declared exactly
+        // when the vendored manifest turns the feature on, as in the runtime
+        // crate, so a gate on the feature always names a declared module.
+        gate: |ctx| {
+            crate::runtime_features::runtime_features(ctx)
+                .vendors(crate::runtime_features::RuntimeFeature::Encoding)
+        },
         append: RUNTIME_MOD_RS_ENCODING_APPEND,
     },
     ModAppend {
@@ -3534,6 +3540,13 @@ fn assemble_project_text(
     } else {
         cargo_toml
     };
+    // The runtime crate's own closure: every declared feature the program's
+    // runtime features turn on in `src/runtime/rust/Cargo.toml` is on here too,
+    // so the vendored tree compiles a selection the runtime crate can make.
+    let cargo_toml = runtime_projection_cargo_toml(
+        &cargo_toml,
+        &crate::runtime_features::runtime_features(ctx),
+    )?;
     // Foreign-crate FFI: append the bound crates' pinned [dependencies] lines
     // (exact versions + effective feature sets, pre-merged by the driver).
     let cargo_toml = if ctx.uses_ffi {
@@ -4274,6 +4287,28 @@ fn promote_declared_feature(base: &str, feature: &str, where_: &'static str) -> 
         });
     }
     promote_default_feature(base, feature, where_)
+}
+
+/// Promote every feature the runtime crate turns on for `features` that the
+/// vendored manifest declares ([`RuntimeFeatureSet::vendored_features`]).
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the base manifest does not declare
+/// a projected feature or the `default` anchor is absent.
+///
+/// [`RuntimeFeatureSet::vendored_features`]: crate::runtime_features::RuntimeFeatureSet::vendored_features
+fn runtime_projection_cargo_toml(
+    base: &str,
+    features: &crate::runtime_features::RuntimeFeatureSet,
+) -> DResult<String> {
+    const WHERE: &str = "ipe_backend_rust::project::runtime_projection_cargo_toml";
+    features
+        .vendored_features()
+        .into_iter()
+        .try_fold(base.to_owned(), |toml, feature| {
+            promote_declared_feature(&toml, feature, WHERE)
+        })
 }
 
 /// Append `deps` to the manifest's `[dependencies]` table, after its last entry.

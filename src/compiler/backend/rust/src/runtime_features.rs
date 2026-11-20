@@ -433,6 +433,111 @@ impl RuntimeFeature {
     }
 }
 
+impl RuntimeFeature {
+    /// The features the vendored manifest declares that this feature turns on
+    /// in `src/runtime/rust/Cargo.toml`, itself included.
+    ///
+    /// The vendored tree compiles the runtime crate's own source, so each
+    /// `#[cfg(feature = …)]` gate in it must read as the runtime crate reads it
+    /// under the same selection; a vendored build that turns on `web` but not
+    /// the `encoding` it implies compiles a combination the runtime crate never
+    /// builds. `tokio` is absent from every row: the vendored manifest declares
+    /// the tokio dependency only for a reactor program, so its feature follows
+    /// [`RuntimeFeatureSet::tokio_features`] through the vendored tokio line.
+    ///
+    /// The `vendored_projection_matches_the_runtime_manifest` seal asserts every
+    /// row against both manifests in both directions.
+    pub const fn vendored_projection(self) -> &'static [&'static str] {
+        match self {
+            Self::Async
+            | Self::Url
+            | Self::Compression
+            | Self::CacheKernel
+            | Self::Regex
+            | Self::Uuid
+            | Self::Random => &[],
+            Self::Json => &["json", "serde"],
+            Self::DbSqlite => &[
+                "db",
+                "db-sqlite",
+                "decimal",
+                "encoding",
+                "json",
+                "secret",
+                "serde",
+                "time-core",
+            ],
+            Self::DbPostgres => &[
+                "db",
+                "db-postgres",
+                "decimal",
+                "encoding",
+                "json",
+                "secret",
+                "serde",
+                "time-core",
+            ],
+            Self::Server => &["encoding", "server"],
+            Self::Web => &[
+                "encoding",
+                "json",
+                "serde",
+                "server",
+                "time-core",
+                "web",
+                "web-core",
+                "widget-assets",
+            ],
+            Self::Tui => &["tui"],
+            Self::Webview => &[
+                "browser-open",
+                "encoding",
+                "json",
+                "serde",
+                "web-core",
+                "webview",
+                "webview-shell",
+            ],
+            Self::WebsocketClient => &["serde", "websocket_client"],
+            Self::Email => &[
+                "email",
+                "encoding",
+                "http_client",
+                "json",
+                "secret",
+                "serde",
+            ],
+            Self::Locale => &["locale"],
+            Self::HttpClient => &["encoding", "http_client", "serde"],
+            Self::Config => &["config", "json", "serde"],
+            Self::CsvKernel => &["csv"],
+            Self::Encoding | Self::CryptoCore => &["encoding"],
+            Self::Log => &["log", "time-core"],
+            Self::TimeCore => &["time-core"],
+            Self::Decimal => &["decimal"],
+            Self::CharCategory => &["char-category"],
+            Self::Secret => &["encoding", "secret"],
+            Self::Crypto => &["crypto", "encoding"],
+            Self::Jwt => &["crypto", "encoding", "json", "jwt", "secret", "serde"],
+            Self::WasmClient => &[
+                "char-category",
+                "decimal",
+                "encoding",
+                "json",
+                "log",
+                "secret",
+                "serde",
+                "time-core",
+                "wasm-client",
+                "web-core",
+            ],
+            Self::Debugger => &["control-wire", "debugger", "encoding", "json", "serde"],
+            Self::ControlWire => &["control-wire", "encoding", "json", "serde"],
+            Self::DevPosture => &["dev-posture"],
+        }
+    }
+}
+
 /// Every runtime feature with its tokio projection, for the manifest seal.
 #[must_use]
 pub fn tokio_projection_table() -> Vec<(&'static str, TokioProjection)> {
@@ -474,6 +579,22 @@ impl RuntimeFeatureSet {
     /// Whether `feature` is selected.
     pub fn contains(&self, feature: RuntimeFeature) -> bool {
         self.0.contains(&feature)
+    }
+
+    /// The vendored-manifest features the selected set turns on: the union of
+    /// every member's [`RuntimeFeature::vendored_projection`], canonical order.
+    pub fn vendored_features(&self) -> BTreeSet<&'static str> {
+        self.0
+            .iter()
+            .flat_map(|f| f.vendored_projection().iter().copied())
+            .collect()
+    }
+
+    /// Whether the vendored manifest turns `feature` on for the selected set.
+    pub fn vendors(&self, feature: RuntimeFeature) -> bool {
+        self.0
+            .iter()
+            .any(|f| f.vendored_projection().contains(&feature.as_str()))
     }
 }
 
@@ -588,6 +709,7 @@ mod tests {
     use crate::{DbDriver, RustBackend};
     use ipe_intern::Interner;
     use ipe_ir::{ModPath, Module, Program};
+    use std::collections::{BTreeMap, BTreeSet};
 
     /// A body-free module with the named `uses_*` flags set. `configure` sets the
     /// surface flags under test; the async spine + tui⇒ui invariants the lowerer
@@ -1226,5 +1348,272 @@ mod tests {
             assert!(!f.as_str().is_empty(), "empty name for {f:?}");
             assert!(seen.insert(f.as_str()), "duplicate name {}", f.as_str());
         }
+    }
+
+    // ── vendored manifest ⇔ runtime crate feature agreement ──────────────────
+
+    /// A setter that turns one surface flag on in a body-free module.
+    type SurfaceFlag = fn(&mut Module);
+
+    /// Every `uses_*` surface flag, by name, as a setter on a body-free module.
+    const SURFACE_FLAGS: &[(&str, SurfaceFlag)] = &[
+        ("tea", |m| m.uses_tea = true),
+        ("server", |m| m.uses_server = true),
+        ("ui", |m| m.uses_ui = true),
+        ("web", |m| m.uses_web = true),
+        ("tui", |m| m.uses_tui = true),
+        ("console", |m| m.uses_console = true),
+        ("webview", |m| m.uses_webview = true),
+        ("css", |m| m.uses_css = true),
+        ("auth", |m| m.uses_auth = true),
+        ("principal", |m| m.uses_principal = true),
+        ("websocket", |m| m.uses_websocket = true),
+        ("email", |m| m.uses_email = true),
+        ("locale", |m| m.uses_locale = true),
+        ("time", |m| m.uses_time = true),
+        ("env_public", |m| m.uses_env_public = true),
+        ("http", |m| m.uses_http = true),
+        ("config", |m| m.uses_config = true),
+        ("compression", |m| m.uses_compression = true),
+        ("csv", |m| m.uses_csv = true),
+        ("cache", |m| m.uses_cache = true),
+        ("encoding", |m| m.uses_encoding = true),
+        ("regex", |m| m.uses_regex = true),
+        ("uuid", |m| m.uses_uuid = true),
+        ("random", |m| m.uses_random = true),
+        ("log", |m| m.uses_log = true),
+        ("decimal", |m| m.uses_decimal = true),
+        ("char_category", |m| m.uses_char_category = true),
+        ("crypto_core", |m| m.uses_crypto_core = true),
+        ("secret", |m| m.uses_secret = true),
+        ("json", |m| m.uses_json = true),
+        ("crypto", |m| m.uses_crypto = true),
+        ("jwt", |m| m.uses_jwt = true),
+        ("url", |m| m.uses_url = true),
+        ("debug", |m| m.uses_debug = true),
+        ("async_runtime", |m| m.uses_async_runtime = true),
+    ];
+
+    /// A `[features]` table: feature name → the names it enables.
+    ///
+    /// `dep:x` enables no feature name; `x/f` enables `x`; `x?/f` enables
+    /// nothing on its own. Every other token is a feature (or implicit
+    /// optional-dependency feature) name.
+    fn feature_table(cargo_toml: &str) -> BTreeMap<String, Vec<String>> {
+        let doc: toml::Table = cargo_toml.parse().expect("a parseable Cargo.toml");
+        let features = doc
+            .get("features")
+            .and_then(toml::Value::as_table)
+            .expect("a [features] table");
+        features
+            .iter()
+            .map(|(name, enables)| {
+                let names = enables
+                    .as_array()
+                    .expect("a feature lists its enables")
+                    .iter()
+                    .filter_map(toml::Value::as_str)
+                    .filter(|tok| !tok.starts_with("dep:") && !tok.contains("?/"))
+                    .map(|tok| tok.split('/').next().unwrap_or(tok).to_owned())
+                    .collect();
+                (name.clone(), names)
+            })
+            .collect()
+    }
+
+    /// The feature names `roots` turn on through `table`, `roots` included.
+    fn closure<'s>(
+        table: &BTreeMap<String, Vec<String>>,
+        roots: impl IntoIterator<Item = &'s str>,
+    ) -> BTreeSet<String> {
+        let mut on = BTreeSet::new();
+        let mut work: Vec<String> = roots.into_iter().map(str::to_owned).collect();
+        while let Some(name) = work.pop() {
+            if on.insert(name.clone()) {
+                work.extend(table.get(&name).into_iter().flatten().cloned());
+            }
+        }
+        on
+    }
+
+    /// The runtime crate's manifest, whose feature closure the vendored one mirrors.
+    const RUNTIME_CARGO_TOML: &str = include_str!("../../../../runtime/rust/Cargo.toml");
+    /// The base vendored manifest, which declares every vendored feature name.
+    const VENDORED_CARGO_TOML: &str = include_str!("../templates/Cargo.toml");
+
+    /// The names a projection compares: every vendored-declared feature but
+    /// `default` and `tokio` (whose vendored feature follows the tokio line,
+    /// sealed by `vendored_tokio_line_is_the_runtime_feature_projection`).
+    fn projected(vendored_table: &BTreeMap<String, Vec<String>>, name: &str) -> bool {
+        name != "default" && name != "tokio" && vendored_table.contains_key(name)
+    }
+
+    /// Each feature's vendored projection is the runtime crate's closure of that
+    /// feature, limited to the names the vendored manifest declares.
+    #[test]
+    fn vendored_projection_matches_the_runtime_manifest() {
+        let runtime_table = feature_table(RUNTIME_CARGO_TOML);
+        let vendored_table = feature_table(VENDORED_CARGO_TOML);
+        let mut drift = Vec::new();
+        for feature in RuntimeFeature::ALL {
+            let expected: BTreeSet<String> = closure(&runtime_table, [feature.as_str()])
+                .into_iter()
+                .filter(|name| projected(&vendored_table, name))
+                .collect();
+            let row: BTreeSet<String> = feature
+                .vendored_projection()
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect();
+            if row != expected {
+                drift.push(format!(
+                    "{}: row {row:?}, runtime manifest {expected:?}",
+                    feature.as_str()
+                ));
+            }
+        }
+        assert!(
+            drift.is_empty(),
+            "RuntimeFeature::vendored_projection drifted from the manifests:\n{}",
+            drift.join("\n")
+        );
+    }
+
+    /// One program's vendored emit, beside its runtime feature names.
+    fn vendored_emit(
+        configure: &dyn Fn(&mut Module),
+    ) -> (ipe_backend::EmittedProject, Vec<&'static str>) {
+        let mut interner = Interner::new();
+        let main = interner.intern("Main").expect("intern Main");
+        let prog = Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            modules: vec![ctx_module(main, configure)],
+        };
+        let backend = RustBackend::new(&interner);
+        let ctx = backend.emit_ctx_for_tests(&prog).expect("build EmitCtx");
+        let project = crate::project::assemble_project_files(&ctx, Vec::new())
+            .expect("a vendored native emit assembles");
+        (project, runtime_features(&ctx).as_feature_names())
+    }
+
+    /// How one program's vendored emit departs from the runtime crate's
+    /// selection for it, as one line per departure.
+    fn selection_drift(
+        shape: &str,
+        project: &ipe_backend::EmittedProject,
+        runtime: &[&str],
+    ) -> Vec<String> {
+        let runtime_table = feature_table(RUNTIME_CARGO_TOML);
+        let vendored_table = feature_table(&project.cargo_toml);
+        let default = vendored_table.get("default").cloned().unwrap_or_default();
+        let vendored: BTreeSet<String> =
+            closure(&vendored_table, default.iter().map(String::as_str))
+                .into_iter()
+                .filter(|name| projected(&vendored_table, name))
+                .collect();
+        let runtime_on: BTreeSet<String> = closure(&runtime_table, runtime.iter().copied())
+            .into_iter()
+            .filter(|name| projected(&vendored_table, name))
+            .collect();
+        let vendored_under_runtime: BTreeSet<String> =
+            closure(&runtime_table, vendored.iter().map(String::as_str))
+                .into_iter()
+                .filter(|name| projected(&vendored_table, name))
+                .collect();
+        let mut drift = Vec::new();
+        let unclosed: Vec<_> = vendored_under_runtime.difference(&vendored).collect();
+        if !unclosed.is_empty() {
+            drift.push(format!(
+                "{shape}: turns on {vendored:?} but leaves off its runtime-crate \
+                 implications {unclosed:?}"
+            ));
+        }
+        let missing: Vec<_> = runtime_on.difference(&vendored).collect();
+        if !missing.is_empty() {
+            drift.push(format!(
+                "{shape}: leaves off {missing:?}, which the runtime crate turns on"
+            ));
+        }
+        let mod_rs = project
+            .files
+            .iter()
+            .find(|(path, _)| path.as_str() == "src/ipe_runtime/mod.rs")
+            .map(|(_, text)| text.as_str())
+            .unwrap_or_default();
+        let declares_encoding = mod_rs.lines().any(|line| line == "pub mod encoding;");
+        if declares_encoding != vendored.contains("encoding") {
+            drift.push(format!(
+                "{shape}: the `encoding` module is declared {declares_encoding}, the \
+                 `encoding` feature is on {}",
+                vendored.contains("encoding")
+            ));
+        }
+        drift
+    }
+
+    /// The vendored manifest turns on a feature combination the runtime crate
+    /// itself can select, and every feature the runtime crate turns on for the
+    /// same program; the `encoding` module is declared exactly when its
+    /// feature is on.
+    ///
+    /// The vendored runtime source is the runtime crate's source, so a
+    /// `#[cfg(feature = …)]` gate must read the same under both emit models. A
+    /// vendored set the runtime crate's own implications would grow (`web`
+    /// without `encoding`) compiles a combination no runtime check ever builds,
+    /// and a feature the runtime crate turns on but the vendored manifest
+    /// leaves off compiles a different program. Checked for the pure program,
+    /// each surface alone, and all at once.
+    #[test]
+    fn vendored_features_are_a_runtime_crate_selection() {
+        let mut drift = Vec::new();
+        let mut check = |shape: &str, configure: &dyn Fn(&mut Module)| {
+            let (project, runtime) = vendored_emit(configure);
+            drift.extend(selection_drift(shape, &project, &runtime));
+        };
+        check("pure", &|_| {});
+        for (shape, configure) in SURFACE_FLAGS {
+            check(shape, configure);
+        }
+        check("all-on", &|m| {
+            for (_, configure) in SURFACE_FLAGS {
+                configure(m);
+            }
+        });
+        assert!(
+            drift.is_empty(),
+            "vendored manifests that are not a runtime-crate selection:\n{}",
+            drift.join("\n")
+        );
+    }
+
+    /// A vendored manifest leaving off a feature the runtime crate implies, or
+    /// declaring the `encoding` module without its feature, is drift.
+    #[test]
+    fn vendored_selection_drift_is_refused() {
+        let (project, runtime) = vendored_emit(&|m| m.uses_web = true);
+        assert_eq!(
+            selection_drift("web", &project, &runtime),
+            Vec::<String>::new(),
+            "precondition: the web emit is a runtime-crate selection"
+        );
+        let mut dropped = project;
+        dropped.cargo_toml = dropped
+            .cargo_toml
+            .replacen("\"encoding\", ", "", 1)
+            .replacen(", \"encoding\"", "", 1);
+        let drift = selection_drift("web", &dropped, &runtime);
+        assert!(
+            drift.iter().any(|d| d.contains("implications")),
+            "web without encoding is not closed: {drift:?}"
+        );
+        assert!(
+            drift.iter().any(|d| d.contains("leaves off")),
+            "web without encoding misses a runtime feature: {drift:?}"
+        );
+        assert!(
+            drift.iter().any(|d| d.contains("module is declared true")),
+            "the encoding module without its feature is drift: {drift:?}"
+        );
     }
 }

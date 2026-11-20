@@ -2746,10 +2746,11 @@ impl<'a> EmitCtx<'a> {
     }
 
     /// `true` when the emitted crate reaches the `base64` / `hex` /
-    /// `percent-encoding` crates — so `project::assemble_project_files` selects
-    /// the `encoding` feature, declares `pub mod encoding;` + `pub mod bytes;`,
-    /// and adds the three codec deps. The single source of truth shared by the
-    /// manifest augmenter and the `mod.rs` append; they can never disagree.
+    /// `percent-encoding` crates — so the runtime feature set selects
+    /// `encoding`. The vendored manifest and its `pub mod encoding;` +
+    /// `pub mod bytes;` append both follow that set's runtime-crate closure
+    /// (`RuntimeFeatureSet::vendors`), which also turns `encoding` on for every
+    /// feature the runtime crate makes imply it.
     ///
     /// Reached directly by an `Ipe.Encoding` / `Ipe.Bytes` kernel
     /// ([`Self::uses_encoding`]), OR transitively by every
