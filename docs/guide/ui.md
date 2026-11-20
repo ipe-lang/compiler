@@ -116,10 +116,14 @@ never on how the runtime changed the page. When a render leaves focus on the
 page body (the focused control is gone, or became disabled, hidden or
 untabbable), the runtime puts focus on the nearest enclosing element of the
 new view that takes focus, else on the view's root, so a key handler on an
-ancestor keeps receiving keys. It checks once the render lands and again two
-animation frames later, after the browser has dropped focus from a control a
-render made unfocusable. It never moves focus the user moved after the render,
-focus a newer render owns, or focus outside the view.
+ancestor keeps receiving keys. It checks once the render lands. When the
+render changed the focused control or one of its ancestors, it checks once
+more when the browser later drops focus from that control (the `focusout` the
+browser raises), however many renders land before the drop. It never moves focus the user moved after the render, focus a
+newer render owns, or focus outside the view. Two cases stay on the page body:
+a drop that only a change outside the focused control's ancestors caused (a
+sibling's class that hides it through a CSS selector), and a browser that
+drops focus without raising `focusout`.
 
 **Frames.** A framed document never shares the app's origin, so it cannot
 reach the page, its storage, or its session. Every `Html.iframe` is sandboxed:

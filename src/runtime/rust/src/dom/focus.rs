@@ -22,6 +22,54 @@ pub const FOCUS_CHAIN_MAX: usize = MAX_HTML_DEPTH;
 /// own `blur` bubbling through a capture listener.
 pub const WINDOW_FOCUS_MOVES: [&str; 1] = ["blur"];
 
+/// The event whose dispatch answers a focus drop the browser makes after S.
+///
+/// A node a patch made unfocusable may lose focus in a task the browser posts
+/// after any number of frames, so the drop check is keyed on this event, never
+/// on a frame or timer count. `client.js` mirrors it as
+/// `__IPE_FOCUS_DROP_EVENT`.
+pub const FOCUS_DROP_EVENT: &str = "focusout";
+
+/// Whether a frame arms the drop check after its synchronous check S.
+///
+/// Armed only when focus is held, the held node is the node focused before
+/// the frame, and either some patch of the frame targets an `ipe-id` on the
+/// recorded chain or the check is `carried` (see [`carries`]): with neither,
+/// no frame can have dropped focus, so a later drop is no frame's and is never
+/// undone.
+#[must_use]
+pub fn arms(
+    chain: &[FocusLink],
+    patched: impl Fn(&str) -> bool,
+    held_unchanged: bool,
+    focus_held: bool,
+    carried: bool,
+) -> bool {
+    focus_held && held_unchanged && (carried || chain.iter().any(|link| patched(&link.id)))
+}
+
+/// Whether the drop check an earlier frame armed carries into this frame.
+///
+/// It carries when it was armed on the node focused before this frame and no
+/// focus move was counted since it was recorded. The browser's drop for a node
+/// a patch made unfocusable may come after any number of later frames, so a
+/// frame that does not touch the chain hands the armed check on rather than
+/// expiring it: whether the drop is answered never depends on an unrelated
+/// frame landing first.
+#[must_use]
+pub const fn carries(armed_on_held: bool, no_move_since: bool) -> bool {
+    armed_on_held && no_move_since
+}
+
+/// Whether a drop event answers the armed check.
+///
+/// Only a drop on the held node itself to nothing (no `relatedTarget`): a move
+/// to another node of the document is the user's or a script's.
+#[must_use]
+pub const fn drop_answers(target_is_held: bool, related_is_null: bool) -> bool {
+    target_is_held && related_is_null
+}
+
 /// One element of a view chain: its stamped identity and its tag.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FocusLink {
@@ -301,6 +349,104 @@ mod tests {
         for refused in [held, moved, stale, focusing] {
             assert!(!settle_due(&rec, &refused), "{refused:?}");
         }
+    }
+
+    #[test]
+    fn arms_needs_a_patch_on_the_chain() {
+        let chain = [link("a", "div"), link("b", "button")];
+        assert!(!arms(&chain, |id| id == "c", true, true, false));
+        assert!(arms(&chain, |id| id == "a", true, true, false));
+        assert!(arms(&chain, |id| id == "b", true, true, false));
+        assert!(!arms(&[], |_| true, true, true, false));
+    }
+
+    #[test]
+    fn arms_refuses_a_moved_or_lost_focus() {
+        let chain = [link("a", "div")];
+        for carried in [false, true] {
+            assert!(!arms(&chain, |_| true, false, true, carried));
+            assert!(!arms(&chain, |_| true, true, false, carried));
+            assert!(!arms(&chain, |_| true, false, false, carried));
+        }
+    }
+
+    /// A frame that touches nothing on the chain keeps an earlier frame's
+    /// armed check alive, so a drop the browser makes after it still lands.
+    #[test]
+    fn arms_carries_an_armed_check_through_an_untouched_frame() {
+        let chain = [link("a", "div"), link("b", "button")];
+        assert!(arms(&chain, |id| id == "c", true, true, true));
+        assert!(arms(&chain, |_| false, true, true, true));
+    }
+
+    #[test]
+    fn carries_only_on_the_same_node_with_no_move_since() {
+        assert!(carries(true, true));
+        assert!(!carries(true, false));
+        assert!(!carries(false, true));
+        assert!(!carries(false, false));
+    }
+
+    #[test]
+    fn drop_answers_only_a_drop_to_nothing_on_the_held_node() {
+        assert!(drop_answers(true, true));
+        assert!(!drop_answers(true, false));
+        assert!(!drop_answers(false, true));
+        assert!(!drop_answers(false, false));
+    }
+
+    /// The body of the first `fn {name}(` in `src`, up to its closing brace at
+    /// column 0; empty when absent.
+    fn rust_fn<'a>(src: &'a str, name: &str) -> &'a str {
+        src.split_once(&format!("fn {name}("))
+            .and_then(|(_, rest)| rest.split_once("\n}\n"))
+            .map_or("", |(body, _)| body)
+    }
+
+    /// The wasm client answers a focus drop by the drop event alone.
+    ///
+    /// No deferred check counts animation frames, the frame commit clears the
+    /// pending check before it applies, the drop listener installs once beside
+    /// the focus-move listeners, and the check runs in a posted task: a
+    /// microtask would run between `focusout` and `focusin` and take back a
+    /// Tab to the next control.
+    #[test]
+    fn wasm_keys_the_drop_check_on_the_drop_event() {
+        let src = include_str!("../wasm/mod.rs");
+        let code = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map_or(src, |(code, _)| code);
+        assert!(
+            !code.contains("settle_later"),
+            "no frame-count deferred check"
+        );
+        let frame = rust_fn(code, "apply_frame");
+        let cleared = frame.find("let earlier = FOCUS_PENDING.take();");
+        let applied = frame.find("apply(document, patches);");
+        assert!(
+            matches!((cleared, applied), (Some(c), Some(a)) if c < a)
+                && !frame.contains("request_animation_frame"),
+            "`apply_frame` clears the pending check before it applies and counts no frames: {cleared:?} {applied:?}"
+        );
+        assert!(
+            frame.contains("carries(") && frame.contains("earlier"),
+            "`apply_frame` hands an earlier frame's armed check on, never drops it unanswered"
+        );
+        let install = rust_fn(code, "install_focus_epoch");
+        let guard = install.find("if FOCUS_EPOCH_INSTALLED.with(Cell::get) {");
+        let drop = install.find("FOCUS_DROP_EVENT");
+        assert!(
+            matches!((guard, drop), (Some(g), Some(d)) if g < d),
+            "the drop listener installs under `FOCUS_EPOCH_INSTALLED`: {guard:?} {drop:?}"
+        );
+        let answer = rust_fn(code, "on_focus_drop");
+        assert!(
+            answer.contains("set_timeout_with_callback_and_timeout_and_arguments_0")
+                && answer.contains("drop_answers(")
+                && !answer.contains("queue_microtask")
+                && !answer.contains("Promise"),
+            "the drop check runs in a posted task, never a microtask"
+        );
     }
 
     #[test]
