@@ -300,7 +300,7 @@ fn manifest_emit_settings(
     let crate_name = match role {
         runtime_embed::BundleRole::Out => {
             ipe_backend_rust::CrateName::Identity(ipe_backend_rust::crate_identity(
-                &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
+                &ipe_backend_rust::sanitize_cargo_name(manifest.name.as_str()),
                 &canonical_project_dir(manifest_path),
             ))
         }
@@ -312,7 +312,7 @@ fn manifest_emit_settings(
             let install = match (role, &manifest.delivery.browser.install) {
                 (runtime_embed::BundleRole::Out, project::Install::On(icon)) => {
                     ipe_backend_rust::ServedInstall::On {
-                        name: manifest.name.clone(),
+                        name: manifest.name.to_string(),
                         icon: icon.clone(),
                     }
                 }
@@ -5548,7 +5548,7 @@ main =
         assert_eq!(test.db_driver, ipe_backend_rust::DbDriver::Postgres);
         assert_eq!(test.crate_name, ipe_backend_rust::CrateName::Test);
         let identity = ipe_backend_rust::crate_identity(
-            &ipe_backend_rust::sanitize_cargo_name(&manifest.name),
+            &ipe_backend_rust::sanitize_cargo_name(manifest.name.as_str()),
             &canonical_project_dir(&manifest_path),
         );
         assert_eq!(

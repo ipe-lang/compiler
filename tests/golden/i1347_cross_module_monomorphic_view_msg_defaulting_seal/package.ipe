@@ -5,6 +5,6 @@ import Ipe.Package exposing (..)
 
 package : Package
 package =
-    { name = "i1347_cross_module_monomorphic_view_msg_defaulting_seal"
+    { name = "i1347-cross-module-monomorphic-view-msg-defaulting-seal"
     , version = "0.1.0"
     }
