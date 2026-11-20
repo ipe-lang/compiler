@@ -3,7 +3,7 @@ use super::{
     SourceGraph, analysis_graphs, analysis_root, analysis_target, attribute_canon_errors,
     attribute_post_link_error, backend_invariant_err, build_root_into, build_test_into,
     capabilities_including_served_widgets, create_source_root, emit_machine_error,
-    emitted_bin_filename, entry_modules, frame_infer_error, graph_over, home_to_source_map,
+    emitted_bin_filename, entry_graphs, entry_modules, frame_infer_error, home_to_source_map,
     lowering_check_query, lowering_check_target, program_constructs_a_widget, run_build,
     runtime_context_for_message, working_dir, write_emitted_project,
 };
@@ -2553,31 +2553,6 @@ fn target_capabilities(
         }
         Ok(caps)
     })?
-}
-
-/// Every entry `target` names, each with its source graph, in declared order.
-///
-/// # Errors
-/// Every refusal of [`analysis_graphs`] and [`graph_over`].
-fn entry_graphs<'t>(
-    target: &'t AnalysisTarget<'_>,
-) -> Result<Vec<(&'t [String], SourceGraph)>, CliError> {
-    match target {
-        AnalysisTarget::Project(root) => {
-            let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
-            entry_modules(root.entries())
-                .into_iter()
-                .map(|module| {
-                    graph_over(root, snapshot.modules(), SourceDir::Src, module)
-                        .map(|graph| (module, graph))
-                })
-                .collect()
-        }
-        AnalysisTarget::Module { module, .. } => Ok(analysis_graphs(target)?
-            .into_iter()
-            .map(|graph| (module.as_slice(), graph))
-            .collect()),
-    }
 }
 
 /// Render a program's inferred capability set in the requested [`OutputFormat`].

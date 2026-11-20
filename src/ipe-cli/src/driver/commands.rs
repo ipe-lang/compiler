@@ -3,8 +3,8 @@ use super::{
     RuntimeContext, RuntimeEmit, SettingsSource, apply_fixes_cmd, attribute_canon_errors,
     attribute_post_link_error, bluegreen_enabled, build_held_into, build_root_into,
     bundle_delivery, compile_prepared, create_source_root, emit_machine_error, emit_permissions,
-    emit_settings, find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines,
-    home_to_source_map, io_err, run_version,
+    find_manifest_for_ipe_file, frame_infer_error, gate_decoder_pipelines, home_to_source_map,
+    io_err, run_version,
 };
 use crate::runtime_embed::{RuntimeRemedy, RuntimeSource};
 use std::num::NonZeroU8;
@@ -4705,12 +4705,30 @@ pub fn analysis_target<'r>(
 /// [`CliError::Io`] (`NotFound`) when the snapshot holds no module the target
 /// names.
 pub fn analysis_graphs(target: &AnalysisTarget<'_>) -> Result<Vec<SourceGraph>, CliError> {
+    Ok(entry_graphs(target)?
+        .into_iter()
+        .map(|(_, graph)| graph)
+        .collect())
+}
+
+/// [`analysis_graphs`], each graph paired with the entry module it is rooted
+/// at.
+///
+/// # Errors
+///
+/// Every refusal of [`analysis_graphs`].
+pub(super) fn entry_graphs<'t>(
+    target: &'t AnalysisTarget<'_>,
+) -> Result<Vec<(&'t [String], SourceGraph)>, CliError> {
     match target {
         AnalysisTarget::Project(root) => {
             let snapshot = SourceSnapshot::read(root, Limits::DEFAULT)?;
             entry_modules(root.entries())
                 .into_iter()
-                .map(|module| graph_over(root, snapshot.modules(), SourceDir::Src, module))
+                .map(|module| {
+                    graph_over(root, snapshot.modules(), SourceDir::Src, module)
+                        .map(|graph| (module, graph))
+                })
                 .collect()
         }
         AnalysisTarget::Module { root, dir, module } => {
@@ -4718,7 +4736,10 @@ pub fn analysis_graphs(target: &AnalysisTarget<'_>) -> Result<Vec<SourceGraph>, 
             let Some(view) = snapshot.view(*dir, module)? else {
                 return Err(module_missing(root, *dir, module));
             };
-            Ok(vec![graph_over(root, view.modules(), *dir, view.entry())?])
+            Ok(vec![(
+                module.as_slice(),
+                graph_over(root, view.modules(), *dir, view.entry())?,
+            )])
         }
     }
 }
