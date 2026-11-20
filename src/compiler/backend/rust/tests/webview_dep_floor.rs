@@ -198,6 +198,9 @@ fn with_http_method_param(mut program: Program, interner: &mut Interner) -> Prog
     program
 }
 
+/// A builder of one body-free `Program` shape.
+type ProgramBuilder = fn(&mut Interner) -> Program;
+
 /// A body-free server-only `Program`: the webview floor's flags swapped for the
 /// server surface alone.
 fn server_program(interner: &mut Interner) -> Program {
@@ -220,7 +223,7 @@ fn server_program(interner: &mut Interner) -> Program {
 #[test]
 #[allow(clippy::expect_used)] // emit-must-succeed is the test's precondition
 fn an_http_method_mention_pulls_no_http_client() {
-    let shapes: [(&str, fn(&mut Interner) -> Program); 2] = [
+    let shapes: [(&str, ProgramBuilder); 2] = [
         ("server-only", server_program),
         ("webview", webview_program),
     ];
