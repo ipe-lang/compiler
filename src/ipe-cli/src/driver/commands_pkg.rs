@@ -406,7 +406,7 @@ fn client_desktop_bundle_id(manifest: &project::ProjectManifest) -> project::Bun
         .mobile
         .bundle_id
         .clone()
-        .unwrap_or_else(|| project::BundleId::derived(&manifest.name))
+        .unwrap_or_else(|| project::BundleId::derived(manifest.name.as_str()))
 }
 
 /// The summary a packed desktop bundle prints: what was packed, where, the
@@ -658,13 +658,13 @@ impl<'a> BundleAssembler<'a> {
     ) -> Result<(), CliError> {
         let manifest = self.manifest();
         let identity = pack::desktop::BundleIdentity::new(
-            &manifest.name,
+            manifest.name.as_str(),
             manifest
                 .version
                 .as_ref()
                 .map(ToString::to_string)
                 .as_deref(),
-            crate::project::BundleId::derived(&manifest.name),
+            crate::project::BundleId::derived(manifest.name.as_str()),
         );
         let accepts = &manifest.capabilities_accept;
         let icon = manifest.icon.as_deref();
@@ -714,7 +714,7 @@ impl<'a> BundleAssembler<'a> {
         let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
 
-        let body = desktop_summary(&manifest.name, os, &bundle_root);
+        let body = desktop_summary(manifest.name.as_str(), os, &bundle_root);
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(crate::screen::Tone::Text, &body)
             .emit();
@@ -846,7 +846,7 @@ impl<'a> BundleAssembler<'a> {
         let shell_target = self.finish.shell_target();
         let shell_dir = shell_target.claim()?;
         let (_, paths) = crate::bundle_www::publish_policed_www(&wasm_crate, &shell_dir, &swaps)?;
-        let site = client_shell_site(&manifest.name, storage_key, &pin, &header, paths)?;
+        let site = client_shell_site(manifest.name.as_str(), storage_key, &pin, &header, paths)?;
         let emitted = ipe_backend_rust::client_shell::emit_client_shell(&site)
             .map_err(backend_invariant_err)?;
         let crate_dir = write_emitted_project(
@@ -859,7 +859,7 @@ impl<'a> BundleAssembler<'a> {
         )?;
 
         let identity = pack::desktop::BundleIdentity::new(
-            &manifest.name,
+            manifest.name.as_str(),
             manifest
                 .version
                 .as_ref()
@@ -899,7 +899,7 @@ impl<'a> BundleAssembler<'a> {
 
         let dist = self.finish.dist_dir()?.child(os.as_str())?;
         let bundle_root = pack::desktop::materialise(&layout, &binary, icon, &dist)?;
-        let body = desktop_summary(&manifest.name, os, &bundle_root);
+        let body = desktop_summary(manifest.name.as_str(), os, &bundle_root);
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(crate::screen::Tone::Text, &body)
             .emit();
@@ -2451,9 +2451,9 @@ pub fn capabilities_in(
             AnalysisTarget::Project(_) => true,
             AnalysisTarget::Module { module, .. } => entry.module() == module.as_slice(),
         })
-        .map(|entry| FrameProgram::new(entry.name().as_str(), entry.module()))
+        .map(|entry| FrameProgram::new(entry.name(), entry.module()))
         .collect();
-    let built_program = FrameProgram::new(built.name().as_str(), built.module());
+    let built_program = FrameProgram::new(built.name(), built.module());
     if !analysed.contains(&built_program) {
         // The list is the project's: a file argument naming another entry
         // still answers whether the build accepts it.
@@ -5053,10 +5053,10 @@ mod mobile_base_tests {
     fn absent_bundle_id_and_orientation_derive_in_both_shells() {
         let (android, ios) = mobile_shells(
             "absent_identity",
-            "My Shop",
+            "my-shop",
             "{ browser = { basePath = \"/\" } }",
         );
-        let derived = project::BundleId::derived("My Shop");
+        let derived = project::BundleId::derived("my-shop");
         assert_eq!(derived.as_str(), "com.ipe.myshop");
         let gradle = android.generated("app/build.gradle").unwrap_or_default();
         assert!(
@@ -5521,7 +5521,12 @@ mod mobile_base_tests {
                 .filter_map(|text| FrameOriginEntry::parse(text).ok()),
         );
         let reach = entries.as_ref().ok().and_then(FrameReach::of)?;
-        let program = |name: &str, module: &str| FrameProgram::new(name, &[module.to_owned()]);
+        let program = |name: &str, module: &str| {
+            FrameProgram::new(
+                &crate::program_name::ProgramName::parse(name).expect("a program name"),
+                &[module.to_owned()],
+            )
+        };
         FrameReport::of(
             reach,
             program("web", "Main"),
@@ -5697,7 +5702,7 @@ mod mobile_base_tests {
             return;
         };
         let site = client_shell_site(
-            &manifest.name,
+            manifest.name.as_str(),
             &key,
             &pin,
             "default-src 'none'",

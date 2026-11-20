@@ -22,11 +22,92 @@ use crate::CliError;
 /// unboundedly long path component.
 const MAX_LEN: usize = 64;
 
+/// Why a raw name is outside the name grammar.
+///
+/// One arm per rule of [`judge`], so each role that shares the grammar maps
+/// every arm to its own wording with no catch-all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameRefusal {
+    /// The name is empty.
+    Empty,
+    /// The name is longer than [`NameRefusal::MAX_LEN`] bytes.
+    TooLong,
+    /// The first character is not an ASCII lowercase letter or digit.
+    BadStart,
+    /// A later character is not an ASCII lowercase letter, digit or `-`.
+    BadChar,
+    /// The name holds two `-` in a row.
+    DoubledDash,
+    /// The name ends with `-`.
+    TrailingDash,
+}
+
+impl NameRefusal {
+    /// The bound a [`NameRefusal::TooLong`] name exceeds, in bytes.
+    pub const MAX_LEN: usize = MAX_LEN;
+
+    /// Why a package name is refused, in the package name's wording.
+    #[must_use]
+    pub fn package_reason(self) -> crate::text::Message {
+        match self {
+            Self::Empty => crate::text::msg::package_name_empty(),
+            Self::TooLong => crate::text::msg::package_name_too_long(&MAX_LEN),
+            Self::BadStart => crate::text::msg::package_name_bad_start(),
+            Self::BadChar => crate::text::msg::package_name_bad_char(),
+            Self::DoubledDash => crate::text::msg::package_name_doubled_dash(),
+            Self::TrailingDash => crate::text::msg::package_name_trailing_dash(),
+        }
+    }
+}
+
+/// Judge `raw` against the one name grammar every named role shares.
+///
+/// Accepted shape: non-empty, at most [`NameRefusal::MAX_LEN`] bytes, first
+/// character an ASCII lowercase letter or digit, remaining characters ASCII
+/// lowercase letters, digits, or `-` (never a leading, trailing, or doubled
+/// `-`).
+///
+/// # Errors
+/// The [`NameRefusal`] of the first rule `raw` breaks.
+pub fn judge(raw: &str) -> Result<(), NameRefusal> {
+    if raw.is_empty() {
+        return Err(NameRefusal::Empty);
+    }
+    if raw.len() > MAX_LEN {
+        return Err(NameRefusal::TooLong);
+    }
+    let mut chars = raw.chars();
+    if !chars
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase() || first.is_ascii_digit())
+    {
+        return Err(NameRefusal::BadStart);
+    }
+    let mut prev_dash = false;
+    for c in chars {
+        if c == '-' {
+            if prev_dash {
+                return Err(NameRefusal::DoubledDash);
+            }
+            prev_dash = true;
+            continue;
+        }
+        prev_dash = false;
+        if !c.is_ascii_lowercase() && !c.is_ascii_digit() {
+            return Err(NameRefusal::BadChar);
+        }
+    }
+    if raw.ends_with('-') {
+        return Err(NameRefusal::TrailingDash);
+    }
+    Ok(())
+}
+
 /// A package name proven to be a single, portable, non-traversing filesystem
 /// path component.
 ///
-/// The only constructor is [`PackageName::parse`]; every value has already been
-/// checked. Use [`PackageName::as_str`] to obtain the validated component for a
+/// The constructors are [`PackageName::parse`] and [`PackageName::judged`], both
+/// over [`judge`]; every value has already been checked. Use [`PackageName::as_str`] to obtain the validated component for a
 /// path join.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PackageName(String);
@@ -47,52 +128,16 @@ impl PackageName {
     /// package name. Fail closed: absent proof the name is a safe component, it is
     /// refused rather than joined.
     pub fn parse(raw: &str) -> Result<Self, CliError> {
-        if raw.is_empty() {
-            return Err(Self::reject(&crate::text::msg::package_name_empty(), raw));
-        }
-        if raw.len() > MAX_LEN {
-            return Err(Self::reject(
-                &crate::text::msg::package_name_too_long(&MAX_LEN),
-                raw,
-            ));
-        }
-        let mut chars = raw.chars();
-        match chars.next() {
-            Some(first) if first.is_ascii_lowercase() || first.is_ascii_digit() => {}
-            _ => {
-                return Err(Self::reject(
-                    &crate::text::msg::package_name_bad_start(),
-                    raw,
-                ));
-            }
-        }
-        let mut prev_dash = false;
-        for c in chars {
-            if c == '-' {
-                if prev_dash {
-                    return Err(Self::reject(
-                        &crate::text::msg::package_name_doubled_dash(),
-                        raw,
-                    ));
-                }
-                prev_dash = true;
-                continue;
-            }
-            prev_dash = false;
-            if !c.is_ascii_lowercase() && !c.is_ascii_digit() {
-                return Err(Self::reject(
-                    &crate::text::msg::package_name_bad_char(),
-                    raw,
-                ));
-            }
-        }
-        if raw.ends_with('-') {
-            return Err(Self::reject(
-                &crate::text::msg::package_name_trailing_dash(),
-                raw,
-            ));
-        }
-        Ok(Self(raw.to_owned()))
+        Self::judged(raw).map_err(|why| Self::reject(&why.package_reason(), raw))
+    }
+
+    /// Parse a raw name into a [`PackageName`], handing back the rule it breaks
+    /// so a caller can locate and word the refusal itself.
+    ///
+    /// # Errors
+    /// The [`NameRefusal`] of the first grammar rule `raw` breaks.
+    pub fn judged(raw: &str) -> Result<Self, NameRefusal> {
+        judge(raw).map(|()| Self(raw.to_owned()))
     }
 
     /// The validated name, safe to use as a single `Path::join` component.

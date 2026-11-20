@@ -324,11 +324,12 @@ fn web_project(name: &str, ships: &str) -> std::path::PathBuf {
     let root = support::scratch_root().join(name);
     e2e_support::scratch::fresh(&root);
     support::expect_scratch_step(name, std::fs::create_dir_all(root.join("src")));
+    let package = name.replace('_', "-");
     let manifest = if ships.is_empty() {
-        support::package_ipe(name)
+        support::package_ipe(&package)
     } else {
         format!(
-            "module Package exposing (package)\n\n\npackage =\n    {{ name = {name:?}, delivery = {{ ships = [ {ships} ] }} }}\n"
+            "module Package exposing (package)\n\n\npackage =\n    {{ name = {package:?}, delivery = {{ ships = [ {ships} ] }} }}\n"
         )
     };
     support::expect_scratch_step(name, std::fs::write(root.join("package.ipe"), manifest));
@@ -369,7 +370,8 @@ fn run_ipe(
 fn client_desktop_project(name: &str, bundle_id: &str) -> std::path::PathBuf {
     let root = web_project(name, "");
     let manifest = format!(
-        "module Package exposing (package)\n\n\npackage =\n    {{ name = {name:?}, delivery = {{ mobile = {{ bundleId = {bundle_id:?} }} }} }}\n"
+        "module Package exposing (package)\n\n\npackage =\n    {{ name = {package:?}, delivery = {{ mobile = {{ bundleId = {bundle_id:?} }} }} }}\n",
+        package = name.replace('_', "-"),
     );
     support::expect_scratch_step(name, std::fs::write(root.join("package.ipe"), manifest));
     root

@@ -1712,6 +1712,14 @@ messages! {
     init_unknown_runtime_choice(word, runtime) = "init-unknown-runtime-choice";
     /// `ipe init` could not derive a project name.
     init_no_project_name(target) = "init-no-project-name";
+    /// `ipe init` named the package by a name derived from the directory name.
+    init_derived_name(dir: &crate::style::TerminalSafe, name) = "init-derived-name";
+    /// `ipe init` named the package by a name derived from a directory name too long to show.
+    init_derived_name_unshown(name) = "init-derived-name-unshown";
+    /// `ipe init` could derive no package name from the directory name.
+    init_no_derivable_name(dir: &crate::style::TerminalSafe, why) = "init-no-derivable-name";
+    /// `ipe init` could derive no package name from a directory name too long to show.
+    init_no_derivable_name_unshown(why) = "init-no-derivable-name-unshown";
     /// `ipe init`'s question before restoring a missing managed file.
     init_restore_ask(file) = "init-restore-ask";
     /// `ipe init`'s question before replacing an existing managed file.
@@ -2229,6 +2237,22 @@ messages! {
     package_name_bad_char = "package-name-bad-char";
     /// Why a package name is invalid: a trailing `-`.
     package_name_trailing_dash = "package-name-trailing-dash";
+    /// A manifest name field whose value is outside the name grammar.
+    manifest_name_refused(field, raw: &crate::style::TerminalSafe, why) = "manifest-name-refused";
+    /// A manifest name field whose value is refused and too long to show.
+    manifest_name_refused_unshown(field, why) = "manifest-name-refused-unshown";
+    /// Why a program name is invalid: it is empty.
+    program_name_empty = "program-name-empty";
+    /// Why a program name is invalid: it is too long.
+    program_name_too_long(max) = "program-name-too-long";
+    /// Why a program name is invalid: its first character.
+    program_name_bad_start = "program-name-bad-start";
+    /// Why a program name is invalid: a doubled `-`.
+    program_name_doubled_dash = "program-name-doubled-dash";
+    /// Why a program name is invalid: a disallowed character.
+    program_name_bad_char = "program-name-bad-char";
+    /// Why a program name is invalid: a trailing `-`.
+    program_name_trailing_dash = "program-name-trailing-dash";
 }
 
 #[cfg(test)]
