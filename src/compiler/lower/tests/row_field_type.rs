@@ -200,7 +200,7 @@ fn lower_any_call(
         msg_defaulted_vars: BTreeMap::new(),
         signature_wildcards: BTreeMap::new(),
     };
-    lower(&m, &types, interner, "", "").map_err(|(d, _home)| d)
+    lower(&m, &types, interner, "", "", ipe_lower::Roots::Entry).map_err(|(d, _home)| d)
 }
 
 /// `getName : any -> String; getName p = p.name` called with `{ name = 1 }`
@@ -332,7 +332,7 @@ fn extra_field_beyond_required_is_accepted() {
         msg_defaulted_vars: BTreeMap::new(),
         signature_wildcards: BTreeMap::new(),
     };
-    let res = lower(&m, &types, &mut i, "", "").map_err(|(d, _home)| d);
+    let res = lower(&m, &types, &mut i, "", "", ipe_lower::Roots::Entry).map_err(|(d, _home)| d);
     assert!(
         res.is_ok(),
         "extra fields beyond those the callee reads must not be rejected — row-openness, got {res:?}"
@@ -441,7 +441,7 @@ fn relayed_any_param_at_row_callee_is_rejected() {
         msg_defaulted_vars: BTreeMap::new(),
         signature_wildcards: BTreeMap::new(),
     };
-    let res = lower(&m, &types, &mut i, "", "").map_err(|(d, _home)| d);
+    let res = lower(&m, &types, &mut i, "", "", ipe_lower::Roots::Entry).map_err(|(d, _home)| d);
     assert!(
         matches!(
             res,
@@ -529,7 +529,7 @@ fn lower_any_call_bare_arg(
         msg_defaulted_vars: BTreeMap::new(),
         signature_wildcards: BTreeMap::new(),
     };
-    lower(&m, &types, interner, "", "").map_err(|(d, _home)| d)
+    lower(&m, &types, interner, "", "", ipe_lower::Roots::Entry).map_err(|(d, _home)| d)
 }
 
 /// `getName : any -> String; getName p = p.name` called with the integer

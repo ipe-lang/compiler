@@ -391,6 +391,57 @@ fn a_task_entry_blocks_on_in_both_layouts() -> DResult<()> {
     Ok(())
 }
 
+/// The spine emit refuses an `ipe_main` that returns a shape app the IR names
+/// no entry for, the same two-witness check the single-file layout makes.
+#[test]
+fn a_spine_shape_main_without_an_ir_entry_is_a_compiler_bug() {
+    let got = entry_main_rs(&IrType::WorkerApp, true, false);
+    assert!(
+        matches!(
+            got,
+            Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
+                ..
+            })
+        ),
+        "an IR/`ipe_main` disagreement must be refused: {got:?}"
+    );
+}
+
+/// A lowered entry that is not the function rendered as `ipe_main` is refused
+/// in both layouts: the run form would be read from one function while the
+/// epilogue calls another.
+#[test]
+fn an_entry_other_than_ipe_main_is_a_compiler_bug() -> DResult<()> {
+    for split in [true, false] {
+        let mut interner = Interner::new();
+        let (mut program, lib_home, main_home) = build_two_module(&mut interner)?;
+        for module in &mut program.modules {
+            module.entry = Some(FuncId::from_raw(0));
+            if !split {
+                for func in &mut module.funcs {
+                    if func.home == lib_home {
+                        func.home = main_home.clone();
+                    }
+                }
+            }
+        }
+        let got = RustBackend::new(&interner).emit(&program);
+        assert!(
+            matches!(
+                got,
+                Err(ipe_diagnostics::Diagnostic::CompilerBug {
+                    where_: "ipe_backend_rust::EmitCtx::build::entry_is_ipe_main",
+                    ..
+                })
+            ),
+            "an entry `ipe_main` does not name must be refused (split: {split}): {:?}",
+            got.as_ref().err()
+        );
+    }
+    Ok(())
+}
+
 /// The single-file emit refuses an `ipe_main` signature that renders a shape app
 /// the IR names no entry for: the IR run form and the emitted signature are two
 /// independent witnesses, and their disagreement is a `CompilerBug`, never an

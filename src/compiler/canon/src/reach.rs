@@ -12,9 +12,10 @@
 //! seeds (its backend roots unconditionally). Edges the lowerer synthesises with
 //! no canonical reference (the `Ipe.Db.Store` helpers) lie outside it; only
 //! `target_gate::check_emitted_for_target`, which re-judges the lowered
-//! survivors after lowering, covers those. A program whose entry is missing, or
-//! is not the linked module's own `main`, keeps every def — the same fail-closed
-//! fallback the lowerer takes, where nothing is pruned.
+//! survivors after lowering, covers those. A program whose linked module defines
+//! no `main` of its own, or whose roots are its whole API ([`Roots::WholeApi`]),
+//! keeps every def — the same fail-closed fallback the lowerer takes, where
+//! nothing is pruned.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -37,6 +38,50 @@ pub const DURATION_TO_MILLIS_HOME: [&str; 2] = ["Ipe", "Duration"];
 /// kernel's emitted code calls.
 pub const DURATION_TO_MILLIS_NAME: &str = "toMillis";
 
+/// The root set a linked program is cut down from.
+///
+/// Read by [`EntryClosure`] and by the lowerer's dead-function elimination, so
+/// the closure a gate judges and the functions lowering keeps start from one
+/// fact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Roots {
+    /// The program the linked module runs: its own `main` (see [`entry_def`])
+    /// plus the functions the backend invokes with no call edge naming them.
+    Entry,
+    /// Every def of the linked graph: the package-capability audit, whose
+    /// honest root set is each exposed function a consumer may call.
+    WholeApi,
+}
+
+impl Roots {
+    /// The position of the def these roots run as the program entry, if any.
+    ///
+    /// [`Roots::Entry`] names the linked module's own `main`;
+    /// [`Roots::WholeApi`] names none, so nothing is pruned.
+    #[must_use]
+    pub fn entry_def(self, linked: &Module, interner: &Interner) -> Option<usize> {
+        match self {
+            Self::Entry => entry_def(linked, interner),
+            Self::WholeApi => None,
+        }
+    }
+}
+
+/// The position of the linked module's own entry `main`.
+///
+/// The def named [`ENTRY_NAME`] whose home is `linked.name`, selected by home,
+/// never by spelling alone or link order: a `main` another module defines (a
+/// second program, a page linked from `src/`) is never the entry, and a linked
+/// module with no `main` of its own has none. Canon refuses two defs of one
+/// name in one module, so at most one def matches.
+#[must_use]
+pub fn entry_def(linked: &Module, interner: &Interner) -> Option<usize> {
+    linked.defs.iter().position(|def| {
+        def.home() == linked.name.as_slice()
+            && interner.resolve(def.name().value) == Some(ENTRY_NAME)
+    })
+}
+
 /// The defs of a linked [`Module`] reachable from its entry.
 ///
 /// Indexed by position in `Module::defs`, with the breadth-first parent of each
@@ -51,13 +96,13 @@ pub struct EntryClosure {
 impl EntryClosure {
     /// The entry closure of `linked`.
     ///
-    /// Seeds: the last def named [`ENTRY_NAME`] when its home is
-    /// `linked.name`, plus every hydration projection and the `Duration`
-    /// accessor; otherwise every def. Edges: each `VarTopLevel` reference,
-    /// visited in (module, name) order so the breadth-first parents, and the
-    /// chains built from them, do not depend on hash order.
+    /// Seeds: the entry `roots` names ([`Roots::entry_def`]) plus every
+    /// hydration projection and the `Duration` accessor; with no entry, every
+    /// def. Edges: each `VarTopLevel` reference, visited in (module, name)
+    /// order so the breadth-first parents, and the chains built from them, do
+    /// not depend on hash order.
     #[must_use]
-    pub fn of(linked: &Module, interner: &Interner) -> Self {
+    pub fn of(linked: &Module, interner: &Interner, roots: Roots) -> Self {
         let count = linked.defs.len();
         let mut closure = Self {
             order: Vec::with_capacity(count),
@@ -66,26 +111,16 @@ impl EntryClosure {
         };
         let mut queue: VecDeque<usize> = VecDeque::new();
 
-        let entry = linked
-            .defs
-            .iter()
-            .rposition(|def| interner.resolve(def.name().value) == Some(ENTRY_NAME));
-        let entry_is_demanded = entry
-            .and_then(|i| linked.defs.get(i))
-            .is_some_and(|def| def.home() == linked.name.as_slice());
-        match entry {
-            Some(i) if entry_is_demanded => {
-                closure.admit(i, None, &mut queue);
-                for (j, def) in linked.defs.iter().enumerate() {
-                    if is_backend_root(def, interner) {
-                        closure.admit(j, None, &mut queue);
-                    }
-                }
-            }
-            Some(_) | None => {
-                for j in 0..count {
+        if let Some(i) = roots.entry_def(linked, interner) {
+            closure.admit(i, None, &mut queue);
+            for (j, def) in linked.defs.iter().enumerate() {
+                if is_backend_root(def, interner) {
                     closure.admit(j, None, &mut queue);
                 }
+            }
+        } else {
+            for j in 0..count {
+                closure.admit(j, None, &mut queue);
             }
         }
 
@@ -338,7 +373,7 @@ mod tests {
                 def(duration, to_millis, Expr_::Unit),
             ],
         );
-        let closure = EntryClosure::of(&linked, &interner);
+        let closure = EntryClosure::of(&linked, &interner, Roots::Entry);
         assert!(
             !closure.contains(0),
             "an uncalled def is outside the closure"
@@ -371,7 +406,7 @@ mod tests {
                 def(main_mod.clone(), main_fn, call(main_mod, helper)),
             ],
         );
-        let closure = EntryClosure::of(&linked, &interner);
+        let closure = EntryClosure::of(&linked, &interner, Roots::Entry);
         assert!(!closure.contains(0), "Lib.helper is never referenced");
         assert!(closure.contains(1), "Main.helper is referenced");
     }
@@ -390,7 +425,7 @@ mod tests {
             main_mod.clone(),
             vec![def(main_mod.clone(), helper, Expr_::Unit)],
         );
-        assert!(EntryClosure::of(&no_main, &interner).contains(0));
+        assert!(EntryClosure::of(&no_main, &interner, Roots::Entry).contains(0));
 
         let foreign_main = module(
             main_mod.clone(),
@@ -399,8 +434,54 @@ mod tests {
                 def(lib, main_fn, Expr_::Unit),
             ],
         );
-        let closure = EntryClosure::of(&foreign_main, &interner);
+        let closure = EntryClosure::of(&foreign_main, &interner, Roots::Entry);
         assert!(closure.contains(0), "a foreign main prunes nothing");
+        assert!(closure.contains(1));
+    }
+
+    /// A `main` linked after the entry module's own is not the entry: the
+    /// entry is chosen by home, never by link order, and the other program's
+    /// `main` stays outside the closure.
+    #[test]
+    fn a_foreign_last_main_is_not_the_entry() {
+        let mut interner = Interner::new();
+        let main_mod = vec![sym(&mut interner, "Main")];
+        let cli = vec![sym(&mut interner, "Cli")];
+        let main_fn = sym(&mut interner, ENTRY_NAME);
+        let linked = module(
+            main_mod.clone(),
+            vec![
+                def(main_mod, main_fn, Expr_::Unit),
+                def(cli, main_fn, Expr_::Unit),
+            ],
+        );
+        assert_eq!(entry_def(&linked, &interner), Some(0));
+        let closure = EntryClosure::of(&linked, &interner, Roots::Entry);
+        assert!(
+            closure.contains(0),
+            "the entry module's own main is the seed"
+        );
+        assert!(!closure.contains(1), "Cli.main is another program's entry");
+    }
+
+    /// The whole-API roots name no entry and keep every def, even beside the
+    /// linked module's own `main`.
+    #[test]
+    fn whole_api_roots_keep_every_def() {
+        let mut interner = Interner::new();
+        let main_mod = vec![sym(&mut interner, "Main")];
+        let main_fn = sym(&mut interner, ENTRY_NAME);
+        let unused = sym(&mut interner, "unused");
+        let linked = module(
+            main_mod.clone(),
+            vec![
+                def(main_mod.clone(), unused, Expr_::Unit),
+                def(main_mod, main_fn, Expr_::Unit),
+            ],
+        );
+        assert_eq!(Roots::WholeApi.entry_def(&linked, &interner), None);
+        let closure = EntryClosure::of(&linked, &interner, Roots::WholeApi);
+        assert!(closure.contains(0), "an uncalled def is an API root");
         assert!(closure.contains(1));
     }
 
@@ -428,7 +509,7 @@ mod tests {
                 def(main_mod.clone(), main_fn, call(main_mod, first_fn)),
             ],
         );
-        let closure = EntryClosure::of(&linked, &interner);
+        let closure = EntryClosure::of(&linked, &interner, Roots::Entry);
         assert_eq!(closure.breadth_first().collect::<Vec<_>>(), vec![2, 0, 1]);
         assert_eq!(closure.chain_to(1), vec![2, 0, 1]);
     }

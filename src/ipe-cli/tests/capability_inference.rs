@@ -222,6 +222,24 @@ const OWN_UNCALLED_CLOCK_EXPORT: &[(&str, &str)] = &[
     ),
 ];
 
+/// [`OWN_UNCALLED_CLOCK_EXPORT`] with a `main` of `Clock`'s own that never
+/// calls its exposed clock read.
+const SIBLING_MAIN_UNCALLED_CLOCK_EXPORT: &[(&str, &str)] = &[
+    (
+        "Main.ipe",
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\
+         main : Task ()\nmain =\n\x20   Io.println \"ok\"\n",
+    ),
+    (
+        "Clock.ipe",
+        "module Clock exposing (main, stamp)\n\nimport Ipe.Error exposing (Error)\n\
+         import Ipe.Io as Io\nimport Ipe.Time as Time\n\
+         import Ipe.Time.Timestamp exposing (Timestamp)\n\n\
+         stamp : Task Error Timestamp\nstamp =\n\x20   Time.now ()\n\n\
+         main : Task ()\nmain =\n\x20   Io.println \"clock\"\n",
+    ),
+];
+
 /// An imported stdlib module whose clock-reading exports the package never
 /// calls does not disclose `clock`.
 #[test]
@@ -253,6 +271,40 @@ fn an_uncalled_package_export_still_discloses_its_capability() -> Result<(), Box
         OWN_UNCALLED_CLOCK_EXPORT,
         &[Capability::Clock],
     )
+}
+
+/// A sibling module's own `main` does not cut its API down: the audit roots
+/// every function of a non-entry module, so an exposed clock read the
+/// sibling's `main` never calls is still disclosed.
+#[test]
+fn a_sibling_main_does_not_hide_an_uncalled_export() -> Result<(), Box<dyn Error>> {
+    assert_shared_equals_per_entry(
+        "sibling_main_uncalled_clock",
+        SIBLING_MAIN_UNCALLED_CLOCK_EXPORT,
+        &[Capability::Clock],
+    )
+}
+
+/// A nested module whose last segment is `Main`, with a `main` the build
+/// never runs.
+const NESTED_MAIN_NOT_A_PROGRAM: &[(&str, &str)] = &[
+    (
+        "Main.ipe",
+        "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\
+         main : Task ()\nmain =\n\x20   Io.println \"ok\"\n",
+    ),
+    (
+        "App/Main.ipe",
+        "module App.Main exposing (main)\n\nmain : Int\nmain =\n\x20   1\n",
+    ),
+];
+
+/// Only the root `Main` is the program entry: `App.Main`'s `main` is an
+/// ordinary function the build never runs, so inference does not gate its
+/// shape as a program entry (`IPE-L0136`) and refuse a package that builds.
+#[test]
+fn a_nested_main_module_is_not_gated_as_the_program_entry() -> Result<(), Box<dyn Error>> {
+    assert_shared_equals_per_entry("nested_main_not_a_program", NESTED_MAIN_NOT_A_PROGRAM, &[])
 }
 
 /// The result is a `Pipeline` error framed against `file_name`.
@@ -372,7 +424,7 @@ fn assert_each_module_analyzed_once(
         "canonicalize ran more often than there are modules ({modules})"
     );
     assert_eq!(
-        log.executions_of("lower_program"),
+        log.executions_of("lower_program") + log.executions_of("lower_package_api"),
         package.entry_module_paths().count(),
         "every entry is lowered exactly once, on the caller's database"
     );

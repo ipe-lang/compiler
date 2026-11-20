@@ -171,7 +171,7 @@ fn lower_leaf_param_ty(leaf: &str, leaf_home: &[Symbol], declare_union: bool) ->
         tag,
     } = build_leaf_fixture(leaf, leaf_home, declare_union);
 
-    let program = match lower(&m, &types, &mut interner, "", "") {
+    let program = match lower(&m, &types, &mut interner, "", "", ipe_lower::Roots::Entry) {
         Ok(p) => p,
         Err((d, _)) => {
             // The assert fails the test; the sentinel is never inspected.

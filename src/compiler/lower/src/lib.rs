@@ -48,12 +48,21 @@ pub use lower::custom_element_tag;
 #[doc(hidden)]
 pub use lower::tco_analysis;
 
+/// The root set a lowered program is cut down from: its entry `main`, or
+/// its whole API for the package-capability audit.
+pub use ipe_canon::reach::Roots;
+
 use ipe_canon::ast as canon;
 use ipe_diagnostics::Diagnostic;
 use ipe_intern::{Interner, SynthStem};
 use ipe_types::SolvedTypes;
 
 /// Lower a canonical module + its solved types into the typed IR.
+///
+/// `roots` names what the program is cut down from: [`Roots::Entry`] keeps
+/// the functions the linked module's own `main` reaches (the program entry,
+/// gated by IPE-L0136); [`Roots::WholeApi`] keeps every function and names no
+/// entry.
 ///
 /// # Errors
 /// * Returns [`ipe_diagnostics::Diagnostic::Lower`] when the input is valid Ipê
@@ -72,6 +81,7 @@ pub fn lower(
     interner: &mut Interner,
     source_path: &str,
     source_text: &str,
+    roots: Roots,
 ) -> Result<ipe_ir::Program, (Diagnostic, Vec<ipe_intern::Symbol>)> {
     // Widest callable arity — the ceiling for the eta / capture pools below.
     // Declared first (an item before any statement) so the `homeless` closure
@@ -271,7 +281,7 @@ pub fn lower(
         source_path,
         source_text,
     )
-    .run()
+    .run(roots)
 }
 
 #[cfg(test)]
@@ -327,7 +337,7 @@ mod tests {
         let src = ipe_parse::parse_module(GOLDEN, &mut i).ok()?;
         let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
         let types = ipe_types::infer(&m, &mut i).ok()?;
-        let program = lower(&m, &types, &mut i, "", "").ok()?;
+        let program = lower(&m, &types, &mut i, "", "", Roots::Entry).ok()?;
         Some((program, i))
     }
 
@@ -393,7 +403,7 @@ mod tests {
             .ok()
             .and_then(|s| ipe_canon::canonicalise(&s, &mut i).ok())
             .and_then(|m| ipe_types::infer(&m, &mut i).ok().map(|t| (m, t)))
-            .and_then(|(m, t)| lower(&m, &t, &mut i, "", "").ok());
+            .and_then(|(m, t)| lower(&m, &t, &mut i, "", "", Roots::Entry).ok());
         assert!(opt.is_some(), "live-enum module must lower");
         let Some(program) = opt else { return };
         let Some(module) = program.modules.first() else {
@@ -521,7 +531,7 @@ mod tests {
         let src = ipe_parse::parse_module(source, &mut i).ok()?;
         let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
         let types = ipe_types::infer(&m, &mut i).ok()?;
-        let program = lower(&m, &types, &mut i, "", "").ok()?;
+        let program = lower(&m, &types, &mut i, "", "", Roots::Entry).ok()?;
         let module = program.modules.into_iter().next()?;
         let func = module
             .funcs
@@ -537,7 +547,7 @@ mod tests {
         let src = ipe_parse::parse_module(source, &mut i).ok()?;
         let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
         let types = ipe_types::infer(&m, &mut i).ok()?;
-        let program = lower(&m, &types, &mut i, "", "").ok()?;
+        let program = lower(&m, &types, &mut i, "", "", Roots::Entry).ok()?;
         let module = program.modules.into_iter().next()?;
         let func = module
             .funcs
@@ -556,7 +566,8 @@ mod tests {
         let src = ipe_parse::parse_module(source, &mut i).map_err(|e| format!("parse: {e:?}"))?;
         let m = ipe_canon::canonicalise(&src, &mut i).map_err(|e| format!("canon: {e:?}"))?;
         let types = ipe_types::infer(&m, &mut i).map_err(|e| format!("infer: {e:?}"))?;
-        let program = lower(&m, &types, &mut i, "", "").map_err(|e| format!("lower: {e:?}"))?;
+        let program =
+            lower(&m, &types, &mut i, "", "", Roots::Entry).map_err(|e| format!("lower: {e:?}"))?;
         let module = program
             .modules
             .into_iter()
@@ -677,7 +688,7 @@ mod tests {
         let src = ipe_parse::parse_module(source, &mut i)?;
         let m = ipe_canon::canonicalise(&src, &mut i)?;
         let types = ipe_types::infer(&m, &mut i)?;
-        lower(&m, &types, &mut i, "", "")
+        lower(&m, &types, &mut i, "", "", Roots::Entry)
             .map(|_| ())
             .map_err(|(d, _home)| d)
     }
@@ -1328,7 +1339,7 @@ mod tests {
                     .ok()?;
             let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
             let types = ipe_types::infer(&m, &mut i).ok()?;
-            lower(&m, &types, &mut i, "", "").ok()
+            lower(&m, &types, &mut i, "", "", Roots::Entry).ok()
         })();
         assert!(pipeline.is_some(), "v must lower");
         let Some(program) = pipeline else { return };
@@ -1479,7 +1490,7 @@ mod tests {
             let src = ipe_parse::parse_module(source, &mut i).ok()?;
             let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
             let types = ipe_types::infer(&m, &mut i).ok()?;
-            lower(&m, &types, &mut i, "", "").ok()
+            lower(&m, &types, &mut i, "", "", Roots::Entry).ok()
         })();
         let enum_def = lowered
             .and_then(|p| p.modules.into_iter().next())
@@ -1778,5 +1789,111 @@ mod tests {
             Some(ipe_ir::BoundSet::UNBOUNDED.with_clone()),
             "a plain generic must stay `Clone`-only"
         );
+    }
+
+    /// A runnable entry `main` (a `Task`).
+    const RUNNABLE_MAIN: &str = "module Main exposing (main)\nimport Ipe.System as System\n\nmain =\n    System.setenv \"HOME\" \"x\"\n";
+
+    /// A second program's runnable `main`, in module `Cli`.
+    const RUNNABLE_CLI: &str = "module Cli exposing (main)\nimport Ipe.System as System\n\nmain =\n    System.setenv \"HOME\" \"y\"\n";
+
+    /// Link `sources` in order into one program demanded at the first
+    /// module, then lower it from `roots`.
+    fn lower_linked(
+        sources: &[&str],
+        roots: Roots,
+    ) -> Result<(ipe_ir::Program, Interner), Diagnostic> {
+        let mut i = Interner::new();
+        let mut modules = Vec::with_capacity(sources.len());
+        for source in sources {
+            let src = ipe_parse::parse_module(source, &mut i)?;
+            modules.push(ipe_canon::canonicalise(&src, &mut i)?);
+        }
+        let entry_name = modules.first().map(|m| m.name.clone()).unwrap_or_default();
+        let linked = ipe_canon::link::link(entry_name, modules, &i)?;
+        let types = ipe_types::infer(&linked, &mut i)?;
+        let program = lower(&linked, &types, &mut i, "", "", roots).map_err(|(d, _home)| d)?;
+        Ok((program, i))
+    }
+
+    /// The home of `module`'s entry function, as dotted source.
+    fn entry_home(module: &ipe_ir::Module, i: &Interner) -> Option<String> {
+        let entry = module.entry?;
+        let func = module.funcs.iter().find(|f| f.id == entry)?;
+        Some(
+            func.home
+                .0
+                .iter()
+                .filter_map(|s| i.resolve(*s))
+                .collect::<Vec<_>>()
+                .join("."),
+        )
+    }
+
+    /// With another program's `main` linked after the demanded module's own,
+    /// the entry is the demanded module's `main`: selected by home, never by
+    /// link order, and the other `main` is pruned as unreachable.
+    #[test]
+    fn entry_is_the_demanded_modules_main() {
+        let lowered = lower_linked(&[RUNNABLE_MAIN, RUNNABLE_CLI], Roots::Entry);
+        assert!(
+            lowered.is_ok(),
+            "the web-first pair must lower: {:?}",
+            lowered.as_ref().err()
+        );
+        let Ok((program, i)) = lowered else { return };
+        let Some(module) = program.modules.first() else {
+            return;
+        };
+        assert_eq!(entry_home(module, &i).as_deref(), Some("Main"));
+        let mains = module
+            .funcs
+            .iter()
+            .filter(|f| i.resolve(f.name) == Some(ipe_canon::reach::ENTRY_NAME))
+            .count();
+        assert_eq!(mains, 1, "Cli.main is outside the entry's closure");
+    }
+
+    /// A non-runnable `main` in the demanded module is refused with IPE-L0136
+    /// even when another program's runnable `main` is linked after it.
+    #[test]
+    fn a_foreign_main_does_not_skip_l0136() {
+        let non_runnable = "module Main exposing (main)\n\nmain : Int\nmain =\n    1\n";
+        let lowered = lower_linked(&[non_runnable, RUNNABLE_CLI], Roots::Entry);
+        assert!(
+            matches!(
+                lowered,
+                Err(Diagnostic::Lower {
+                    msg: LowerError::NonEntryMain { .. },
+                    ..
+                })
+            ),
+            "the demanded module's own `main` is the gated entry, got {:?}",
+            lowered.as_ref().err()
+        );
+    }
+
+    /// The whole-API roots name no entry, keep every function and gate no
+    /// `main`'s shape.
+    #[test]
+    fn whole_api_roots_name_no_entry() {
+        let non_runnable = "module Main exposing (main)\n\nmain : Int\nmain =\n    1\n";
+        let lowered = lower_linked(&[non_runnable, RUNNABLE_CLI], Roots::WholeApi);
+        assert!(
+            lowered.is_ok(),
+            "the whole API must lower: {:?}",
+            lowered.as_ref().err()
+        );
+        let Ok((program, i)) = lowered else { return };
+        let Some(module) = program.modules.first() else {
+            return;
+        };
+        assert_eq!(module.entry, None);
+        let mains = module
+            .funcs
+            .iter()
+            .filter(|f| i.resolve(f.name) == Some(ipe_canon::reach::ENTRY_NAME))
+            .count();
+        assert_eq!(mains, 2, "every function is an API root");
     }
 }

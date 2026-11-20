@@ -7080,7 +7080,8 @@ const RELEASE_GREETING: &str =
 ///
 /// Consent parses, solves (`typecheck`, the joint solve the build path
 /// lowers through) and lowers every user module as its own entry on the
-/// observed front end; the two member emits after it, under two
+/// observed front end — the entry as the program the emit reads, every other
+/// module as an API; the two member emits after it, under two
 /// configurations, execute no front-end query there, only their own emit. A build that opens its own front end
 /// leaves the log untouched: the negative control that the log sees this
 /// front end alone, so a judged emit that opened a second one would leave
@@ -7101,13 +7102,24 @@ fn one_front_end_judges_and_emits_every_release_member() {
     let Ok(release) = release else {
         return;
     };
-    for query in ["parse", "typecheck", "lower_program"] {
+    for query in ["parse", "typecheck"] {
         assert!(
             log.executions_of(query) >= 2,
             "consent executes `{query}` for each user module: {:?}",
             log.keys()
         );
     }
+    assert_eq!(
+        log.executions_of("lower_program"),
+        1,
+        "consent lowers the entry as the program the emit reads: {:?}",
+        log.keys()
+    );
+    assert!(
+        log.executions_of("lower_package_api") >= 1,
+        "consent lowers each other user module as an API: {:?}",
+        log.keys()
+    );
     log.keys().clear();
 
     let out = ipe_test_temp::temp_root().join(format!("ipe-one-front-end-{}", std::process::id()));
@@ -7139,6 +7151,7 @@ fn one_front_end_judges_and_emits_every_release_member() {
         "typecheck",
         "infer_module_scoped",
         "lower_program",
+        "lower_package_api",
     ] {
         assert_eq!(
             log.executions_of(query),

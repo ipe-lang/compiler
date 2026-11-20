@@ -3950,21 +3950,44 @@ pub fn emit_spine(ctx: &EmitCtx, program: &Program) -> DResult<String> {
     let mut out = file.render();
 
     // Shape-app entry switch in the spine (Native and WASI): `ipe_main` lives
-    // in a module file, so the run form is read from the IR alone — the same
+    // in a module file, so the run form is read from the IR — the same
     // `EntryRun` the single-file layout and the lowerer's admissibility read.
     // A `Server.listen [ Server.mountApp (Web.embed { … }) … ]` program sets
     // `uses_web` yet its `main` returns a task, so it runs as a task.
-    let main_returns_shape_leaf = ipe_ir::EntryRun::ShapeApp.is_entry_of(program);
-    if main_returns_shape_leaf
-        && matches!(
-            ctx.target,
-            ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
-        )
-    {
-        out = switch_shape_app_entry(
-            &out,
-            "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
-        )?;
+    if matches!(
+        ctx.target,
+        ipe_ir::Target::Native | ipe_ir::Target::WasmWasi
+    ) {
+        let main_returns_shape_leaf = ipe_ir::EntryRun::ShapeApp.is_entry_of(program);
+        // The independent second witness, as in the single-file layout: the
+        // run form of the function rendered as `ipe_main`, found by its
+        // emitted name rather than through `Module.entry`.
+        let renders_shape_app = program
+            .modules
+            .iter()
+            .flat_map(|module| &module.funcs)
+            .find(|func| {
+                ctx.func_names.get(&func.id).map(String::as_str) == Some(crate::naming::ENTRY_FN)
+            })
+            .is_some_and(|func| {
+                ipe_ir::EntryRun::of(&func.ret) == Some(ipe_ir::EntryRun::ShapeApp)
+            });
+        if main_returns_shape_leaf != renders_shape_app {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
+                detail: format!(
+                    "shape-app entry-switch: the IR entry run form says shape app = \
+                     {main_returns_shape_leaf}, the function rendered as `ipe_main` says \
+                     {renders_shape_app}"
+                ),
+            });
+        }
+        if main_returns_shape_leaf {
+            out = switch_shape_app_entry(
+                &out,
+                "ipe_backend_rust::project::emit_spine::shape_app_entry_switch",
+            )?;
+        }
     }
 
     Ok(out)

@@ -1912,6 +1912,7 @@ impl<'a> EmitCtx<'a> {
                 }
             }
         }
+        refuse_entry_not_ipe_main(program, &func_names)?;
 
         // Prepass: collect every distinct CLOSED record shape the program uses
         // (recursing into nested records / tuples), so each gets one synthesised
@@ -4361,6 +4362,38 @@ fn type_reaches_enum(
         // `Ui { ctor, msg }` — descend into `msg`.
         IrType::Ui { msg, .. } => type_reaches_enum(msg, target, enums, visited),
     }
+}
+
+/// Refuse a program whose lowered entry is not the function rendered as
+/// [`naming::ENTRY_FN`].
+///
+/// The epilogue's `fn main` calls `ipe_main`, the name
+/// [`naming::module_value`] gives `Main.main`, while its run form is read from
+/// `Module.entry`. Two witnesses of one fact: when they name different
+/// functions the run site expects one return type and the call yields
+/// another, so the disagreement is a `CompilerBug` here, never a crate
+/// `cargo` refuses.
+fn refuse_entry_not_ipe_main(
+    program: &Program,
+    func_names: &BTreeMap<FuncId, String>,
+) -> DResult<()> {
+    for module in &program.modules {
+        let Some(entry) = module.entry else {
+            continue;
+        };
+        let rendered = func_names.get(&entry).map(String::as_str);
+        if rendered != Some(naming::ENTRY_FN) {
+            return Err(Diagnostic::CompilerBug {
+                where_: "ipe_backend_rust::EmitCtx::build::entry_is_ipe_main",
+                detail: format!(
+                    "the lowered entry renders as `{}`, not the `{}` the epilogue calls",
+                    rendered.unwrap_or("<unnamed>"),
+                    naming::ENTRY_FN
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The app surface the program's entry `main` pins, from its lowered return type.

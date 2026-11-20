@@ -95,7 +95,7 @@ fn run_owned(
     };
     // `lower` pairs its diagnostic with the owning def's `home`;
     // these single-module gap tests assert only on the diagnostic, so drop it.
-    lower(&m, &types, interner, "", "").map_err(|(d, _home)| d)
+    lower(&m, &types, interner, "", "", ipe_lower::Roots::Entry).map_err(|(d, _home)| d)
 }
 
 /// Assert the lowering failed with exactly the expected unsupported feature,
