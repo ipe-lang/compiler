@@ -170,12 +170,12 @@ fn installer_banner_success_and_footer_use_the_two_space_gutter() {
     );
 }
 
-/// The two install entry points must stay consistent: the README `curl … | sh`
-/// one-liner and the `ipe upgrade` self-updater (`INSTALL_SH_URL`) must reference
-/// the SAME URL, and it must point at the installer that actually exists at the
-/// repository root. When `install.sh` moved under `tools/scripts/`, the README and
-/// the upgrade URL kept pointing at the old path and silently 404'd — this test
-/// replicates both entry points and fails if they drift apart again.
+/// The README install line and `ipe upgrade` fetch the same root installer.
+///
+/// The README line and the self-updater's `INSTALL_SH_URL` reference the same
+/// URL, which names the `install.sh` at the repository root. The README line
+/// saves the whole script before running it, so a cut-off download runs
+/// nothing.
 #[test]
 fn install_entrypoints_agree_on_the_root_installer() {
     // 1. The installer lives at the repository root (short, easy-to-locate path).
@@ -193,14 +193,14 @@ fn install_entrypoints_agree_on_the_root_installer() {
         "ipe upgrade INSTALL_SH_URL must point at `main/install.sh`, got `{upgrade_url}`"
     );
 
-    // 3. The README `curl … | sh` one-liner must curl that same URL — one source
-    //    of truth shared by the fresh-install and self-update paths.
+    // 3. The README curl line fetches that same URL — one source of truth
+    //    shared by the fresh-install and self-update paths.
     let readme = std::fs::read_to_string(e2e_support::manifest_dir!().join("../../README.md"))
         .expect("README.md is readable");
     let curl_line = readme
         .lines()
         .find(|l| l.contains("curl") && l.contains("install.sh"))
-        .expect("README must document a `curl … install.sh | sh` install command");
+        .expect("README must document a `curl … install.sh` install command");
     assert!(
         curl_line.contains(upgrade_url),
         "the README curl one-liner must use the same URL as `ipe upgrade` (`{upgrade_url}`); \
@@ -208,8 +208,8 @@ fn install_entrypoints_agree_on_the_root_installer() {
         curl_line.trim()
     );
     assert!(
-        curl_line.contains("| sh"),
-        "the README install command must pipe the script into `sh`; line: `{}`",
+        curl_line.contains(" -o ipe-install.sh && sh ipe-install.sh"),
+        "the README install command must save the script whole, then run it; line: `{}`",
         curl_line.trim()
     );
 }

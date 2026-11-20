@@ -2,7 +2,7 @@
 # Ipê installer — detects your platform, downloads the matching release binary,
 # and installs `ipe` (+ `ipe-ffi-inspector`) to a bin dir on your PATH.
 #
-#   curl -fsSL https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh -o ipe-install.sh && sh ipe-install.sh
 #
 # Overrides:  IPE_VERSION=v0.1.0  IPE_INSTALL_DIR=$HOME/.local/bin  sh install.sh
 set -eu
@@ -210,7 +210,7 @@ prompt() {
 # the SAME line is rewritten (carriage return) to a light-green ✓ + message; on
 # failure to a light-red ✗ + message. Off a terminal (pipe / CI / NO_COLOR) each
 # stage is one plain flush-left line with no spinner, no rewrite, and no ANSI, so
-# `curl … | sh` logs stay clean. All chatter goes to stderr so stdout stays clean.
+# CI logs stay clean. All chatter goes to stderr so stdout stays clean.
 #
 # The rendered (already escaped) label of the stage currently in flight, so an
 # outcome can clear a line at least as wide as it and leave no tail behind.
@@ -289,17 +289,31 @@ info() {
   printf '    %s%s%s\n' "$C_DIM" "$MSG_TEXT" "$C_RESET" >&2
 }
 
-# die FMT [VALUE...] — settle any running stage as a failure, then exit
-# non-zero. Mirrors the CLI's failure shape: the actionable message rides the ✗
-# line.
-die() {
+# die_settle FMT [VALUE...] — the failure line die and die_prerequisite share:
+# settle any running stage as a failure carrying the message, or print it on a
+# ✗ line of its own.
+die_settle() {
   msg_text "$@"
   if [ -n "$STAGE_LABEL" ]; then
     stage_settle_fail "$MSG_TEXT"
   else
     printf '\n  %s✗%s %s%s%s\n' "$C_RED" "$C_RESET" "$C_RED" "$MSG_TEXT" "$C_RESET" >&2
   fi
+}
+
+# die FMT [VALUE...] — settle any running stage as a failure, then exit 1.
+# Mirrors the CLI's failure shape: the actionable message rides the ✗ line.
+die() {
+  die_settle "$@"
   exit 1
+}
+
+# die_prerequisite FMT [VALUE...] — die for a host tool the installer needs and
+# did not find, with exit 3: distinct from a failed install (1) and from no
+# prebuilt binary (2, die_no_prebuilt).
+die_prerequisite() {
+  die_settle "$@"
+  exit 3
 }
 
 # banner FMT [VALUE...] — the opening "Ipê language - <version>" line.
@@ -651,12 +665,468 @@ tag_file_ok() {
 }
 # <<< private-scratch helpers
 
+# >>> prerequisite commands
+# The command that installs each host prerequisite, per OS family: one
+# `KIND:FAMILY)` row per pair. The CLI's own prerequisite table is checked
+# against these rows.
+PREREQ_FAMILIES='debian fedora arch alpine suse macos freebsd'
+
+# prereq_command KIND FAMILY — set PREREQ_CMD to the command that installs KIND
+# (`c-toolchain` or `curl`) on FAMILY, or '' when there is no row.
+prereq_command() {
+  case "$1:$2" in
+    c-toolchain:debian) PREREQ_CMD='sudo apt install build-essential' ;;
+    c-toolchain:fedora) PREREQ_CMD='sudo dnf install gcc' ;;
+    c-toolchain:arch) PREREQ_CMD='sudo pacman -S --needed base-devel' ;;
+    c-toolchain:alpine) PREREQ_CMD='sudo apk add build-base' ;;
+    c-toolchain:suse) PREREQ_CMD='sudo zypper install gcc' ;;
+    c-toolchain:macos) PREREQ_CMD='xcode-select --install' ;;
+    c-toolchain:freebsd) PREREQ_CMD='cc ships in the FreeBSD base system' ;;
+    curl:debian) PREREQ_CMD='sudo apt install curl' ;;
+    curl:fedora) PREREQ_CMD='sudo dnf install curl' ;;
+    curl:arch) PREREQ_CMD='sudo pacman -S --needed curl' ;;
+    curl:alpine) PREREQ_CMD='sudo apk add curl' ;;
+    curl:suse) PREREQ_CMD='sudo zypper install curl' ;;
+    curl:macos) PREREQ_CMD='brew install curl' ;;
+    curl:freebsd) PREREQ_CMD='sudo pkg install curl' ;;
+    *) PREREQ_CMD='' ;;
+  esac
+}
+
+# os_family FILE — set OS_FAMILY from the os-release FILE: the family of the
+# first word of `ID`, then of `ID_LIKE`, that names one, else `unknown`. At most
+# 64 lines are read.
+os_family() {
+  OS_FAMILY=unknown; _of_id=''; _of_like=''; _of_n=0; _of_line=''
+  [ -f "$1" ] && [ -r "$1" ] || return 0
+  while IFS= read -r _of_line || [ -n "$_of_line" ]; do
+    _of_n=$((_of_n + 1))
+    [ "$_of_n" -le 64 ] || break
+    case "$_of_line" in
+      ID=*) _of_id="${_of_line#ID=}" ;;
+      ID_LIKE=*) _of_like="${_of_line#ID_LIKE=}" ;;
+    esac
+    _of_line=''
+  done <"$1"
+  # Every byte but a lowercase letter, a digit and `._-` becomes a blank, so the
+  # unquoted split below sees plain words and no glob character.
+  _of_words="$(printf '%s %s' "$_of_id" "$_of_like" \
+    | LC_ALL=C sed 's/[^abcdefghijklmnopqrstuvwxyz0123456789._-]/ /g')" || _of_words=''
+  for _of_word in $_of_words; do
+    case "$_of_word" in
+      debian|ubuntu|linuxmint|pop|raspbian|elementary|zorin|kali|neon) OS_FAMILY=debian ;;
+      fedora|rhel|centos|rocky|almalinux|ol|amzn) OS_FAMILY=fedora ;;
+      arch|manjaro|endeavouros|artix|garuda) OS_FAMILY=arch ;;
+      alpine|postmarketos) OS_FAMILY=alpine ;;
+      suse|opensuse|opensuse-leap|opensuse-tumbleweed|sles|sled) OS_FAMILY=suse ;;
+      *) ;;
+    esac
+    [ "$OS_FAMILY" = unknown ] || return 0
+  done
+}
+
+# prereq_remedy KIND — print the command that installs KIND on OS_FAMILY, or
+# every family's row when the family is unknown.
+prereq_remedy() {
+  if [ "$OS_FAMILY" != unknown ]; then
+    prereq_command "$1" "$OS_FAMILY"
+    say '        @D@%s@0@' "$PREREQ_CMD"
+    return 0
+  fi
+  for _pr_family in $PREREQ_FAMILIES; do
+    prereq_command "$1" "$_pr_family"
+    say '        %s: @D@%s@0@' "$_pr_family" "$PREREQ_CMD"
+  done
+}
+# <<< prerequisite commands
+
+# >>> fetch helpers
+# Every network request the installer makes goes through fetch_to or fetch_ok,
+# and every fetcher they run gives the same guarantees: HTTPS only, redirects
+# included; TLS 1.2 or later; certificate verification that no user config or
+# environment can turn off; failure on an HTTP error; a time ceiling; and a
+# size ceiling checked before the body is used. curl comes first, then GNU
+# Wget, then FreeBSD fetch; any other wget is refused.
+FETCHER=''
+RUSTUP_CMD=''
+FETCH_AUTH=0
+FETCH_TOTAL=0
+WGET_CODE=''
+WGET_LOCATION=''
+# The bytes a fetched URL may hold, spelled out so no locale widens a range.
+FETCH_URL_CHARS='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._~:/?#@!*+,;=%&-'
+# The most redirects a GNU Wget fetch follows.
+FETCH_MAX_HOPS=5
+# The size ceiling of the release archive, in bytes (256 MiB).
+ARCHIVE_MAX_BYTES=268435456
+
+# fetch_url_ok URL — URL starts `https://`, is at most 2048 bytes, and holds
+# only FETCH_URL_CHARS.
+fetch_url_ok() {
+  [ "${#1}" -le 2048 ] || return 1
+  case "$1" in
+    https://?*) ;;
+    *) return 1 ;;
+  esac
+  # shellcheck disable=SC2254  # FETCH_URL_CHARS is a deliberate bracket set
+  case "$1" in
+    *[!$FETCH_URL_CHARS]*) return 1 ;;
+  esac
+}
+
+# fetch_resolve — set FETCHER to the first fetcher on this host that gives
+# every guarantee, and write GNU Wget's private config; refuse the host when no
+# fetcher does.
+fetch_resolve() {
+  FETCHER=''; _fr_other_wget=0
+  if command -v curl >/dev/null 2>&1; then
+    FETCHER=curl
+  elif command -v wget >/dev/null 2>&1; then
+    _fr_version="$(wget --version 2>/dev/null | head -n 1)" || _fr_version=''
+    case "$_fr_version" in
+      'GNU Wget '*) FETCHER=wget ;;
+      *) _fr_other_wget=1 ;;
+    esac
+  fi
+  if [ -z "$FETCHER" ] && [ "$plat" = freebsd ] && command -v fetch >/dev/null 2>&1; then
+    FETCHER=fetch
+  fi
+  if [ -z "$FETCHER" ]; then
+    if [ "$_fr_other_wget" = 1 ]; then
+      die_other_wget
+    fi
+    die_no_fetcher
+  fi
+  # The rustup bootstrap, spelled for this fetcher, for the user to run.
+  case "$FETCHER" in
+    curl) RUSTUP_CMD="curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" ;;
+    wget) RUSTUP_CMD='wget --https-only --secure-protocol=TLSv1_2 -qO- https://sh.rustup.rs | sh' ;;
+    *) RUSTUP_CMD='fetch -qo - https://sh.rustup.rs | sh' ;;
+  esac
+  if [ "$FETCHER" = wget ]; then
+    # Replaces every system and user wgetrc for each GNU Wget run.
+    printf 'check_certificate = on\nnetrc = off\n' >"$tmp/wgetrc" \
+      || die 'Could not write %s.' "$tmp/wgetrc"
+  fi
+}
+
+# die_no_fetcher — refuse a host with no fetcher, naming the install command.
+die_no_fetcher() {
+  say '\n    The installer downloads over HTTPS with curl or GNU Wget and found neither.'
+  say '    Install curl, then run the installer again:'
+  prereq_remedy curl
+  die_prerequisite 'Missing prerequisite: curl or wget [prerequisite fetcher].'
+}
+
+# die_other_wget — refuse a wget that is not GNU Wget (such as BusyBox wget):
+# the installer runs only fetchers whose certificate verification it can hold on.
+die_other_wget() {
+  say '\n    The installer downloads with curl or GNU Wget, each run with certificate verification held on.'
+  say '    The wget on this host is another implementation (such as BusyBox wget). Install curl, then run the installer again:'
+  prereq_remedy curl
+  case "$OS_FAMILY" in
+    alpine|unknown) ;;
+    *) say '        alpine: @D@%s@0@' "apk add curl" ;;
+  esac
+  die_prerequisite 'Missing prerequisite: curl or GNU Wget [prerequisite fetcher].'
+}
+
+# fetch_auth_setup — when GITHUB_TOKEN or GH_TOKEN holds a token, write it to a
+# private file the fetcher reads it from, never its arguments, and set
+# FETCH_AUTH to 1. FreeBSD fetch sends no custom header, so it resolves the
+# release anonymously; so does a value with a byte no GitHub token holds.
+fetch_auth_setup() {
+  FETCH_AUTH=0
+  _fa_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  [ -n "$_fa_token" ] || return 0
+  [ "$FETCHER" != fetch ] || return 0
+  case "$_fa_token" in
+    *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+      info 'The GitHub token in the environment is not a token; resolving the release anonymously.'
+      return 0
+      ;;
+  esac
+  if [ "${#_fa_token}" -gt 1024 ]; then
+    info 'The GitHub token in the environment is not a token; resolving the release anonymously.'
+    return 0
+  fi
+  if [ "$FETCHER" = curl ]; then
+    ( umask 077 && printf 'Authorization: Bearer %s\n' "$_fa_token" >"$tmp/auth.header" ) \
+      || die 'Could not write %s.' "$tmp/auth.header"
+  else
+    ( umask 077 \
+      && printf 'check_certificate = on\nnetrc = off\nheader = Authorization: Bearer %s\n' \
+        "$_fa_token" >"$tmp/auth.wgetrc" ) \
+      || die 'Could not write %s.' "$tmp/auth.wgetrc"
+  fi
+  FETCH_AUTH=1
+}
+
+# fetch_to FILE URL MAX_BYTES MAX_SECS [auth] — write URL's body to FILE. Fails
+# when URL is refused by fetch_url_ok, the fetch fails, or the body exceeds
+# MAX_BYTES. `auth` sends the token fetch_auth_setup prepared, if any. MAX_SECS
+# bounds a curl transfer; GNU Wget and fetch stop on a stalled read.
+fetch_to() {
+  _ft_file="$1"; _ft_url="$2"; _ft_max="$3"; _ft_secs="$4"; _ft_auth="${5:-}"
+  [ "$FETCH_AUTH" = 1 ] || _ft_auth=''
+  fetch_url_ok "$_ft_url" || return 1
+  case "$FETCHER" in
+    curl)
+      if [ "$_ft_auth" = auth ]; then
+        curl -q --proto =https --proto-redir =https --tlsv1.2 -fsSL \
+          --connect-timeout 15 --max-time "$_ft_secs" --max-filesize "$_ft_max" \
+          -H @"$tmp/auth.header" -o "$_ft_file" "$_ft_url" 2>/dev/null || return 1
+      else
+        curl -q --proto =https --proto-redir =https --tlsv1.2 -fsSL \
+          --connect-timeout 15 --max-time "$_ft_secs" --max-filesize "$_ft_max" \
+          -o "$_ft_file" "$_ft_url" 2>/dev/null || return 1
+      fi
+      ;;
+    wget) wget_walk "$_ft_file" "$_ft_url" "$_ft_auth" || return 1 ;;
+    fetch)
+      ( unset SSL_NO_VERIFY_PEER SSL_NO_VERIFY_HOSTNAME SSL_CA_CERT_FILE SSL_CA_CERT_PATH
+        fetch -q -T 30 -o "$_ft_file" "$_ft_url" 2>/dev/null ) || return 1
+      ;;
+    *) return 1 ;;
+  esac
+  fetch_size_ok "$_ft_file" "$_ft_max"
+}
+
+# fetch_size_ok FILE MAX_BYTES — FILE exists and holds at most MAX_BYTES bytes;
+# an oversized FILE is removed.
+fetch_size_ok() {
+  [ -f "$1" ] || return 1
+  _fs_got="$(wc -c <"$1" | tr -d ' ')" || return 1
+  case "$_fs_got" in
+    ''|*[!0123456789]*) return 1 ;;
+  esac
+  if [ "$_fs_got" -gt "$2" ]; then
+    rm -f "$1"
+    info 'The server sent %s bytes, over the %s-byte ceiling for that file.' "$_fs_got" "$2"
+    return 1
+  fi
+}
+
+# fetch_ok URL — URL answers with a success status.
+fetch_ok() {
+  fetch_url_ok "$1" || return 1
+  case "$FETCHER" in
+    curl)
+      curl -q --proto =https --proto-redir =https --tlsv1.2 -fsSL \
+        --connect-timeout 15 --max-time 15 -I -o /dev/null "$1" 2>/dev/null
+      ;;
+    wget) wget_walk '' "$1" '' ;;
+    fetch)
+      ( unset SSL_NO_VERIFY_PEER SSL_NO_VERIFY_HOSTNAME SSL_CA_CERT_FILE SSL_CA_CERT_PATH
+        fetch -q -T 30 -s "$1" >/dev/null 2>&1 )
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# fetch_total URL — set FETCH_TOTAL to URL's size from a one-byte range
+# request, or 0 when unknown. curl only: the progress bar runs under curl.
+fetch_total() {
+  FETCH_TOTAL=0
+  [ "$FETCHER" = curl ] || return 0
+  fetch_url_ok "$1" || return 0
+  _fl_head="$(curl -q --proto =https --proto-redir =https --tlsv1.2 -fsSL \
+    --connect-timeout 15 --max-time 30 -r 0-0 -D - -o /dev/null "$1" 2>/dev/null)" \
+    || _fl_head=''
+  [ -n "$_fl_head" ] || return 0
+  FETCH_TOTAL="$(printf '%s\n' "$_fl_head" \
+    | tr -d '\r' \
+    | sed -n 's#^[Cc]ontent-[Rr]ange: *bytes [0-9]*-[0-9]*/\([0-9][0-9]*\).*#\1#p' \
+    | tail -n 1)" || FETCH_TOTAL=0
+  case "$FETCH_TOTAL" in
+    ''|*[!0123456789]*) FETCH_TOTAL=0 ;;
+  esac
+  [ "${#FETCH_TOTAL}" -le 12 ] || FETCH_TOTAL=0
+}
+
+# wget_walk FILE URL [auth] — fetch URL with GNU Wget into FILE, or probe it
+# when FILE is empty, following at most FETCH_MAX_HOPS redirects by hand: each
+# hop's Location must pass fetch_url_ok, so a redirect never leaves HTTPS.
+wget_walk() {
+  _ww_file="$1"; _ww_url="$2"; _ww_hops=0
+  _ww_config="$tmp/wgetrc"
+  if [ "${3:-}" = auth ]; then
+    _ww_config="$tmp/auth.wgetrc"
+  fi
+  while :; do
+    fetch_url_ok "$_ww_url" || return 1
+    _ww_status=0
+    if [ -n "$_ww_file" ]; then
+      wget --config="$_ww_config" --https-only --secure-protocol=TLSv1_2 --timeout=15 \
+        --tries=1 --max-redirect=0 --server-response -q -O "$_ww_file" "$_ww_url" \
+        2>"$tmp/wget.log" || _ww_status=$?
+    else
+      wget --config="$_ww_config" --https-only --secure-protocol=TLSv1_2 --timeout=15 \
+        --tries=1 --max-redirect=0 --server-response -q --spider "$_ww_url" \
+        2>"$tmp/wget.log" || _ww_status=$?
+    fi
+    [ "$_ww_status" != 0 ] || return 0
+    # GNU Wget exits 8 on any server error response, a redirect it may not
+    # follow included.
+    [ "$_ww_status" = 8 ] || return 1
+    wget_redirect "$tmp/wget.log" || return 1
+    _ww_hops=$((_ww_hops + 1))
+    [ "$_ww_hops" -le "$FETCH_MAX_HOPS" ] || return 1
+    _ww_url="$WGET_LOCATION"
+  done
+}
+
+# wget_redirect LOG — set WGET_LOCATION to the target of the last response in
+# GNU Wget's --server-response LOG; fail unless that response is a redirect
+# (301, 302, 303, 307 or 308) whose Location starts `https://`.
+wget_redirect() {
+  WGET_CODE=''; WGET_LOCATION=''; _wr_n=0; _wr_line=''
+  while IFS= read -r _wr_line || [ -n "$_wr_line" ]; do
+    _wr_n=$((_wr_n + 1))
+    [ "$_wr_n" -le 256 ] || return 1
+    case "$_wr_line" in
+      '  HTTP/'*)
+        _wr_rest="${_wr_line#*HTTP/}"
+        _wr_rest="${_wr_rest#*[ ]}"
+        WGET_CODE="${_wr_rest%%[ ]*}"
+        WGET_LOCATION=''
+        ;;
+      '  '[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:*)
+        # One blank follows the colon; any other spacing leaves the target
+        # empty, which is refused below.
+        _wr_rest="${_wr_line#*:}"
+        _wr_rest="${_wr_rest# }"
+        WGET_LOCATION="${_wr_rest%%[ ]*}"
+        ;;
+    esac
+    _wr_line=''
+  done <"$1"
+  case "$WGET_CODE" in
+    301|302|303|307|308) ;;
+    *) return 1 ;;
+  esac
+  case "$WGET_LOCATION" in
+    https://?*) ;;
+    *) return 1 ;;
+  esac
+}
+# <<< fetch helpers
+
+# ── Checksum helpers ─────────────────────────────────────────────────────────
+SHA256_TOOL=''
+SHA256_GOT=''
+SUMS_WANT=''
+SUMS_FAULT=''
+
+# sha256_resolve — set SHA256_TOOL to the first SHA-256 tool on this host;
+# refuse the host when it has none, since every download is verified.
+sha256_resolve() {
+  SHA256_TOOL=''
+  for _sr_tool in sha256sum shasum sha256 openssl; do
+    if command -v "$_sr_tool" >/dev/null 2>&1; then
+      SHA256_TOOL="$_sr_tool"
+      return 0
+    fi
+  done
+  die_no_sha256
+}
+
+# die_no_sha256 — refuse a host with no SHA-256 tool, naming the tools.
+die_no_sha256() {
+  say '\n    The installer verifies every download against the release SHA256SUMS and found no SHA-256 tool.'
+  say '    Install one of sha256sum (coreutils), shasum, sha256 or openssl, then run the installer again.'
+  die_prerequisite 'Missing prerequisite: a SHA-256 tool [prerequisite sha256].'
+}
+
+# hex_digest_ok TEXT — TEXT is exactly 64 lowercase hex digits.
+hex_digest_ok() {
+  [ "${#1}" -eq 64 ] || return 1
+  case "$1" in
+    *[!0123456789abcdef]*) return 1 ;;
+  esac
+}
+
+# sha256_of FILE — set SHA256_GOT to FILE's SHA-256 digest, computed by
+# SHA256_TOOL; fail unless the tool printed one well-formed digest.
+sha256_of() {
+  SHA256_GOT=''
+  case "$SHA256_TOOL" in
+    sha256sum) _so_out="$(sha256sum "$1" 2>/dev/null)" || return 1 ;;
+    shasum) _so_out="$(shasum -a 256 "$1" 2>/dev/null)" || return 1 ;;
+    sha256) _so_out="$(sha256 -q "$1" 2>/dev/null)" || return 1 ;;
+    openssl) _so_out="$(openssl dgst -sha256 -r "$1" 2>/dev/null)" || return 1 ;;
+    *) return 1 ;;
+  esac
+  _so_out="${_so_out%%[ ]*}"
+  hex_digest_ok "$_so_out" || return 1
+  SHA256_GOT="$_so_out"
+}
+
+# sums_entry FILE NAME — set SUMS_WANT to the digest the SHA256SUMS FILE lists
+# for exactly NAME, a `<digest>  NAME` or `<digest> *NAME` line. SUMS_FAULT is
+# '' on one well-formed entry, `missing` on none, and `malformed` on a bad
+# digest, a second entry, or a list over 4096 lines.
+sums_entry() {
+  SUMS_WANT=''; SUMS_FAULT=missing; _se_n=0; _se_line=''
+  [ -f "$1" ] || return 0
+  while IFS= read -r _se_line || [ -n "$_se_line" ]; do
+    _se_n=$((_se_n + 1))
+    if [ "$_se_n" -gt 4096 ]; then
+      SUMS_FAULT=malformed
+      return 0
+    fi
+    _se_hex="${_se_line%%[ ]*}"
+    _se_rest="${_se_line#"$_se_hex"}"
+    _se_line=''
+    case "$_se_rest" in
+      "  $2"|" *$2") ;;
+      *) continue ;;
+    esac
+    if [ -n "$SUMS_WANT" ] || ! hex_digest_ok "$_se_hex"; then
+      SUMS_FAULT=malformed
+      return 0
+    fi
+    SUMS_WANT="$_se_hex"
+    SUMS_FAULT=''
+  done <"$1"
+}
+
+# ── The closing "Before your first build" block ──────────────────────────────
+# before_first_build — name each build prerequisite this host lacks, with the
+# command that installs it, and the curl the other `ipe` commands download
+# with when the installer ran without it. Advisory: ipe is already installed.
+before_first_build() {
+  if [ "$cargo_ok" = 1 ] && [ "$cc_ok" = 1 ] && [ "$FETCHER" = curl ]; then
+    return 0
+  fi
+  say '\n  @B@Before your first build@0@'
+  if [ "$cargo_ok" != 1 ]; then
+    if [ "$plat" = windows ]; then
+      say '    Install Rust %s or later with the installer from @D@%s@0@' "$MIN_CARGO_VERSION" "$rustup_url"
+    elif [ "$cargo_old" = 1 ]; then
+      say '    Update Rust to %s or later:' "$MIN_CARGO_VERSION"
+      say '        @D@%s@0@' "rustup update"
+    else
+      say '    Install Rust %s or later with rustup:' "$MIN_CARGO_VERSION"
+      say '        @D@%s@0@' "$RUSTUP_CMD"
+    fi
+  fi
+  if [ "$cc_ok" != 1 ]; then
+    say '    Install a C toolchain, which Rust links through:'
+    prereq_remedy c-toolchain
+  fi
+  if [ "$FETCHER" != curl ]; then
+    say '    ipe upgrade, ipe login and ipe publish download with curl. Install it:'
+    prereq_remedy curl
+  fi
+}
+
 # die_no_prebuilt TAG PLAT CPU — exits 2, a distinct code the `ipe upgrade`
 # wrapper uses to show the "still being generated" message instead of generic
 # failure text. Exit 2 (not 1) signals "no prebuilt binary" specifically.
 #
 # IPE_UPGRADE_WRAPPED=1 marks a run launched BY `ipe upgrade` (never set by a
-# direct `curl | sh`): that wrapper renders its own single failure message
+# direct run of the installer): that wrapper renders its own single failure message
 # using the real resolved tag, so this function skips its own stderr banner
 # and instead writes the tag into the private file the wrapper named in
 # IPE_UPGRADE_TAG_FILE — only when tag_file_ok verifies it is a private file in
@@ -739,36 +1209,51 @@ esac
 artifact="ipe-$plat-$cpu"
 [ "$plat" = windows ] && ext=zip || ext=tar.gz
 
-# Fetch the GitHub "latest release" JSON. When a token is present in the
-# environment (GITHUB_TOKEN / GH_TOKEN) the request is authenticated, so shared
-# CI runners are not rate-limited — the anonymous API allows only 60 req/hr/IP
-# and a busy runner IP hits 403. A real user without a token uses the generous
-# per-IP anonymous limit unchanged.
+# ── The OS family, for the commands that install a missing prerequisite ──────
+case "$plat" in
+  darwin) OS_FAMILY=macos ;;
+  freebsd) OS_FAMILY=freebsd ;;
+  linux) os_family /etc/os-release ;;
+  *) OS_FAMILY=unknown ;;
+esac
+
+# ── The private scratch directory, before any download ───────────────────────
+tmp="$(mktemp -d "$scratch_base/ipe-install.XXXXXX")" \
+  || die 'Could not create a private temp directory under %s.' "$scratch_base"
+trap 'rm -rf "$tmp"' EXIT
+private_dir_ok "$tmp" || die 'The temp directory %s is not private to you.' "$tmp"
+pkg="$tmp/pkg.$ext"
+
+if [ -n "${IPE_VERSION:-}" ]; then
+  banner '%s' "$IPE_VERSION"
+else
+  banner 'latest'
+fi
+
+# ── Host prerequisites the install itself needs ──────────────────────────────
+fetch_resolve
+sha256_resolve
+# A GitHub token in the environment authenticates the release lookup, so a
+# shared CI runner is not held to the anonymous API's per-IP rate limit.
+fetch_auth_setup
+
+# gh_latest_release — set tag to the latest release's tag; fail when the API
+# cannot be reached or its answer names no tag.
 gh_latest_release() {
-  _tok="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-  if [ -n "$_tok" ]; then
-    curl -fsSL -H "Authorization: Bearer $_tok" "https://api.github.com/repos/$REPO/releases/latest"
-  else
-    curl -fsSL "https://api.github.com/repos/$REPO/releases/latest"
-  fi
+  fetch_to "$tmp/latest.json" "https://api.github.com/repos/$REPO/releases/latest" \
+    1048576 30 auth || return 1
+  tag="$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n 1)" \
+    || return 1
+  [ -n "$tag" ]
 }
 
 # ── Resolve version (default: latest release tag) ────────────────────────────
-# Fetch the whole API response into a variable FIRST, then parse it. Piping curl
-# straight into `grep -m1`/`head` makes the reader close the pipe early, curl
-# hits EPIPE mid-write, and you get `curl: (23) Failed writing body`. Capturing
-# the body in full sidesteps SIGPIPE entirely.
 if [ -n "${IPE_VERSION:-}" ]; then
   tag="$IPE_VERSION"
-  banner '%s' "$tag"
 else
-  banner 'latest'
   stage_start 'Resolving the latest release…'
-  resp="$(gh_latest_release)" \
-    || die 'Could not reach GitHub to resolve the latest release (set IPE_VERSION=vX.Y.Z).'
-  # Grep over the captured string — no pipe from curl, so no early-close.
-  tag="$(printf '%s\n' "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
-  [ -n "$tag" ] || die 'Could not parse the latest release tag (set IPE_VERSION=vX.Y.Z).'
+  gh_latest_release \
+    || die 'Could not resolve the latest release from GitHub (set IPE_VERSION=vX.Y.Z).'
   require_release_tag "$tag"
   stage_ok 'Found %s.' "$tag"
 fi
@@ -783,13 +1268,13 @@ url="$base/$artifact.$ext"
 # ── Check prebuilt binary availability ──────────────────────────────
 stage_start 'Checking for prebuilt binaries…'
 have_bin=0
-if curl -fsSL -o /dev/null -I --max-time 10 "$url" 2>/dev/null; then
+if fetch_ok "$url"; then
   have_bin=1
   stage_ok 'Prebuilt binary available for %s-%s.' "$plat" "$cpu"
 else
   # Settle the stage without restating the fact here — the fact is stated
   # exactly once, either by the retry prompt just below or by die_no_prebuilt
-  # at the final gate; saying it here too was a literal duplicate.
+  # at the final gate.
   stage_skip
   if [ -n "${IPE_VERSION:-}" ] && [ "$IS_TTY" = 1 ] && [ -r /dev/tty ]; then
     say '\n    @B@No prebuilt ipe %s binary for %s-%s.@0@' "$ver" "$plat" "$cpu"
@@ -799,15 +1284,12 @@ else
       case "$ans" in
         ''|[Yy]|[Yy][Ee][Ss])
           stage_start 'Resolving the latest release…'
-          resp="$(gh_latest_release)" \
-            || die 'Could not reach GitHub.'
-          tag="$(printf '%s\n' "$resp" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
-          [ -n "$tag" ] || die 'Could not parse latest release tag.'
+          gh_latest_release || die 'Could not resolve the latest release from GitHub.'
           require_release_tag "$tag"
           ver="${tag#ipe-}"
           base="https://github.com/$REPO/releases/download/$tag"
           url="$base/$artifact.$ext"
-          if curl -fsSL -o /dev/null -I --max-time 10 "$url" 2>/dev/null; then
+          if fetch_ok "$url"; then
             have_bin=1
             stage_ok 'Prebuilt binary available for %s-%s.' "$plat" "$cpu"
           else
@@ -836,8 +1318,13 @@ version_gte() {
 }
 
 # ── Check Rust toolchain ────────────────────────────────────────────
+# Rust is a build prerequisite, not an install one: it is installed only on
+# the user's consent at a terminal, and otherwise named in the closing
+# "Before your first build" block.
 stage_start 'Checking Rust toolchain…'
 cargo_ok=0
+cargo_old=0
+rustup_url="https://win.rustup.rs/x86_64"
 if command -v cargo >/dev/null 2>&1; then
   cargo_ver_raw="$(cargo version 2>/dev/null | cut -d' ' -f2)"
   cargo_ver="${cargo_ver_raw%%-*}"
@@ -853,6 +1340,7 @@ if command -v cargo >/dev/null 2>&1; then
     cargo_ok=1
     stage_ok 'Found cargo %s (>= %s).' "$cargo_ver_raw" "$MIN_CARGO_VERSION"
   else
+    cargo_old=1
     info 'Found cargo %s (< required %s).' "$cargo_ver_raw" "$MIN_CARGO_VERSION"
   fi
 else
@@ -874,54 +1362,59 @@ else
       esac
     fi
   fi
-  if [ "$cargo_ok" != 1 ]; then
-    rustup_url="https://win.rustup.rs/x86_64"
-    if [ "$IS_TTY" = 1 ] && [ -r /dev/tty ]; then
-      say '\n    @B@Rust is not installed.@0@'
-      case "$plat" in
-        linux|darwin|freebsd)
-          prompt '    Install Rust via @B@rustup@0@? [Y/n] '
-          ;;
-        windows)
-          say '    Download the Rust installer from:\n      @D@%s@0@' "$rustup_url"
-          prompt '    Open the link and run the installer? [Y/n] '
+  if [ "$cargo_ok" != 1 ] && [ "$IS_TTY" = 1 ] && [ -r /dev/tty ]; then
+    say '\n    @B@Rust is not installed.@0@'
+    case "$plat" in
+      linux|darwin|freebsd)
+        prompt '    Install Rust via @B@rustup@0@? [Y/n] '
+        ;;
+      windows)
+        say '    Download the Rust installer from:\n      @D@%s@0@' "$rustup_url"
+        prompt '    Open the link and run the installer? [Y/n] '
+        ;;
+    esac
+    ans=''
+    if IFS= read -r ans < /dev/tty 2>/dev/null; then
+      case "$ans" in
+        ''|[Yy]|[Yy][Ee][Ss])
+          case "$plat" in
+            linux|darwin|freebsd)
+              stage_start 'Installing Rust via rustup…'
+              # rustup-init is fetched whole before it runs, so a failed fetch
+              # is a failed install; `-y` answers rustup-init's own prompt.
+              if fetch_to "$tmp/rustup-init.sh" https://sh.rustup.rs 1048576 60 \
+                && sh "$tmp/rustup-init.sh" -y 2>/dev/null; then
+                if [ -f "$USER_HOME/.cargo/env" ]; then
+                  # shellcheck source=/dev/null
+                  . "$USER_HOME/.cargo/env"
+                fi
+                if command -v cargo >/dev/null 2>&1; then
+                  cargo_ok=1
+                  info 'Rust installed (%s).' "$(cargo version | cut -d' ' -f2)"
+                fi
+              else
+                info 'rustup exited non-zero — check https://rustup.rs for manual install.'
+              fi
+              ;;
+            windows)
+              info 'Download the installer from: %s' "$rustup_url"
+              ;;
+          esac
           ;;
       esac
-      ans=''
-      if IFS= read -r ans < /dev/tty 2>/dev/null; then
-        case "$ans" in
-          ''|[Yy]|[Yy][Ee][Ss])
-            case "$plat" in
-              linux|darwin|freebsd)
-                stage_start 'Installing Rust via rustup…'
-                # `sh -s -- -y` hands `-y` to rustup-init (unattended install).
-                if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs 2>/dev/null \
-                  | sh -s -- -y 2>/dev/null; then
-                  if [ -f "$USER_HOME/.cargo/env" ]; then
-                    # shellcheck source=/dev/null
-                    . "$USER_HOME/.cargo/env"
-                  fi
-                  if command -v cargo >/dev/null 2>&1; then
-                    cargo_ok=1
-                    info 'Rust installed (%s).' "$(cargo version | cut -d' ' -f2)"
-                  fi
-                else
-                  info 'rustup exited non-zero — check https://rustup.rs for manual install.'
-                fi
-                ;;
-              windows)
-                info 'Download the installer from: %s' "$rustup_url"
-                ;;
-            esac
-            ;;
-        esac
-      fi
-    fi
-    if [ "$cargo_ok" != 1 ]; then
-      info 'Install Rust later: https://rustup.rs'
     fi
   fi
 fi
+
+# ── Check the C toolchain Rust links through (advisory) ──────────────────────
+# macOS always has the /usr/bin/cc shim, so the Command Line Tools are asked
+# for directly. Windows links through the MSVC tools, which `ipe` itself checks.
+cc_ok=1
+case "$plat" in
+  darwin) xcode-select -p >/dev/null 2>&1 || cc_ok=0 ;;
+  windows) ;;
+  *) command -v cc >/dev/null 2>&1 || cc_ok=0 ;;
+esac
 
 # ── Bail out when no binary is available ────────────────────────────
 if [ "$have_bin" != 1 ]; then
@@ -929,50 +1422,33 @@ if [ "$have_bin" != 1 ]; then
 fi
 
 # ── Download the binary with a friendly progress display ─────────────────────
-tmp="$(mktemp -d "$scratch_base/ipe-install.XXXXXX")" \
-  || die 'Could not create a private temp directory under %s.' "$scratch_base"
-trap 'rm -rf "$tmp"' EXIT
-private_dir_ok "$tmp" || die 'The temp directory %s is not private to you.' "$tmp"
-pkg="$tmp/pkg.$ext"
-
 stage_start 'Downloading ipe %s for %s-%s…' "$ver" "$plat" "$cpu"
 
 # download_with_progress URL DEST
-# On a TTY, run curl in the background writing to DEST, and animate a spinner +
-# percent + bar + size + ETA by polling DEST's on-disk size against the known
-# total. Off a TTY (pipe/CI), fall back to a couple of plain lines — no ANSI,
-# no animation, no SIGPIPE.
+# Under curl on a TTY, download in the background writing to DEST, and animate
+# a spinner + percent + bar + size + ETA by polling DEST's on-disk size against
+# the known total. Otherwise download quietly and print one plain line — no
+# ANSI, no animation.
 download_with_progress() {
   dl_url="$1"; dl_dest="$2"
 
-  # Total size (best-effort; 0 ⇒ unknown, bar degrades to a byte counter).
-  # A one-byte range GET is more reliable than HEAD across GitHub's signed CDN
-  # redirect: it always lands on a 206 carrying `Content-Range: bytes 0-0/TOTAL`.
-  # Parse from a captured string, never a live pipe (no SIGPIPE).
-  total=0
-  range_resp="$(curl -fsSL -r 0-0 -D - -o /dev/null "$dl_url" 2>/dev/null || true)"
-  if [ -n "$range_resp" ]; then
-    total="$(printf '%s\n' "$range_resp" \
-      | tr -d '\r' \
-      | sed -n 's#^[Cc]ontent-[Rr]ange: *bytes [0-9]*-[0-9]*/\([0-9][0-9]*\).*#\1#p' \
-      | tail -n1)"
-    [ -n "$total" ] || total=0
-  fi
-
-  if [ "$IS_TTY" != 1 ]; then
-    # Non-terminal: quiet download, single plain status line, no animation.
-    curl -fsSL "$dl_url" -o "$dl_dest" \
+  if [ "$IS_TTY" != 1 ] || [ "$FETCHER" != curl ]; then
+    fetch_to "$dl_dest" "$dl_url" "$ARCHIVE_MAX_BYTES" 900 \
       || die 'Download failed: %s' "$dl_url"
     got="$(wc -c < "$dl_dest" 2>/dev/null || echo 0)"
     stage_ok 'Downloaded %s.' "$(human "$got")"
     return 0
   fi
 
-  # Terminal: curl in background (its own subshell so `set -e` can't trip on the
-  # spinner loop); poll DEST size for the animation. Pre-create DEST so the
+  # Total size (best-effort; 0 ⇒ unknown, bar degrades to a byte counter).
+  fetch_total "$dl_url"
+  total="$FETCH_TOTAL"
+
+  # The download runs in its own subshell so `set -e` can't trip on the
+  # spinner loop; poll DEST size for the animation. Pre-create DEST so the
   # poller's `< DEST` never hits a not-yet-opened file mid-race.
   : > "$dl_dest"
-  ( curl -fsSL "$dl_url" -o "$dl_dest"; echo $? > "$tmp/curl.rc" ) &
+  ( dl_rc=0; fetch_to "$dl_dest" "$dl_url" "$ARCHIVE_MAX_BYTES" 900 || dl_rc=$?; echo "$dl_rc" > "$tmp/curl.rc" ) &
   dl_pid=$!
 
   si=0
@@ -998,36 +1474,24 @@ download_with_progress() {
 
 download_with_progress "$url" "$pkg"
 
-# ── Verify checksum (when the release ships SHA256SUMS) ───────────────────────
-# Opportunistic: if the release publishes SHA256SUMS and we have a sha256 tool,
-# verify the artifact. A present-but-mismatched sum is fatal; a missing sums
-# file or missing tool is a soft skip (older releases, minimal environments).
+# ── Verify the checksum ──────────────────────────────────────────────────────
+# Every install is verified against the release's SHA256SUMS: a list that
+# cannot be fetched, holds no entry for the artifact, or holds a malformed one
+# stops the install before anything is extracted.
 stage_start 'Verifying the download…'
-sums="$(curl -fsSL "$base/SHA256SUMS" 2>/dev/null || true)"
-if [ -n "$sums" ]; then
-  want="$(printf '%s\n' "$sums" \
-    | sed -n "s/^\\([0-9a-fA-F][0-9a-fA-F]*\\) [ *]*$artifact\\.$ext\$/\\1/p" \
-    | head -n1)"
-  if [ -n "$want" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then
-      got_sum="$(sha256sum "$pkg" | cut -d' ' -f1)"
-    elif command -v shasum >/dev/null 2>&1; then
-      got_sum="$(shasum -a 256 "$pkg" | cut -d' ' -f1)"
-    else
-      got_sum=''
-    fi
-    if [ -z "$got_sum" ]; then
-      info 'No sha256 tool found — skipping checksum verification.'
-    elif [ "$got_sum" = "$want" ]; then
-      stage_ok 'Checksum verified.'
-    else
-      die 'Checksum mismatch for %s — refusing to install (expected %s, got %s).' "$artifact.$ext" "$want" "$got_sum"
-    fi
-  else
-    info 'No checksum listed for %s — skipping verification.' "$artifact.$ext"
-  fi
+fetch_to "$tmp/SHA256SUMS" "$base/SHA256SUMS" 65536 60 \
+  || die 'Could not fetch %s, so the download cannot be verified [checksum-unavailable].' "$base/SHA256SUMS"
+sums_entry "$tmp/SHA256SUMS" "$artifact.$ext"
+case "$SUMS_FAULT" in
+  '') ;;
+  missing) die 'The release SHA256SUMS lists no checksum for %s, so the download cannot be verified [checksum-entry-missing].' "$artifact.$ext" ;;
+  *) die 'The release SHA256SUMS entry for %s is not one 64-digit SHA-256 checksum [checksum-entry-malformed].' "$artifact.$ext" ;;
+esac
+sha256_of "$pkg" || die 'Could not compute the SHA-256 checksum of the download.'
+if [ "$SHA256_GOT" = "$SUMS_WANT" ]; then
+  stage_ok 'Checksum verified.'
 else
-  info 'This release ships no SHA256SUMS — skipping checksum verification.'
+  die 'Checksum mismatch for %s — refusing to install (expected %s, got %s).' "$artifact.$ext" "$SUMS_WANT" "$SHA256_GOT"
 fi
 
 # ── Extract + install ────────────────────────────────────────────────────────
@@ -1259,5 +1723,6 @@ fi
 # Success banner: the green word carries the good news; the footer mirrors the
 # CLI's "report bugs" line (kept in sync with the style SSOT by a drift test).
 say '\n  Ipê %s was @G@successfully@0@ installed!' "$ver"
+before_first_build
 say '\n  If you find any bugs, please report them at https://github.com/%s/issues.\n' "$REPO"
 } >/dev/null
