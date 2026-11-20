@@ -2,8 +2,9 @@ use super::{
     ArgPlan, Callee, DResult, Diagnostic, Expr, GenericScope, Guard, IrType, KernelClass, KernelFn,
     LitKind, LowerError, NativeUiEmit, Span, Symbol, UiDelegate, UiEmitPlan,
     appearance_literal_record_fields, callee_name, clone_targets_in_expr, emit_expr_at,
-    emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars, int_literal,
-    kernel_name, once_closure_bug, render_type, shape_appearance_literal_args, ui_call_shape,
+    emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars,
+    func_value_name, int_literal, kernel_name, once_closure_bug, render_type,
+    shape_appearance_literal_args, ui_call_shape,
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
@@ -4399,7 +4400,8 @@ pub fn emit_json_decoder_call(
     ) && let Some(arg) = args.first()
     {
         match arg {
-            // Case 1: named function (FuncValue) — curry{n}(fn_name)
+            // Case 1: named function (FuncValue) — curry{n}(fn_name); a kernel
+            // payload is refused, never curried as a bare runtime `fn`.
             Expr::FuncValue {
                 callee: fn_callee,
                 ty: IrType::Fun(params, _),
@@ -4411,7 +4413,7 @@ pub fn emit_json_decoder_call(
                         msg: LowerError::DecodeSucceedArityTooHigh { n },
                     });
                 }
-                let fn_name = callee_name(ctx, fn_callee)?;
+                let fn_name = func_value_name(ctx, fn_callee)?;
                 return Ok(Some(decode_succeed_curried(n, &fn_name)));
             }
             // Case 2: lambda — curry{n}(move |params| -> ret { body })

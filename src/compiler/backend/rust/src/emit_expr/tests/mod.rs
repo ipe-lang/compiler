@@ -336,3 +336,48 @@ fn no_kernel_is_emitted_as_a_bare_function_value() -> DResult<()> {
     );
     Ok(())
 }
+
+/// `succeed`'s function payload is curried by name (`curry1(<fn>)`), a
+/// function-value emit site of its own: a kernel payload is refused there too
+/// rather than curried as a bare runtime `fn`.
+#[test]
+fn no_kernel_is_curried_as_a_bare_succeed_payload() -> DResult<()> {
+    let interner = Interner::new();
+    let backend = RustBackend::new(&interner);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let generics = GenericScope::new(&[]);
+    let ty = IrType::Fun(vec![IrType::Str], Box::new(IrType::Int));
+    let curried = KernelFn::ALL
+        .iter()
+        .copied()
+        .flat_map(|k| {
+            [
+                KernelFn::JsonDecSucceed,
+                KernelFn::DbDecSucceed,
+                KernelFn::ConfigSucceed,
+            ]
+            .map(|succeed| (succeed, k))
+        })
+        .filter(|&(succeed, k)| {
+            let call = Expr::Call {
+                callee: Callee::Kernel(succeed),
+                args: vec![Expr::FuncValue {
+                    callee: Callee::Kernel(k),
+                    ty: ty.clone(),
+                }],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            };
+            !matches!(
+                super::emit_expr_at(&ctx, &call, 1, 0, generics),
+                Err(Diagnostic::CompilerBug { .. })
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        curried.is_empty(),
+        "kernels curried as a bare succeed payload: {curried:?}"
+    );
+    Ok(())
+}
