@@ -16,7 +16,7 @@
 use ipe_backend::Backend;
 use ipe_backend_rust::{RuntimeContentId, RuntimeDep, RustBackend};
 use ipe_intern::Interner;
-use ipe_ir::{ModPath, Module, Program};
+use ipe_ir::{Expr, Func, FuncId, IrType, ModPath, Module, Param, Program};
 
 /// A body-free webview-native `Program`: `uses_webview` with NO `uses_web` and NO
 /// `uses_server`. `uses_ui` + `uses_async_runtime` mirror a real webview app (the
@@ -174,4 +174,87 @@ fn webview_dep_manifest_selects_only_the_render_core() {
         toml.contains("\"webview\""),
         "webview dep-model Cargo.toml must select the `webview` feature;\ngot:\n{toml}"
     );
+}
+
+/// `program` with one function `describe : HttpMethod -> String`, a pure mention.
+#[allow(clippy::expect_used)] // interning a fresh name cannot fail
+fn with_http_method_param(mut program: Program, interner: &mut Interner) -> Program {
+    let main = interner.intern("Main").expect("intern");
+    let describe = interner.intern("describe").expect("intern");
+    let method = interner.intern("method").expect("intern");
+    let func = Func {
+        id: FuncId::from_raw(0),
+        name: describe,
+        home: ModPath(vec![main]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![Param::owned(method, IrType::HttpMethod)],
+        ret: IrType::Str,
+        body: Expr::Str(String::new()),
+    };
+    for module in &mut program.modules {
+        module.funcs.push(func.clone());
+    }
+    program
+}
+
+/// A body-free server-only `Program`: the webview floor's flags swapped for the
+/// server surface alone.
+fn server_program(interner: &mut Interner) -> Program {
+    let mut program = webview_program(interner);
+    for module in &mut program.modules {
+        module.uses_server = true;
+        module.uses_webview = false;
+        module.uses_tea = false;
+        module.uses_ui = false;
+    }
+    program
+}
+
+/// Naming `HttpMethod` selects nothing: the type lives in the ungated
+/// `http_method` leaf, not the `http_client` module that links `reqwest`.
+///
+/// Each shape's feature list is identical with and without the mention (so
+/// the async spine is untouched too), and the dependency-model manifest names
+/// neither the client feature nor `reqwest`.
+#[test]
+#[allow(clippy::expect_used)] // emit-must-succeed is the test's precondition
+fn an_http_method_mention_pulls_no_http_client() {
+    let shapes: [(&str, fn(&mut Interner) -> Program); 2] = [
+        ("server-only", server_program),
+        ("webview", webview_program),
+    ];
+    for (shape, base) in shapes {
+        let mut interner = Interner::new();
+        let bare = base(&mut interner);
+        let named = with_http_method_param(base(&mut interner), &mut interner);
+        let backend = RustBackend::new(&interner);
+        let bare_features = backend
+            .runtime_feature_names(&bare)
+            .expect("runtime_feature_names must succeed for the bare program");
+        let named_features = backend
+            .runtime_feature_names(&named)
+            .expect("runtime_feature_names must succeed for the mentioning program");
+        assert!(
+            !named_features.contains(&"http_client"),
+            "{shape}: an `HttpMethod` mention must not select `http_client`; got {named_features:?}"
+        );
+        assert_eq!(
+            bare_features, named_features,
+            "{shape}: an `HttpMethod` mention must change no feature, the async spine included"
+        );
+        let toml = without_comments(
+            &RustBackend::new(&interner)
+                .with_runtime_dep(Some(RuntimeDep {
+                    content: RuntimeContentId::from_digest_bytes([0; 16]),
+                }))
+                .emit(&named)
+                .expect("emit must succeed for a body-free program naming `HttpMethod`")
+                .cargo_toml,
+        );
+        assert!(
+            !toml.contains("reqwest") && !toml.contains("\"http_client\""),
+            "{shape}: an `HttpMethod` mention must link no outbound client;\ngot:\n{toml}"
+        );
+    }
 }

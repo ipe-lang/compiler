@@ -701,3 +701,139 @@ fn runtime_tree_resolves() {
          vendored `Cargo.toml` the SEALs splice: {manifest:?}",
     );
 }
+
+// ── HttpMethod is one ungated leaf every surface shares ────────────────────
+
+/// A server that names `HttpMethod` and converts a method in a handler, with no
+/// outbound client call.
+const SERVER_HTTP_METHOD: &str = "module Main exposing (main)\n\
+    import Ipe.Http as Http\n\
+    import Ipe.Http.Server as Server\n\
+    import Ipe.Task\n\
+    describe : Http.HttpMethod -> String\n\
+    describe method =\n    Http.methodToString method\n\
+    handle : Server.Request -> Task Error Server.Response\n\
+    handle _req =\n    Task.succeed (Server.html (describe Http.Patch))\n\
+    main =\n    Server.listen 8080 [ Server.get \"/\" handle ]\n";
+
+/// A `Web.tea` app whose `Model` holds a `HttpMethod` field, so the type must
+/// derive the serde the web model's state codec needs.
+const WEB_MODEL_HTTP_METHOD: &str = r#"module Main exposing (main)
+
+import Ipe.Http as Http
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+
+
+type alias Model =
+    { method : Http.HttpMethod }
+
+
+type Msg
+    = Toggle
+    | NoOp
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init _req =
+    ( { method = Http.Get }, Cmd.none )
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Toggle ->
+            ( { model | method = Http.Post }, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions _model =
+    Sub.none
+
+
+view : Model -> Element Msg
+view model =
+    Ui.column []
+        [ Ui.button [] { onPress = Just Toggle, label = Ui.text "toggle" }
+        , Ui.text (Http.methodToString model.method)
+        ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = NoOp
+        }
+"#;
+
+/// The emitted manifest of shape `name`, comment lines dropped.
+#[allow(clippy::expect_used)] // the build above wrote the manifest
+fn emitted_manifest(name: &str) -> String {
+    let path = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("seal_modset_{name}_emitted"))
+        .join("Cargo.toml");
+    std::fs::read_to_string(path)
+        .expect("read the emitted Cargo.toml")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A server naming `HttpMethod` cargo-builds in the dependency model and
+/// selects no outbound client: the type lives in the ungated `http_method` leaf.
+#[test]
+fn server_http_method_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build("server_http_method", SERVER_HTTP_METHOD).expect(
+        "a server naming HttpMethod must cargo-build: the type is declared in every module set",
+    );
+    let manifest = emitted_manifest("server_http_method");
+    assert!(
+        !manifest.contains("\"http_client\"") && !manifest.contains("reqwest"),
+        "a server naming HttpMethod must select no outbound client;\ngot:\n{manifest}"
+    );
+}
+
+/// The same server cargo-builds under the vendored emit model.
+#[test]
+fn server_http_method_vendored_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_vendored("server_http_method_vendored", SERVER_HTTP_METHOD)
+        .expect("a server naming HttpMethod must cargo-build under the vendored emit model");
+}
+
+/// A web `Model` holding a `HttpMethod` cargo-builds in the dependency model:
+/// the type derives the serde its state codec needs.
+#[test]
+fn web_model_http_method_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build("web_model_http_method", WEB_MODEL_HTTP_METHOD)
+        .expect("a web Model with a HttpMethod field must cargo-build: HttpMethod derives serde");
+}
+
+/// The same web app cargo-builds under the vendored emit model.
+#[test]
+fn web_model_http_method_vendored_builds() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    emit_and_build_vendored("web_model_http_method_vendored", WEB_MODEL_HTTP_METHOD).expect(
+        "a web Model with a HttpMethod field must cargo-build under the vendored emit model",
+    );
+}

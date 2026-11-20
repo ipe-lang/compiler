@@ -84,10 +84,11 @@ use ipe_diagnostics::DResult;
 use ipe_intern::Interner;
 use ipe_ir::{
     CallPin, Callee, Expr, Func, FuncId, IrType, KernelFn, ModPath, Module, OnFormKind, Program,
-    Target,
+    RUNTIME_ALIASED_ENUMS, RuntimeBridgedEnum, RuntimeFeatureId, SHOWN_LEAVES, ShowPolicy,
+    ShowShape, Target, UiCtor, UiPlain, ir_type_feature_requirement,
 };
 
-use cfg::{CfgEnv, ModuleGates};
+use cfg::{CfgEnv, ModuleGates, Truth};
 
 /// The flag space, identical to `runtime_modset_closure.rs`: bit `i` sets
 /// `uses_*` flag `i`. The two SEALs share one flag layout so the featureset
@@ -1910,5 +1911,299 @@ fn links_web_runtime_is_the_widget_registration_target() {
         seen,
         BTreeSet::from([false, true]),
         "the sweep must reach both a project that links the web runtime and one that does not"
+    );
+}
+
+// ── each type's feature row against its defining module's gate ──────────────
+
+/// Every leaf whose feature row disagrees with its defining module's gate.
+///
+/// Each entry is an open defect, pinned so a new disagreement or a closed one
+/// fails [`every_type_feature_row_matches_its_module_gate`]. `Db`, `Principal`,
+/// the shape apps, `Cmd`/`Sub` and the terminal `Ui` constructors render into a
+/// gated module while their row requires nothing; `WebReq` requires `web`
+/// while its `dom` module is ungated.
+const ROW_GATE_DISAGREEMENTS: &[&str] = &[
+    "CliApp",
+    "CliAttribute",
+    "CliLines",
+    "Cells",
+    "Cmd",
+    "Db",
+    "Principal",
+    "Sub",
+    "TuiApp",
+    "TuiAttribute",
+    "WebApp",
+    "WebReq",
+    "WorkerApp",
+];
+
+/// One sample per leaf `IrType` whose node renders its own runtime type.
+fn gate_samples() -> Vec<IrType> {
+    let unit = || Box::new(IrType::Unit);
+    let mut samples = vec![
+        IrType::Int,
+        IrType::SessionHandle,
+        IrType::Float,
+        IrType::Bool,
+        IrType::Str,
+        IrType::Char,
+        IrType::Unit,
+        IrType::Task(unit()),
+        IrType::Bytes,
+        IrType::Json,
+        IrType::Decoder(unit()),
+        IrType::Db,
+        IrType::Cmd(unit()),
+        IrType::Sub(unit()),
+        IrType::ServerRequest,
+        IrType::ServerResponse,
+        IrType::ServerRoute,
+        IrType::ServerCookie,
+        IrType::StreamWriter,
+        IrType::HttpRequest,
+        IrType::WebSocketServer,
+        IrType::WebSocketServerCfg,
+        IrType::WebReq,
+        IrType::WebRoute(unit()),
+        IrType::CustomElement {
+            down: unit(),
+            up: unit(),
+        },
+        IrType::Order,
+        IrType::BackoffStrategy,
+        IrType::HttpMethod,
+        IrType::Decimal,
+        IrType::Principal,
+        IrType::AuthConfig,
+        IrType::TokenSource,
+        IrType::ErrorKind,
+        IrType::Error,
+        IrType::ErrorDetails,
+        IrType::ErrorInfo,
+        IrType::PanicInfo,
+        IrType::TypeInfo,
+        IrType::SqlFragment,
+        IrType::Secret,
+        IrType::Path,
+        IrType::Regex,
+        IrType::ProcessRunWithCfg,
+        IrType::ProcessRunInPtyCfg,
+        IrType::CacheCfg,
+        IrType::CacheStats,
+        IrType::WebSocketClientCfg,
+        IrType::CsvDoc,
+        IrType::EmailMessage,
+        IrType::EmailAttachment,
+        IrType::EmailSesConfig,
+        IrType::EmailSmtpConfig,
+        IrType::EmailProvider,
+        IrType::CryptoKey,
+        IrType::CryptoMac,
+        IrType::EmailAddress,
+        IrType::Url,
+        IrType::UrlRelative,
+        IrType::Dsn,
+        IrType::DbLocation,
+        IrType::Connection,
+        IrType::ConnReadOnly,
+        IrType::ConnReadWrite,
+        IrType::Setting,
+        IrType::ShapeWeb,
+        IrType::ShapeWebView,
+        IrType::ShapeTerminal,
+        IrType::Locale,
+        IrType::WebApp,
+        IrType::TuiApp,
+        IrType::CliApp,
+        IrType::WorkerApp,
+    ];
+    samples.extend(ui_gate_samples());
+    samples
+}
+
+/// One sample per `Ui` constructor and plain `Ui` leaf.
+fn ui_gate_samples() -> Vec<IrType> {
+    let ui = |ctor| IrType::Ui {
+        ctor,
+        msg: Box::new(IrType::Unit),
+    };
+    let mut samples: Vec<IrType> = [
+        UiCtor::Html,
+        UiCtor::Element,
+        UiCtor::Cells,
+        UiCtor::UiAttribute,
+        UiCtor::TuiAttribute,
+        UiCtor::CliLines,
+        UiCtor::CliAttribute,
+        UiCtor::HtmlAttribute,
+        UiCtor::HtmlEvent,
+        UiCtor::Label,
+        UiCtor::Placeholder,
+        UiCtor::RadioOption,
+    ]
+    .map(ui)
+    .to_vec();
+    samples.extend(
+        [
+            UiPlain::Length,
+            UiPlain::Color,
+            UiPlain::HAlign,
+            UiPlain::VAlign,
+            UiPlain::Location,
+            UiPlain::PseudoClass,
+            UiPlain::Description,
+            UiPlain::LayoutContext,
+            UiPlain::ColorError,
+            UiPlain::TermProfile,
+            UiPlain::AnsiColor,
+            UiPlain::WcagLevel,
+            UiPlain::TextSize,
+            UiPlain::Deficiency,
+        ]
+        .map(IrType::UiPlain),
+    );
+    samples
+}
+
+/// Each sample's show-leaf name with its feature row.
+fn gate_rows() -> Vec<(&'static str, Option<RuntimeFeatureId>)> {
+    gate_samples()
+        .iter()
+        .filter_map(|ty| match ty.show_shape() {
+            ShowShape::Leaf(leaf) => Some((leaf.name(), ir_type_feature_requirement(ty))),
+            ShowShape::Carrier(_)
+            | ShowShape::Param
+            | ShowShape::Named { .. }
+            | ShowShape::TooWide => None,
+        })
+        .collect()
+}
+
+/// Every `"Leaf" => Policy: Type;` pin line of the runtime's `show_rows.rs`.
+fn parse_show_pins(text: &str) -> Vec<(&str, &str)> {
+    text.lines()
+        .filter_map(|line| {
+            let (leaf, rest) = line.trim().strip_prefix('"')?.split_once('"')?;
+            let (_, ty) = rest.trim().strip_prefix("=>")?.split_once(':')?;
+            Some((leaf, ty.trim().strip_suffix(';')?.trim()))
+        })
+        .collect()
+}
+
+/// The top-level runtime module a pinned type path names; `None` for a std type.
+fn pinned_module(path: &str) -> Option<&str> {
+    path.strip_prefix("ipe_runtime_rust::")?.split("::").next()
+}
+
+/// Every row whose feature closure and its leaf's module gate disagree, by leaf.
+///
+/// A row naming a feature must compile the module under that feature's closure
+/// and must not name a module that compiles with no feature at all; a row
+/// naming none must name an ungated module (or a std type). A gated row whose
+/// leaf has no pinned type disagrees too.
+fn row_disagreements(
+    rows: &[(&'static str, Option<RuntimeFeatureId>)],
+    pins: &[(&str, &str)],
+    gates: &ModuleGates,
+    table: &BTreeMap<String, Vec<String>>,
+) -> Vec<(&'static str, String)> {
+    let featureless = native_env(&resolve_features(&[], table));
+    let mut found = Vec::new();
+    for &(leaf, row) in rows {
+        let modules: Vec<Option<&str>> = pins
+            .iter()
+            .filter(|(name, _)| *name == leaf)
+            .map(|(_, path)| pinned_module(path))
+            .collect();
+        if modules.is_empty() && row.is_some() {
+            found.push((leaf, format!("row {row:?} has no pinned runtime type")));
+        }
+        for module in modules.into_iter().flatten() {
+            let bare = gates.truth(module, &featureless);
+            if row.is_none() && bare != Truth::Holds {
+                found.push((
+                    leaf,
+                    format!("the row requires nothing, yet `{module}` is gated"),
+                ));
+            }
+            if let Some(feature) = row.map(RuntimeFeatureId::feature_name) {
+                let env = native_env(&resolve_features(&[feature], table));
+                if gates.truth(module, &env) != Truth::Holds {
+                    found.push((leaf, format!("`{feature}` does not compile `{module}`")));
+                }
+                if bare == Truth::Holds {
+                    found.push((
+                        leaf,
+                        format!("`{module}` is ungated, yet the row requires `{feature}`"),
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Each leaf type's feature row equals the gate of the module defining it.
+///
+/// The leaf's runtime type comes from the runtime's `show_rows.rs` pins, which
+/// `emit_types.rs` holds equal to the backend's render; its module's gate is
+/// read from the runtime's `src/mod.rs`. A type parked in a gated sibling
+/// module would otherwise drag that module's dependencies into every program
+/// that merely names it. Moving `HttpMethod`'s row back to `http_client` must
+/// disagree.
+#[test]
+#[allow(clippy::expect_used)] // test scaffolding: the runtime crate's sources always read
+fn every_type_feature_row_matches_its_module_gate() {
+    let crate_root = e2e_support::require_runtime_crate();
+    let cargo_toml =
+        std::fs::read_to_string(crate_root.join("Cargo.toml")).expect("read runtime Cargo.toml");
+    let table = parse_feature_table(&cargo_toml);
+    let gates = runtime_module_gates(&crate_root);
+    let pins_src = std::fs::read_to_string(crate_root.join("tests").join("show_rows.rs"))
+        .expect("read runtime tests/show_rows.rs");
+    let pins = parse_show_pins(&pins_src);
+    let rows = gate_rows();
+
+    let sampled: BTreeSet<&str> = rows.iter().map(|(leaf, _)| *leaf).collect();
+    let named: BTreeSet<&str> = RuntimeBridgedEnum::ALL
+        .iter()
+        .map(|bridged| bridged.show_leaf().name())
+        .chain(RUNTIME_ALIASED_ENUMS.iter().map(|(_, leaf)| leaf.name()))
+        .collect();
+    for (name, policy) in SHOWN_LEAVES {
+        assert!(
+            policy.tag() == ShowPolicy::Refused.tag()
+                || sampled.contains(name)
+                || named.contains(name),
+            "shown leaf {name} has no gate sample"
+        );
+    }
+
+    let found = row_disagreements(&rows, &pins, &gates, &table);
+    let disagreeing: BTreeSet<&str> = found.iter().map(|(leaf, _)| *leaf).collect();
+    let pinned: BTreeSet<&str> = ROW_GATE_DISAGREEMENTS.iter().copied().collect();
+    assert_eq!(
+        disagreeing, pinned,
+        "feature rows disagree with their module gates: {found:#?}"
+    );
+
+    let mutated: Vec<(&'static str, Option<RuntimeFeatureId>)> = rows
+        .iter()
+        .map(|&(leaf, row)| {
+            let row = if leaf == "HttpMethod" {
+                Some(RuntimeFeatureId::HttpClient)
+            } else {
+                row
+            };
+            (leaf, row)
+        })
+        .collect();
+    assert!(
+        row_disagreements(&mutated, &pins, &gates, &table)
+            .iter()
+            .any(|(leaf, _)| *leaf == "HttpMethod"),
+        "an `HttpMethod` row requiring `http_client` must disagree with its ungated module"
     );
 }
