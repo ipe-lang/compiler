@@ -1,7 +1,7 @@
 //! The `docs/reference/cli.md` renderer — a deterministic projection of the CLI
 //! surface from the [`crate::help`] SSOT.
 //!
-//! Every fact — a command name, its synopsis, its argument description, its
+//! Every fact — a command name, its synopsis, its arguments, its
 //! flags, and the section it belongs to — is read from [`crate::help`]'s
 //! projections ([`crate::help::all_command_specs`],
 //! [`crate::help::all_section_specs`], [`crate::help::all_group_specs`]), the
@@ -148,8 +148,28 @@ fn render_command(out: &mut String, cmd: &CommandSpec) {
     }
     out.push_str("\n```\n\n");
 
-    if !cmd.args_desc.is_empty() {
-        let _ = writeln!(out, "**Arguments:** {}\n", cmd.args_desc);
+    if !cmd.arguments.is_empty() {
+        out.push_str("**Arguments:**\n\n");
+        for item in &cmd.arguments {
+            let _ = writeln!(out, "- `{}` — {}", item.name, item.desc);
+        }
+        out.push('\n');
+    }
+
+    if !cmd.subcommands.is_empty() {
+        out.push_str("**Subcommands:**\n\n");
+        for item in &cmd.subcommands {
+            let _ = writeln!(out, "- `{}` — {}", item.name, item.desc);
+        }
+        out.push('\n');
+    }
+
+    if !cmd.notes.is_empty() {
+        out.push_str("**Notes:**\n\n");
+        for note in &cmd.notes {
+            let _ = writeln!(out, "- {note}");
+        }
+        out.push('\n');
     }
 
     if !cmd.output_desc.is_empty() {

@@ -6,7 +6,11 @@ ipe test [<path>]
 
 ## Arguments
 
-A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project, which selects that project. Defaults to the current directory's project. The tests always run from the project's tests/Main.ipe and build with its package.ipe settings, its database driver included.
+- `[<path>]` — a project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project, which selects that project (default: the current directory's project)
+
+## Notes
+
+- The tests always run from the project's tests/Main.ipe and build with its package.ipe settings, its database driver included.
 
 ## Options
 

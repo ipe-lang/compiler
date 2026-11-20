@@ -6,7 +6,7 @@ ipe release eject [<dir>]
 
 ## Arguments
 
-A project directory (default: the current directory).
+- `[<dir>]` — a project directory (default: the current directory)
 
 ## Options
 

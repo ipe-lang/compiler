@@ -6,7 +6,11 @@ ipe dev watch [<dir>]
 
 ## Arguments
 
-A project directory (default: the current directory). `dev watch` serves the delivery declared in package.ipe and refuses a `web client` delivery, stated or declared, which has no server to restart: build it with `ipe dev build web client`.
+- `[<dir>]` — a project directory (default: the current directory)
+
+## Notes
+
+- `dev watch` serves the delivery declared in package.ipe and refuses a `web client` delivery, stated or declared, which has no server to restart: build it with `ipe dev build web client`.
 
 ## Options
 

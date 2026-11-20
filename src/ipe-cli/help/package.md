@@ -6,7 +6,14 @@ ipe package <audit|audit-entry|publish|validate-entry> [<path>]
 
 ## Arguments
 
-The subcommand and its path: `audit`/`publish` take the project directory or `package.ipe` (defaults to the current project); `validate-entry` takes a `packages/<name>.toml` entry file (schema check only); `audit-entry` takes the same entry file and runs the full index CI receiving gate: schema, fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every new version. `audit` regenerates a native package's FFI bindings only inside a jail — a host without bubblewrap, or with `IPE_FFI_ALLOW_UNSANDBOXED=1` set, is refused — and applies the supply-chain policy built into the compiler, never one from the package, the working directory, or a runtime tree found on disk. The audited program links the runtime embedded in the compiler: `IPE_RUNTIME_DIR`, `IPE_RUNTIME_VENDORED`, and a runtime tree above the working directory are ignored.
+- `[<path>]` — the project directory, `package.ipe`, or entry file the chosen subcommand takes; see Subcommands for which (default: the current project, for `audit`/`publish`)
+
+## Subcommands
+
+- `audit` — takes the project directory or `package.ipe` (default: the current project); regenerates a native package's FFI bindings only inside a jail — a host without bubblewrap, or with `IPE_FFI_ALLOW_UNSANDBOXED=1` set, is refused — and applies the supply-chain policy built into the compiler, never one from the package, the working directory, or a runtime tree found on disk. The audited program links the runtime embedded in the compiler: `IPE_RUNTIME_DIR`, `IPE_RUNTIME_VENDORED`, and a runtime tree above the working directory are ignored
+- `audit-entry` — takes a `packages/<name>.toml` entry file and runs the full index CI receiving gate: schema, fetch+integrity-verify, and the complete Tier-1 (+ Tier-2) audit for every new version
+- `publish` — takes the project directory or `package.ipe` (default: the current project)
+- `validate-entry` — takes a `packages/<name>.toml` entry file (schema check only)
 
 ## Options
 

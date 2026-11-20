@@ -6,4 +6,4 @@ ipe add <package>
 
 ## Arguments
 
-The package name, optionally `@version`.
+- `<package>` — the package name, optionally `@version`

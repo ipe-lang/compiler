@@ -6,7 +6,7 @@ ipe fix <path>
 
 ## Arguments
 
-The module file to fix, under `src/` or `tests/` of the current directory's project.
+- `<path>` — the module file to fix, under `src/` or `tests/` of the current directory's project
 
 ## Options
 

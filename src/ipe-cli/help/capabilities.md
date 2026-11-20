@@ -6,7 +6,7 @@ ipe capabilities [<path>]
 
 ## Arguments
 
-A project directory, its package.ipe, or one of its entry files under `src/`; a file must lie in the current directory's project. Defaults to the current directory's project, every entry.
+- `[<path>]` — a project directory, its package.ipe, or one of its entry files under `src/`; a file must lie in the current directory's project (default: the current directory's project, every entry)
 
 ## Options
 

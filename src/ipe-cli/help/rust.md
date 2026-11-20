@@ -6,7 +6,13 @@ ipe rust <add|remove|install> [<args>...]
 
 ## Arguments
 
-The action to run (add / remove / install) and its arguments.
+- `[<args>...]` — the chosen action's own arguments: a crate name, optionally `@version`, for add/remove; none for install
+
+## Subcommands
+
+- `add` — add a Rust crate dependency
+- `remove` — remove a Rust crate dependency
+- `install` — install the project's declared Rust crate dependencies
 
 ## Options
 

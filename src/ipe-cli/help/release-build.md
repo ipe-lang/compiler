@@ -6,7 +6,15 @@ ipe release build [<dir>] [<shape>] [<runtime>] [<host>]
 
 ## Arguments
 
-A project directory (default: the current directory). shape/runtime/host are the delivery grammar shared with `dev build`: a `desktop`/`ios`/`android` host lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell). An `android` host produces an unsigned Gradle project: a store build needs your own keystore configured in Gradle. With no delivery args, `release build` builds every delivery declared in `ships` in package.ipe, each for the target its ship names (the served default when `ships` is absent). Each delivery lands in its own `out/release/<delivery>/` (its words joined by `-`, e.g. `out/release/web-client/`, then `-<triple>` for a cross target), one delivery included.
+- `[<dir>]` — a project directory (default: the current directory)
+- `[<shape>]` — the delivery grammar shared with `dev build`, cross-checked against `main`
+- `[<runtime>]` — the delivery grammar shared with `dev build`: `web client` is the self-contained browser client; omit it for served (the default)
+- `[<host>]` — desktop/ios/android, the delivery grammar shared with `dev build`; lays out the production app bundle for that host (a self-contained desktop bundle, or a native mobile system-webview shell); an `android` host produces an unsigned Gradle project — a store build needs your own keystore configured in Gradle
+
+## Notes
+
+- With no delivery args, `release build` builds every delivery declared in `ships` in package.ipe, each for the target its ship names (the served default when `ships` is absent).
+- Each delivery lands in its own `out/release/<delivery>/` (its words joined by `-`, e.g. `out/release/web-client/`, then `-<triple>` for a cross target), one delivery included.
 
 ## Options
 

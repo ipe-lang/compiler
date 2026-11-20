@@ -363,6 +363,14 @@ Verbs:
 
 Arguments
 
+## help-subcommands-label
+
+Subcommands
+
+## help-notes-label
+
+Notes
+
 ## help-options-label
 
 Options

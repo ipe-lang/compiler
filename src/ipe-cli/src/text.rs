@@ -784,8 +784,12 @@ messages! {
     delivery_word_shadows_path(word) = "delivery-word-shadows-path";
     /// The label over a command group's verb list.
     verbs_label = "verbs-label";
-    /// The heading of a help page's argument description.
+    /// The heading of a help page's argument list.
     help_arguments_label = "help-arguments-label";
+    /// The heading of a help page's subcommand list.
+    help_subcommands_label = "help-subcommands-label";
+    /// The heading of a help page's notes list.
+    help_notes_label = "help-notes-label";
     /// The heading of a help page's option list.
     help_options_label = "help-options-label";
     /// The heading of a help page's output-location note.

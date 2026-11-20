@@ -6,7 +6,7 @@ ipe verify [<path>]
 
 ## Arguments
 
-A project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project. Defaults to the current directory's project.
+- `[<path>]` — a project directory, its package.ipe, or a module file under `src/` or `tests/` of the current directory's project (default: the current directory's project)
 
 ## Options
 

@@ -24,7 +24,15 @@
 //!
 //! ## Arguments
 //!
-//! <argument description, one line>
+//! - `<placeholder, exactly as the synopsis spells it>` — <description, one line>
+//!
+//! ## Subcommands
+//!
+//! - `<subcommand name>` — <description, one line>
+//!
+//! ## Notes
+//!
+//! - <a remark that belongs to no single argument, one line>
 //!
 //! ## Options
 //!
@@ -36,14 +44,29 @@
 //! <where the output lands, one line>
 //! ````
 //!
-//! Every section is optional except the summary and the synopsis. Parsing is
-//! total: a page that strays from the shape still renders, and the defects it
-//! reports are pinned empty by the page tests, so a malformed page cannot ship.
+//! Every section is optional except the summary and the synopsis. Arguments
+//! and Subcommands are lists in the same `- `name` — desc` shape as Options;
+//! Notes is a list of bare `- <text>` lines. Every `<placeholder>` the
+//! synopsis spells without a `|` alternation must have exactly one matching
+//! Arguments item, and every Arguments item must name a placeholder the
+//! synopsis actually spells. Parsing is total: a page that strays from the
+//! shape still renders, and the defects it reports are pinned empty by the
+//! page tests, so a malformed page cannot ship.
 
-/// The heading of a page's argument description.
+/// The heading of a page's argument list.
 #[must_use]
 pub const fn arguments_heading() -> &'static str {
     crate::text::help_arguments_label()
+}
+/// The heading of a page's subcommand list.
+#[must_use]
+pub const fn subcommands_heading() -> &'static str {
+    crate::text::help_subcommands_label()
+}
+/// The heading of a page's notes list.
+#[must_use]
+pub const fn notes_heading() -> &'static str {
+    crate::text::help_notes_label()
 }
 /// The heading of a page's option list.
 #[must_use]
@@ -72,6 +95,17 @@ pub struct Opt {
     pub desc: &'static str,
 }
 
+/// One Arguments or Subcommands list item: a synopsis placeholder (or a
+/// subcommand's bare name) and its one-line description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArgText {
+    /// The placeholder exactly as the synopsis spells it (`[]`/`<>`/`...`
+    /// included), or a subcommand's bare name.
+    pub name: &'static str,
+    /// What it does, one line.
+    pub desc: &'static str,
+}
+
 /// The text of one command's help page, parsed.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommandText {
@@ -79,8 +113,13 @@ pub struct CommandText {
     pub summary: &'static str,
     /// The positional-argument synopsis after `ipe <command>`; empty when none.
     pub args: &'static str,
-    /// The argument description; empty when the command takes no argument.
-    pub args_desc: &'static str,
+    /// The argument list, in page order; empty when the command takes no
+    /// argument.
+    pub arguments: Vec<ArgText>,
+    /// Remarks that belong to no single argument, in page order.
+    pub notes: Vec<&'static str>,
+    /// The subcommand list, in page order; empty when the command has none.
+    pub subcommands: Vec<ArgText>,
     /// The options, in page order (shared flags resolved).
     pub options: Vec<Opt>,
     /// Where the command's primary output lands; empty when not documented.
@@ -117,6 +156,31 @@ pub enum PageDefect {
     MalformedOption(&'static str),
     /// A `- @--flag` citing a flag `flags.md` does not define.
     UnknownSharedFlag(&'static str),
+    /// An Arguments line that is not `- `name` — desc`.
+    MalformedArgument(&'static str),
+    /// A Subcommands line that is not `- `name` — desc`.
+    MalformedSubcommand(&'static str),
+    /// A Notes line that is not `- <text>`.
+    MalformedNote(&'static str),
+    /// A synopsis placeholder (no `|` alternation in the synopsis) with no
+    /// matching Arguments item.
+    ArgumentMissingForPlaceholder(&'static str),
+    /// An Arguments item naming a placeholder the synopsis does not spell.
+    ArgumentNotInSynopsis(&'static str),
+}
+
+/// Parse `- `<name>` — <desc>` into an [`ArgText`] (shared shape with [`Opt`]).
+fn parse_item_line(line: &'static str) -> Option<ArgText> {
+    parse_option_line(line).map(|opt| ArgText {
+        name: opt.flag,
+        desc: opt.desc,
+    })
+}
+
+/// Parse a bare `- <text>` note line.
+fn parse_note_line(line: &'static str) -> Option<&'static str> {
+    let text = line.trim().strip_prefix("- ")?.trim();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Parse `- `<flag>` — <desc>` into an [`Opt`].
@@ -203,7 +267,15 @@ pub fn parse_command_page(name: &str, page: &'static str) -> (CommandText, Vec<P
         }
         if let Some(heading) = trimmed.strip_prefix("## ") {
             let heading = heading.trim();
-            if ![arguments_heading(), options_heading(), output_heading()].contains(&heading) {
+            if ![
+                arguments_heading(),
+                subcommands_heading(),
+                notes_heading(),
+                options_heading(),
+                output_heading(),
+            ]
+            .contains(&heading)
+            {
                 defects.push(PageDefect::UnknownSection(heading));
             }
             at = At::Section(Some(heading));
@@ -212,7 +284,22 @@ pub fn parse_command_page(name: &str, page: &'static str) -> (CommandText, Vec<P
         match at {
             At::Lead => set_once(&mut text.summary, line, &mut defects),
             At::Section(Some(heading)) if heading == arguments_heading() => {
-                set_once(&mut text.args_desc, line, &mut defects);
+                match parse_item_line(line) {
+                    Some(item) => text.arguments.push(item),
+                    None => defects.push(PageDefect::MalformedArgument(line)),
+                }
+            }
+            At::Section(Some(heading)) if heading == subcommands_heading() => {
+                match parse_item_line(line) {
+                    Some(item) => text.subcommands.push(item),
+                    None => defects.push(PageDefect::MalformedSubcommand(line)),
+                }
+            }
+            At::Section(Some(heading)) if heading == notes_heading() => {
+                match parse_note_line(line) {
+                    Some(note) => text.notes.push(note),
+                    None => defects.push(PageDefect::MalformedNote(line)),
+                }
             }
             At::Section(Some(heading)) if heading == output_heading() => {
                 set_once(&mut text.output_desc, line, &mut defects);
@@ -244,6 +331,21 @@ pub fn parse_command_page(name: &str, page: &'static str) -> (CommandText, Vec<P
     }
     if text.summary.is_empty() {
         defects.push(PageDefect::MissingSummary);
+    }
+    for item in &text.arguments {
+        if !text.args.contains(item.name) {
+            defects.push(PageDefect::ArgumentNotInSynopsis(item.name));
+        }
+    }
+    // A synopsis that alternates (`|`) describes the alternation by hand
+    // (often as a `## Subcommands` list); only a non-alternating synopsis is
+    // checked placeholder-by-placeholder.
+    if !text.args.contains('|') {
+        for token in text.args.split_whitespace().filter(|t| t.contains('<')) {
+            if text.arguments.iter().filter(|a| a.name == token).count() != 1 {
+                defects.push(PageDefect::ArgumentMissingForPlaceholder(token));
+            }
+        }
     }
     (text, defects)
 }
@@ -304,7 +406,8 @@ mod tests {
     use super::*;
 
     const GOOD: &str = "Do a thing.\n\n```\nipe thing [<path>]\n```\n\n## Arguments\n\n\
-                        The path.\n\n## Options\n\n- `[--x]` — the x flag\n- @--quiet\n";
+                        - `[<path>]` — the path\n\n## Notes\n\n- it does the thing\n\n\
+                        ## Options\n\n- `[--x]` — the x flag\n- @--quiet\n";
 
     #[test]
     fn a_well_formed_page_parses_without_defects() {
@@ -312,7 +415,14 @@ mod tests {
         assert!(defects.is_empty(), "{defects:?}");
         assert_eq!(text.summary, "Do a thing.");
         assert_eq!(text.args, "[<path>]");
-        assert_eq!(text.args_desc, "The path.");
+        assert_eq!(
+            text.arguments,
+            vec![ArgText {
+                name: "[<path>]",
+                desc: "the path"
+            }]
+        );
+        assert_eq!(text.notes, vec!["it does the thing"]);
         assert_eq!(text.options.len(), 2);
         assert!(matches!(
             text.options.first(),
@@ -325,6 +435,53 @@ mod tests {
             text.options.get(1),
             Some(Opt { flag, .. }) if flag.contains("--quiet")
         ));
+    }
+
+    #[test]
+    fn arguments_and_notes_refuse_prose() {
+        let (_, d) = parse_command_page(
+            "thing",
+            "Sum.\n```\nipe thing [<path>]\n```\n## Arguments\nThe path.\n",
+        );
+        assert!(
+            d.contains(&PageDefect::MalformedArgument("The path.")),
+            "{d:?}"
+        );
+        let (_, d) = parse_command_page(
+            "thing",
+            "Sum.\n```\nipe thing [<path>]\n```\n## Arguments\n- `[<path>]` — the path\n\
+             ## Notes\nA remark.\n",
+        );
+        assert!(d.contains(&PageDefect::MalformedNote("A remark.")), "{d:?}");
+    }
+
+    #[test]
+    fn a_placeholder_and_its_item_must_match_both_ways() {
+        // A placeholder with no item.
+        let (_, d) = parse_command_page("thing", "Sum.\n```\nipe thing [<path>]\n```\n");
+        assert!(
+            d.contains(&PageDefect::ArgumentMissingForPlaceholder("[<path>]")),
+            "{d:?}"
+        );
+        // An item naming a placeholder absent from the synopsis.
+        let (_, d) = parse_command_page(
+            "thing",
+            "Sum.\n```\nipe thing\n```\n## Arguments\n- `[<path>]` — the path\n",
+        );
+        assert!(
+            d.contains(&PageDefect::ArgumentNotInSynopsis("[<path>]")),
+            "{d:?}"
+        );
+        // An alternating synopsis is exempt from the forward direction.
+        let (_, d) = parse_command_page(
+            "thing",
+            "Sum.\n```\nipe thing <a|b>\n```\n## Subcommands\n- `a` — does a\n- `b` — does b\n",
+        );
+        assert!(
+            !d.iter()
+                .any(|def| matches!(def, PageDefect::ArgumentMissingForPlaceholder(_))),
+            "{d:?}"
+        );
     }
 
     #[test]

@@ -6,4 +6,4 @@ ipe remove <package>
 
 ## Arguments
 
-The package name.
+- `<package>` — the package name

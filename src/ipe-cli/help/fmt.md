@@ -6,7 +6,12 @@ ipe fmt [<path>...]
 
 ## Arguments
 
-Files and directories to format; a directory formats every `.ipe` under it (`.` when none is given). A file reached twice is formatted once. Every file is formatted before any is written, so one refused file leaves them all unchanged.
+- `[<path>...]` — files and directories to format; a directory formats every `.ipe` under it (`.` when none is given)
+
+## Notes
+
+- A file reached twice is formatted once.
+- Every file is formatted before any is written, so one refused file leaves them all unchanged.
 
 ## Options
 

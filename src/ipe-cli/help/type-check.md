@@ -6,7 +6,7 @@ ipe type-check [<path>]
 
 ## Arguments
 
-A module file under `src/` or `tests/` of the current directory's project, a project directory, or a package.ipe. Defaults to the current directory's project, every entry.
+- `[<path>]` — a module file under `src/` or `tests/` of the current directory's project, a project directory, or a package.ipe (default: the current directory's project, every entry)
 
 ## Options
 

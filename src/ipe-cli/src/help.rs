@@ -196,6 +196,16 @@ pub fn flag_names(synopsis: &str) -> impl Iterator<Item = &str> {
         .filter(|token| token.starts_with('-') && !matches!(*token, "-" | "--"))
 }
 
+/// One argument or subcommand entry in [`CommandSpec`]: the placeholder (or
+/// subcommand name) and a one-line description.
+#[derive(Clone, Debug)]
+pub struct ArgSpec {
+    /// The placeholder as the synopsis spells it, or a subcommand's bare name.
+    pub name: &'static str,
+    /// A one-line description.
+    pub desc: &'static str,
+}
+
 /// A command's public metadata, projected from [`COMMANDS`] for the CLI
 /// coverage surface.
 #[derive(Clone, Debug)]
@@ -207,9 +217,13 @@ pub struct CommandSpec {
     /// The positional-argument synopsis (e.g. `"[<path>]"`), empty when the
     /// command takes no positional.
     pub args: &'static str,
-    /// The plain-English description of the positional argument, empty when
-    /// there is none.
-    pub args_desc: &'static str,
+    /// The argument list, in page order; empty when the command takes no
+    /// positional.
+    pub arguments: Vec<ArgSpec>,
+    /// Remarks that belong to no single argument, in page order.
+    pub notes: Vec<&'static str>,
+    /// The subcommand list, in page order; empty when the command has none.
+    pub subcommands: Vec<ArgSpec>,
     /// A plain-English note on where the command's primary output lands, shown
     /// under `Output:` in the generated CLI reference. Empty when the command
     /// has no notable output location to document.
@@ -263,7 +277,23 @@ pub fn all_command_specs() -> Vec<CommandSpec> {
                 name: c.name(),
                 summary: text.summary,
                 args: text.args,
-                args_desc: text.args_desc,
+                arguments: text
+                    .arguments
+                    .iter()
+                    .map(|a| ArgSpec {
+                        name: a.name,
+                        desc: a.desc,
+                    })
+                    .collect(),
+                notes: text.notes.clone(),
+                subcommands: text
+                    .subcommands
+                    .iter()
+                    .map(|a| ArgSpec {
+                        name: a.name,
+                        desc: a.desc,
+                    })
+                    .collect(),
                 output_desc: text.output_desc,
                 hidden: c.hidden(),
                 options: text
@@ -597,13 +627,23 @@ fn render_command_markdown(cmd: Entry) -> String {
         let _ = write!(out, " {}", text.args);
     }
     out.push_str("\n```\n");
-    if !text.args_desc.is_empty() {
-        let _ = writeln!(
-            out,
-            "\n## {}\n\n{}",
-            help_page::arguments_heading(),
-            text.args_desc
-        );
+    if !text.arguments.is_empty() {
+        let _ = writeln!(out, "\n## {}\n", help_page::arguments_heading());
+        for item in &text.arguments {
+            let _ = writeln!(out, "- `{}` — {}", item.name, item.desc);
+        }
+    }
+    if !text.subcommands.is_empty() {
+        let _ = writeln!(out, "\n## {}\n", help_page::subcommands_heading());
+        for item in &text.subcommands {
+            let _ = writeln!(out, "- `{}` — {}", item.name, item.desc);
+        }
+    }
+    if !text.notes.is_empty() {
+        let _ = writeln!(out, "\n## {}\n", help_page::notes_heading());
+        for note in &text.notes {
+            let _ = writeln!(out, "- {note}");
+        }
     }
     if !text.options.is_empty() {
         let _ = writeln!(out, "\n## {}\n", help_page::options_heading());
@@ -680,6 +720,23 @@ fn render_group(g: &Group, p: &Palette) -> String {
     gutter(&out)
 }
 
+/// Render a `name — desc` list column-aligned: every name padded to the
+/// widest one's length, so every description starts in the same column.
+/// Shared by Arguments, Subcommands, and Options so the three lists read as
+/// one rendering path.
+fn render_aligned_list<'a>(
+    items: impl Iterator<Item = (&'a str, &'a str)> + Clone,
+    p: &Palette,
+) -> String {
+    let width = items.clone().map(|(name, _)| name.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (name, desc) in items {
+        let pad = " ".repeat(width.saturating_sub(name.chars().count()));
+        let _ = writeln!(out, "  {name}{pad}  {}{desc}{}", p.dim, p.reset);
+    }
+    out
+}
+
 /// The synopsis line for command `name`: `ipe <name>` in yellow, then its
 /// arguments inline in plain text.
 fn command_line(name: &str, args: &str, p: &Palette) -> String {
@@ -750,11 +807,30 @@ fn render_top_level(p: &Palette) -> String {
 ///   "sections": [ { "title": "<name>", "commands": ["<name>",…] }, … ],
 ///   "groups": [ { "name": "<name>", "summary": "<text>", "members": ["<verb>",…] }, … ],
 ///   "commands": [ { "name": "<name>", "summary": "<text>",
-///                   "args": "<synopsis>", "args_desc": "<text>",
+///                   "args": "<synopsis>",
+///                   "arguments": [ { "name": "<placeholder>", "desc": "<text>" }, … ],
+///                   "subcommands": [ { "name": "<word>", "desc": "<text>" }, … ],
+///                   "notes": ["<text>", …],
 ///                   "hidden": <bool>,
 ///                   "options": [ { "flag": "<synopsis>", "desc": "<text>" }, … ]
 ///                 }, … ] }
 /// ```
+/// A compact JSON array of `{"name":…,"desc":…}` objects, from an Arguments
+/// or Subcommands list.
+fn json_arg_array(items: &[help_page::ArgText]) -> String {
+    use crate::cli_args::json;
+    let objs: Vec<String> = items
+        .iter()
+        .map(|a| {
+            json::object(&[
+                ("name", json::string(a.name)),
+                ("desc", json::string(a.desc)),
+            ])
+        })
+        .collect();
+    json::array(&objs)
+}
+
 #[must_use]
 pub fn help_json() -> String {
     use crate::cli_args::json;
@@ -792,7 +868,9 @@ pub fn help_json() -> String {
                 ("name", json::string(c.name())),
                 ("summary", json::string(text.summary)),
                 ("args", json::string(text.args)),
-                ("args_desc", json::string(text.args_desc)),
+                ("arguments", json_arg_array(&text.arguments)),
+                ("subcommands", json_arg_array(&text.subcommands)),
+                ("notes", json::string_array(&text.notes)),
                 (
                     "hidden",
                     if c.hidden() {
@@ -856,7 +934,9 @@ pub fn command_json(name: &str) -> Option<String> {
         ("name", json::string(c.name())),
         ("summary", json::string(text.summary)),
         ("args", json::string(text.args)),
-        ("args_desc", json::string(text.args_desc)),
+        ("arguments", json_arg_array(&text.arguments)),
+        ("subcommands", json_arg_array(&text.subcommands)),
+        ("notes", json::string_array(&text.notes)),
         (
             "hidden",
             if c.hidden() {
@@ -886,19 +966,36 @@ fn render_command(cmd: Entry, p: &Palette) -> String {
     out.push('\n');
     out.push_str(&command_line(cmd.name(), text.args, p));
     out.push('\n');
-    if !text.args_desc.is_empty() {
+    if !text.arguments.is_empty() {
         out.push('\n');
         let _ = writeln!(out, "{}:", help_page::arguments_heading());
-        let _ = writeln!(out, "  {}{}{}", p.dim, text.args_desc, p.reset);
+        out.push_str(&render_aligned_list(
+            text.arguments.iter().map(|a| (a.name, a.desc)),
+            p,
+        ));
+    }
+    if !text.subcommands.is_empty() {
+        out.push('\n');
+        let _ = writeln!(out, "{}:", help_page::subcommands_heading());
+        out.push_str(&render_aligned_list(
+            text.subcommands.iter().map(|a| (a.name, a.desc)),
+            p,
+        ));
+    }
+    if !text.notes.is_empty() {
+        out.push('\n');
+        let _ = writeln!(out, "{}:", help_page::notes_heading());
+        for note in &text.notes {
+            let _ = writeln!(out, "  {}{}{}", p.dim, note, p.reset);
+        }
     }
     if !text.options.is_empty() {
         out.push('\n');
         let _ = writeln!(out, "{}:", help_page::options_heading());
-        let width = text.options.iter().map(|o| o.flag.len()).max().unwrap_or(0);
-        for opt in &text.options {
-            let pad = " ".repeat(width.saturating_sub(opt.flag.chars().count()));
-            let _ = writeln!(out, "  {}{pad}  {}{}{}", opt.flag, p.dim, opt.desc, p.reset);
-        }
+        out.push_str(&render_aligned_list(
+            text.options.iter().map(|o| (o.flag, o.desc)),
+            p,
+        ));
     }
     out.push('\n');
     gutter(&out)
@@ -1038,15 +1135,22 @@ mod tests {
     fn commands_with_an_argument_describe_it() {
         for cmd in entries() {
             let text = cmd.text();
-            if text.args_desc.is_empty() {
+            if text.arguments.is_empty() {
                 continue;
             }
             let page = render_command(cmd, &Palette::PLAIN);
             assert!(
-                page.contains("Arguments:") && page.contains(text.args_desc),
-                "missing argument description for {}",
+                page.contains("Arguments:"),
+                "missing `Arguments:` for {}",
                 cmd.name()
             );
+            for item in &text.arguments {
+                assert!(
+                    page.contains(item.name) && page.contains(item.desc),
+                    "missing argument item {item:?} for {}",
+                    cmd.name()
+                );
+            }
         }
     }
 
