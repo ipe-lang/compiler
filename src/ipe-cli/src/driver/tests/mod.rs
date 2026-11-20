@@ -3393,7 +3393,7 @@ fn reachable_runtime_copy_refuses_path_attributes_leaving_the_tree() {
 fn embedded_runtime_closure_vendors_every_path_attribute_target() -> Result<(), CliError> {
     let tree = RuntimeSource::Embedded.module_tree()?;
     let prefix = Path::new("src/ipe_runtime");
-    let top_level: BTreeSet<String> = tree
+    let top_level: std::collections::BTreeSet<String> = tree
         .files()
         .keys()
         .filter_map(|rel| {
