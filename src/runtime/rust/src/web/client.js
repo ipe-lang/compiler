@@ -476,7 +476,7 @@ function __ipeAdoptFullBody(token, applyFn, route) {
     applyFn();
     __ipeEpoch = token;
     __ipeSyncRoute(route, false, next);
-  });
+  }, null);
   return true;
 }
 // Where the patches diffed from render `from` to render `to` stand against the
@@ -503,7 +503,7 @@ function __ipeAdoptPatches(frame) {
     __ipeEpoch = frame.to;
     __ipeSyncRoute(frame.route, own, __ipeOwnEpoch(frame.to));
     __ipeFocusAddressed(frame);
-  });
+  }, frame.patches);
 }
 // Record `route`, the browser path a render at epoch `at` was committed with,
 // as the location: a new entry when `push`, otherwise the current entry
@@ -1076,13 +1076,17 @@ function __ipeSwapPreservingFocus(container, tmp) {
 // carries one (focus in the debugger overlay, on the body or outside the view
 // records nothing). After the frame, when nothing holds focus, focus goes to
 // the deepest node of the chain still in the view that takes focus, else to
-// `#ipe-root`. The check runs at the end of the commit and again two animation
-// frames later, after the browser's own focus fixup for a node a patch made
-// unfocusable. Neither check moves focus the user moved since the commit, nor
+// `#ipe-root`. The check runs at the end of the commit. When a patch of the
+// frame targets the chain and focus held, the browser's own later drop of the
+// focused node to nothing (its fixup for a node a patch made unfocusable) is
+// answered once, by the drop event it raises, in a task posted after the whole
+// focus change. Neither check moves focus the user moved since the commit, nor
 // one a newer frame owns, nor while the runtime is moving focus itself.
 var __IPE_FOCUS_CHAIN_MAX = 1024;
-// The pending deferred check: the record of the newest frame that took one.
-var __ipeFocusKeep = null;
+// The event whose dispatch answers the drop check (`dom::focus::FOCUS_DROP_EVENT`).
+var __IPE_FOCUS_DROP_EVENT = "focusout";
+// The armed drop check of the newest frame: {chain, rec, held}; null when none.
+var __ipeFocusPending = null;
 // The view chain of the focused node below `root`, downward; null when focus
 // is not below `root`, its first link carries no `ipe-id`, or it is nested
 // deeper than `__IPE_FOCUS_CHAIN_MAX`.
@@ -1107,27 +1111,61 @@ function __ipeFocusSettleDue(rec) {
   return !held && __ipeFocusEpoch === rec.epoch && __ipeEpoch === rec.frame &&
       !__ipeRuntimeFocusing;
 }
-// Runs `run`, the one commit of a frame, inside the focus keep.
-function __ipeKeepFocus(run) {
+// Whether a frame arms the drop check (`dom::focus::arms`): focus is held, by
+// the node focused before the frame, and some patch targets the chain or an
+// earlier frame's check carries.
+function __ipeFocusArms(chain, patched, heldUnchanged, focusHeld, carried) {
+  return focusHeld && heldUnchanged && (carried || chain.some(function(link) { return patched(link.id); }));
+}
+// Whether an earlier frame's armed drop check carries into this frame
+// (`dom::focus::carries`): armed on the node focused before this frame, with
+// no focus move since.
+function __ipeFocusCarries(armedOnHeld, noMoveSince) {
+  return armedOnHeld && noMoveSince;
+}
+// Whether a drop answers the armed check (`dom::focus::drop_answers`): the
+// held node itself lost focus to nothing.
+function __ipeFocusDropAnswers(targetIsHeld, relatedIsNull) {
+  return targetIsHeld && relatedIsNull;
+}
+// Runs `run`, the one commit of a frame, inside the focus keep; `patches` are
+// the frame's patches, null for a whole-body swap, which arms no drop check.
+function __ipeKeepFocus(run, patches) {
+  var before = __ipeDoc.active();
   var chain = __ipeFocusChain(__ipeDoc.byId("ipe-root"));
   var epoch = __ipeFocusEpoch;
+  var earlier = __ipeFocusPending;
+  __ipeFocusPending = null;
   run();
-  if (chain === null) {
-    __ipeFocusKeep = null;
-    return;
-  }
+  if (chain === null) return;
   var rec = {chain: chain, epoch: epoch, frame: __ipeEpoch};
-  __ipeFocusKeep = rec;
   if (__ipeFocusSettleDue(rec)) __ipeRestoreFocus(rec.chain);
-  if (typeof window.requestAnimationFrame !== "function") return;
-  window.requestAnimationFrame(function() {
-    window.requestAnimationFrame(function() {
-      if (__ipeFocusKeep !== rec) return;
-      __ipeFocusKeep = null;
-      if (__ipeFocusSettleDue(rec)) __ipeRestoreFocus(rec.chain);
-    });
-  });
+  if (!patches) return;
+  var held = __ipeDoc.active();
+  var patched = function(id) {
+    return patches.some(function(p) { return String(p.id) === id; });
+  };
+  var carried = !!earlier &&
+      __ipeFocusCarries(earlier.held === before, earlier.rec.epoch === epoch);
+  if (__ipeFocusArms(chain, patched, !!held && held === before,
+      !!held && held !== __ipeDoc.body(), carried)) {
+    __ipeFocusPending = {chain: chain, rec: rec, held: held};
+  }
 }
+// Answers the armed drop check in a task posted after the whole focus change:
+// a microtask would run between `focusout` and `focusin` and read a Tab as a
+// drop.
+__ipeDoc.on(__IPE_FOCUS_DROP_EVENT, function(ev) {
+  var pending = __ipeFocusPending;
+  if (!pending) return;
+  var related = ev.relatedTarget;
+  if (!__ipeFocusDropAnswers(ev.target === pending.held,
+      related === null || related === undefined)) return;
+  __ipeFocusPending = null;
+  setTimeout(function() {
+    if (__ipeFocusSettleDue(pending.rec)) __ipeRestoreFocus(pending.rec.chain);
+  }, 0);
+}, true);
 // The ONE element child of `at` whose `ipe-id` and tag equal `link`; null when
 // none or several do, or when the children cannot be read. The children are
 // walked through the core node members (`firstChild`, `nextSibling`), which
