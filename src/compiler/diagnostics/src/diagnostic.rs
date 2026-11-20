@@ -1311,7 +1311,7 @@ pub const SQL_PARAM_TYPES: [&str; 5] = ["Int", "Float", "String", "Bool", "SqlVa
 /// The methods one `Ipe.Server` route may name besides `ANY`, in hint order.
 ///
 /// Mirrors the runtime's routable method set
-/// (`ipe_runtime_rust::encoding::RoutableMethod::ALL`), which the diagnostics
+/// (`ipe_runtime_rust::http_method::HttpMethod::ALL`), which the diagnostics
 /// crate cannot import; the backend's route grammar tests assert the two agree.
 pub const ROUTABLE_METHOD_NAMES: [&str; 7] =
     ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];

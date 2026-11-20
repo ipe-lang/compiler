@@ -796,6 +796,11 @@ pub use stringify::*;
 pub mod retained;
 pub use retained::{Bytes, RetainedBytes};
 
+// The one `HttpMethod`: std-only and ungated, so naming a method links no
+// client or server dependency.
+pub mod http_method;
+pub use http_method::*;
+
 pub mod char_kernel;
 pub use char_kernel::*;
 

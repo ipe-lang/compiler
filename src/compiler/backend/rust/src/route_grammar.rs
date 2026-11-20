@@ -1167,11 +1167,11 @@ mod agreement_tests {
     /// served one.
     #[test]
     fn unknown_method_hint_names_the_routable_set() {
-        use ipe_runtime_rust::encoding::RoutableMethod;
+        use ipe_runtime_rust::http_method::HttpMethod;
         let mut hint = ipe_diagnostics::ROUTABLE_METHOD_NAMES.to_vec();
-        let mut served: Vec<&str> = RoutableMethod::ALL
+        let mut served: Vec<&str> = HttpMethod::ALL
             .into_iter()
-            .map(RoutableMethod::as_str)
+            .map(HttpMethod::as_str)
             .collect();
         hint.sort_unstable();
         served.sort_unstable();

@@ -43,8 +43,7 @@ pins! {
     "Unit" => Value: ();
     "Order" => Value: ipe_runtime_rust::basics::IpeOrder;
     "BackoffStrategy" => Value: ipe_runtime_rust::task::BackoffStrategy;
-    #[cfg(any(feature = "http_client", all(target_arch = "wasm32", feature = "wasm-client")))]
-    "HttpMethod" => Value: ipe_runtime_rust::http_client::HttpMethod;
+    "HttpMethod" => Value: ipe_runtime_rust::http_method::HttpMethod;
     #[cfg(any(feature = "http_client", all(target_arch = "wasm32", feature = "wasm-client")))]
     "RedirectPolicy" => Value: ipe_runtime_rust::http_client::RedirectPolicy;
     #[cfg(feature = "decimal")]

@@ -15877,9 +15877,12 @@ impl StdlibKernel {
 
     /// `true` when this variant belongs to the outbound `Ipe.Http` client
     /// family — the `Http.get` / `Http.post` / `Http.request` senders plus the
-    /// pure request/method builders (`Http.defaultRequest`, `Http.with*`,
-    /// `Http.methodFromString` / `methodToString`), the `Http.parseQuery`
-    /// query splitter, and the `Ipe.Http.Stream` relay kernels.
+    /// pure request builders (`Http.defaultRequest`, `Http.with*`), the
+    /// `Http.parseQuery` query splitter, and the `Ipe.Http.Stream` relay kernels.
+    ///
+    /// `Http.methodFromString` / `methodToString` are not here: they live in the
+    /// ungated `http_method` runtime module beside `HttpMethod` itself, so a
+    /// program that only names a method links no reqwest.
     ///
     /// Every variant here emits a symbol that lives in the `http_client` or
     /// `http_stream` runtime module, both of which require reqwest. Used by
@@ -15911,8 +15914,6 @@ impl StdlibKernel {
                 | Self::HttpWithHeader
                 | Self::HttpWithUrl
                 | Self::HttpWithRedirects
-                | Self::HttpMethodFromString
-                | Self::HttpMethodToString
                 // Outbound HTTP streaming: open/stream/close a reqwest response
                 // body incrementally. These call http_client::ssrf_apply +
                 // method_to_reqwest, so they require reqwest just like Http.get.
@@ -19386,19 +19387,31 @@ mod tests {
         }
     }
 
-    /// Every `Ipe.Http` kernel (qualifier `"Http"`) emits a symbol that lives in
-    /// the `http_client` runtime module, so it MUST be reported by
-    /// `is_http_client()` — that predicate is what gates declaring `http_client`
-    /// and linking `reqwest` in the emitted crate. A new `Http.*` kernel that
-    /// forgets the predicate would emit `ipe_runtime::http_client::…` into a
-    /// crate that declares neither the module nor the dependency (E0433 at
-    /// `cargo build`); this test fails the instant that happens. The
+    /// Every `Ipe.Http` kernel (qualifier `"Http"`) outside the ungated
+    /// `http_method` module is reported by `is_http_client()`.
+    ///
+    /// That predicate is what gates declaring `http_client` and linking
+    /// `reqwest` in the emitted crate. A new `Http.*` kernel that forgets the
+    /// predicate would emit a `http_client` symbol into a crate that declares
+    /// neither the module nor the dependency (E0433 at `cargo build`); this test
+    /// fails the instant that happens. The two method converters live in the
+    /// ungated `http_method` module, so they must NOT pull the client. The
     /// `Ipe.Http.Stream` relay kernels use the distinct `"HttpStream"` qualifier
     /// and are intentionally NOT covered (they ride the server surface).
     #[test]
     fn every_http_kernel_is_reported_as_http_client() {
+        let in_http_method = [
+            StdlibKernel::HttpMethodFromString,
+            StdlibKernel::HttpMethodToString,
+        ];
+        for k in in_http_method {
+            assert!(
+                !k.is_http_client(),
+                "{k:?} lives in the ungated `http_method` module and must not pull `http_client`"
+            );
+        }
         for k in StdlibKernel::ALL {
-            if k.decl().qualifier == "Http" {
+            if k.decl().qualifier == "Http" && !in_http_method.contains(k) {
                 assert!(
                     k.is_http_client(),
                     "{k:?} is an `Ipe.Http` kernel (emits `{}` in http_client) but \

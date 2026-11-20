@@ -30,6 +30,7 @@
 //!    on every `Location` target, since an IP literal bypasses any resolver.
 
 use super::*;
+use crate::http_method::HttpMethod;
 #[cfg(any(
     not(target_arch = "wasm32"),
     all(target_arch = "wasm32", feature = "wasm-client")
@@ -80,69 +81,6 @@ crate::stringify::show_row!("RedirectPolicy", Value, [] RedirectPolicy, |p| matc
     RedirectPolicy::NoRedirects => "NoRedirects".to_owned(),
     RedirectPolicy::FollowRedirects(n) => format!("FollowRedirects {n}"),
 });
-
-/// Closed set of HTTP methods — the Rust mirror of the `HttpMethod` ADT in
-/// `Ipe.Http`.  Variant names match the Ipê constructors verbatim so emitted
-/// match arms (`HttpMethod::Get`, `HttpMethod::Post`, …) resolve through the
-/// `pub use http_client::*` glob in the generated `mod.rs`.
-///
-/// Conversions to/from reqwest `Method` happen at the request executor
-/// boundary (`method_to_reqwest`) — never at every call site.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HttpMethod {
-    Get,
-    Post,
-    Put,
-    Delete,
-    Patch,
-    Head,
-    Options,
-}
-
-crate::retained::inline_measure!(HttpMethod);
-
-crate::stringify::show_row!("HttpMethod", Value, [] HttpMethod, |m| match m {
-    HttpMethod::Get => "Get".to_owned(),
-    HttpMethod::Post => "Post".to_owned(),
-    HttpMethod::Put => "Put".to_owned(),
-    HttpMethod::Delete => "Delete".to_owned(),
-    HttpMethod::Patch => "Patch".to_owned(),
-    HttpMethod::Head => "Head".to_owned(),
-    HttpMethod::Options => "Options".to_owned(),
-});
-
-impl HttpMethod {
-    /// Convert to the canonical uppercase ASCII string.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            HttpMethod::Get => "GET",
-            HttpMethod::Post => "POST",
-            HttpMethod::Put => "PUT",
-            HttpMethod::Delete => "DELETE",
-            HttpMethod::Patch => "PATCH",
-            HttpMethod::Head => "HEAD",
-            HttpMethod::Options => "OPTIONS",
-        }
-    }
-
-    /// Parse from a string (case-insensitive).  Returns `None` for any
-    /// unrecognised verb — the parse-don't-validate boundary.
-    // Named `from_str` for call-site readability; it returns `Option<Self>`, not
-    // `FromStr`'s `Result`, so it deliberately does not implement that trait.
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> Option<Self> {
-        match s.to_ascii_uppercase().as_str() {
-            "GET" => Some(HttpMethod::Get),
-            "POST" => Some(HttpMethod::Post),
-            "PUT" => Some(HttpMethod::Put),
-            "DELETE" => Some(HttpMethod::Delete),
-            "PATCH" => Some(HttpMethod::Patch),
-            "HEAD" => Some(HttpMethod::Head),
-            "OPTIONS" => Some(HttpMethod::Options),
-            _ => None,
-        }
-    }
-}
 
 /// Convert an `HttpMethod` to a reqwest `Method`.  Infallible: every ADT
 /// variant maps to a well-known reqwest method constant.
@@ -200,21 +138,6 @@ crate::redact::redacting_debug!(HttpRequest {
     shown: [method, redirects, timeout],
     masked: [body, headers, url],
 });
-
-/// `Http.methodFromString : String -> Maybe HttpMethod` — the typed parse
-/// boundary for inbound method strings.  Returns `Just` for the seven
-/// standard verbs (case-insensitive), `Nothing` for anything else.
-pub fn http_method_from_string(s: String) -> crate::core::IpeMaybe<HttpMethod> {
-    match HttpMethod::from_str(&s) {
-        Some(m) => crate::core::IpeMaybe::Just(m),
-        None => crate::core::IpeMaybe::Nothing,
-    }
-}
-
-/// `Http.methodToString : HttpMethod -> String` — canonical uppercase string.
-pub fn http_method_to_string(m: HttpMethod) -> String {
-    m.as_str().to_string()
-}
 
 // ---------------------------------------------------------------------------
 // Typed request-target builders — API-layer scheme narrowing (fail-closed)
