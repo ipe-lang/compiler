@@ -88,7 +88,7 @@ pub fn http_method_to_string(m: HttpMethod) -> String {
     m.as_str().to_owned()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::HttpMethod;
 
