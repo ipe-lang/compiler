@@ -2701,31 +2701,37 @@ pub fn render_capabilities(
             }
             let mut out = style::frame(&style::gutter(&body));
             if let Some(report) = frames {
-                let mut block = String::new();
-                if let Some(reach) = reach {
-                    let _ = writeln!(block, "{}", reach.notice());
-                }
-                let built = report.built();
-                let _ = writeln!(
-                    block,
-                    "{}",
-                    text::msg::capabilities_frame_program(&built.name(), &built.file())
-                );
-                for program in report.not_applicable() {
-                    let _ = writeln!(
-                        block,
-                        "{}",
-                        text::msg::capabilities_frame_not_applicable(
-                            &program.name(),
-                            &program.file()
-                        )
-                    );
-                }
-                out.push_str(&style::frame(&style::gutter(&block)));
+                out.push_str(&style::frame(&style::gutter(&frame_report_block(report))));
             }
             out
         }
     }
+}
+
+/// The human block of a frame report: the frame notice when the list
+/// applies, then the program it applies to and each analysed program it
+/// does not apply to, one line each.
+fn frame_report_block(report: &crate::frame_reach::FrameReport) -> String {
+    use std::fmt::Write as _;
+
+    let mut block = String::new();
+    if let Some(reach) = report.reach() {
+        let _ = writeln!(block, "{}", reach.notice());
+    }
+    let built = report.built();
+    let _ = writeln!(
+        block,
+        "{}",
+        text::msg::capabilities_frame_program(&built.name(), &built.file())
+    );
+    for program in report.not_applicable() {
+        let _ = writeln!(
+            block,
+            "{}",
+            text::msg::capabilities_frame_not_applicable(&program.name(), &program.file())
+        );
+    }
+    block
 }
 
 /// `ipe version` — print the ipe version in the requested format.

@@ -2108,6 +2108,29 @@ fn capabilities_command_refuses_a_frame_list_when_the_built_program_has_no_web_l
     Ok(())
 }
 
+/// A library project (only `exposedModules`) compiles no program, so no page
+/// trusts its frame list: `ipe capabilities` refuses the list, and reports
+/// the same library without it.
+#[test]
+fn capabilities_command_refuses_a_frame_list_on_a_library() -> TestResult {
+    let lib = "module Lib exposing (shout)\n\nimport Ipe.String as String\n\nshout : String -> String\nshout s =\n    String.toUpper s\n";
+    for (tag, delivery) in [("lib-listed", LISTED), ("lib-absent", "")] {
+        let dir = frame_project(
+            tag,
+            &format!(", exposedModules = [ \"Lib\" ]{delivery}"),
+            lib,
+        )?;
+        std::fs::remove_file(dir.join("src/Main.ipe"))?;
+        std::fs::write(dir.join("src/Lib.ipe"), lib)?;
+        let run = run_ipe_in(&dir, &["capabilities", "--plain"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ok, plain) = run?;
+        assert_eq!(ok, delivery.is_empty(), "{tag}: {plain}");
+        assert!(!plain.contains("frame"), "{tag}: {plain}");
+    }
+    Ok(())
+}
+
 /// A served page rendered through `Html.render`, with no `Web.tea` or `Web.embed` leaf.
 const SERVED_HTML: &str = r#"module Main exposing (main)
 
