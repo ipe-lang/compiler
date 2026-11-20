@@ -16524,6 +16524,70 @@ mod emitted_router_behavior_tests {
         );
     }
 
+    /// Every [`StartupRefusal`] keeps the [`crate::system::ScrubbedDisplay`]
+    /// promise: built from raw text holding `\` and a newline, each variant's
+    /// fail-closed log line shows the `\` once escaped and no raw control. The
+    /// match names every variant, so a new one must add its sample here.
+    #[test]
+    #[allow(clippy::panic)] // a ceiling or base that accepts the hostile value fails the test
+    fn every_startup_refusal_logs_scrubbed_once() {
+        const RAW: &str = "a\\b\n";
+        let Err(base) = parse_mount_base("/a\\b\n") else {
+            panic!("a base holding `\\` is refused");
+        };
+        let Err(ceiling) = crate::server::shutdown::SHUTDOWN_GRACE_CEILING.parse(Ok(RAW.into()))
+        else {
+            panic!("a non-decimal grace is refused");
+        };
+        let env = || crate::system::EnvValueRefusal::new("IPE_X", "a mode", RAW.as_bytes());
+        let samples = [
+            StartupRefusal::RouteTable(route::RoutePatternRefusal {
+                pattern: crate::system::RefusedText::new(RAW),
+                refusal: crate::encoding::RouteSegmentRefusal::CatchAll,
+            }),
+            StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+                backend: "postgres",
+                cause: crate::system::RefusedText::new(RAW),
+            }),
+            base,
+            StartupRefusal::Ceiling(ceiling),
+            StartupRefusal::FrameAncestors(crate::telemetry::FrameAncestorsRefusal::Blank),
+            StartupRefusal::Bind(env()),
+            StartupRefusal::Auth(crate::app_config::AuthStartupRefusal::Revocation(env())),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for cause in &samples {
+            let (kind, quotes_raw) = match cause {
+                StartupRefusal::RouteTable(_) => ("route", true),
+                StartupRefusal::SessionStore(_) => ("store", true),
+                StartupRefusal::MountBase { .. } => ("base", true),
+                StartupRefusal::Ceiling(_) => ("ceiling", true),
+                StartupRefusal::FrameAncestors(_) => ("frame", false),
+                StartupRefusal::Bind(_) => ("bind", true),
+                StartupRefusal::Auth(_) => ("auth", true),
+            };
+            seen.insert(kind);
+            let line = crate::system::scrubbed_runtime_log_line(
+                crate::system::LogStream::Stderr,
+                None,
+                "live",
+                &fail_closed_log_message(cause),
+            );
+            assert!(
+                !line.chars().any(crate::system::is_log_hazard),
+                "{kind}: a raw control survived: {line:?}"
+            );
+            assert!(
+                !line.contains("\\\\\\\\"),
+                "{kind}: scrubbed twice: {line:?}"
+            );
+            if quotes_raw {
+                assert!(line.contains("a\\\\b\\n"), "{kind}: {line:?}");
+            }
+        }
+        assert_eq!(seen.len(), 7, "one sample per variant: {seen:?}");
+    }
+
     /// A mounted routed app whose table holds a malformed pattern answers every
     /// path with the fixed 503 body; the pattern stays in the server log.
     #[test]
