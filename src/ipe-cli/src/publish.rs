@@ -200,7 +200,7 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
     //    existing entry (refusing a duplicate); `--fresh` writes a single-version
     //    entry (the new version only), used to reset the disposable reserved smoke
     //    probe so its index entry never accumulates.
-    let package_name = manifest.name.clone();
+    let package_name = manifest.name;
     let index_root = crate::resolve::index_root()?;
     let entry_toml = if args.fresh {
         build_fresh_entry(&package_name, &claimed, blessing.as_ref(), &entry_version)?

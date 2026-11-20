@@ -83,7 +83,7 @@ impl FrameProgram {
 
     /// The program's name, as `package.ipe` writes it.
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub const fn name(&self) -> &str {
         self.name.as_str()
     }
 
