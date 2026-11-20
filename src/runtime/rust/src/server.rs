@@ -24,8 +24,9 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::encoding::{EndpointMethod, EndpointMethodRefusal, RoutableMethod, WireMethod};
+use crate::encoding::{EndpointMethod, EndpointMethodRefusal, WireMethod};
 use crate::entropy::EntropyError;
+use crate::http_method::HttpMethod;
 use crate::redact::{Redacted, redacting_debug};
 use crate::system::RefusedText;
 
@@ -359,7 +360,7 @@ fn author_method(name: &str) -> AuthorMethod {
 }
 
 /// A handler route serving `method` alone.
-const fn one(method: RoutableMethod) -> AuthorMethod {
+const fn one(method: HttpMethod) -> AuthorMethod {
     Ok(EndpointMethod::One(method))
 }
 
@@ -410,7 +411,7 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route(one(RoutableMethod::Get), path, h)
+    route(one(HttpMethod::Get), path, h)
 }
 
 pub fn server_post<E, H>(path: String, h: H) -> ServerRoute
@@ -418,7 +419,7 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route(one(RoutableMethod::Post), path, h)
+    route(one(HttpMethod::Post), path, h)
 }
 
 pub fn server_put<E, H>(path: String, h: H) -> ServerRoute
@@ -426,7 +427,7 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route(one(RoutableMethod::Put), path, h)
+    route(one(HttpMethod::Put), path, h)
 }
 
 pub fn server_delete<E, H>(path: String, h: H) -> ServerRoute
@@ -434,11 +435,11 @@ where
     E: Send + 'static,
     H: IntoServerHandler<E>,
 {
-    route(one(RoutableMethod::Delete), path, h)
+    route(one(HttpMethod::Delete), path, h)
 }
 
 /// `Server.any`: the handler serves every routable method
-/// ([`RoutableMethod::ALL`]), never `TRACE`, `CONNECT` or an unknown method.
+/// ([`HttpMethod::ALL`]), never `TRACE`, `CONNECT` or an unknown method.
 pub fn server_any<E, H>(path: String, h: H) -> ServerRoute
 where
     E: Send + 'static,
@@ -763,12 +764,7 @@ fn reissue_set_cookie_with(
 /// not been reached, a fresh token is minted and attached via `Set-Cookie`.
 /// `iat`, `cap`, and `jti` are carried verbatim from the verified-origin
 /// `ReissueContext` — a client cannot move the cap outward or change the session id.
-fn authed_route<E, F>(
-    method: RoutableMethod,
-    path: String,
-    cfg: AuthConfig,
-    handler: F,
-) -> ServerRoute
+fn authed_route<E, F>(method: HttpMethod, path: String, cfg: AuthConfig, handler: F) -> ServerRoute
 where
     E: Send + 'static,
     F: Fn(ServerRequest, crate::principal::Principal) -> IpeTask<E, ServerResponse>
@@ -906,7 +902,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route(RoutableMethod::Get, path, cfg, handler)
+    authed_route(HttpMethod::Get, path, cfg, handler)
 }
 
 #[cfg(feature = "jwt")]
@@ -919,7 +915,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route(RoutableMethod::Post, path, cfg, handler)
+    authed_route(HttpMethod::Post, path, cfg, handler)
 }
 
 #[cfg(feature = "jwt")]
@@ -932,7 +928,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route(RoutableMethod::Put, path, cfg, handler)
+    authed_route(HttpMethod::Put, path, cfg, handler)
 }
 
 #[cfg(feature = "jwt")]
@@ -945,7 +941,7 @@ where
         + Sync
         + 'static,
 {
-    authed_route(RoutableMethod::Delete, path, cfg, handler)
+    authed_route(HttpMethod::Delete, path, cfg, handler)
 }
 
 // ─── response builders (pure) ─────────────────────────────────────────────
@@ -1982,7 +1978,7 @@ impl MountTable {
 /// language does not know is answered `501`, and `TRACE` or `CONNECT` is
 /// answered by [`unroutable_method`] before any router or handler sees the
 /// request, so no route (`ANY` included) is ever reached by a method outside
-/// [`RoutableMethod`].
+/// [`HttpMethod`].
 ///
 /// A malformed path or query is answered with the fixed 400 before routing, so
 /// an unrouted path and the fallback are refused alike; the 400 carries the
@@ -2037,7 +2033,7 @@ type CanonicalFuture<F> = futures_util::future::Either<
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MethodSet {
     /// A member, so the set is never empty.
-    first: RoutableMethod,
+    first: HttpMethod,
     /// One bit per member ([`MethodSet::bit`]).
     bits: u8,
 }
@@ -2052,22 +2048,22 @@ impl Eq for MethodSet {}
 
 impl MethodSet {
     /// `GET`, and with it `HEAD`.
-    pub(crate) const GET: Self = Self::of(RoutableMethod::Get);
+    pub(crate) const GET: Self = Self::of(HttpMethod::Get);
     /// `POST`.
     #[cfg(feature = "web")]
-    pub(crate) const POST: Self = Self::of(RoutableMethod::Post);
+    pub(crate) const POST: Self = Self::of(HttpMethod::Post);
     /// Every routable method: what an author's "every method" serves, never
     /// the router's every-method wildcard.
-    pub(crate) const ALL: Self = Self::of(RoutableMethod::Delete)
-        .or(Self::of(RoutableMethod::Get))
-        .or(Self::of(RoutableMethod::Head))
-        .or(Self::of(RoutableMethod::Options))
-        .or(Self::of(RoutableMethod::Patch))
-        .or(Self::of(RoutableMethod::Post))
-        .or(Self::of(RoutableMethod::Put));
+    pub(crate) const ALL: Self = Self::of(HttpMethod::Delete)
+        .or(Self::of(HttpMethod::Get))
+        .or(Self::of(HttpMethod::Head))
+        .or(Self::of(HttpMethod::Options))
+        .or(Self::of(HttpMethod::Patch))
+        .or(Self::of(HttpMethod::Post))
+        .or(Self::of(HttpMethod::Put));
 
     /// The set of `method` alone.
-    pub(crate) const fn of(method: RoutableMethod) -> Self {
+    pub(crate) const fn of(method: HttpMethod) -> Self {
         Self {
             first: method,
             bits: Self::bit(method),
@@ -2083,28 +2079,27 @@ impl MethodSet {
     }
 
     /// The bit `method` holds in a set.
-    const fn bit(method: RoutableMethod) -> u8 {
+    const fn bit(method: HttpMethod) -> u8 {
         match method {
-            RoutableMethod::Delete => 1,
-            RoutableMethod::Get => 1 << 1,
-            RoutableMethod::Head => 1 << 2,
-            RoutableMethod::Options => 1 << 3,
-            RoutableMethod::Patch => 1 << 4,
-            RoutableMethod::Post => 1 << 5,
-            RoutableMethod::Put => 1 << 6,
+            HttpMethod::Delete => 1,
+            HttpMethod::Get => 1 << 1,
+            HttpMethod::Head => 1 << 2,
+            HttpMethod::Options => 1 << 3,
+            HttpMethod::Patch => 1 << 4,
+            HttpMethod::Post => 1 << 5,
+            HttpMethod::Put => 1 << 6,
         }
     }
 
     /// Whether the set's router entry answers `method`.
-    const fn serves(self, method: RoutableMethod) -> bool {
+    const fn serves(self, method: HttpMethod) -> bool {
         self.bits & Self::bit(method) != 0
-            || matches!(method, RoutableMethod::Head)
-                && self.bits & Self::bit(RoutableMethod::Get) != 0
+            || matches!(method, HttpMethod::Head) && self.bits & Self::bit(HttpMethod::Get) != 0
     }
 
     /// The router's filter for exactly this set's members.
     fn filter(self) -> axum::routing::MethodFilter {
-        RoutableMethod::ALL
+        HttpMethod::ALL
             .into_iter()
             .filter(|method| self.bits & Self::bit(*method) != 0)
             .fold(self.first.filter(), |filter, method| {
@@ -2128,10 +2123,10 @@ impl MethodSet {
 
     /// The `Allow` value naming every method the set serves.
     fn allow_names(self) -> String {
-        RoutableMethod::ALL
+        HttpMethod::ALL
             .into_iter()
             .filter(|method| self.serves(*method))
-            .map(RoutableMethod::as_str)
+            .map(HttpMethod::as_str)
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -3093,7 +3088,7 @@ fn handler_endpoint(
     MethodSet::from(method).on(svc)
 }
 
-impl RoutableMethod {
+impl HttpMethod {
     /// The router's filter for this method.
     const fn filter(self) -> axum::routing::MethodFilter {
         use axum::routing::MethodFilter as F;
@@ -6852,7 +6847,7 @@ mod tests {
                 "{method:?}"
             );
         }
-        assert!(EndpointMethod::parse("patch") == Some(EndpointMethod::One(RoutableMethod::Patch)));
+        assert!(EndpointMethod::parse("patch") == Some(EndpointMethod::One(HttpMethod::Patch)));
     }
 
     /// A handler serves its own method only: a `PATCH` handler answers
@@ -7008,7 +7003,7 @@ mod tests {
             ServerRoute {
                 path: "/api".to_owned(),
                 target: RouteTarget::Handler(
-                    Ok(EndpointMethod::One(RoutableMethod::Get)),
+                    Ok(EndpointMethod::One(HttpMethod::Get)),
                     counting_handler(&runs),
                 ),
             },
@@ -7062,11 +7057,11 @@ mod tests {
             );
         }
         assert_eq!(runs.load(Ordering::SeqCst), 0);
-        for method in RoutableMethod::ALL {
+        for method in HttpMethod::ALL {
             let resp = answer_method(&app, method.as_str(), "/hook").await;
             assert_eq!(resp.status(), axum::http::StatusCode::OK, "{method:?}");
         }
-        assert_eq!(runs.load(Ordering::SeqCst), RoutableMethod::ALL.len());
+        assert_eq!(runs.load(Ordering::SeqCst), HttpMethod::ALL.len());
     }
 
     /// Prove the refusal at listen: a `Server.api` spec naming `TRACE` or
@@ -7151,7 +7146,7 @@ mod tests {
     fn get_route(path: &str) -> ServerRoute {
         ServerRoute {
             path: path.to_string(),
-            target: RouteTarget::Handler(one(RoutableMethod::Get), name_echo()),
+            target: RouteTarget::Handler(one(HttpMethod::Get), name_echo()),
         }
     }
 
@@ -7295,11 +7290,7 @@ mod tests {
         let at_cap = params_path(cap);
         let pattern = crate::encoding::ServerPattern::parse(&at_cap).expect("at the cap parses");
         let path = pattern.router_path().to_owned();
-        let mr = method_router(
-            EndpointMethod::One(RoutableMethod::Get),
-            pattern,
-            name_echo(),
-        );
+        let mr = method_router(EndpointMethod::One(HttpMethod::Get), pattern, name_echo());
         assert!(
             insert_endpoint(
                 axum::Router::new(),
@@ -7328,13 +7319,7 @@ mod tests {
     #[allow(clippy::expect_used)] // test: the fixed pattern parses
     fn a_router_rejected_insert_is_its_own_refusal() {
         let pattern = || crate::encoding::ServerPattern::parse("/a").expect("parses");
-        let mr = || {
-            method_router(
-                EndpointMethod::One(RoutableMethod::Get),
-                pattern(),
-                name_echo(),
-            )
-        };
+        let mr = || method_router(EndpointMethod::One(HttpMethod::Get), pattern(), name_echo());
         let app = insert_endpoint(
             axum::Router::new(),
             "/a",
@@ -7483,11 +7468,7 @@ mod tests {
             let path = pattern.router_path().to_owned();
             app = app.route(
                 &path,
-                method_router(
-                    EndpointMethod::One(RoutableMethod::Get),
-                    pattern,
-                    name_echo(),
-                ),
+                method_router(EndpointMethod::One(HttpMethod::Get), pattern, name_echo()),
             );
         }
         let app = behind_listener(app);
@@ -7528,11 +7509,7 @@ mod tests {
             app = insert_endpoint(
                 app,
                 &path,
-                method_router(
-                    EndpointMethod::One(RoutableMethod::Get),
-                    pattern,
-                    name_echo(),
-                ),
+                method_router(EndpointMethod::One(HttpMethod::Get), pattern, name_echo()),
                 RefusedText::new(raw),
             )
             .expect("a brace literal registers as a literal");
@@ -7930,7 +7907,7 @@ mod tests {
         let path = pattern.router_path().to_owned();
         axum::Router::new().route(
             &path,
-            method_router(EndpointMethod::One(RoutableMethod::Get), pattern, h),
+            method_router(EndpointMethod::One(HttpMethod::Get), pattern, h),
         )
     }
 
@@ -8816,7 +8793,7 @@ mod tests {
         });
         assert!(matches!(
             r.target,
-            RouteTarget::Handler(Ok(EndpointMethod::One(RoutableMethod::Get)), _)
+            RouteTarget::Handler(Ok(EndpointMethod::One(HttpMethod::Get)), _)
         ));
         let resp = server_with_status(404, server_text("nope".to_string()));
         assert_eq!(resp.status, 404);
@@ -13205,7 +13182,7 @@ mod worker_gate_tests {
                 router.route(
                     &path,
                     method_router(
-                        EndpointMethod::One(RoutableMethod::Get),
+                        EndpointMethod::One(HttpMethod::Get),
                         pattern,
                         script_handler(),
                     ),

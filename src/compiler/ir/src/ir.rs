@@ -96,9 +96,10 @@ pub struct Module {
     /// server_stream::*;` to the emitted `ipe_runtime/mod.rs`.
     pub uses_server: bool,
     /// `true` when the lowerer detected at least one outbound `Ipe.Http` client
-    /// kernel call (`Http.get` / `post` / `request`, the pure request/method
+    /// kernel call (`Http.get` / `post` / `request`, the pure request
     /// builders, `Http.parseQuery`) — or a function signature mentioning
-    /// `HttpRequest` / `HttpMethod` — in the module.
+    /// `HttpRequest` — in the module. `HttpMethod` lives in the ungated
+    /// `http_method` leaf, so naming it sets nothing.
     ///
     /// Set by `ipe_lower` when any call site resolves to a
     /// `KernelFn::is_http_client()` variant (or a signature mentions an
@@ -1561,9 +1562,9 @@ pub enum IrType {
 
     /// `Ipe.Http.HttpMethod` — the closed ADT for HTTP verbs.
     ///
-    /// Renders as `ipe_runtime::HttpMethod` (a `#[derive(Clone, Copy, Debug,
-    /// PartialEq, Eq)]` enum with seven variants: `Get / Post / Put / Delete /
-    /// Patch / Head / Options`).  Constructors emit as
+    /// Renders as `ipe_runtime::HttpMethod`, the ungated `http_method` leaf (a
+    /// `Copy` enum deriving serde, with seven variants: `Get / Post / Put /
+    /// Delete / Patch / Head / Options`).  Constructors emit as
     /// `ipe_runtime::HttpMethod::Get` etc. via the `builtin_runtime_enum` path
     /// — no synthetic `EnumDef` is injected.  The lowerer registers `HttpMethod`
     /// as a pre-interned nominal (like `Order` / `Decimal`) so any `Ty::Con`
@@ -2344,7 +2345,8 @@ pub fn ir_type_is_serde(ty: &IrType, enum_serde: &impl Fn(&ModPath, Symbol) -> b
         // Model's `historyError : Maybe Error` field). The nominal payload
         // types `IpeErrorInfo`/`IpePanicInfo`/`IpeTypeInfo` derive serde for
         // the same reason (they ride inside `Error`; SEAL fix).
-        // `HttpMethod` derives serde (unit-variant enum, maps to/from string).
+        // `HttpMethod` derives serde in the ungated `http_method` leaf
+        // (unit-variant enum, maps to/from string).
         | IrType::Order
         | IrType::HttpMethod
         | IrType::Decimal
@@ -2549,8 +2551,8 @@ pub enum RuntimeFeatureId {
     /// `AuthConfig` / `TokenSource` / `StreamWriter` / the WebSocket-server
     /// handles).
     Server,
-    /// `http_client` — the `ipe_runtime::http_client::{HttpRequest, HttpMethod}`
-    /// outbound-client types.
+    /// `http_client` — the `ipe_runtime::http_client::HttpRequest` outbound-client
+    /// type.
     HttpClient,
     /// `web` — the `ipe_runtime::web::{WebReq, route::Route}` app types.
     Web,
@@ -2665,9 +2667,9 @@ pub const fn ir_type_feature_requirement(ty: &IrType) -> Option<RuntimeFeatureId
         | IrType::StreamWriter
         | IrType::WebSocketServer
         | IrType::WebSocketServerCfg => Some(RuntimeFeatureId::Server),
-        // ── `http_client` — the outbound-client request / method types ───────
-        // Both render behind `pub use http_client::*` (gated `http_client`).
-        IrType::HttpRequest | IrType::HttpMethod => Some(RuntimeFeatureId::HttpClient),
+        // ── `http_client` — the outbound-client request type ─────────────────
+        // It renders behind `pub use http_client::*` (gated `http_client`).
+        IrType::HttpRequest => Some(RuntimeFeatureId::HttpClient),
         // ── `web` — the Live web app request + route types ───────────────────
         IrType::WebReq | IrType::WebRoute(_) => Some(RuntimeFeatureId::Web),
         // ── ungated leaves: primitives, always-compiled runtime types, and the
@@ -2688,6 +2690,8 @@ pub const fn ir_type_feature_requirement(ty: &IrType) -> Option<RuntimeFeatureId
         // gated runtime type, so it is ungated like the primitives.
         | IrType::SessionHandle
         | IrType::Order
+        // `HttpMethod` renders to the ungated `http_method` leaf.
+        | IrType::HttpMethod
         | IrType::ErrorKind
         | IrType::Error
         | IrType::ErrorDetails
@@ -4742,7 +4746,6 @@ mod tests {
             (IrType::StreamWriter, RuntimeFeatureId::Server),
             (IrType::AuthConfig, RuntimeFeatureId::Server),
             (IrType::HttpRequest, RuntimeFeatureId::HttpClient),
-            (IrType::HttpMethod, RuntimeFeatureId::HttpClient),
             (IrType::WebReq, RuntimeFeatureId::Web),
             (
                 IrType::WebRoute(Box::new(IrType::Unit)),
@@ -4768,6 +4771,7 @@ mod tests {
             IrType::Bytes,
             IrType::Db,
             IrType::Order,
+            IrType::HttpMethod,
             IrType::Error,
             IrType::Path,
             IrType::Principal,

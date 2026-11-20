@@ -1769,7 +1769,7 @@ mod show_pin_agreement {
         ("WsServerCfg", "ipe_runtime::server::WsServerCfg"),
         ("StreamWriter", "ipe_runtime::server_stream::StreamWriter"),
         ("HttpRequest", "ipe_runtime::http_client::HttpRequest"),
-        ("HttpMethod", "ipe_runtime::http_client::HttpMethod"),
+        ("HttpMethod", "ipe_runtime::http_method::HttpMethod"),
         ("RedirectPolicy", "ipe_runtime::http_client::RedirectPolicy"),
         ("IpeDbFailure", "ipe_runtime::error::IpeDbFailure"),
         ("IpeAuthError", "ipe_runtime::error::IpeAuthError"),
@@ -2141,7 +2141,7 @@ mod show_pin_agreement {
         );
         assert_eq!(
             resolved_path("ipe_runtime::HttpMethod"),
-            "ipe_runtime::http_client::HttpMethod"
+            "ipe_runtime::http_method::HttpMethod"
         );
     }
 

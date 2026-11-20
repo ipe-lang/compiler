@@ -164,9 +164,9 @@ pub(super) fn ir_type_mentions_sqlvalue(ty: &IrType, enums: &[Symbol]) -> bool {
     })
 }
 
-/// `true` when `ty` mentions an `Ipe.Http`-client opaque type — `HttpRequest`
-/// or `HttpMethod`, both defined in the `http_client` runtime module. A
-/// function that merely passes such a value through (without itself calling a
+/// `true` when `ty` mentions an `Ipe.Http`-client opaque type — `HttpRequest`,
+/// defined in the `http_client` runtime module (`HttpMethod` lives in the
+/// ungated `http_method` leaf and requires nothing). A function that merely passes such a value through (without itself calling a
 /// client kernel) still references the type in emitted code, so the module and
 /// its `reqwest` dependency must be present. Mirrors [`ir_type_mentions_server`]
 /// for the client surface.
