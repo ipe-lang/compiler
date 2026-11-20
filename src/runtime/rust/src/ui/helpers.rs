@@ -403,25 +403,25 @@ pub fn ui_grid_columns_<M>(n: i64) -> Attribute<M> {
 /// `Ui.px : Int -> Length`
 #[must_use]
 pub fn ui_px_(n: i64) -> Length {
-    Length::Px(n)
+    Length::px(n)
 }
 
 /// `Ui.fill : Length`  (`fillPortion 1`)
 #[must_use]
 pub fn ui_fill_() -> Length {
-    Length::Fill(Portion::ONE)
+    Length::fill(Portion::ONE)
 }
 
 /// `Ui.content : Length`
 #[must_use]
 pub fn ui_content_() -> Length {
-    Length::Content
+    Length::content()
 }
 
 /// `Ui.shrink : Length`  (alias for `Ui.content` in Ipê)
 #[must_use]
 pub fn ui_shrink_() -> Length {
-    Length::Content
+    Length::content()
 }
 
 /// `Ui.fillPortion : Int -> Length` — `n <= 0` is `Ui.shrink`.
@@ -433,25 +433,25 @@ pub fn ui_fill_portion_(n: i64) -> Length {
 /// `Ui.vh : Int -> Length`
 #[must_use]
 pub fn ui_vh_(n: i64) -> Length {
-    Length::Vh(n)
+    Length::vh(n)
 }
 
 /// `Ui.vw : Int -> Length`
 #[must_use]
 pub fn ui_vw_(n: i64) -> Length {
-    Length::Vw(n)
+    Length::vw(n)
 }
 
 /// `Ui.minimum : Int -> Length -> Length`
 #[must_use]
 pub fn ui_minimum_(n: i64, l: Length) -> Length {
-    Length::Min(n, Box::new(l))
+    l.at_least(n)
 }
 
 /// `Ui.maximum : Int -> Length -> Length`
 #[must_use]
 pub fn ui_maximum_(n: i64, l: Length) -> Length {
-    Length::Max(n, Box::new(l))
+    l.at_most(n)
 }
 
 // ── Color builders ────────────────────────────────────────────────────────────

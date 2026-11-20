@@ -1054,6 +1054,38 @@ mod tests {
         );
     }
 
+    /// Refusal of a bounded width the sink drops: `Ui.onPseudo Hover [Ui.width
+    /// (Ui.minimum 96 Ui.shrink)]` reaches the scoped `<style>` block as plain
+    /// `width` / `min-width` declarations the CSS gate admits.
+    #[test]
+    fn pseudo_rule_with_bounded_width_survives_sink() {
+        use crate::html::{assign_ipe_ids, render_html};
+        use crate::ui::element::Element;
+        use crate::ui::helpers::{ui_hover_, ui_minimum_, ui_on_pseudo_, ui_shrink_, ui_width_};
+        use crate::ui::render::ui_layout;
+
+        let pseudo =
+            ui_on_pseudo_::<()>(ui_hover_(), vec![ui_width_(ui_minimum_(96, ui_shrink_()))]);
+        let mut html = ui_layout(vec![pseudo], Element::Text("hi".to_owned()));
+        assign_ipe_ids(&mut html, "r");
+        apply_style_injections(&mut html);
+        let out = render_html(&html);
+        let style = out
+            .split("<style")
+            .skip(1)
+            .find(|block| block.contains(":hover"))
+            .unwrap_or("");
+        assert!(
+            style.contains("min-width:96px"),
+            "hover rule keeps the floor: {out}"
+        );
+        assert!(
+            style.contains("width:fit-content"),
+            "hover rule keeps the base: {out}"
+        );
+        assert!(!out.contains("max(96px"), "no CSS math function: {out}");
+    }
+
     /// Repro B: an `@import` breakout through `Background.image` inside
     /// `Ui.onPseudo` must not reach the emitted `<style>` block.
     #[test]

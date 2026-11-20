@@ -19,7 +19,8 @@
 //! deserialization, by which a `UiTemplate` yields a handler or unescaped HTML.
 
 use super::element::{
-    Attribute, Description, Element, HAlign, HeadingLevel, Length, PseudoClass, VAlign, WhiteSpace,
+    Attribute, BaseLength, Description, Element, HAlign, HeadingLevel, Length, PseudoClass, VAlign,
+    WhiteSpace,
 };
 use crate::color::Color;
 use crate::html::{Attribute as HtmlAttribute, Event};
@@ -113,11 +114,14 @@ impl UiColor {
     }
 }
 
-/// `Ipe.Ui.Length` reduced to inert data. Mirrors [`Length`] variant-for-variant
-/// (including the self-recursive `Min` / `Max`), so materialize rebuilds the
-/// exact `Length` the render path formats. `Fill` carries the raw portion `Int`;
-/// decoding it goes through [`Length::fill_portion`], the same parse the inline
-/// `Ui.fillPortion` takes.
+/// `Ipe.Ui.Length` reduced to inert data.
+///
+/// The wire keeps the recursive `Min` / `Max` shapes, so every baked template
+/// decodes; [`UiLength::from_length`] writes the normal form `Min(lo, Max(hi,
+/// base))` (an absent bound omitted), and [`UiLength::to_length`] folds any chain
+/// in nesting order through the same [`crate::length::PxBounds`] the kernels use.
+/// `Fill` carries the raw portion `Int`; decoding it goes through
+/// [`Length::fill_portion`], the same parse the inline `Ui.fillPortion` takes.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UiLength {
@@ -132,27 +136,53 @@ pub enum UiLength {
 
 impl UiLength {
     fn from_length(l: &Length) -> Self {
-        match l {
-            Length::Px(n) => Self::Px(*n),
-            Length::Content => Self::Content,
-            Length::Fill(p) => Self::Fill(i64::from(p.get())),
-            Length::Min(n, inner) => Self::Min(*n, Box::new(Self::from_length(inner))),
-            Length::Max(n, inner) => Self::Max(*n, Box::new(Self::from_length(inner))),
-            Length::Vh(n) => Self::Vh(*n),
-            Length::Vw(n) => Self::Vw(*n),
+        let base = match l.base() {
+            BaseLength::Px(n) => Self::Px(n),
+            BaseLength::Content => Self::Content,
+            BaseLength::Fill(p) => Self::Fill(i64::from(p.get())),
+            BaseLength::Vh(n) => Self::Vh(n),
+            BaseLength::Vw(n) => Self::Vw(n),
+        };
+        let bounds = l.bounds();
+        let capped = match bounds.upper() {
+            Some(hi) => Self::Max(hi, Box::new(base)),
+            None => base,
+        };
+        match bounds.lower() {
+            Some(lo) => Self::Min(lo, Box::new(capped)),
+            None => capped,
         }
     }
 
+    /// Fold the wire chain without recursion: walk the `Min` / `Max` spine
+    /// outer-to-inner, then apply the bounds inner-to-outer.
     fn to_length(&self) -> Length {
-        match self {
-            Self::Px(n) => Length::Px(*n),
-            Self::Content => Length::Content,
-            Self::Fill(n) => Length::fill_portion(*n),
-            Self::Min(n, inner) => Length::Min(*n, Box::new(inner.to_length())),
-            Self::Max(n, inner) => Length::Max(*n, Box::new(inner.to_length())),
-            Self::Vh(n) => Length::Vh(*n),
-            Self::Vw(n) => Length::Vw(*n),
-        }
+        let mut spine: Vec<(bool, i64)> = Vec::new();
+        let mut cur = self;
+        let base = loop {
+            match cur {
+                Self::Min(n, inner) => {
+                    spine.push((true, *n));
+                    cur = inner;
+                }
+                Self::Max(n, inner) => {
+                    spine.push((false, *n));
+                    cur = inner;
+                }
+                Self::Px(n) => break Length::px(*n),
+                Self::Content => break Length::content(),
+                Self::Fill(n) => break Length::fill_portion(*n),
+                Self::Vh(n) => break Length::vh(*n),
+                Self::Vw(n) => break Length::vw(*n),
+            }
+        };
+        spine.iter().rev().fold(base, |l, (at_least, n)| {
+            if *at_least {
+                l.at_least(*n)
+            } else {
+                l.at_most(*n)
+            }
+        })
     }
 }
 
@@ -1357,17 +1387,57 @@ mod tests {
     /// `Portion::MAX`, and a positive one round-trips.
     #[test]
     fn decoded_fill_portion_takes_the_inline_parse() {
-        assert_eq!(UiLength::Fill(0).to_length(), Length::Content);
-        assert_eq!(UiLength::Fill(-3).to_length(), Length::Content);
-        assert_eq!(UiLength::Fill(i64::MIN).to_length(), Length::Content);
+        assert_eq!(UiLength::Fill(0).to_length(), Length::content());
+        assert_eq!(UiLength::Fill(-3).to_length(), Length::content());
+        assert_eq!(UiLength::Fill(i64::MIN).to_length(), Length::content());
         assert_eq!(
             UiLength::Fill(i64::MAX).to_length(),
-            Length::Fill(Portion::MAX)
+            Length::fill(Portion::MAX)
         );
-        assert_eq!(UiLength::Fill(1).to_length(), Length::Fill(Portion::ONE));
+        assert_eq!(UiLength::Fill(1).to_length(), Length::fill(Portion::ONE));
         let three = Length::fill_portion(3);
         assert_eq!(UiLength::from_length(&three).to_length(), three);
         assert_eq!(UiLength::from_length(&three), UiLength::Fill(3));
+    }
+
+    /// Refusal of a wire fold that disagrees with the kernels: a non-normal
+    /// depth-3 chain decodes to the kernel-built `Length`, re-encodes as the
+    /// normal form `Min(lo, Max(hi, base))`, and round-trips stably.
+    #[test]
+    fn wire_fold_matches_kernel_fold() {
+        use crate::ui::helpers::{ui_fill_, ui_maximum_, ui_minimum_, ui_shrink_};
+        let wire = UiLength::Max(
+            200,
+            Box::new(UiLength::Min(
+                40,
+                Box::new(UiLength::Max(300, Box::new(UiLength::Fill(1)))),
+            )),
+        );
+        let kernel = ui_maximum_(200, ui_minimum_(40, ui_maximum_(300, ui_fill_())));
+        assert_eq!(wire.to_length(), kernel);
+        let normal = UiLength::Min(
+            40,
+            Box::new(UiLength::Max(200, Box::new(UiLength::Fill(1)))),
+        );
+        assert_eq!(UiLength::from_length(&kernel), normal);
+        assert_eq!(normal.to_length(), kernel);
+        assert_eq!(UiLength::from_length(&normal.to_length()), normal);
+
+        // The outer cap wins over an inner floor, on the wire as in the kernel.
+        let crossed = UiLength::Max(10, Box::new(UiLength::Min(30, Box::new(UiLength::Content))));
+        assert_eq!(
+            crossed.to_length(),
+            ui_maximum_(10, ui_minimum_(30, ui_shrink_()))
+        );
+        assert_eq!(
+            UiLength::from_length(&crossed.to_length()),
+            UiLength::Min(10, Box::new(UiLength::Max(10, Box::new(UiLength::Content))))
+        );
+        // A floor alone and a cap alone omit the absent side.
+        assert_eq!(
+            UiLength::from_length(&ui_minimum_(96, ui_shrink_())),
+            UiLength::Min(96, Box::new(UiLength::Content))
+        );
     }
 
     // Render an `Element` the way the app does — through the public `ui_layout`
@@ -1420,7 +1490,7 @@ mod tests {
             vec![
                 Attribute::AttrStyle("__row".to_string(), "true".to_string()),
                 Attribute::AttrSpacing(8),
-                Attribute::AttrWidth(Length::Fill(Portion::ONE)),
+                Attribute::AttrWidth(Length::fill(Portion::ONE)),
             ],
             vec![
                 Element::Text("a".to_string()),
@@ -1810,7 +1880,9 @@ mod tests {
     fn backend_baked_json_decodes_to_the_described_tree() {
         let baked = concat!(
             r#"{"TaggedNode":{"tag":"section","desc":{"DescHeading":2},"attrs":["#,
-            r#"{"Width":{"Max":[320,{"Vh":80}]}},{"Padding":[1,2,3,4]},{"Style":["k","v"]},"#,
+            r#"{"Width":{"Max":[320,{"Vh":80}]}},"#,
+            r#"{"Height":{"Min":[40,{"Max":[200,{"Fill":1}]}]}},"#,
+            r#"{"Padding":[1,2,3,4]},{"Style":["k","v"]},"#,
             r#"{"AlignX":"CenterX"},"Pointer",{"FontAlign":"center"},"#,
             r#"{"FontColor":{"r":10,"g":20,"b":30,"a":1.0}},"#,
             r#"{"BgColor":{"r":1,"g":2,"b":3,"a":0.25}},{"FontLetterSpacing":1.5}],"#,
@@ -1824,6 +1896,13 @@ mod tests {
                 super::UiTemplateAttr::Width(super::UiLength::Max(
                     320,
                     Box::new(super::UiLength::Vh(80)),
+                )),
+                super::UiTemplateAttr::Height(super::UiLength::Min(
+                    40,
+                    Box::new(super::UiLength::Max(
+                        200,
+                        Box::new(super::UiLength::Fill(1)),
+                    )),
                 )),
                 super::UiTemplateAttr::Padding(1, 2, 3, 4),
                 super::UiTemplateAttr::Style("k".to_string(), "v".to_string()),
