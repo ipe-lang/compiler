@@ -314,6 +314,47 @@ fn shared_cache_keeps_identity() -> Result<(), BoxError> {
     Ok(())
 }
 
+/// An ejected served-web program vendors its runtime's `#[path]` siblings.
+///
+/// Every runtime file a vendored module declares is vendored with it, so under
+/// `IPE_E2E` the ejected crate builds under cargo.
+#[test]
+fn ejected_served_web_builds() -> Result<(), BoxError> {
+    let tree = ipe::project_root::SourceTree::main(WEB_MAIN).named(NAME);
+    let fixture = ipe::RootFixture::from_tree(&tree)?;
+    let base = scratch("ejected_served_web_builds");
+    let out = base.join("ejected");
+    run_ipe(
+        &[
+            OsStr::new("release"),
+            OsStr::new("eject"),
+            fixture.path().as_os_str(),
+            OsStr::new("--out"),
+            out.as_os_str(),
+        ],
+        &[],
+    )?;
+    let runtime = out.join("src").join("ipe_runtime");
+    assert!(
+        runtime.join("js_port_glue.rs").is_file(),
+        "a served-web eject vendors `js_port_glue`"
+    );
+    assert!(
+        runtime.join("native_bridge.rs").is_file(),
+        "the `#[path]` sibling of `js_port_glue` is vendored"
+    );
+    if e2e_support::e2e_tier() != e2e_support::Tier::Unit {
+        let built = e2e_support::build_rust_binary("ejected_served_web", &out);
+        assert!(
+            built.is_ok(),
+            "the ejected crate must build: {:?}",
+            built.err()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
 /// Every file under `dir`, recursively, as text (non-UTF-8 files are skipped).
 fn tree_texts(dir: &Path) -> Vec<(PathBuf, String)> {
     let mut texts = Vec::new();

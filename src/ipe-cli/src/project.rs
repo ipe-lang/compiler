@@ -1314,7 +1314,8 @@ pub enum ModuleProvenance {
 /// The role a user module plays when lowered as its own entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EntryRole {
-    /// A module whose last path segment is `Main` — the program entry.
+    /// The root module `Main` — the program entry, whose `main` the emitted
+    /// `fn main` runs. A nested `App.Main` is an ordinary module.
     Main,
     /// Any other user module.
     Library,
@@ -1324,7 +1325,9 @@ impl EntryRole {
     /// The role implied by a module path.
     #[must_use]
     pub fn of_module_path(module_path: &[String]) -> Self {
-        if module_path.last().is_some_and(|last| last == "Main") {
+        if let [only] = module_path
+            && only == "Main"
+        {
             Self::Main
         } else {
             Self::Library
@@ -3168,6 +3171,15 @@ import String
         );
         assert_eq!(main.provenance(), ModuleProvenance::User(EntryRole::Main));
         assert_eq!(lib.provenance(), ModuleProvenance::User(EntryRole::Library));
+        let nested = DiscoveredModule::user(
+            PathBuf::from("src/App/Main.ipe"),
+            vec!["App".to_owned(), "Main".to_owned()],
+        );
+        assert_eq!(
+            nested.provenance(),
+            ModuleProvenance::User(EntryRole::Library),
+            "only the root `Main` is the program entry"
+        );
     }
 
     #[test]

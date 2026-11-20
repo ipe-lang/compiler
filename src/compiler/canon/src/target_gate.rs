@@ -23,7 +23,7 @@ use ipe_intern::{Interner, Symbol};
 use ipe_kernels::Target;
 
 use crate::ast::{CaseBranch, Def, Expr, Expr_, LetBinding, Module};
-use crate::reach::{EntryClosure, def_body, module_display_name};
+use crate::reach::{EntryClosure, Roots, def_body, module_display_name};
 
 /// Reject every kernel/FFI reference reachable from the entry of `module` that
 /// has no `WasmClient` denotation.
@@ -111,7 +111,7 @@ pub fn check_emitted_for_target(
 /// denotation on this wasm target is rejected before it can become a cargo
 /// failure".
 fn check_wasm_target(module: &Module, interner: &Interner, target: Target) -> DResult<()> {
-    let closure = EntryClosure::of(module, interner);
+    let closure = EntryClosure::of(module, interner, Roots::Entry);
     for def in closure.defs(module) {
         if let Some(denied) = first_denied(def_body(def), interner, target) {
             return Err(denied.into_diagnostic());

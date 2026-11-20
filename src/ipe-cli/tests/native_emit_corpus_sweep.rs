@@ -26,7 +26,15 @@ fn lower_entry(entry: &Path) -> Option<(Interner, ipe_ir::Program)> {
     let module = ipe_parse::parse_module(&src, &mut interner).ok()?;
     let canonical = ipe_canon::canonicalise(&module, &mut interner).ok()?;
     let types = ipe_types::infer(&canonical, &mut interner).ok()?;
-    let program = ipe_lower::lower(&canonical, &types, &mut interner, "", "").ok()?;
+    let program = ipe_lower::lower(
+        &canonical,
+        &types,
+        &mut interner,
+        "",
+        "",
+        ipe_lower::Roots::Entry,
+    )
+    .ok()?;
     Some((interner, program))
 }
 

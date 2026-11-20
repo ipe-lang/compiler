@@ -230,16 +230,20 @@ pub fn enum_name(module: &[&str], ty: &str) -> String {
     mangle_reserved(to_camel_case(&format!("{}_{}", module_prefix(module), ty)))
 }
 
+/// The Rust name of the program entry function the epilogue's `fn main` calls.
+pub const ENTRY_FN: &str = "ipe_main";
+
 /// The Rust function name for a top-level value: `module_value(["Main"],
 /// "update")` → `main_update`.
 ///
-/// The program entry `main` in module `Main` is special-cased to `ipe_main`
-/// (the fixed `fn main` entry-point in the epilogue calls `ipe_main()`), matching
-/// the reference compiler `rustName` rule in `ModuleEmitter.hs`.
+/// The program entry `main` in module `Main` is special-cased to
+/// [`ENTRY_FN`] (the fixed `fn main` entry-point in the epilogue calls
+/// `ipe_main()`), matching the reference compiler `rustName` rule in
+/// `ModuleEmitter.hs`.
 #[must_use]
 pub fn module_value(module: &[&str], name: &str) -> String {
     if name == "main" && module == ["Main"] {
-        return "ipe_main".to_owned();
+        return ENTRY_FN.to_owned();
     }
     // A record type-alias auto-constructor is the ONLY top-level value
     // whose Ipê name begins with an uppercase letter (the parser forces every

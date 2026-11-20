@@ -145,19 +145,17 @@ pub fn each_kernel_site(
 
 /// The program's entry: the `main` its entry module itself defines.
 ///
-/// The lowered entry names the last linked `main`, which is an unimported
-/// module's when the project holds several programs, so the entry is read as
-/// the function of that name whose home is the entry module. `None` when the
-/// entry module defines no `main` (a library).
+/// Read from the lowered entry, which the lowerer selects by home; an entry
+/// whose home is not its module is refused as no entry, never re-selected.
+/// `None` when the entry module defines no `main` (a library).
 #[must_use]
 pub fn program_entry(program: &Program) -> Option<FuncId> {
     program.modules.iter().find_map(|module| {
         let lowered = module.entry?;
-        let name = module.funcs.iter().find(|f| f.id == lowered)?.name;
         module
             .funcs
             .iter()
-            .find(|f| f.name == name && f.home == module.name)
+            .find(|f| f.id == lowered && f.home == module.name)
             .map(|f| f.id)
     })
 }

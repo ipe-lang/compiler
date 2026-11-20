@@ -2905,7 +2905,8 @@ pub fn remove_stale_static_config(crate_dir: &OwnedDir) -> Result<(), CliError> 
 ///      entry here can escape `out_dir`).
 ///
 /// # Errors
-/// The refusals of [`RuntimeSource::module_tree`] for a vendored emit and of
+/// The refusals of [`RuntimeSource::module_tree`] and, for an eject, of
+/// [`collect_reachable_runtime_text`] for a vendored emit, and of
 /// [`RuntimeSource::bundled`] for a linked one.
 pub fn build_emit_manifest(
     emitted: &ipe_backend::EmittedProject,
@@ -2917,22 +2918,30 @@ pub fn build_emit_manifest(
     // The emit shape is self-describing: a vendored emit always writes
     // `src/ipe_runtime/mod.rs`; the dep-model emit never does. Use this to
     // branch between the two materialization strategies.
-    let emitted_mod_rs = emitted
+    let vendored = emitted
         .files
         .iter()
-        .find(|(rel, _)| rel.as_str() == "src/ipe_runtime/mod.rs")
-        .map(|(_, contents)| contents.as_str());
-    if let Some(mod_rs) = emitted_mod_rs {
+        .any(|(rel, _)| rel.as_str() == "src/ipe_runtime/mod.rs");
+    if vendored {
         // Vendored model: copy the runtime source tree into `src/ipe_runtime/`.
         let tree = runtime.module_tree()?;
         let prefix = Path::new("src/ipe_runtime");
         if tree_shake_vendored {
             // Eject shape: vendor only the runtime source the program reaches.
-            // The emitted `mod.rs` declares `pub mod X;` for exactly the reached
-            // top-level modules; a source file whose module is never declared is
-            // one rustc would drop anyway, so omitting it from the tree is
-            // behaviour-preserving and shrinks the shippable, auditable artifact.
-            collect_reachable_runtime_text(&tree, prefix, mod_rs, &mut manifest);
+            // A source file no reached `mod` declaration names is one rustc
+            // never reads, so omitting it is behaviour-preserving and shrinks
+            // the shippable, auditable artifact.
+            let overlay: BTreeMap<PathBuf, &str> = emitted
+                .files
+                .iter()
+                .filter_map(|(rel, text)| {
+                    Path::new(rel.as_str())
+                        .strip_prefix(prefix)
+                        .ok()
+                        .map(|under| (under.to_path_buf(), text.as_str()))
+                })
+                .collect();
+            collect_reachable_runtime_text(&tree, prefix, &overlay, &mut manifest)?;
         } else {
             for (rel, text) in tree.files() {
                 manifest.insert(prefix.join(rel), text.clone());
@@ -2992,65 +3001,844 @@ fn refuse_unlexable_rust(manifest: &BTreeMap<PathBuf, String>) -> Result<(), Cli
     })
 }
 
-/// Vendor only the runtime source files the emitted `mod.rs` reaches.
+/// Vendor exactly the runtime source files the emitted `mod.rs` reaches.
 ///
-/// The emitted `ipe_runtime/mod.rs` is a flat, non-`cfg`-gated list of `pub mod
-/// X;` for exactly the top-level modules the program reaches. For each declared
-/// name this copies the file `X.rs` when the tree holds one and the ENTIRE `X/`
-/// subtree when it holds that directory — never parsing the subtree's own
-/// nested `mod` declarations. Copying a reached directory whole is the fail-closed
-/// choice the eject contract requires: it can only ever include a file, never
-/// omit one a nested `mod` needs, so the vendored tree always compiles. The
-/// modules a directory does not reach are already excluded at the top level
-/// (an unreached `web`/`db`/`tui`/… directory is never declared, so its whole
-/// subtree is dropped) — where the large size wins come from.
+/// The reached set is the fixpoint of "a reached file reaches every file a
+/// `mod` declaration in it resolves to", resolved with rustc's rules: a plain
+/// `mod y;` names `y.rs` or `y/mod.rs` under the declaring file's module
+/// directory (its own directory for a `mod.rs` or a `#[path]`-loaded file,
+/// `<dir>/<stem>/` for any other file), nested under each enclosing inline
+/// `mod x { … }`; a `#[path = "p"]` declaration names `p` relative to the
+/// declaring file's directory (or to the module directory inside an inline
+/// block). Every reached file's text comes from `overlay` (the emitted files
+/// under `dst_prefix`, keyed relative to it) when the emit writes it, else from
+/// `tree`, and is scanned in turn.
 ///
-/// `mod.rs` itself is always copied (it IS the emitted file, overlaid verbatim
-/// by the caller's `emitted.files` pass afterwards); the loop only resolves the
-/// modules it names.
+/// Every `include!`-family literal a reached file names outside test-only code
+/// (see [`scan_module`]) is vendored too, resolved against the including file's
+/// directory as rustc does: an asset a module embeds (`client.js`) is a file
+/// the compiled crate reads, wherever in the tree it sits. Beside these, the
+/// whole module directory of every reached file other than the root is copied:
+/// it can only add a file.
+///
+/// `mod.rs` is the root and is read from `overlay`; the caller's
+/// `emitted.files` pass writes it, so it is never copied from `tree`.
+///
+/// # Errors
+/// [`CliError::Pipeline`] carrying [`Diagnostic::CompilerBug`] when `overlay`
+/// holds no `mod.rs`, a reached file is not one [`scan_module`] reads, a
+/// declaration or a production include resolves to no file in `tree` or
+/// `overlay`, a `#[path]` literal is absolute or leaves its base directory, or
+/// an include literal leaves the tree: the ejected crate would not build, so
+/// the eject is refused rather than shipped.
 pub fn collect_reachable_runtime_text(
     tree: &RuntimeModuleTree,
     dst_prefix: &Path,
-    emitted_mod_rs: &str,
+    overlay: &BTreeMap<PathBuf, &str>,
     manifest: &mut BTreeMap<PathBuf, String>,
-) {
-    let declared = declared_modules(emitted_mod_rs);
-    // A `pub mod X;` with neither `X.rs` nor `X/` in the tree is an inline
-    // module (a `pub mod web { pub mod route; }` block) — it has no separate
-    // source file to vendor, so nothing is copied for it.
-    for (rel, text) in tree.files() {
-        let reached = declared
-            .iter()
-            .any(|name| rel.starts_with(name) || rel.as_path() == Path::new(&format!("{name}.rs")));
-        if reached {
+) -> Result<(), CliError> {
+    let refuse = |rel: &Path, detail: String| CliError::Pipeline {
+        file: dst_prefix.join(rel),
+        src: String::new(),
+        diag: Box::new(Diagnostic::CompilerBug {
+            where_: "ipe::driver::build_pipeline::collect_reachable_runtime_text",
+            detail,
+        }),
+    };
+    let root = ReachedModule {
+        rel: PathBuf::from("mod.rs"),
+        owns_parent_dir: true,
+        test_only: false,
+    };
+    let exists = |p: &Path| tree.files().contains_key(p) || overlay.contains_key(p);
+    let mut seen = BTreeSet::from([root.clone()]);
+    let mut work = vec![root];
+    let mut included = BTreeSet::new();
+    while let Some(module) = work.pop() {
+        let text = overlay
+            .get(&module.rel)
+            .copied()
+            .or_else(|| tree.files().get(&module.rel).map(String::as_str))
+            .ok_or_else(|| refuse(&module.rel, "the reached module has no source".to_owned()))?;
+        let scan = scan_module(text).map_err(|why| refuse(&module.rel, why.to_string()))?;
+        if !module.test_only {
+            for literal in &scan.includes {
+                let target = include_target(&module.parent_dir(), literal)
+                    .map_err(|why| refuse(&module.rel, why.to_string()))?;
+                if !exists(&target) {
+                    let why = ModScanRefusal::NoSourceFile {
+                        decl: format!("include!({literal:?})"),
+                        looked_for: vec![target],
+                    };
+                    return Err(refuse(&module.rel, why.to_string()));
+                }
+                included.insert(target);
+            }
+        }
+        for decl in &scan.decls {
+            let targets = module
+                .resolve(decl, &exists)
+                .map_err(|why| refuse(&module.rel, why.to_string()))?;
+            for target in targets {
+                if seen.insert(target.clone()) {
+                    work.push(target);
+                }
+            }
+        }
+    }
+    for module in &seen {
+        let owned_dir = module.child_dir();
+        for (rel, text) in tree.files() {
+            let in_owned_dir =
+                owned_dir.components().next().is_some() && rel.starts_with(&owned_dir);
+            if (rel == &module.rel && rel != Path::new("mod.rs")) || in_owned_dir {
+                manifest.insert(dst_prefix.join(rel), text.clone());
+            }
+        }
+    }
+    for rel in &included {
+        if let Some(text) = tree.files().get(rel) {
             manifest.insert(dst_prefix.join(rel), text.clone());
+        }
+    }
+    Ok(())
+}
+
+/// A runtime source file the vendored closure reached, and how rustc reads it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ReachedModule {
+    /// The file, relative to the runtime module root.
+    rel: PathBuf,
+    /// Whether the file's child modules live in its own directory.
+    ///
+    /// True for a `mod.rs`, the root, or a `#[path]`-loaded file; any other
+    /// `x.rs` owns `x/`.
+    owns_parent_dir: bool,
+    /// Whether rustc compiles the file only under `cfg(test)`, so no build
+    /// reads its includes.
+    test_only: bool,
+}
+
+impl ReachedModule {
+    /// The file's directory.
+    fn parent_dir(&self) -> PathBuf {
+        self.rel
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf)
+    }
+
+    /// The directory the file's plain child `mod` declarations resolve under.
+    fn child_dir(&self) -> PathBuf {
+        let parent = self.parent_dir();
+        match self.rel.file_stem() {
+            Some(stem)
+                if !self.owns_parent_dir
+                    && self.rel.file_name() != Some(std::ffi::OsStr::new("mod.rs")) =>
+            {
+                parent.join(stem)
+            }
+            _ => parent,
+        }
+    }
+
+    /// The files `decl`, declared in this file, resolves to under rustc's rules.
+    ///
+    /// # Errors
+    /// [`ModScanRefusal::PathNotRelative`] for a `#[path]` literal that is not a
+    /// plain relative path; [`ModScanRefusal::NoSourceFile`] when the
+    /// declaration names no file `exists` admits.
+    fn resolve(
+        &self,
+        decl: &ModDecl,
+        exists: &impl Fn(&Path) -> bool,
+    ) -> Result<Vec<Self>, ModScanRefusal> {
+        let test_only = self.test_only || decl.test_only;
+        let mut inline_dir = self.child_dir();
+        for name in &decl.inline {
+            inline_dir.push(name);
+        }
+        let Some(literal) = &decl.path_attr else {
+            let candidates = [
+                Self {
+                    rel: inline_dir.join(format!("{}.rs", decl.name)),
+                    owns_parent_dir: false,
+                    test_only,
+                },
+                Self {
+                    rel: inline_dir.join(&decl.name).join("mod.rs"),
+                    owns_parent_dir: true,
+                    test_only,
+                },
+            ];
+            let found: Vec<Self> = candidates
+                .iter()
+                .filter(|m| exists(&m.rel))
+                .cloned()
+                .collect();
+            return if found.is_empty() {
+                Err(ModScanRefusal::NoSourceFile {
+                    decl: format!("mod {};", decl.name),
+                    looked_for: candidates.into_iter().map(|m| m.rel).collect(),
+                })
+            } else {
+                Ok(found)
+            };
+        };
+        let base = if decl.inline.is_empty() {
+            self.parent_dir()
+        } else {
+            inline_dir
+        };
+        let rel = base.join(relative_path_literal(literal)?);
+        if exists(&rel) {
+            Ok(vec![Self {
+                rel,
+                owns_parent_dir: true,
+                test_only,
+            }])
+        } else {
+            Err(ModScanRefusal::NoSourceFile {
+                decl: format!("#[path = {literal:?}] mod {};", decl.name),
+                looked_for: vec![rel],
+            })
         }
     }
 }
 
-/// The module names a runtime `mod.rs` declares with `pub mod X;` / `mod X;`.
+/// The plain relative path a `#[path]` literal spells, segment by segment.
 ///
-/// A parse-free line scan sufficient for the emitted `mod.rs`, whose module
-/// declarations are one-per-line `pub mod <name>;` with no attributes, braces,
-/// or trailing content. A declaration that opens an inline module body (`pub
-/// mod web {`) is deliberately excluded — it has no separate source file — by
-/// requiring the statement to end in `;`.
-pub fn declared_modules(mod_rs: &str) -> BTreeSet<String> {
-    let mut names = BTreeSet::new();
-    for line in mod_rs.lines() {
-        let line = line.trim();
-        let rest = line
-            .strip_prefix("pub mod ")
-            .or_else(|| line.strip_prefix("mod "));
-        if let Some(rest) = rest
-            && let Some(name) = rest.strip_suffix(';')
-            && !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+/// # Errors
+/// [`ModScanRefusal::PathNotRelative`] for an empty literal, an absolute one, a
+/// Windows drive or separator, or any empty, `.` or `..` segment: the target
+/// must stay inside the vendored tree, spelled one way on every host.
+fn relative_path_literal(literal: &str) -> Result<PathBuf, ModScanRefusal> {
+    let mut path = PathBuf::new();
+    for segment in literal.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.contains(['\\', ':'])
         {
-            names.insert(name.to_owned());
+            return Err(ModScanRefusal::PathNotRelative(literal.to_owned()));
+        }
+        path.push(segment);
+    }
+    Ok(path)
+}
+
+/// The tree-relative file an include literal names from the directory `dir`.
+///
+/// rustc resolves the literal against the including file's directory: a `..`
+/// segment climbs one directory, a `.` segment stays.
+///
+/// # Errors
+/// [`ModScanRefusal::IncludeLeavesTree`] for an empty or absolute literal, a
+/// Windows drive or separator, an empty segment, or a `..` above the tree's
+/// root: the target must be a tree file, spelled one way on every host.
+fn include_target(dir: &Path, literal: &str) -> Result<PathBuf, ModScanRefusal> {
+    let leaves = || ModScanRefusal::IncludeLeavesTree(literal.to_owned());
+    let mut segments: Vec<&str> = dir
+        .iter()
+        .map(|part| part.to_str().ok_or_else(leaves))
+        .collect::<Result<_, _>>()?;
+    for segment in literal.split('/') {
+        match segment {
+            "" => return Err(leaves()),
+            "." => {}
+            ".." => {
+                segments.pop().ok_or_else(leaves)?;
+            }
+            _ if segment.contains(['\\', ':']) => return Err(leaves()),
+            _ => segments.push(segment),
         }
     }
-    names
+    if segments.is_empty() {
+        return Err(leaves());
+    }
+    Ok(segments.iter().collect())
+}
+
+/// One out-of-line `mod NAME;` declaration of a Rust source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModDecl {
+    /// The module's name, a raw identifier's `r#` dropped.
+    pub name: String,
+    /// The enclosing inline `mod x { … }` blocks, outermost first.
+    pub inline: Vec<String>,
+    /// The literal of the declaration's `#[path = "…"]` attribute.
+    pub path_attr: Option<String>,
+    /// Whether the declaration sits under a `cfg` that holds only in tests.
+    pub test_only: bool,
+}
+
+/// What a Rust source file reaches beyond itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleScan {
+    /// Every out-of-line `mod` declaration, in source order.
+    pub decls: Vec<ModDecl>,
+    /// The literal of every `include_str!` and `include_bytes!` outside
+    /// test-only code, in source order.
+    pub includes: Vec<String>,
+}
+
+/// Why the vendored module closure refused a runtime source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModScanRefusal {
+    /// A string, character or comment the file never closes.
+    Unterminated(&'static str),
+    /// A `}` with no open `{`, or a `{` never closed.
+    UnbalancedBraces,
+    /// A `mod` keyword not followed by `NAME;` or `NAME {`.
+    UnreadableMod,
+    /// A `path` attribute other than `#[path = "<literal>"]`.
+    UnreadablePathAttr,
+    /// A `#[path]` attribute on an inline module block.
+    PathOnInlineModule(String),
+    /// An out-of-line `mod NAME;` inside a block that is not a module.
+    ModOutsideModuleScope(String),
+    /// A `#[path]` literal that is not a plain relative path inside the tree.
+    PathNotRelative(String),
+    /// An `include!`-family call outside test-only code that is not
+    /// `include_str!` or `include_bytes!` of one plain string literal.
+    UnreadableInclude(String),
+    /// An include literal that names no file inside the tree.
+    IncludeLeavesTree(String),
+    /// A declaration whose every candidate file is absent from the tree.
+    NoSourceFile {
+        /// The declaration, as written.
+        decl: String,
+        /// Every file rustc would read for it.
+        looked_for: Vec<PathBuf>,
+    },
+}
+
+impl std::fmt::Display for ModScanRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unterminated(what) => write!(f, "an unterminated {what}"),
+            Self::UnbalancedBraces => f.write_str("unbalanced braces"),
+            Self::UnreadableMod => f.write_str("a `mod` that is not `mod NAME;` or `mod NAME {`"),
+            Self::UnreadablePathAttr => {
+                f.write_str("a `path` attribute that is not `#[path = \"<literal>\"]`")
+            }
+            Self::PathOnInlineModule(name) => {
+                write!(f, "a `#[path]` attribute on the inline module `{name}`")
+            }
+            Self::ModOutsideModuleScope(name) => {
+                write!(f, "`mod {name};` inside a block that is not a module")
+            }
+            Self::PathNotRelative(literal) => write!(
+                f,
+                "`#[path = {literal:?}]` is not a plain relative path inside the runtime tree"
+            ),
+            Self::UnreadableInclude(name) => write!(
+                f,
+                "a `{name}!` outside test-only code that is not `include_str!` or \
+                 `include_bytes!` of one plain string literal"
+            ),
+            Self::IncludeLeavesTree(literal) => write!(
+                f,
+                "the include literal {literal:?} names no file inside the runtime tree"
+            ),
+            Self::NoSourceFile { decl, looked_for } => write!(
+                f,
+                "`{decl}` names {looked_for:?}, none of which is in the runtime tree"
+            ),
+        }
+    }
+}
+
+/// One Rust token, as far as module declarations need.
+///
+/// Comments, whitespace, lifetimes, numbers and character literals are dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ModTok {
+    /// An identifier or keyword; a raw identifier keeps its `r#`.
+    Ident(String),
+    /// A string literal: its value when it holds no escape, else `None`.
+    Str(Option<String>),
+    /// Any other single character.
+    Punct(char),
+}
+
+/// Every out-of-line `mod` declaration and production include of a Rust file.
+///
+/// The file is read by Rust's own lexical grammar: comments, string literals
+/// (raw and byte forms included) and character literals never hide or forge a
+/// declaration. A declaration nested in inline `mod x { … }` blocks records
+/// them; `#[cfg]`-gated declarations are all kept, so the reached set is the
+/// union over every feature set.
+///
+/// Code is test-only when an outer `#[cfg(test)]` or `#[cfg(all(…, test, …))]`
+/// gates its item or an enclosing block. That gate is read only in those two
+/// spellings and is dropped at the next `;`, `,`, `{` or `}`, so a misread
+/// can only count test code as production, never the reverse. An include in
+/// test-only code is never read by a build and is not recorded.
+///
+/// # Errors
+/// [`ModScanRefusal`] for a file this reader cannot resolve exactly: an
+/// unterminated literal or comment, unbalanced braces, a `mod` of another
+/// shape, a `path` attribute other than `#[path = "<literal>"]`, a `#[path]`
+/// on an inline module, an out-of-line `mod` inside a non-module block, or a
+/// production `include!`-family call other than `include_str!`/`include_bytes!`
+/// of one plain string literal.
+pub fn scan_module(text: &str) -> Result<ModuleScan, ModScanRefusal> {
+    let toks = mod_tokens(text)?;
+    let mut scan = ModuleScan::default();
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut pending_path: Option<String> = None;
+    let mut pending_test = false;
+    let mut at = 0;
+    while let Some(tok) = toks.get(at) {
+        at += 1;
+        let in_test = pending_test || blocks.iter().any(|block| block.test_only);
+        match tok {
+            ModTok::Punct('#') => match read_attribute(&toks, &mut at)? {
+                Attr::Path(literal) => pending_path = Some(literal),
+                Attr::TestOnly => pending_test = true,
+                Attr::Other => {}
+            },
+            ModTok::Ident(word) if word == "mod" => {
+                let Some(ModTok::Ident(name)) = toks.get(at) else {
+                    return Err(ModScanRefusal::UnreadableMod);
+                };
+                let name = name.strip_prefix("r#").unwrap_or(name).to_owned();
+                match toks.get(at + 1) {
+                    Some(ModTok::Punct(';')) => {
+                        if blocks.iter().any(|block| block.module.is_none()) {
+                            return Err(ModScanRefusal::ModOutsideModuleScope(name));
+                        }
+                        scan.decls.push(ModDecl {
+                            name,
+                            inline: blocks.iter().filter_map(|b| b.module.clone()).collect(),
+                            path_attr: pending_path.take(),
+                            test_only: in_test,
+                        });
+                    }
+                    Some(ModTok::Punct('{')) => {
+                        if pending_path.is_some() {
+                            return Err(ModScanRefusal::PathOnInlineModule(name));
+                        }
+                        blocks.push(Block {
+                            module: Some(name),
+                            test_only: in_test,
+                        });
+                    }
+                    _ => return Err(ModScanRefusal::UnreadableMod),
+                }
+                pending_test = false;
+                at += 2;
+            }
+            ModTok::Ident(word)
+                if matches!(word.as_str(), "include" | "include_str" | "include_bytes")
+                    && toks.get(at) == Some(&ModTok::Punct('!')) =>
+            {
+                if !in_test {
+                    let literal = match (word.as_str(), toks.get(at + 1..at + 4)) {
+                        (
+                            "include_str" | "include_bytes",
+                            Some(
+                                [
+                                    ModTok::Punct(open),
+                                    ModTok::Str(Some(literal)),
+                                    ModTok::Punct(close),
+                                ],
+                            ),
+                        ) if matches!((open, close), ('(', ')') | ('[', ']') | ('{', '}')) => {
+                            literal.clone()
+                        }
+                        _ => return Err(ModScanRefusal::UnreadableInclude(word.clone())),
+                    };
+                    scan.includes.push(literal);
+                }
+            }
+            ModTok::Punct('{') => {
+                blocks.push(Block {
+                    module: None,
+                    test_only: in_test,
+                });
+                pending_path = None;
+                pending_test = false;
+            }
+            ModTok::Punct('}') => {
+                blocks.pop().ok_or(ModScanRefusal::UnbalancedBraces)?;
+                pending_path = None;
+                pending_test = false;
+            }
+            ModTok::Punct(';') => {
+                pending_path = None;
+                pending_test = false;
+            }
+            ModTok::Punct(',') => pending_test = false,
+            _ => {}
+        }
+    }
+    if blocks.is_empty() {
+        Ok(scan)
+    } else {
+        Err(ModScanRefusal::UnbalancedBraces)
+    }
+}
+
+/// One open `{` of a Rust source file.
+struct Block {
+    /// The module name of an inline `mod NAME {`, `None` for any other block.
+    module: Option<String>,
+    /// Whether the block is test-only code.
+    test_only: bool,
+}
+
+/// What an attribute tells the module scan.
+enum Attr {
+    /// `#[path = "<literal>"]`.
+    Path(String),
+    /// `#[cfg(test)]` or `#[cfg(all(…, test, …))]`.
+    TestOnly,
+    /// Any other attribute, or a bare `#`.
+    Other,
+}
+
+/// Read the attribute whose `#` sits just before `at`.
+///
+/// On an attribute, `at` advances past its closing `]`.
+///
+/// # Errors
+/// [`ModScanRefusal::UnreadablePathAttr`] for any other attribute holding
+/// `path =` (an inner `#![path]`, a `cfg_attr(…, path = …)`, an escaped
+/// literal); [`ModScanRefusal::Unterminated`] for an attribute never closed.
+fn read_attribute(toks: &[ModTok], at: &mut usize) -> Result<Attr, ModScanRefusal> {
+    let inner = toks.get(*at) == Some(&ModTok::Punct('!'));
+    let open = *at + usize::from(inner);
+    if toks.get(open) != Some(&ModTok::Punct('[')) {
+        return Ok(Attr::Other);
+    }
+    let mut depth = 0_usize;
+    let mut end = open;
+    loop {
+        match toks.get(end) {
+            Some(ModTok::Punct('[')) => depth += 1,
+            Some(ModTok::Punct(']')) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Some(_) => {}
+            None => return Err(ModScanRefusal::Unterminated("attribute")),
+        }
+        end += 1;
+    }
+    let body = toks.get(open + 1..end).unwrap_or_default();
+    *at = end + 1;
+    let names_path = body
+        .windows(2)
+        .any(|pair| matches!(pair, [ModTok::Ident(word), ModTok::Punct('=')] if word == "path"));
+    if !names_path {
+        return Ok(if !inner && cfg_holds_only_in_tests(body) {
+            Attr::TestOnly
+        } else {
+            Attr::Other
+        });
+    }
+    match body {
+        [
+            ModTok::Ident(word),
+            ModTok::Punct('='),
+            ModTok::Str(Some(literal)),
+        ] if word == "path" && !inner => Ok(Attr::Path(literal.clone())),
+        _ => Err(ModScanRefusal::UnreadablePathAttr),
+    }
+}
+
+/// Whether the attribute body is `cfg(test)` or `cfg(all(…, test, …))`.
+///
+/// Any other spelling answers `false`, the conservative reading.
+fn cfg_holds_only_in_tests(body: &[ModTok]) -> bool {
+    let is_test = |pred: &[ModTok]| matches!(pred, [ModTok::Ident(word)] if word == "test");
+    let [
+        ModTok::Ident(cfg),
+        ModTok::Punct('('),
+        pred @ ..,
+        ModTok::Punct(')'),
+    ] = body
+    else {
+        return false;
+    };
+    if cfg != "cfg" {
+        return false;
+    }
+    if is_test(pred) {
+        return true;
+    }
+    let [
+        ModTok::Ident(all),
+        ModTok::Punct('('),
+        args @ ..,
+        ModTok::Punct(')'),
+    ] = pred
+    else {
+        return false;
+    };
+    if all != "all" {
+        return false;
+    }
+    let mut depth = 0_usize;
+    let mut arg_start = 0_usize;
+    for (index, tok) in args.iter().enumerate() {
+        match tok {
+            ModTok::Punct('(') => depth += 1,
+            ModTok::Punct(')') => match depth.checked_sub(1) {
+                Some(shallower) => depth = shallower,
+                None => return false,
+            },
+            ModTok::Punct(',') if depth == 0 => {
+                if args.get(arg_start..index).is_some_and(is_test) {
+                    return true;
+                }
+                arg_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    depth == 0 && args.get(arg_start..).is_some_and(is_test)
+}
+
+/// The [`ModTok`] stream of a Rust source file.
+///
+/// # Errors
+/// [`ModScanRefusal::Unterminated`] for a string, character or block comment
+/// the file never closes.
+pub(super) fn mod_tokens(text: &str) -> Result<Vec<ModTok>, ModScanRefusal> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut toks = Vec::new();
+    let mut at = 0;
+    while let Some(&c) = chars.get(at) {
+        let next = chars.get(at + 1).copied();
+        if c.is_whitespace() {
+            at += 1;
+        } else if c == '/' && next == Some('/') {
+            while chars.get(at).is_some_and(|&c| c != '\n') {
+                at += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            at = skip_block_comment(&chars, at)?;
+        } else if c == '"' {
+            let (tok, end) = cooked_string(&chars, at + 1)?;
+            toks.push(tok);
+            at = end;
+        } else if c == '\'' {
+            at = skip_char_or_lifetime(&chars, at)?;
+        } else if c == '_' || c.is_alphabetic() {
+            at = ident_or_prefixed_literal(&chars, at, &mut toks)?;
+        } else if c.is_ascii_digit() {
+            at = skip_number(&chars, at);
+        } else {
+            toks.push(ModTok::Punct(c));
+            at += 1;
+        }
+    }
+    Ok(toks)
+}
+
+/// The index just past the number literal starting at `at`.
+///
+/// A decimal literal takes its fraction (`.` then a digit) and its signed
+/// exponent (`1e-3`) as rustc does; `1..2`, `1.max(2)` and `1usize-3` stay a
+/// number, then punctuation.
+fn skip_number(chars: &[char], at: usize) -> usize {
+    let word_end = |from: usize| {
+        let mut end = from;
+        while chars
+            .get(end)
+            .is_some_and(|&c| c == '_' || c.is_alphanumeric())
+        {
+            end += 1;
+        }
+        end
+    };
+    let radix = chars.get(at) == Some(&'0') && matches!(chars.get(at + 1), Some('x' | 'o' | 'b'));
+    let mut end = word_end(at);
+    if radix {
+        return end;
+    }
+    if chars.get(end) == Some(&'.') && chars.get(end + 1).is_some_and(char::is_ascii_digit) {
+        end = word_end(end + 1);
+    }
+    let mantissa_then_e = end.checked_sub(1).is_some_and(|last| {
+        chars.get(last).is_some_and(|&c| matches!(c, 'e' | 'E'))
+            && chars.get(at..last).is_some_and(|digits| {
+                digits
+                    .iter()
+                    .all(|&c| c.is_ascii_digit() || matches!(c, '_' | '.'))
+            })
+    });
+    if mantissa_then_e
+        && matches!(chars.get(end), Some('+' | '-'))
+        && chars.get(end + 1).is_some_and(char::is_ascii_digit)
+    {
+        end = word_end(end + 1);
+    }
+    end
+}
+
+/// The index just past the (nestable) block comment opening at `at`.
+fn skip_block_comment(chars: &[char], at: usize) -> Result<usize, ModScanRefusal> {
+    let mut depth = 0_usize;
+    let mut i = at;
+    loop {
+        match (chars.get(i), chars.get(i + 1)) {
+            (Some('/'), Some('*')) => {
+                depth += 1;
+                i += 2;
+            }
+            (Some('*'), Some('/')) => {
+                depth = depth.saturating_sub(1);
+                i += 2;
+                if depth == 0 {
+                    return Ok(i);
+                }
+            }
+            (Some(_), _) => i += 1,
+            (None, _) => return Err(ModScanRefusal::Unterminated("block comment")),
+        }
+    }
+}
+
+/// The cooked string whose body starts at `at`, and the index past its quote.
+fn cooked_string(chars: &[char], at: usize) -> Result<(ModTok, usize), ModScanRefusal> {
+    let mut value = String::new();
+    let mut escaped = false;
+    let mut i = at;
+    loop {
+        match chars.get(i) {
+            Some('"') => {
+                let tok = ModTok::Str((!escaped).then_some(value));
+                return Ok((tok, i + 1));
+            }
+            Some('\\') => {
+                escaped = true;
+                i += 2;
+            }
+            Some(&c) => {
+                value.push(c);
+                i += 1;
+            }
+            None => return Err(ModScanRefusal::Unterminated("string literal")),
+        }
+    }
+}
+
+/// The body end and the index past the raw string whose body starts at `at`.
+///
+/// `hashes` is the count of `#`s its opening quote follows.
+fn raw_string_end(
+    chars: &[char],
+    at: usize,
+    hashes: usize,
+) -> Result<(usize, usize), ModScanRefusal> {
+    let mut i = at;
+    loop {
+        match chars.get(i) {
+            Some('"') if (1..=hashes).all(|k| chars.get(i + k) == Some(&'#')) => {
+                return Ok((i, i + 1 + hashes));
+            }
+            Some(_) => i += 1,
+            None => return Err(ModScanRefusal::Unterminated("raw string literal")),
+        }
+    }
+}
+
+/// The index just past the character literal or lifetime at `at` (a `'`).
+fn skip_char_or_lifetime(chars: &[char], at: usize) -> Result<usize, ModScanRefusal> {
+    match (chars.get(at + 1), chars.get(at + 2)) {
+        (Some('\\'), _) => {
+            let mut i = at + 3;
+            loop {
+                match chars.get(i) {
+                    Some('\'') => return Ok(i + 1),
+                    Some(_) => i += 1,
+                    None => return Err(ModScanRefusal::Unterminated("character literal")),
+                }
+            }
+        }
+        (Some(_), Some('\'')) => Ok(at + 3),
+        _ => {
+            let mut i = at + 1;
+            while chars
+                .get(i)
+                .is_some_and(|&c| c == '_' || c.is_alphanumeric())
+            {
+                i += 1;
+            }
+            Ok(i)
+        }
+    }
+}
+
+/// Lex the identifier at `at`, returning the index just past it.
+///
+/// An `r`/`b`/`br`/`c`/`cr` prefix that opens a string, raw string, raw
+/// identifier or byte character lexes that token instead.
+fn ident_or_prefixed_literal(
+    chars: &[char],
+    at: usize,
+    toks: &mut Vec<ModTok>,
+) -> Result<usize, ModScanRefusal> {
+    let mut end = at;
+    while chars
+        .get(end)
+        .is_some_and(|&c| c == '_' || c.is_alphanumeric())
+    {
+        end += 1;
+    }
+    let word: String = chars.get(at..end).unwrap_or_default().iter().collect();
+    let next = chars.get(end).copied();
+    let raw_prefix = matches!(word.as_str(), "r" | "br" | "cr");
+    if raw_prefix && matches!(next, Some('"' | '#')) {
+        let hashes = chars
+            .get(end..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|&&c| c == '#')
+            .count();
+        match chars.get(end + hashes) {
+            Some('"') => {
+                let start = end + hashes + 1;
+                let (body_end, close) = raw_string_end(chars, start, hashes)?;
+                let body: String = chars
+                    .get(start..body_end)
+                    .unwrap_or_default()
+                    .iter()
+                    .collect();
+                toks.push(ModTok::Str(Some(body)));
+                return Ok(close);
+            }
+            Some(_) if word == "r" && hashes == 1 => {
+                let mut ident_end = end + 1;
+                while chars
+                    .get(ident_end)
+                    .is_some_and(|&c| c == '_' || c.is_alphanumeric())
+                {
+                    ident_end += 1;
+                }
+                let ident: String = chars
+                    .get(at..ident_end)
+                    .unwrap_or_default()
+                    .iter()
+                    .collect();
+                toks.push(ModTok::Ident(ident));
+                return Ok(ident_end);
+            }
+            _ => {}
+        }
+    }
+    if matches!(word.as_str(), "b" | "c") && next == Some('"') {
+        let (tok, close) = cooked_string(chars, end + 1)?;
+        toks.push(tok);
+        return Ok(close);
+    }
+    if word == "b" && next == Some('\'') {
+        return skip_char_or_lifetime(chars, end);
+    }
+    toks.push(ModTok::Ident(word));
+    Ok(end)
 }
 
 /// The emitted project's binary files keyed by crate-relative path, beside the

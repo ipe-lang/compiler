@@ -38,7 +38,8 @@ mod tests {
         let src = ipe_parse::parse_module(source, &mut i).ok()?;
         let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
         let types = ipe_types::infer(&m, &mut i).ok()?;
-        let program: Program = crate::lower(&m, &types, &mut i, "", "").ok()?;
+        let program: Program =
+            crate::lower(&m, &types, &mut i, "", "", crate::Roots::Entry).ok()?;
         Some(program_capabilities(&program))
     }
 
@@ -213,7 +214,8 @@ mod tests {
         let src = ipe_parse::parse_module(source, &mut i).ok()?;
         let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
         let types = ipe_types::infer(&m, &mut i).ok()?;
-        let program: Program = crate::lower(&m, &types, &mut i, "", "").ok()?;
+        let program: Program =
+            crate::lower(&m, &types, &mut i, "", "", crate::Roots::Entry).ok()?;
         Some(super::capabilities_reached_from(&program, &i, |_| roots))
     }
 
