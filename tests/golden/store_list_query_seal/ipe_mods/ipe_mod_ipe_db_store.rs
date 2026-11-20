@@ -534,7 +534,7 @@ pub(crate) fn user_ipe_db_store_read_cells<T1: 'static + Send + Clone>(
 
 pub(crate) fn user_ipe_db_store_cells_decoder() -> Decoder<HashMap<String, IpeMaybe<String>>> {
     let _ipe_recursion_guard = crate::recursion_guard();
-    config_dict(config_nullable(decode_one_of(vec![json_decode_string::<IpeError>(), decode_map({ let __ipe_fn: Box<dyn Fn(i64) -> String + Send + Sync + 'static> = Box::new(string_from_int); __ipe_fn }, json_decode_int::<IpeError>()), decode_map({ let __ipe_fn: Box<dyn Fn(f64) -> String + Send + Sync + 'static> = Box::new(string_from_float); __ipe_fn }, json_decode_float::<IpeError>()), decode_map({ let __ipe_fn: Box<dyn Fn(bool) -> String + Send + Sync + 'static> = Box::new(string_from_bool); __ipe_fn }, json_decode_bool::<IpeError>())])))
+    config_dict(config_nullable(decode_one_of(vec![json_decode_string::<IpeError>(), decode_map({ let __ipe_fn: Box<dyn Fn(i64) -> String + Send + Sync + 'static> = Box::new(move |__u_eta_0: i64| -> String { string_from_int(__u_eta_0) }); __ipe_fn }, json_decode_int::<IpeError>()), decode_map({ let __ipe_fn: Box<dyn Fn(f64) -> String + Send + Sync + 'static> = Box::new(move |__u_eta_1: f64| -> String { string_from_float(__u_eta_1) }); __ipe_fn }, json_decode_float::<IpeError>()), decode_map({ let __ipe_fn: Box<dyn Fn(bool) -> String + Send + Sync + 'static> = Box::new(move |__u_eta_2: bool| -> String { string_from_bool(__u_eta_2) }); __ipe_fn }, json_decode_bool::<IpeError>())])))
 }
 
 pub(crate) fn user_ipe_db_store_decode_rows<T1: 'static + Send + Sync + Clone>(

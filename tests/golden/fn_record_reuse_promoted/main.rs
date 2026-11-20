@@ -300,13 +300,15 @@ pub fn ipe_main() -> IpeTask<()> {
         count: 3i64,
         format: {
             let __ipe_fn: ::std::sync::Arc<dyn Fn(i64) -> String + Send + Sync + 'static> =
-                Arc::new(string_from_int);
+                ::std::sync::Arc::new(move |__u_eta_1: i64| -> String {
+                    string_from_int(__u_eta_1)
+                });
             __ipe_fn
         },
         label: "len".to_string(),
         onChange: {
             let __ipe_fn: ::std::sync::Arc<dyn Fn(String) -> i64 + Send + Sync + 'static> =
-                Arc::new(string_length);
+                ::std::sync::Arc::new(move |__u_eta_0: String| -> i64 { string_length(__u_eta_0) });
             __ipe_fn
         },
     }))
