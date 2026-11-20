@@ -5050,6 +5050,16 @@ impl From<StartupRefusal> for crate::error::IpeError {
     }
 }
 
+#[cfg(feature = "web")]
+impl crate::system::ScrubbedDisplay for StartupRefusal {}
+
+/// The operator log message of a fail-closed mount: the refusal's text,
+/// already scrubbed where it was built, reaches the log scrubbed once.
+#[cfg(feature = "web")]
+fn fail_closed_log_message(cause: &StartupRefusal) -> crate::system::ScrubbedLine {
+    crate::system::ScrubbedLine::of_refusal(cause).after("mounted web app disabled: ")
+}
+
 /// The fixed public body of a fail-closed mount's 503. One constant for every
 /// [`StartupRefusal`], so a response never carries the operator detail.
 #[cfg(feature = "web")]
@@ -5098,7 +5108,7 @@ const WEB_STATIC_PREFIX: &str = "/static";
 /// silently-dead route. The cause is logged once here, server-side only.
 #[cfg(feature = "web")]
 fn fail_closed_router(cause: &StartupRefusal) -> crate::server::ServedRouter {
-    crate::system::emit_runtime_log("live", &format!("mounted web app disabled: {cause}"));
+    crate::system::emit_runtime_log_scrubbed("live", &fail_closed_log_message(cause));
     crate::server::ServedRouter::answering_everywhere(|| async {
         (
             axum::http::StatusCode::SERVICE_UNAVAILABLE,
@@ -16483,6 +16493,34 @@ mod emitted_router_behavior_tests {
             "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
              (host a\\\\b); fix the connection URL or the server, or set \
              IPE_WEB_STORE=file|memory"
+        );
+    }
+
+    /// A fail-closed mount logs its refusal scrubbed once: a `\` the refusal
+    /// quotes shows as `\\` in the log line, never `\\\\`, and a control in it
+    /// stays a visible escape.
+    #[test]
+    fn fail_closed_router_message_scrubbed_once() {
+        let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
+            backend: "postgres",
+            cause: crate::system::RefusedText::new("host a\\b\n[ipe.live] forged"),
+        });
+        let line = crate::system::scrubbed_runtime_log_line(
+            crate::system::LogStream::Stderr,
+            None,
+            "live",
+            &fail_closed_log_message(&cause),
+        );
+        assert_eq!(
+            line.trim_start(),
+            "[ipe.live] mounted web app disabled: session store misconfigured: \
+             IPE_WEB_STORE=postgres refused at connect (host a\\\\b\\n[ipe.live] forged); \
+             fix the connection URL or the server, or set IPE_WEB_STORE=file|memory"
+        );
+        assert!(!line.contains("a\\\\\\\\b"), "{line:?}");
+        assert!(
+            !line.chars().any(crate::system::is_log_hazard),
+            "a raw control survived: {line:?}"
         );
     }
 

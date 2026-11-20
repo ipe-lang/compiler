@@ -881,6 +881,80 @@ impl std::fmt::Display for RefusedText {
     }
 }
 
+/// A log message already escaped by [`scrub_log_controls`], exactly once.
+///
+/// Built only by scrubbing raw text ([`Self::scrub`]), from a [`RefusedText`],
+/// or from a [`ScrubbedDisplay`] refusal whose text is assembled from scrubbed
+/// parts. The scrubbed sinks ([`emit_runtime_log_scrubbed`]) take it as is,
+/// so raw text cannot skip the scrub and scrubbed text is never scrubbed a
+/// second time (which would double every `\` it shows).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScrubbedLine(String);
+
+impl ScrubbedLine {
+    /// The scrubbed form of `raw`.
+    #[must_use]
+    pub(crate) fn scrub(raw: &str) -> Self {
+        Self(scrub_log_controls(raw).into_owned())
+    }
+
+    /// The rendered text of `refusal`, whose `Display` quotes only scrubbed
+    /// text beside its own fixed words.
+    ///
+    /// Fails closed: a rendering that still holds a log hazard (which no
+    /// [`ScrubbedDisplay`] refusal writes) is scrubbed whole.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "web-core"),
+        allow(dead_code) // only the web render core renders a refusal
+    )]
+    pub(crate) fn of_refusal<R: ScrubbedDisplay + ?Sized>(refusal: &R) -> Self {
+        let shown = refusal.to_string();
+        if shown.chars().any(is_log_hazard) {
+            Self::scrub(&shown)
+        } else {
+            Self(shown)
+        }
+    }
+
+    /// `raw` scrubbed, followed by `self`.
+    ///
+    /// The scrub escapes one character at a time, so the concatenation of two
+    /// scrubbed texts is the scrub of their concatenation.
+    #[must_use]
+    #[cfg_attr(
+        not(feature = "web"),
+        allow(dead_code) // only a mounted web app prefixes a scrubbed refusal
+    )]
+    pub(crate) fn after(self, raw: &str) -> Self {
+        let mut out = scrub_log_controls(raw).into_owned();
+        out.push_str(&self.0);
+        Self(out)
+    }
+}
+
+impl From<RefusedText> for ScrubbedLine {
+    fn from(text: RefusedText) -> Self {
+        Self(text.0)
+    }
+}
+
+impl std::fmt::Display for ScrubbedLine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A refusal whose `Display` writes its own fixed words and text already
+/// escaped where the refusal was built ([`RefusedText`], `shown_env_value`),
+/// so it reaches a log line through [`ScrubbedLine::of_refusal`], never a
+/// second scrub.
+#[cfg_attr(
+    not(feature = "web-core"),
+    allow(dead_code) // only the web render core renders a refusal
+)]
+pub(crate) trait ScrubbedDisplay: std::fmt::Display {}
+
 /// Append the scrubbed spelling of one character to `out`.
 fn push_scrubbed(c: char, out: &mut String) {
     use std::fmt::Write as _;
@@ -964,13 +1038,12 @@ impl LogStream {
     }
 }
 
-/// Build a `"[ipe.<tag>] [<stamp> ]<msg>"` line with `msg` scrubbed.
+/// Build a `"[ipe.<tag>] [<stamp> ]<msg>"` line from a scrubbed `msg`.
 ///
 /// Private: the only place the literal `"[ipe."` prefix is constructed. The
 /// tag leads and the optional stamp follows it, so every runtime line shares
 /// one layout; call sites use the `emit_runtime_log*` fns.
-fn format_runtime_log(stamp: Option<&str>, tag: &str, msg: &str) -> String {
-    let msg = scrub_log_controls(msg);
+fn format_runtime_log(stamp: Option<&str>, tag: &str, msg: &ScrubbedLine) -> String {
     match stamp {
         Some(stamp) => format!("[ipe.{tag}] {stamp} {msg}"),
         None => format!("[ipe.{tag}] {msg}"),
@@ -988,6 +1061,16 @@ pub(crate) fn runtime_log_line(
     tag: &str,
     msg: &str,
 ) -> String {
+    scrubbed_runtime_log_line(stream, stamp, tag, &ScrubbedLine::scrub(msg))
+}
+
+/// [`runtime_log_line`] for a message already scrubbed.
+pub(crate) fn scrubbed_runtime_log_line(
+    stream: LogStream,
+    stamp: Option<&str>,
+    tag: &str,
+    msg: &ScrubbedLine,
+) -> String {
     gutter_line(&format_runtime_log(stamp, tag, msg), stream.is_terminal())
 }
 
@@ -1001,6 +1084,17 @@ pub(crate) fn runtime_log_line(
 pub(crate) fn emit_runtime_log(tag: &str, msg: &str) {
     let stream = LogStream::Stderr;
     stream.write_line(&runtime_log_line(stream, None, tag, msg));
+}
+
+/// [`emit_runtime_log`] for a message already scrubbed: written as is, never
+/// scrubbed again.
+#[cfg_attr(
+    not(feature = "web"),
+    allow(dead_code) // only a mounted web app logs a scrubbed refusal
+)]
+pub(crate) fn emit_runtime_log_scrubbed(tag: &str, msg: &ScrubbedLine) {
+    let stream = LogStream::Stderr;
+    stream.write_line(&scrubbed_runtime_log_line(stream, None, tag, msg));
 }
 
 /// `emit_runtime_log` for a line that carries a timestamp after its tag (the
@@ -6738,7 +6832,7 @@ mod gutter_line_tests {
                 "[ipe.web] listening on http://127.0.0.1:8000",
             ),
         ] {
-            let line = format_runtime_log(stamp, tag, msg);
+            let line = format_runtime_log(stamp, tag, &super::ScrubbedLine::scrub(msg));
             assert_eq!(line, flush_left);
             assert_eq!(gutter_line(&line, false), flush_left);
             assert_eq!(gutter_line(&line, true), format!("    {flush_left}"));
@@ -7099,6 +7193,52 @@ mod scrub_log_controls_tests {
             line.trim_start(),
             "[ipe.http] GET /x\\r\\n[ipe.http] forged\\u{1b}[31m"
         );
+    }
+
+    /// Text a [`super::RefusedText`] already scrubbed reaches the log line as
+    /// is: `a\b` shows as `a\\b`, never re-escaped to `a\\\\b`.
+    #[test]
+    fn refused_text_with_backslash_logs_once_escaped() {
+        let msg = super::ScrubbedLine::from(super::RefusedText::new("a\\b"));
+        let line = super::scrubbed_runtime_log_line(LogStream::Stderr, None, "live", &msg);
+        assert_eq!(line.trim_start(), "[ipe.live] a\\\\b");
+        assert!(!line.contains("a\\\\\\\\b"), "{line:?}");
+    }
+
+    /// The single scrub is never zero scrubs: raw text built into a
+    /// [`super::ScrubbedLine`] is escaped, a prefix joined by `after` is
+    /// escaped, and a refusal rendering that still holds a hazard is scrubbed
+    /// whole.
+    #[test]
+    fn raw_text_reaching_a_scrubbed_line_is_still_escaped() {
+        struct Leaky;
+        impl std::fmt::Display for Leaky {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("x\n[ipe.live] forged\u{202e}")
+            }
+        }
+        impl super::ScrubbedDisplay for Leaky {}
+        for (msg, want) in [
+            (
+                super::ScrubbedLine::scrub("a\\b\r\n\u{1b}[31m"),
+                "[ipe.live] a\\\\b\\r\\n\\u{1b}[31m",
+            ),
+            (
+                super::ScrubbedLine::scrub("tail").after("p\nq: "),
+                "[ipe.live] p\\nq: tail",
+            ),
+            (
+                super::ScrubbedLine::of_refusal(&Leaky),
+                "[ipe.live] x\\n[ipe.live] forged\\u{202e}",
+            ),
+        ] {
+            let line = super::scrubbed_runtime_log_line(LogStream::Stderr, None, "live", &msg);
+            assert!(
+                !line.chars().any(super::is_log_hazard),
+                "control survived: {line:?}"
+            );
+            assert_eq!(line.trim_start(), want);
+        }
     }
 }
 
