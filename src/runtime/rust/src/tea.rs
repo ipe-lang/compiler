@@ -2690,7 +2690,8 @@ mod bounded_input_tests {
                 CliEvent::Key(..)
                 | CliEvent::Interrupt
                 | CliEvent::Msg(())
-                | CliEvent::PerformDone(()) => ("other", None),
+                | CliEvent::PerformDone(())
+                | CliEvent::Ended(_) => ("other", None),
             });
         }
         out
