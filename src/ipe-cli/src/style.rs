@@ -127,12 +127,15 @@ pub mod glyph {
 /// (a green cross, a red check); routing through the outcome closes that class.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Outcome {
-    /// A step in progress: the step bullet, painted in the running amber.
+    /// A step in progress: the step bullet, painted in the running soft yellow.
     Step,
     /// A completed step: the success check, painted green.
     Success,
-    /// A failed step: the failure cross, painted red.
-    Failure,
+    /// A failed step: the failure cross, carrying who is to blame for it so the
+    /// tint can give it the orange a user can fix or the light red of an
+    /// internal `ipe` bug — see [`crate::screen::Fault`], the one place that
+    /// blame/colour mapping is decided.
+    Failure(crate::screen::Fault),
 }
 
 impl Outcome {
@@ -151,21 +154,24 @@ pub const fn outcome_glyph(outcome: Outcome) -> &'static str {
     match outcome {
         Outcome::Step => glyph::STEP,
         Outcome::Success => glyph::OK,
-        Outcome::Failure => glyph::FAIL,
+        Outcome::Failure(_) => glyph::FAIL,
     }
 }
 
 /// The tint (an escape from `p`) that paints a line reporting `outcome`.
 ///
-/// Amber for a step in progress, green for a success, red for a failure — the
-/// single mapping from a semantic outcome to its palette field, paired with
-/// [`outcome_glyph`] so glyph and colour never drift apart.
+/// Soft yellow for a step in progress, green for a success; a failure's tint
+/// follows its [`crate::screen::Fault`] — orange when the user can fix it,
+/// light red when it is an internal `ipe` bug — the same blame-to-colour rule
+/// [`crate::screen::Tone::ink`] applies, so the two never drift apart. Paired
+/// with [`outcome_glyph`] so glyph and colour never drift apart either.
 #[must_use]
 pub const fn outcome_tint(outcome: Outcome, p: &Palette) -> &'static str {
     match outcome {
-        Outcome::Step => p.bright_yellow,
+        Outcome::Step => p.yellow,
         Outcome::Success => p.green,
-        Outcome::Failure => p.red,
+        Outcome::Failure(crate::screen::Fault::User) => p.orange,
+        Outcome::Failure(crate::screen::Fault::Internal) => p.light_red,
     }
 }
 
@@ -188,19 +194,15 @@ pub mod progress_bar {
 /// off every field is the empty string, so the same format code produces clean
 /// plain text.
 pub struct Palette {
-    /// A soft Ipê-amarelo (256-colour 222), for the product name and command
-    /// names.
+    /// A soft Ipê-amarelo (256-colour 222): the product name, command names,
+    /// and every running/in-progress or suggested-fix accent — the single
+    /// yellow the palette carries. There is no stronger yellow: an accent that
+    /// used to reach for one takes this tint instead.
     pub yellow: &'static str,
-    /// A bright/light yellow (ANSI bright yellow), for the `ipe health`
-    /// suggested-fix bullets — a stronger amber than [`yellow`](Self::yellow) so
-    /// each actionable item stands out from the report above it.
-    pub bright_yellow: &'static str,
     /// A mid grey (256-colour 244), for descriptions and the footer.
     pub dim: &'static str,
     /// A soft green (256-colour 114), for success emphasis.
     pub green: &'static str,
-    /// A plain red, for failure emphasis.
-    pub red: &'static str,
     /// A light red (ANSI bright red), for an internal (ipe-side) error.
     pub light_red: &'static str,
     /// A light orange (256-colour 215), for a user-side error.
@@ -215,14 +217,12 @@ pub struct Palette {
 
 impl Palette {
     /// The coloured palette: a soft Ipê-amarelo (222) for names, a mid grey
-    /// (244) for dim text, a soft green (114) for success, plain red for
-    /// failure.
+    /// (244) for dim text, a soft green (114) for success, orange (215) for a
+    /// user-fixable failure, light red (ANSI bright red) for an internal one.
     pub const COLOR: Self = Self {
         yellow: "\x1b[38;5;222m",
-        bright_yellow: "\x1b[93m",
         dim: "\x1b[38;5;244m",
         green: "\x1b[38;5;114m",
-        red: "\x1b[31m",
         light_red: "\x1b[91m",
         orange: "\x1b[38;5;215m",
         white: "\x1b[38;5;252m",
@@ -233,10 +233,8 @@ impl Palette {
     /// The plain palette: every escape is empty, yielding aligned plain text.
     pub const PLAIN: Self = Self {
         yellow: "",
-        bright_yellow: "",
         dim: "",
         green: "",
-        red: "",
         light_red: "",
         orange: "",
         white: "",
@@ -304,7 +302,8 @@ pub use ipe_diagnostics::terminal::TerminalSafe;
 pub use ipe_diagnostics::terminal::TerminalLine;
 
 /// A framed, guttered status line: a leading success/failure glyph, then the
-/// message. `ok` picks the green check or the red cross; `color` toggles ANSI.
+/// message. `outcome` picks the glyph and tint (a failure's blame picks orange
+/// or light red); `color` toggles ANSI.
 ///
 /// The one way a human-mode command reports a completed step — replacing a bare
 /// left-flush spinner line with `<glyph> <message>` plus the 2-space gutter.
@@ -314,13 +313,8 @@ pub use ipe_diagnostics::terminal::TerminalLine;
 /// carry, so a message routed here can never smuggle ANSI or control bytes to the
 /// terminal.
 #[must_use]
-pub fn status_line(ok: bool, message: &TerminalSafe, color: bool) -> String {
+pub fn status_line(outcome: Outcome, message: &TerminalSafe, color: bool) -> String {
     let p = Palette::select(color);
-    let outcome = if ok {
-        Outcome::Success
-    } else {
-        Outcome::Failure
-    };
     let (glyph, tint) = outcome.glyph_and_tint(p);
     frame(&gutter(&format!("{tint}{glyph}{} {message}", p.reset)))
 }
@@ -329,53 +323,172 @@ pub fn status_line(ok: bool, message: &TerminalSafe, color: bool) -> String {
 mod tests {
     use super::*;
 
+    /// Pin every approved [`Palette::COLOR`] field to its exact escape and every
+    /// [`Palette::PLAIN`] field to empty, via an exhaustive destructure: a new
+    /// field added to [`Palette`] fails to compile here until it is pinned too,
+    /// so an unpinned colour can never ship silently.
     #[test]
-    fn color_palette_carries_ansi_plain_does_not() {
-        assert!(Palette::COLOR.yellow.contains('\x1b'));
-        assert!(Palette::PLAIN.yellow.is_empty());
-        // The bright-yellow field the health fix bullets use follows the same
-        // rule: an escape under colour, empty under plain.
-        assert!(Palette::COLOR.bright_yellow.contains('\x1b'));
-        assert!(Palette::PLAIN.bright_yellow.is_empty());
+    fn palette_fields_are_pinned_to_their_approved_escapes() {
+        let Palette {
+            yellow,
+            dim,
+            green,
+            light_red,
+            orange,
+            white,
+            bold,
+            reset,
+        } = Palette::COLOR;
+        assert_eq!(yellow, "\x1b[38;5;222m");
+        assert_eq!(dim, "\x1b[38;5;244m");
+        assert_eq!(green, "\x1b[38;5;114m");
+        assert_eq!(light_red, "\x1b[91m");
+        assert_eq!(orange, "\x1b[38;5;215m");
+        assert_eq!(white, "\x1b[38;5;252m");
+        assert_eq!(bold, "\x1b[1m");
+        assert_eq!(reset, "\x1b[0m");
+
+        let Palette {
+            yellow,
+            dim,
+            green,
+            light_red,
+            orange,
+            white,
+            bold,
+            reset,
+        } = Palette::PLAIN;
+        for field in [yellow, dim, green, light_red, orange, white, bold, reset] {
+            assert_eq!(field, "", "every PLAIN field must be empty");
+        }
+
         // `select` returns the coloured palette on true, the plain one on false.
-        assert!(Palette::select(true).red.contains('\x1b'));
-        assert!(Palette::select(false).red.is_empty());
+        assert!(Palette::select(true).green.contains('\x1b'));
+        assert!(Palette::select(false).green.is_empty());
+    }
+
+    /// Neither removed colour — ANSI bright yellow (`93`) nor plain red (`31`)
+    /// — has a way back in: no [`Palette::COLOR`] field may carry either escape.
+    #[test]
+    fn no_approved_colour_is_a_removed_strong_colour() {
+        let Palette {
+            yellow,
+            dim,
+            green,
+            light_red,
+            orange,
+            white,
+            bold,
+            reset,
+        } = Palette::COLOR;
+        for field in [yellow, dim, green, light_red, orange, white, bold, reset] {
+            assert!(!field.contains("[93m"), "strong yellow must not recur");
+            assert!(!field.contains("[31m"), "plain red must not recur");
+        }
     }
 
     #[test]
     fn outcome_pairs_each_glyph_with_its_tint_in_one_place() {
         // Each outcome resolves its glyph and tint together, so the pairing is
-        // defined once — a step bullet in amber, a success check in green, a
-        // failure cross in red.
+        // defined once — a step bullet in soft yellow, a success check in
+        // green, a failure cross in orange (user-fixable) or light red
+        // (internal), by blame.
         let c = &Palette::COLOR;
         assert_eq!(outcome_glyph(Outcome::Step), glyph::STEP);
         assert_eq!(outcome_glyph(Outcome::Success), glyph::OK);
-        assert_eq!(outcome_glyph(Outcome::Failure), glyph::FAIL);
-        assert_eq!(outcome_tint(Outcome::Step, c), c.bright_yellow);
+        assert_eq!(
+            outcome_glyph(Outcome::Failure(crate::screen::Fault::User)),
+            glyph::FAIL
+        );
+        assert_eq!(
+            outcome_glyph(Outcome::Failure(crate::screen::Fault::Internal)),
+            glyph::FAIL
+        );
+        assert_eq!(outcome_tint(Outcome::Step, c), c.yellow);
         assert_eq!(outcome_tint(Outcome::Success, c), c.green);
-        assert_eq!(outcome_tint(Outcome::Failure, c), c.red);
+        assert_eq!(
+            outcome_tint(Outcome::Failure(crate::screen::Fault::User), c),
+            c.orange
+        );
+        assert_eq!(
+            outcome_tint(Outcome::Failure(crate::screen::Fault::Internal), c),
+            c.light_red
+        );
         // The convenience pairing agrees with the two field functions.
         assert_eq!(Outcome::Success.glyph_and_tint(c), (glyph::OK, c.green));
         // Under the plain palette every tint is empty, so no ANSI leaks.
-        assert!(outcome_tint(Outcome::Failure, &Palette::PLAIN).is_empty());
+        assert!(
+            outcome_tint(
+                Outcome::Failure(crate::screen::Fault::User),
+                &Palette::PLAIN
+            )
+            .is_empty()
+        );
     }
 
     #[test]
-    fn status_line_routes_success_and_failure_through_the_outcome_ssot() {
-        let ok = status_line(true, &TerminalSafe::sanitize("built"), true);
+    fn status_line_routes_every_outcome_through_the_outcome_ssot() {
+        let ok = status_line(Outcome::Success, &TerminalSafe::sanitize("built"), true);
         assert!(ok.contains(glyph::OK), "success uses the check glyph");
         assert!(ok.contains(Palette::COLOR.green), "success is green");
-        assert!(!ok.contains(Palette::COLOR.red), "success is never red");
-        let bad = status_line(false, &TerminalSafe::sanitize("broke"), true);
-        assert!(bad.contains(glyph::FAIL), "failure uses the cross glyph");
-        assert!(bad.contains(Palette::COLOR.red), "failure is red");
         assert!(
-            !bad.contains(Palette::COLOR.green),
+            !ok.contains(Palette::COLOR.orange),
+            "success is never orange"
+        );
+        assert!(
+            !ok.contains(Palette::COLOR.light_red),
+            "success is never light red"
+        );
+
+        let user_fault = status_line(
+            Outcome::Failure(crate::screen::Fault::User),
+            &TerminalSafe::sanitize("broke"),
+            true,
+        );
+        assert!(
+            user_fault.contains(glyph::FAIL),
+            "failure uses the cross glyph"
+        );
+        assert!(
+            user_fault.contains(Palette::COLOR.orange),
+            "a user-fixable failure is orange"
+        );
+        assert!(
+            !user_fault.contains(Palette::COLOR.green),
             "failure is never green"
         );
-        // Plain mode carries no ANSI in either outcome.
-        assert!(!status_line(true, &TerminalSafe::sanitize("built"), false).contains('\x1b'));
-        assert!(!status_line(false, &TerminalSafe::sanitize("broke"), false).contains('\x1b'));
+        assert!(
+            !user_fault.contains(Palette::COLOR.light_red),
+            "user blame is never light red"
+        );
+
+        let internal_fault = status_line(
+            Outcome::Failure(crate::screen::Fault::Internal),
+            &TerminalSafe::sanitize("bug"),
+            true,
+        );
+        assert!(
+            internal_fault.contains(Palette::COLOR.light_red),
+            "an internal failure is light red"
+        );
+        assert!(
+            !internal_fault.contains(Palette::COLOR.orange),
+            "internal blame is never orange"
+        );
+
+        // Plain mode carries no ANSI in any outcome.
+        assert!(
+            !status_line(Outcome::Success, &TerminalSafe::sanitize("built"), false)
+                .contains('\x1b')
+        );
+        assert!(
+            !status_line(
+                Outcome::Failure(crate::screen::Fault::User),
+                &TerminalSafe::sanitize("broke"),
+                false
+            )
+            .contains('\x1b')
+        );
     }
 
     #[test]
@@ -420,8 +533,8 @@ mod tests {
             "name is soft yellow: {h:?}"
         );
         assert!(
-            !h.contains(&format!("{}Ipê language{}", c.bright_yellow, c.reset)),
-            "name must not be the strong bright_yellow: {h:?}"
+            !h.contains(&format!("{}Ipê language{}", "\x1b[93m", c.reset)),
+            "name must not be the removed strong yellow: {h:?}"
         );
         assert!(
             h.contains(&format!("{}v{version}{}", c.green, c.reset)),

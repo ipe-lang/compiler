@@ -100,7 +100,9 @@ impl Status {
             // and Unknown are health-only states with their own bullets.
             Self::Ok => style::outcome_glyph(style::Outcome::Success),
             Self::Warn => "!",
-            Self::Missing => style::outcome_glyph(style::Outcome::Failure),
+            Self::Missing => {
+                style::outcome_glyph(style::Outcome::Failure(crate::screen::Fault::User))
+            }
             Self::Unknown => "?",
         }
     }
@@ -1542,7 +1544,7 @@ fn render_human(report: &Report, stream: &impl IsTerminal) -> String {
         for check in section {
             let color = match check.status {
                 Status::Ok => p.green,
-                Status::Missing => p.red,
+                Status::Missing => p.orange,
                 Status::Warn | Status::Unknown => p.yellow,
             };
             let _ = writeln!(
@@ -1691,7 +1693,7 @@ fn apply_fixes(report: &Report, consent: Consent, stream: &impl IsTerminal) {
                 // failed edit must not abort the rest, and it must not exit the
                 // command non-zero (the exit code is the diagnostic verdict, not
                 // the apply outcome).
-                let (glyph, tint) = style::Outcome::Failure.glyph_and_tint(p);
+                let (glyph, tint) = style::Outcome::Failure(e.fault()).glyph_and_tint(p);
                 crate::screen::chatter_styled(
                     crate::screen::Stream::Stdout,
                     &crate::style::gutter(&format!(
@@ -1712,7 +1714,7 @@ const FIX_INDENT: &str = "  ";
 /// again so they hang under the bullet.
 const FIX_BODY_INDENT: &str = "    ";
 
-/// Render one suggested-fix bullet: a bright-yellow bullet leading the detected
+/// Render one suggested-fix bullet: a soft-yellow bullet leading the detected
 /// problem, then the change as a `+` diff-add line, then the file it touches.
 ///
 /// Presented in the order a reader reasons about a fix: what is wrong, what will
@@ -1723,7 +1725,7 @@ fn fix_bullet(check: &Check, fix: &Fix, p: &style::Palette) -> String {
     let FixChange { change, file } = fix_change(fix);
     let mut out = format!(
         "\n{FIX_INDENT}{}• {}{}\n",
-        p.bright_yellow,
+        p.yellow,
         TerminalSafe::sanitize(&check.detail),
         p.reset
     );
@@ -2952,7 +2954,7 @@ mod tests {
     }
 
     #[test]
-    fn fix_bullet_is_bright_yellow_under_colour() {
+    fn fix_bullet_is_soft_yellow_under_colour() {
         let check = Check {
             group: Group::Target,
             id: "shared-target",
@@ -2966,8 +2968,8 @@ mod tests {
         let fix = check.fix.clone().expect("fix");
         let text = fix_bullet(&check, &fix, style::Palette::select(true));
         assert!(
-            text.contains(style::Palette::COLOR.bright_yellow),
-            "the bullet is bright-yellow on a colour terminal"
+            text.contains(style::Palette::COLOR.yellow),
+            "the bullet is soft yellow on a colour terminal"
         );
         assert!(text.contains("+ build.target-dir"), "a + change line");
     }

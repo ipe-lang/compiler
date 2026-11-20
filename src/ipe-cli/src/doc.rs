@@ -3679,7 +3679,7 @@ fn generate(path: &Path, out: &Path, write_format: WriteFormat) -> Result<(), Cl
         };
         crate::screen::status(
             crate::screen::Stream::Stdout,
-            true,
+            crate::style::Outcome::Success,
             &crate::style::TerminalSafe::sanitize(&format!(
                 "control model: {}; capabilities: {caps}",
                 disclosure.control_model,
@@ -3689,7 +3689,7 @@ fn generate(path: &Path, out: &Path, write_format: WriteFormat) -> Result<(), Cl
 
     crate::screen::status(
         crate::screen::Stream::Stdout,
-        true,
+        crate::style::Outcome::Success,
         &crate::style::TerminalSafe::sanitize(&format!(
             "documented {} module{} to {}",
             docs.modules.len(),

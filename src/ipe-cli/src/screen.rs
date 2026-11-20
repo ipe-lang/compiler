@@ -387,11 +387,11 @@ pub fn emit_report(format: crate::cli_args::OutputFormat, text: &str) {
     }
 }
 
-/// Write a completed step as its own screen on `stream`: the success or failure
-/// glyph, then `message` (see [`style::status_line`]).
-pub fn status(stream: Stream, ok: bool, message: &TerminalSafe) {
+/// Write a completed step as its own screen on `stream`: the glyph and tint
+/// `outcome` resolves, then `message` (see [`style::status_line`]).
+pub fn status(stream: Stream, outcome: style::Outcome, message: &TerminalSafe) {
     Screen::new(stream)
-        .guttered(&style::status_line(ok, message, stream.color()))
+        .guttered(&style::status_line(outcome, message, stream.color()))
         .emit();
 }
 
@@ -699,12 +699,10 @@ mod tests {
     ///
     /// The colour palette plus the diagnostic renderer's severity colours;
     /// anything else in a rendered screen was injected.
-    const OWN_ESCAPES: [&str; 13] = [
+    const OWN_ESCAPES: [&str; 11] = [
         Palette::COLOR.yellow,
-        Palette::COLOR.bright_yellow,
         Palette::COLOR.dim,
         Palette::COLOR.green,
-        Palette::COLOR.red,
         Palette::COLOR.light_red,
         Palette::COLOR.orange,
         Palette::COLOR.white,

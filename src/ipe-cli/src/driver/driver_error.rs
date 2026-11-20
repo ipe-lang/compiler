@@ -1106,7 +1106,7 @@ pub fn test_failed_message(code: i32) -> String {
     format!(
         "{}{} {}",
         style::GUTTER,
-        style::outcome_glyph(style::Outcome::Failure),
+        style::outcome_glyph(style::Outcome::Failure(crate::screen::Fault::User)),
         text::cli_test_failed_suffix(&code),
     )
 }
@@ -1293,7 +1293,8 @@ impl std::fmt::Display for CliError {
             // caller prints it as-is.
             Self::TestFailed { code } => f.write_str(&test_failed_message(*code)),
             Self::UpgradeNoPrebuilt { version, platform } => {
-                let glyph = style::outcome_glyph(style::Outcome::Failure);
+                let glyph =
+                    style::outcome_glyph(style::Outcome::Failure(crate::screen::Fault::User));
                 f.write_str(&style::gutter(&text::cli_upgrade_no_prebuilt(
                     &glyph, version, platform,
                 )))

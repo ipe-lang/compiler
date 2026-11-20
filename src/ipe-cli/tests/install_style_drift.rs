@@ -36,10 +36,9 @@ fn installer_palette_mirrors_the_style_ssot() {
     // spelling exactly while staying independent of which shell var holds it.
     for (name, escape) in [
         ("yellow", color.yellow),
-        ("bright_yellow", color.bright_yellow),
         ("dim", color.dim),
         ("green", color.green),
-        ("red", color.red),
+        ("orange", color.orange),
         ("bold", color.bold),
         ("reset", color.reset),
     ] {

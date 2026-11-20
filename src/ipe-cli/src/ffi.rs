@@ -2644,7 +2644,7 @@ fn add_one(
             j
         }
         Err(e) => {
-            stage.failure(format!("resolve failed for {crate_label}"));
+            stage.failure(e.fault(), format!("resolve failed for {crate_label}"));
             // A build failure from the inspector is not command-line misuse.
             return Err(match e {
                 CliError::Usage(msg) => map_inspector_error(msg),
@@ -2706,11 +2706,12 @@ fn add_one(
             Ok(())
         }
         Err(diag) => {
-            build_stage.failure(format!("build failed for {crate_label}"));
+            let err = ffi_build_error(diag);
+            build_stage.failure(err.fault(), format!("build failed for {crate_label}"));
             if verbose {
                 emit_raw_inspector_log(&doc_text);
             }
-            Err(ffi_build_error(diag))
+            Err(err)
         }
     }
 }

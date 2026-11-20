@@ -666,7 +666,7 @@ pub fn announce<O: FnOnce(&BrowserUrl) -> OpenOutcome>(
         })?;
     crate::screen::status(
         crate::screen::Stream::Stdout,
-        true,
+        crate::style::Outcome::Success,
         &crate::style::TerminalSafe::sanitize(serving(&url).as_str()),
     );
     let note = opener.and_then(|open| match open(&url) {

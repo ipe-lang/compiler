@@ -300,12 +300,14 @@ fn watch_line(text: &crate::style::TerminalSafe, role: WatchRole) -> String {
         WatchRole::Info => (p.dim, "", p.reset),
         WatchRole::Success => (p.green, "", p.reset),
         // A failed rebuild leaves the last-good binary running, so it is a soft
-        // warning, not a hard stop — a calm light yellow, never alarming red.
+        // warning, not a hard stop — the calm single soft yellow, never alarming
+        // orange or red.
         WatchRole::Failure => (
-            // Failure glyph from the SSOT; the tint is the soft warning amber,
-            // not red — a failed rebuild leaves the last-good binary running.
-            p.bright_yellow,
-            crate::style::outcome_glyph(crate::style::Outcome::Failure),
+            // Failure glyph from the SSOT; the tint is the soft warning yellow,
+            // not orange/light-red — a failed rebuild leaves the last-good
+            // binary running. The source error is the developer's to fix.
+            p.yellow,
+            crate::style::outcome_glyph(crate::style::Outcome::Failure(crate::screen::Fault::User)),
             p.reset,
         ),
     };
@@ -2810,12 +2812,12 @@ fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> std::io::Result<C
 fn compile_failed_frame(msg: &str, p: &crate::style::Palette) -> String {
     let safe_msg = crate::style::TerminalSafe::sanitize(msg.trim_end());
     // The failure glyph comes from the style SSOT; the tint is deliberately the
-    // soft warning amber, not the red a hard failure wears — the last-good binary
-    // stays up.
+    // soft warning yellow, not the orange/light-red a hard failure wears — the
+    // last-good binary stays up.
     let body = format!(
         "{}{} [ipe dev watch] build failed (last-good binary stays up):{}\n{}",
-        p.bright_yellow,
-        crate::style::outcome_glyph(crate::style::Outcome::Failure),
+        p.yellow,
+        crate::style::outcome_glyph(crate::style::Outcome::Failure(crate::screen::Fault::User,)),
         p.reset,
         safe_msg.as_str()
     );

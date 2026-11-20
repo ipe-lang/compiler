@@ -156,7 +156,7 @@ impl std::fmt::Display for ToolchainMissing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         use crate::style::{self, GUTTER};
         let task = self.intent.task_phrase();
-        let glyph = style::outcome_glyph(style::Outcome::Failure);
+        let glyph = style::outcome_glyph(style::Outcome::Failure(crate::screen::Fault::User));
         let name = match self.tool {
             Tool::Cargo => {
                 write!(

@@ -2201,10 +2201,10 @@ pub fn run_test(rest: &[String]) -> Result<(), CliError> {
             Ok(())
         }
         Err(err) => {
-            // The stage settles red before the error propagates to the
+            // The stage settles by blame before the error propagates to the
             // exit-code contract, naming what happened: a failing case, or a
             // run that never reached the tests.
-            stage.failure(test_stage_failure(&err));
+            stage.failure(err.fault(), test_stage_failure(&err));
             Err(err)
         }
     }
@@ -2280,13 +2280,14 @@ pub fn run_verify(rest: &[String]) -> Result<(), CliError> {
 
     for (index, (name, stage)) in VERIFY_STAGES.iter().enumerate() {
         let step = index + 1;
-        // Each stage is one progress line: a light-yellow running line that
-        // settles to a green ✓ or a red ✗ — the shared stage shape every
-        // multi-step command uses, not a hand-rolled colour print.
+        // Each stage is one progress line: a soft-yellow running line that
+        // settles to a green ✓ or an orange/light-red ✗ (by blame) — the
+        // shared stage shape every multi-step command uses, not a hand-rolled
+        // colour print.
         let line =
             progress::Stage::start(std::io::stdout(), format!("stage {step}/{total}: {name}"));
         if let Err(err) = stage(path) {
-            line.failure(format!("stage {step}/{total}: {name} failed"));
+            line.failure(err.fault(), format!("stage {step}/{total}: {name} failed"));
             // The stage ran correctly and reported a real failure — a gate
             // result, not a misuse of `verify`. Rewrap it as [`VerifyFailed`] so
             // the stage's own rendered report is shown alone, never the `verify`
@@ -2783,7 +2784,8 @@ fn run_upgrade_binary(
             return Ok(());
         }
         version_check::UpgradeAction::Unreachable => {
-            let (glyph, tint) = style::Outcome::Failure.glyph_and_tint(p);
+            let (glyph, tint) =
+                style::Outcome::Failure(crate::screen::Fault::User).glyph_and_tint(p);
             crate::screen::Screen::new(crate::screen::Stream::Stdout)
                 .styled(&format!(
                     "{tint}{glyph}{}  {}",
@@ -3137,7 +3139,7 @@ pub fn run_installer() -> Result<(), CliError> {
             script
         }
         Err(e) => {
-            download.failure("Could not download the installer.");
+            download.failure(e.fault(), "Could not download the installer.");
             return Err(e);
         }
     };

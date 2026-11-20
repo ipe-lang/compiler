@@ -2,11 +2,12 @@
 //! uses to report a running step and its outcome.
 //!
 //! A stage renders as a single gutter-indented line. While it runs the line is
-//! a light-yellow spinner and label (`  ⠙ Resolving the latest release…`); on
+//! a soft-yellow spinner and label (`  ⠙ Resolving the latest release…`); on
 //! success the SAME line is rewritten to a light-green check and message
-//! (`  ✓ Found ipe-v0.1.36`); on failure to a light-red cross and message
-//! (`  ✗ …`). The rewrite is a carriage return, so a completed stage leaves one
-//! settled line behind rather than a scroll of chatter.
+//! (`  ✓ Found ipe-v0.1.36`); on failure to a cross and message in orange (the
+//! user can fix it) or light red (an internal `ipe` bug) (`  ✗ …`). The
+//! rewrite is a carriage return, so a completed stage leaves one settled line
+//! behind rather than a scroll of chatter.
 //!
 //! The colour palette, gutter, spinner frames, and glyphs all come from
 //! [`crate::style`] — this module owns the stage *composition*, never a second
@@ -111,22 +112,23 @@ pub fn success_line(mode: Mode, msg: &TerminalLine) -> String {
     outcome_line(mode, Outcome::Success, msg)
 }
 
-/// Render the failure outcome for `msg`.
+/// Render the failure outcome for `msg`, blamed on `fault`.
 ///
-/// Terminal: a carriage return over the running line, the gutter, a light-red
-/// cross glyph, the light-red message, a clear-to-end, and a settling newline.
-/// Plain: the gutter, the cross glyph, and the plain message on their own line.
+/// Terminal: a carriage return over the running line, the gutter, a cross
+/// glyph and message in orange (a failure the user can fix) or light red (an
+/// internal `ipe` bug), a clear-to-end, and a settling newline. Plain: the
+/// gutter, the cross glyph, and the plain message on their own line.
 #[must_use]
-pub fn failure_line(mode: Mode, msg: &TerminalLine) -> String {
-    outcome_line(mode, Outcome::Failure, msg)
+pub fn failure_line(mode: Mode, fault: crate::screen::Fault, msg: &TerminalLine) -> String {
+    outcome_line(mode, Outcome::Failure(fault), msg)
 }
 
 /// The shared outcome shape: `<glyph> <msg>` in the outcome's tint, rewriting
 /// the running line in place on a terminal and standing alone in plain mode.
 ///
 /// The glyph and tint both come from `outcome` via the [`crate::style`] SSOT,
-/// so a success is a green check and a failure a red cross by one decision, not
-/// a per-site pairing.
+/// so a success is a green check and a failure's cross is orange or light red
+/// by blame, decided in one place, not a per-site pairing.
 fn outcome_line(mode: Mode, outcome: Outcome, msg: &TerminalLine) -> String {
     let p = mode.palette();
     let (glyph, color) = outcome.glyph_and_tint(p);
@@ -264,15 +266,16 @@ impl<W: Write> Stage<W> {
         let _ = self.writer.flush();
     }
 
-    /// Finish the stage as a failure, rewriting the running line to a light-red
-    /// cross and `msg`. Whether the command then stops or continues is the
-    /// caller's decision — this only renders the line.
-    pub fn failure(mut self, msg: impl AsRef<str>) {
+    /// Finish the stage as a failure, rewriting the running line to a cross and
+    /// `msg` tinted by `fault` — orange when the user can fix it, light red
+    /// when it is an internal `ipe` bug. Whether the command then stops or
+    /// continues is the caller's decision — this only renders the line.
+    pub fn failure(mut self, fault: crate::screen::Fault, msg: impl AsRef<str>) {
         self.finished = true;
         let _ = write!(
             self.writer,
             "{}",
-            failure_line(self.mode, &TerminalLine::sanitize(msg.as_ref()))
+            failure_line(self.mode, fault, &TerminalLine::sanitize(msg.as_ref()))
         );
         let _ = self.writer.flush();
     }
@@ -458,6 +461,7 @@ mod tests {
         assert_eq!(ok, "  ✓ Found ipe-v0.1.36\n");
         let bad = failure_line(
             Mode::Plain,
+            crate::screen::Fault::User,
             &TerminalLine::from("Binary not found — set IPE_VERSION"),
         );
         assert_eq!(bad, "  ✗ Binary not found — set IPE_VERSION\n");
@@ -468,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_running_line_rewrites_in_place_in_light_yellow() {
+    fn terminal_running_line_rewrites_in_place_in_soft_yellow() {
         let line = running_line(
             Mode::Terminal,
             &TerminalLine::from("Resolving the latest release…"),
@@ -479,9 +483,9 @@ mod tests {
         assert!(line.starts_with('\r'));
         assert!(!line.ends_with('\n'));
         assert!(line.contains(GUTTER));
-        // The running colour is light (bright) yellow, applied to both spinner
-        // and label.
-        assert!(line.contains(Palette::COLOR.bright_yellow));
+        // The running colour is the single soft yellow, applied to both
+        // spinner and label.
+        assert!(line.contains(Palette::COLOR.yellow));
         assert!(line.contains("Resolving the latest release…"));
         // Frame index 1 selects the second spinner frame.
         assert!(line.contains(style::SPINNER_FRAMES[1]));
@@ -497,21 +501,38 @@ mod tests {
         assert!(line.contains(style::glyph::OK));
         assert!(line.contains(Palette::COLOR.green));
         assert!(line.contains("Found ipe-v0.1.36"));
-        assert!(!line.contains(Palette::COLOR.red));
+        assert!(!line.contains(Palette::COLOR.orange));
+        assert!(!line.contains(Palette::COLOR.light_red));
     }
 
     #[test]
-    fn terminal_failure_is_light_red_and_settles_with_a_newline() {
-        let line = failure_line(
+    fn terminal_failure_is_orange_or_light_red_by_blame_and_settles_with_a_newline() {
+        let user = failure_line(
             Mode::Terminal,
+            crate::screen::Fault::User,
             &TerminalLine::from("Binary for latest release not found"),
         );
-        assert!(line.starts_with('\r'));
-        assert!(line.ends_with('\n'));
-        assert!(line.contains(style::glyph::FAIL));
-        assert!(line.contains(Palette::COLOR.red));
-        assert!(line.contains("Binary for latest release not found"));
-        assert!(!line.contains(Palette::COLOR.green));
+        assert!(user.starts_with('\r'));
+        assert!(user.ends_with('\n'));
+        assert!(user.contains(style::glyph::FAIL));
+        assert!(
+            user.contains(Palette::COLOR.orange),
+            "a user-fixable failure is orange"
+        );
+        assert!(user.contains("Binary for latest release not found"));
+        assert!(!user.contains(Palette::COLOR.green));
+        assert!(!user.contains(Palette::COLOR.light_red));
+
+        let internal = failure_line(
+            Mode::Terminal,
+            crate::screen::Fault::Internal,
+            &TerminalLine::from("decode produced an invalid frame"),
+        );
+        assert!(
+            internal.contains(Palette::COLOR.light_red),
+            "an internal ipe bug is light red"
+        );
+        assert!(!internal.contains(Palette::COLOR.orange));
     }
 
     #[test]
@@ -549,7 +570,10 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let stage = Stage::with_mode(&mut buf, Mode::Plain, "Checking for prebuilt binaries…");
-            stage.failure("No prebuilt binary — build from source");
+            stage.failure(
+                crate::screen::Fault::User,
+                "No prebuilt binary — build from source",
+            );
         }
         let text = String::from_utf8(buf).expect("stage output is utf-8");
         assert_eq!(
@@ -617,7 +641,7 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let stage = Stage::with_mode(&mut buf, Mode::Plain, "x\u{202E}y\n\x1b[2J");
-            stage.failure("a\u{200B}b\nc");
+            stage.failure(crate::screen::Fault::User, "a\u{200B}b\nc");
         }
         let text = String::from_utf8(buf).expect("stage output is utf-8");
         assert_eq!(text, "  xy\n  ✗ abc\n");
@@ -629,7 +653,10 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         {
             let stage = Stage::with_mode(&mut buf, Mode::Terminal, "x\u{202E}y\n\x1b[2J");
-            stage.failure("a\u{200B}b\nc\x1b]8;;https://evil\x07");
+            stage.failure(
+                crate::screen::Fault::User,
+                "a\u{200B}b\nc\x1b]8;;https://evil\x07",
+            );
         }
         let mut text = String::from_utf8(buf).expect("stage output is utf-8");
         assert!(
@@ -640,10 +667,8 @@ mod tests {
         for own in [
             CLEAR_TO_EOL,
             p.yellow,
-            p.bright_yellow,
             p.dim,
             p.green,
-            p.red,
             p.light_red,
             p.orange,
             p.white,

@@ -22,29 +22,30 @@ TAG_FILE="${IPE_UPGRADE_TAG_FILE:-}"
 # Every installer write to the terminal goes through this block. A message is a
 # single-quoted format plus values: the helpers fill each `%s` with the value
 # escaped by safe_text, so an environment- or network-derived value can never
-# drive or spoof the terminal. Style tokens (`@B@` bold, `@Y@` yellow, `@L@`
-# light yellow, `@D@` dim, `@G@` green, `@R@` red, `@0@` reset) are expanded in
+# drive or spoof the terminal. Style tokens (`@B@` bold, `@Y@` yellow, `@D@`
+# dim, `@G@` green, `@R@` orange, `@0@` reset) are expanded in
 # the format only, never in a value. The install-script tests scan the rest of
 # the script and refuse any other shape: a `$` in a format, a non-literal
 # format, a value count that differs from the `%s` count, or a terminal write
 # outside this block.
 
 # ── Palette ──────────────────────────────────────────────────────────────────
-# Mirror the CLI (style.rs): a soft Ipê-amarelo (256-colour 222) for the banner,
-# a light (bright) yellow (ANSI 93) for a running stage, a soft green (114) for
-# success, a plain red (31) for failure, a mid grey (244) for dim hints. Colour
-# only when stderr is a terminal and NO_COLOR is unset (per https://no-color.org).
+# Mirror the CLI (style.rs): a soft Ipê-amarelo (256-colour 222) for the banner
+# AND a running stage (one soft yellow, never a strong one), a soft green
+# (114) for success, an orange (38;5;215) for a failure the user can fix (this
+# installer never reaches an ipe-internal failure, so it carries no separate
+# internal colour), a mid grey (244) for dim hints. Colour only when stderr is
+# a terminal and NO_COLOR is unset (per https://no-color.org).
 if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
   C_YELLOW="$(printf '\033[38;5;222m')"
-  C_LYELLOW="$(printf '\033[93m')"
   C_DIM="$(printf '\033[38;5;244m')"
   C_GREEN="$(printf '\033[38;5;114m')"
-  C_RED="$(printf '\033[31m')"
+  C_ORANGE="$(printf '\033[38;5;215m')"
   C_BOLD="$(printf '\033[1m')"
   C_RESET="$(printf '\033[0m')"
   IS_TTY=1
 else
-  C_YELLOW=''; C_LYELLOW=''; C_DIM=''; C_GREEN=''; C_RED=''; C_BOLD=''; C_RESET=''
+  C_YELLOW=''; C_DIM=''; C_GREEN=''; C_ORANGE=''; C_BOLD=''; C_RESET=''
   IS_TTY=0
 fi
 
@@ -158,10 +159,9 @@ msg_style() {
     case "${_ms_rest%"$_ms_tail"}" in
       @B@) _ms_code="$C_BOLD" ;;
       @Y@) _ms_code="$C_YELLOW" ;;
-      @L@) _ms_code="$C_LYELLOW" ;;
       @D@) _ms_code="$C_DIM" ;;
       @G@) _ms_code="$C_GREEN" ;;
-      @R@) _ms_code="$C_RED" ;;
+      @R@) _ms_code="$C_ORANGE" ;;
       @0@) _ms_code="$C_RESET" ;;
       *) _ms_code='@'; _ms_tail="${_ms_rest#@}" ;;
     esac
@@ -206,9 +206,9 @@ prompt() {
 
 # ── Stage progress ───────────────────────────────────────────────────────────
 # The streamlined per-stage shape shared with the CLI (src/ipe-cli/src/progress.rs):
-# while a stage runs it is one line — a light-yellow spinner + label; on success
+# while a stage runs it is one line — a soft-yellow spinner + label; on success
 # the SAME line is rewritten (carriage return) to a light-green ✓ + message; on
-# failure to a light-red ✗ + message. Off a terminal (pipe / CI / NO_COLOR) each
+# failure to an orange ✗ + message. Off a terminal (pipe / CI / NO_COLOR) each
 # stage is one plain flush-left line with no spinner, no rewrite, and no ANSI, so
 # `curl … | sh` logs stay clean. All chatter goes to stderr so stdout stays clean.
 #
@@ -217,14 +217,14 @@ prompt() {
 STAGE_LABEL=''
 
 # stage_start FMT [VALUE...] — paint the running line (spinner frame 0 + label
-# in light yellow) with no trailing newline on a terminal, so the outcome
+# in soft yellow) with no trailing newline on a terminal, so the outcome
 # overwrites it.
 stage_start() {
   msg_text "$@"
   STAGE_LABEL="$MSG_TEXT"
   if [ "$IS_TTY" = 1 ]; then
     printf '\r  %s⠋%s %s%s%s\033[0K' \
-      "$C_LYELLOW" "$C_RESET" "$C_LYELLOW" "$STAGE_LABEL" "$C_RESET" >&2
+      "$C_YELLOW" "$C_RESET" "$C_YELLOW" "$STAGE_LABEL" "$C_RESET" >&2
   else
     printf '  %s\n' "$STAGE_LABEL" >&2
   fi
@@ -242,12 +242,12 @@ stage_settle_ok() {
   STAGE_LABEL=''
 }
 
-# stage_settle_fail TEXT — rewrite the running line to a light-red ✗ and the
+# stage_settle_fail TEXT — rewrite the running line to an orange ✗ and the
 # rendered TEXT (terminal), or emit one plain line (non-terminal).
 stage_settle_fail() {
   if [ "$IS_TTY" = 1 ]; then
     printf '\r  %s✗%s %s%s%s\033[0K\n' \
-      "$C_RED" "$C_RESET" "$C_RED" "$1" "$C_RESET" >&2
+      "$C_ORANGE" "$C_RESET" "$C_ORANGE" "$1" "$C_RESET" >&2
   else
     printf '  ✗ %s\n' "$1" >&2
   fi
@@ -297,7 +297,7 @@ die() {
   if [ -n "$STAGE_LABEL" ]; then
     stage_settle_fail "$MSG_TEXT"
   else
-    printf '\n  %s✗%s %s%s%s\n' "$C_RED" "$C_RESET" "$C_RED" "$MSG_TEXT" "$C_RESET" >&2
+    printf '\n  %s✗%s %s%s%s\n' "$C_ORANGE" "$C_RESET" "$C_ORANGE" "$MSG_TEXT" "$C_RESET" >&2
   fi
   exit 1
 }

@@ -572,13 +572,12 @@ impl CargoBuild<'_> {
         let mode = Mode::for_stream(&stderr);
         let live = Mutex::new(Live::new(stderr, mode, self.output.verbosity(), self.what));
         let drained = run_to_exit(cmd, ARTIFACT_STREAM_CAP, wall, &live).map_err(io_err)?;
-        let built = matches!(&drained.waited, BuildExit::Exited(status) if status.success())
-            && drained.stdout.error.is_none()
-            && drained.stderr.error.is_none();
+        let verdict = self.verdict(drained);
+        let outcome = verdict.as_ref().map(|_| ()).map_err(|e| e.fault());
         live.into_inner()
             .unwrap_or_else(PoisonError::into_inner)
-            .finish(built);
-        let stdout = self.verdict(drained)?;
+            .finish(outcome);
+        let stdout = verdict?;
         if let Some(dir) = self.krate.owned() {
             dir.verify()?;
         }
@@ -941,7 +940,7 @@ fn establish_lock(
     if let Some(stage) = stage {
         match &locked {
             Ok(locked) => stage.success(locked.settled()),
-            Err(_) => stage.failure("dependency resolution failed"),
+            Err(_) => stage.failure(crate::screen::Fault::User, "dependency resolution failed"),
         }
     }
     locked
@@ -1553,19 +1552,19 @@ impl<W: Write> Live<W> {
         }
     }
 
-    /// Settle the stage: a success naming the crates built, or a failure.
-    fn finish(self, built: bool) {
+    /// Settle the stage: a success naming the crates built, or a failure
+    /// tinted by `outcome`'s blame.
+    fn finish(self, outcome: Result<(), crate::screen::Fault>) {
         if let Self::Progress(build) = self {
-            if built {
-                build.stage.success(format!(
+            match outcome {
+                Ok(()) => build.stage.success(format!(
                     "compiled {} ({})",
                     build.what,
                     crates_built(build.built)
-                ));
-            } else {
-                build
+                )),
+                Err(fault) => build
                     .stage
-                    .failure(format!("compiling {} failed", build.what));
+                    .failure(fault, format!("compiling {} failed", build.what)),
             }
         }
     }
@@ -1992,7 +1991,7 @@ mod tests {
                 let live = progress_live(&mut buf, mode);
                 feed_stdout(HOSTILE.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
                 assert_eq!(counted(&live), 1, "{mode:?}");
-                live.into_inner().expect("unpoisoned").finish(true);
+                live.into_inner().expect("unpoisoned").finish(Ok(()));
             }
             let out = String::from_utf8(buf).expect("utf8");
             for forbidden in ["\x1b[2J", "\x1b]", "\x1b[31m", "\x07"] {
@@ -2065,7 +2064,7 @@ mod tests {
             let stdout = format!("{record}\n").repeat(5000);
             feed_stdout(stdout.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
             assert_eq!(counted(&live), 5000);
-            live.into_inner().expect("unpoisoned").finish(true);
+            live.into_inner().expect("unpoisoned").finish(Ok(()));
         }
         let out = String::from_utf8(buf).expect("utf8");
         let budget = usize::try_from(super::PLAIN_PROGRESS_LINES).expect("small") + 2;
@@ -2098,7 +2097,9 @@ mod tests {
                 "{{\"reason\":\"compiler-artifact\",\"target\":{{\"name\":\"{name}\"}}}}\n"
             );
             feed_stdout(record.as_bytes(), super::ARTIFACT_STREAM_CAP, &live);
-            live.into_inner().expect("unpoisoned").finish(false);
+            live.into_inner()
+                .expect("unpoisoned")
+                .finish(Err(crate::screen::Fault::User));
         }
         let out = String::from_utf8(buf).expect("utf8");
         let shown = "n".repeat(super::CRATE_NAME_SHOWN);
