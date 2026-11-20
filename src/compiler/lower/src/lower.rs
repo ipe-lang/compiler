@@ -27701,14 +27701,29 @@ impl<'a> Lowerer<'a> {
     /// IPE-L0135 ([`Feature::NonCloneValueReuse`]) at `span` when the emitted
     /// type holds a non-`Clone` leaf under its generic bounds.
     fn clone_reproduced_succeed_payload(&self, span: Span, value: Expr) -> DResult<Expr> {
-        let refused = self.region_ty(span).is_some_and(|solved| {
-            self.ir_type_from_ty(solved, span)
-                .is_ok_and(|ty| bounded_nonclone(self.clone_env(), &ty))
-        });
-        if refused {
-            return Err(unsupported(span, Feature::NonCloneValueReuse));
+        if let Some(solved) = self.region_ty(span) {
+            self.refuse_nonclone_succeed_payload(solved, span)?;
         }
         Ok(value)
+    }
+
+    /// Refuse a `succeed` payload type the factory cannot reproduce by
+    /// `.clone()`.
+    ///
+    /// A payload type that does not lower here is passed through: its carrier
+    /// is judged where the payload is lowered.
+    ///
+    /// # Errors
+    /// IPE-L0135 ([`Feature::NonCloneValueReuse`]) at `span` when the emitted
+    /// payload type holds a non-`Clone` leaf under its generic bounds.
+    fn refuse_nonclone_succeed_payload(&self, payload: &Ty, span: Span) -> DResult<()> {
+        if self
+            .ir_type_from_ty(payload, span)
+            .is_ok_and(|ty| bounded_nonclone(self.clone_env(), &ty))
+        {
+            return Err(unsupported(span, Feature::NonCloneValueReuse));
+        }
+        Ok(())
     }
 
     /// The parameter types and return type of the `arity`-arrow callee at `span`.
@@ -27937,6 +27952,18 @@ impl<'a> Lowerer<'a> {
                 "callee type has fewer arrows than its arity",
             ),
         )?;
+        // A point-free `succeed` reaches its payload factory through the eta
+        // parameter, which the factory reproduces by `.clone()` exactly as a
+        // saturated call's payload: the same IPE-L0135 refusal applies.
+        if matches!(
+            resolved,
+            Callee::Kernel(
+                KernelFn::JsonDecSucceed | KernelFn::DbDecSucceed | KernelFn::ConfigSucceed
+            )
+        ) && let Some(payload) = arg_tys.first()
+        {
+            self.refuse_nonclone_succeed_payload(payload, call_span)?;
+        }
 
         let supplied = lowered_args.len();
         // The missing parameters are argument positions `supplied..arity`.

@@ -18293,13 +18293,19 @@ impl StdlibKernel {
     ///
     /// Such a kernel's emit arm carries a bridge or a guard (the input
     /// subscriptions' `KeyEvent` bridge and surface check, `Task.loop`'s bridge
-    /// from the emitted `Step` enum to the runtime `LoopStep`) that a point-free
-    /// first-class reference would bypass, so the lowerer eta-expands every
-    /// point-free reference to it into `\x -> kernel x` and the backend refuses
-    /// to box it as a bare function value.
+    /// from the emitted `Step` enum to the runtime `LoopStep`, `succeed`'s
+    /// payload factory over the runtime `decode_succeed`'s `Fn() -> A`
+    /// parameter) that a point-free first-class reference would bypass, so the
+    /// lowerer eta-expands every point-free reference to it into
+    /// `\x -> kernel x` and the backend refuses to box it as a bare function
+    /// value.
     #[must_use]
     pub const fn requires_saturated_emit(self) -> bool {
-        self.input_surface().is_some() || matches!(self, Self::TaskLoop)
+        self.input_surface().is_some()
+            || matches!(
+                self,
+                Self::TaskLoop | Self::JsonDecSucceed | Self::DbDecSucceed | Self::ConfigSucceed
+            )
     }
 
     /// `true` when this variant belongs to the `Ipe.CssSafety` leaf
