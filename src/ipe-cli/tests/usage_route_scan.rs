@@ -141,7 +141,7 @@ const ADMITTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "init.rs",
-        "project_name_for",
+        "target_dir_name",
         1,
         "a target path argument with no final name to call the project",
     ),
