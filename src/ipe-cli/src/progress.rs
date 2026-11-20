@@ -234,7 +234,7 @@ impl RowState {
     }
 
     /// Record where the cursor is after a write that ended a line or did not.
-    fn settle_cursor(&mut self, ended_line: bool) {
+    const fn settle_cursor(&mut self, ended_line: bool) {
         self.cursor = if ended_line && self.handed == 0 {
             Cursor::Clean
         } else {
@@ -243,7 +243,7 @@ impl RowState {
     }
 
     /// Whether every live slot is taken.
-    fn full(&self) -> bool {
+    const fn full(&self) -> bool {
         self.live.len() >= MAX_LIVE_STAGES
     }
 
@@ -337,7 +337,7 @@ fn row() -> &'static Row {
 /// Off a terminal the bytes go straight through. On a terminal a live stage's
 /// line is cleared first and repainted after a write that ends a line.
 #[derive(Clone, Debug)]
-pub enum Door {
+pub(crate) enum Door {
     /// The process's stdout.
     Stdout,
     /// The process's stderr.
@@ -398,7 +398,7 @@ impl Write for Door {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.with_raw(Write::flush)
+        self.with_raw(|raw| raw.flush())
     }
 }
 
@@ -495,7 +495,7 @@ struct Painter<W> {
 }
 
 impl<W> Painter<W> {
-    fn new(writer: W, label: TerminalLine) -> Self {
+    const fn new(writer: W, label: TerminalLine) -> Self {
         Self {
             cell: Mutex::new(Paint {
                 writer,
@@ -1000,30 +1000,30 @@ pub(crate) mod testing {
     use super::Timing;
 
     /// A ticker that turns every millisecond from the start.
-    pub(crate) const QUICK: Timing = Timing {
+    pub const QUICK: Timing = Timing {
         delay: Duration::ZERO,
         frame: Duration::from_millis(1),
     };
 
     /// A ticker that never turns within a test, so painted bytes are exact.
-    pub(crate) const FROZEN: Timing = Timing {
+    pub const FROZEN: Timing = Timing {
         delay: Duration::ZERO,
         frame: Duration::from_secs(3600),
     };
 
     /// A writer whose bytes the test still holds after the stage drops it.
     #[derive(Clone, Default, Debug)]
-    pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
+    pub struct Capture(Arc<Mutex<Vec<u8>>>);
 
     impl Capture {
         /// Everything written so far, lossily decoded.
-        pub(crate) fn text(&self) -> String {
+        pub fn text(&self) -> String {
             let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             String::from_utf8_lossy(&bytes).into_owned()
         }
 
         /// How many clones of this capture are alive, this one included.
-        pub(crate) fn handles(&self) -> usize {
+        pub fn handles(&self) -> usize {
             Arc::strong_count(&self.0)
         }
     }
