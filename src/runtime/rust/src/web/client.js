@@ -1112,9 +1112,16 @@ function __ipeFocusSettleDue(rec) {
       !__ipeRuntimeFocusing;
 }
 // Whether a frame arms the drop check (`dom::focus::arms`): focus is held, by
-// the node focused before the frame, and some patch targets the chain.
-function __ipeFocusArms(chain, patched, heldUnchanged, focusHeld) {
-  return focusHeld && heldUnchanged && chain.some(function(link) { return patched(link.id); });
+// the node focused before the frame, and some patch targets the chain or an
+// earlier frame's check carries.
+function __ipeFocusArms(chain, patched, heldUnchanged, focusHeld, carried) {
+  return focusHeld && heldUnchanged && (carried || chain.some(function(link) { return patched(link.id); }));
+}
+// Whether an earlier frame's armed drop check carries into this frame
+// (`dom::focus::carries`): armed on the node focused before this frame, with
+// no focus move since.
+function __ipeFocusCarries(armedOnHeld, noMoveSince) {
+  return armedOnHeld && noMoveSince;
 }
 // Whether a drop answers the armed check (`dom::focus::drop_answers`): the
 // held node itself lost focus to nothing.
@@ -1127,6 +1134,7 @@ function __ipeKeepFocus(run, patches) {
   var before = __ipeDoc.active();
   var chain = __ipeFocusChain(__ipeDoc.byId("ipe-root"));
   var epoch = __ipeFocusEpoch;
+  var earlier = __ipeFocusPending;
   __ipeFocusPending = null;
   run();
   if (chain === null) return;
@@ -1137,8 +1145,10 @@ function __ipeKeepFocus(run, patches) {
   var patched = function(id) {
     return patches.some(function(p) { return String(p.id) === id; });
   };
+  var carried = !!earlier &&
+      __ipeFocusCarries(earlier.held === before, earlier.rec.epoch === epoch);
   if (__ipeFocusArms(chain, patched, !!held && held === before,
-      !!held && held !== __ipeDoc.body())) {
+      !!held && held !== __ipeDoc.body(), carried)) {
     __ipeFocusPending = {chain: chain, rec: rec, held: held};
   }
 }

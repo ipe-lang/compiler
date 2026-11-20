@@ -33,17 +33,32 @@ pub const FOCUS_DROP_EVENT: &str = "focusout";
 /// Whether a frame arms the drop check after its synchronous check S.
 ///
 /// Armed only when focus is held, the held node is the node focused before
-/// the frame, and some patch of the frame targets an `ipe-id` on the recorded
-/// chain: with no patch on the chain the frame cannot have dropped focus, so a
-/// later drop is no frame's and is never undone.
+/// the frame, and either some patch of the frame targets an `ipe-id` on the
+/// recorded chain or the check is `carried` (see [`carries`]): with neither,
+/// no frame can have dropped focus, so a later drop is no frame's and is never
+/// undone.
 #[must_use]
 pub fn arms(
     chain: &[FocusLink],
     patched: impl Fn(&str) -> bool,
     held_unchanged: bool,
     focus_held: bool,
+    carried: bool,
 ) -> bool {
-    focus_held && held_unchanged && chain.iter().any(|link| patched(&link.id))
+    focus_held && held_unchanged && (carried || chain.iter().any(|link| patched(&link.id)))
+}
+
+/// Whether the drop check an earlier frame armed carries into this frame.
+///
+/// It carries when it was armed on the node focused before this frame and no
+/// focus move was counted since it was recorded. The browser's drop for a node
+/// a patch made unfocusable may come after any number of later frames, so a
+/// frame that does not touch the chain hands the armed check on rather than
+/// expiring it: whether the drop is answered never depends on an unrelated
+/// frame landing first.
+#[must_use]
+pub const fn carries(armed_on_held: bool, no_move_since: bool) -> bool {
+    armed_on_held && no_move_since
 }
 
 /// Whether a drop event answers the armed check.
@@ -339,18 +354,37 @@ mod tests {
     #[test]
     fn arms_needs_a_patch_on_the_chain() {
         let chain = [link("a", "div"), link("b", "button")];
-        assert!(!arms(&chain, |id| id == "c", true, true));
-        assert!(arms(&chain, |id| id == "a", true, true));
-        assert!(arms(&chain, |id| id == "b", true, true));
-        assert!(!arms(&[], |_| true, true, true));
+        assert!(!arms(&chain, |id| id == "c", true, true, false));
+        assert!(arms(&chain, |id| id == "a", true, true, false));
+        assert!(arms(&chain, |id| id == "b", true, true, false));
+        assert!(!arms(&[], |_| true, true, true, false));
     }
 
     #[test]
     fn arms_refuses_a_moved_or_lost_focus() {
         let chain = [link("a", "div")];
-        assert!(!arms(&chain, |_| true, false, true));
-        assert!(!arms(&chain, |_| true, true, false));
-        assert!(!arms(&chain, |_| true, false, false));
+        for carried in [false, true] {
+            assert!(!arms(&chain, |_| true, false, true, carried));
+            assert!(!arms(&chain, |_| true, true, false, carried));
+            assert!(!arms(&chain, |_| true, false, false, carried));
+        }
+    }
+
+    /// A frame that touches nothing on the chain keeps an earlier frame's
+    /// armed check alive, so a drop the browser makes after it still lands.
+    #[test]
+    fn arms_carries_an_armed_check_through_an_untouched_frame() {
+        let chain = [link("a", "div"), link("b", "button")];
+        assert!(arms(&chain, |id| id == "c", true, true, true));
+        assert!(arms(&chain, |_| false, true, true, true));
+    }
+
+    #[test]
+    fn carries_only_on_the_same_node_with_no_move_since() {
+        assert!(carries(true, true));
+        assert!(!carries(true, false));
+        assert!(!carries(false, true));
+        assert!(!carries(false, false));
     }
 
     #[test]
@@ -387,12 +421,16 @@ mod tests {
             "no frame-count deferred check"
         );
         let frame = rust_fn(code, "apply_frame");
-        let cleared = frame.find("FOCUS_PENDING.set(None);");
+        let cleared = frame.find("let earlier = FOCUS_PENDING.take();");
         let applied = frame.find("apply(document, patches);");
         assert!(
             matches!((cleared, applied), (Some(c), Some(a)) if c < a)
                 && !frame.contains("request_animation_frame"),
             "`apply_frame` clears the pending check before it applies and counts no frames: {cleared:?} {applied:?}"
+        );
+        assert!(
+            frame.contains("carries(") && frame.contains("earlier"),
+            "`apply_frame` hands an earlier frame's armed check on, never drops it unanswered"
         );
         let install = rust_fn(code, "install_focus_epoch");
         let guard = install.find("if FOCUS_EPOCH_INSTALLED.with(Cell::get) {");

@@ -1064,6 +1064,33 @@ test("focus-across-patch: a focused button disabled in place lands on the ancest
   await expect(page.locator("#keys")).toHaveText("keys: j");
 });
 
+test("focus-across-patch: a drop the browser makes after a later untouched frame still lands on the ancestor", async ({ page }) => {
+  await open(page);
+  const frame = await clickHeld(page, "#disableself");
+  expect(inPlace(frame, "disabled")).toBe(true);
+  // A second frame, off the button's chain, held behind the first: both commit
+  // in one task, before the browser drops focus from the disabled button.
+  await page.keyboard.press("j");
+  await expect.poll(() => page.evaluate(() => window.__testHeld.length)).toBe(2);
+  const later = await page.evaluate(() => JSON.parse(window.__testHeld[1][0]));
+  const chain = await page.evaluate(() => {
+    const ids = [];
+    for (let at = document.getElementById("disableself"); at; at = at.parentElement) {
+      const id = at.getAttribute("ipe-id");
+      if (id !== null) ids.push(id);
+    }
+    return ids;
+  });
+  expect(later.patches.length).toBeGreaterThan(0);
+  expect(later.patches.some((p) => chain.includes(String(p.id)))).toBe(false);
+  await deliverHeldBeforeAnimationFrames(page);
+  await expect(page.locator("#disableself")).toBeDisabled();
+  await expect(page.locator("#keys")).toHaveText("keys: j");
+  await expect.poll(() => focusedId(page)).toBe("keephost");
+  await runHeldAnimationFrames(page);
+  expect(await focusedId(page)).toBe("keephost");
+});
+
 /** Waits one task posted after every task the page has posted so far, then two rendering steps. */
 async function aTaskThenSettle(page) {
   await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 0)));

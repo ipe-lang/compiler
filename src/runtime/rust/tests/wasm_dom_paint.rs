@@ -419,6 +419,35 @@ async fn a_control_disabled_in_place_lands_on_the_ancestor_whenever_the_browser_
 }
 
 #[wasm_bindgen_test]
+async fn a_drop_after_a_later_untouched_frame_still_lands_on_the_ancestor() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "fkc",
+        r#"<div ipe-id="fkc_0_div" id="fkc-host" tabindex="-1"><button ipe-id="fkc_0_div_0_button" id="fkc-btn">go</button></div><p ipe-id="fkc_1_p" id="fkc-side">a</p>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    assert!(focus_on(&doc, "fkc-btn"));
+    // The frame that disables the button, then one off its chain, both before
+    // the browser drops focus from it.
+    let disable = [patch("fkc_0_div_0_button", None, &[("disabled", Some(""))])];
+    apply_frame(&doc, &disable, None, &QueuedCause::default());
+    let side = [patch("fkc_1_p", None, &[("class", Some("lit"))])];
+    apply_frame(&doc, &side, None, &QueuedCause::default());
+    if let Some(button) =
+        by_id(&doc, "fkc-btn").and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = button.blur();
+    }
+    a_task().await;
+    assert_eq!(focused_id(&doc), "fkc-host");
+    root.remove();
+}
+
+#[wasm_bindgen_test]
 async fn a_script_blur_after_an_untouched_frame_stays_on_the_body() {
     let doc = document();
     assert!(doc.is_some(), "run_in_browser must provide a document");

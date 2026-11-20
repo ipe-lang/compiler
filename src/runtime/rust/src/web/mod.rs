@@ -10137,6 +10137,14 @@ mod base_path_tests {
         let cleared = keep.find("__ipeFocusPending = null;");
         let run = keep.find("run();");
         assert!(
+            keep.contains("var earlier = __ipeFocusPending;")
+                && keep.contains(
+                    "__ipeFocusCarries(earlier.held === before, earlier.rec.epoch === epoch)"
+                )
+                && keep.contains("!!held && held !== __ipeDoc.body(), carried)"),
+            "the commit hands an earlier frame's armed drop check on, never drops it unanswered"
+        );
+        assert!(
             matches!((cleared, run), (Some(c), Some(r)) if c < r)
                 && !js.contains("requestAnimationFrame")
                 && !js.contains("__ipeFocusKeep"),
@@ -10175,8 +10183,13 @@ mod base_path_tests {
         assert_eq!(event, Some(crate::dom::focus::FOCUS_DROP_EVENT));
         assert_eq!(
             js_function(js, "__ipeFocusArms").unwrap_or_default(),
-            "\nfunction __ipeFocusArms(chain, patched, heldUnchanged, focusHeld) {\n  return focusHeld && heldUnchanged && chain.some(function(link) { return patched(link.id); });",
+            "\nfunction __ipeFocusArms(chain, patched, heldUnchanged, focusHeld, carried) {\n  return focusHeld && heldUnchanged && (carried || chain.some(function(link) { return patched(link.id); }));",
             "`__ipeFocusArms` is `dom::focus::arms`"
+        );
+        assert_eq!(
+            js_function(js, "__ipeFocusCarries").unwrap_or_default(),
+            "\nfunction __ipeFocusCarries(armedOnHeld, noMoveSince) {\n  return armedOnHeld && noMoveSince;",
+            "`__ipeFocusCarries` is `dom::focus::carries`"
         );
         assert_eq!(
             js_function(js, "__ipeFocusDropAnswers").unwrap_or_default(),

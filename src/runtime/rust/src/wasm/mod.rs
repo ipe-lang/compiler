@@ -40,8 +40,8 @@ use crate::dom::{
     HandlerIndex, WebReq, build_index,
     diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, StampedId, diff, focus_target},
     focus::{
-        FOCUS_DROP_EVENT, FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, arms, chain_from_ancestry,
-        drop_answers, landing, settle_due,
+        FOCUS_DROP_EVENT, FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, arms, carries,
+        chain_from_ancestry, drop_answers, landing, settle_due,
     },
     keep::{AUTHORITY_ATTRS, Control, Field, Keep, is_authority_attr, keep},
 };
@@ -2380,10 +2380,11 @@ fn commit_frame(patches: &[Patch], target: Option<&StampedId>, queued: &QueuedCa
 /// Applies `patches` (the `Vec<Patch>` the SSE wire serialises, through typed
 /// web-sys calls, each target found by its `ipe-id` as in `client.js`), then
 /// focuses `target`. Focus the frame left on the body is put back by the rule
-/// of [`crate::dom::focus`] at once; when the frame patched the focused node's
-/// chain and focus held, the browser's own later drop of that node to nothing
-/// is answered once, by the drop event it raises. A restore moves a pending
-/// user mark in `queued` onto the landing node.
+/// of [`crate::dom::focus`] at once; when the frame (or an earlier one whose
+/// check it carries) patched the focused node's chain and focus held, the
+/// browser's own later drop of that node to nothing is answered once, by the
+/// drop event it raises. A restore moves a pending user mark in `queued` onto
+/// the landing node.
 pub fn apply_frame(
     document: &web_sys::Document,
     patches: &[Patch],
@@ -2438,7 +2439,9 @@ pub fn apply_frame(
         .clone()
         .and_then(|focused| view_chain(document, focused));
     let focus_epoch = FOCUS_EPOCH.with(Cell::get);
-    FOCUS_PENDING.set(None);
+    // Taken before the commit: a drop the commit raises answers no record. An
+    // armed check on the node still held is handed on to this frame below.
+    let earlier = FOCUS_PENDING.take();
     apply(document, patches);
     if let Some(target) = target {
         focus_stamped(document, target.as_str());
@@ -2454,11 +2457,18 @@ pub fn apply_frame(
     let rec = Recorded { focus_epoch, frame };
     keep_focus(document, &chain, rec, queued);
     let held = document.active_element();
+    let carried = earlier.is_some_and(|armed| {
+        carries(
+            before.as_ref() == Some(&armed.held),
+            armed.rec.focus_epoch == focus_epoch,
+        )
+    });
     let armed = arms(
         &chain,
         |id| patches.iter().any(|p| p.id == id),
         held.is_some() && held == before,
         !focus_on_body(document),
+        carried,
     );
     // The drop listener is installed here too: a frame can commit before a
     // mount installed the focus-move listeners.
