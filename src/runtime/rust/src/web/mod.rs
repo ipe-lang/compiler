@@ -2945,9 +2945,10 @@ fn dispatch_cmd<Msg: Send + 'static>(
                         }
                     }),
                 );
+                // A refused start ends the session, as a trip in the Cmd would.
                 match started {
                     Ok(task) => task.detach(crate::threads::Detached::IpeOwned(cmds.ends())),
-                    Err(refused) => crate::system::emit_runtime_log("live", &refused.to_string()),
+                    Err(refused) => cmds.ends().end(crate::threads::OwnerEnd::Refused(refused)),
                 }
             }
             cmd_admission::Admit::Refused(msg) => cmd_admission::deliver_refusal(msg, tx, cmds),
@@ -3231,13 +3232,15 @@ async fn take_input<Model, Msg, T>(
 }
 
 /// The 500 a session publication answers when it panicked or tripped.
+///
+/// `reference` is the correlation id the fault was logged under.
 #[cfg(feature = "web")]
-fn publication_500(payload: &(dyn std::any::Any + Send)) -> axum::response::Response {
+fn publication_500(reference: &str) -> axum::response::Response {
     use axum::response::IntoResponse;
     (
         axum::http::StatusCode::INTERNAL_SERVER_ERROR,
         [(axum::http::header::CONTENT_TYPE, "application/json")],
-        crate::core::panic_500_body(payload),
+        crate::core::internal_error_body(reference),
     )
         .into_response()
 }
@@ -3348,7 +3351,7 @@ async fn drive_session<Model, Msg, FUpdate, FView, FSubs>(
     let sid = scope.sid().to_owned();
     // One keyed subscription runtime per session: a re-evaluation keeps a
     // still-requested `Sub.every` timer and its phase.
-    let mut sub_runtime = SubRuntime::new(msg_tx.clone());
+    let mut sub_runtime = SubRuntime::new(msg_tx.clone(), cmds.ends());
 
     // Register initial subscriptions at session creation, before the first
     // event. Without this a watch-only session never subscribes until it
@@ -5924,11 +5927,11 @@ mod handlers {
                     store::Installed::Refused(_) => {
                         StoreWriteFailure::SetRefused.count();
                         drop(owner);
-                        return installed;
+                        return Ok(installed);
                     }
                     store::Installed::Displaced => {
                         drop(owner);
-                        return installed;
+                        return Ok(installed);
                     }
                 }
                 // The life's port endpoints open now the store holds this session,
@@ -5975,13 +5978,21 @@ mod handlers {
                         sid.to_owned(),
                         Arc::downgrade(&entry),
                     ),
-                    Err(refused) => crate::system::emit_runtime_log("live", &refused.to_string()),
+                    // No driver would ever take the session's Msgs: the session
+                    // ends before its seed Cmd runs, and nothing is published.
+                    Err(refused) => {
+                        crate::system::emit_runtime_log("live", &refused.to_string());
+                        close_session(&store, sid, Some(&entry), CloseReason::Ended).await;
+                        drop(birth);
+                        drop(owner);
+                        return Err(refused);
+                    }
                 }
                 // Fire the entry Cmd into the loop (batched after init's on a miss).
                 pubsub::with_session(&scope, || run_cmd(cmd0, &msg_tx, &scope, &cmds));
                 drop(birth);
                 drop(owner);
-                installed
+                Ok(installed)
             }),
         );
         let Ok(commit) = commit else {
@@ -5989,22 +6000,33 @@ mod handlers {
         };
         // The publication runs to its end even when this request is dropped.
         match commit
-            .join_shielded(crate::threads::Detached::IpeOwned(publication_ends))
+            .join_shielded(crate::threads::Detached::IpeOwned(publication_ends.clone()))
             .await
         {
-            Ok(Some(store::Installed::Held | store::Installed::Diverged(_))) => {}
+            Ok(Some(Ok(store::Installed::Held | store::Installed::Diverged(_)))) => {}
             // The store cannot persist the session: nothing was published,
             // no cookie is set, and the claim is released.
-            Ok(Some(store::Installed::Refused(_))) => return store_unavailable(),
-            // A displaced sid, or a shutdown that closed first: nothing was
-            // published, and the claim is released.
-            Ok(Some(store::Installed::Displaced) | None) => return entry_unavailable(),
+            Ok(Some(Ok(store::Installed::Refused(_)))) => return store_unavailable(),
+            // A displaced sid, a session whose driver could not start, or a
+            // shutdown that closed first: nothing was published, and the
+            // claim is released.
+            Ok(Some(Ok(store::Installed::Displaced) | Err(_)) | None) => {
+                return entry_unavailable();
+            }
+            // A publication that tripped or panicked ends the session it
+            // published, as a fault in any of the session's tasks does.
             Err(crate::threads::Unjoined::Trip(fault)) => {
-                let payload: Box<dyn std::any::Any + Send> = Box::new(fault);
-                return publication_500(&*payload);
+                let reference = crate::core::classify_and_log_panic(&fault);
+                publication_ends.end(crate::threads::OwnerEnd::Trip(fault));
+                return publication_500(&reference);
             }
             Err(crate::threads::Unjoined::Ended(crate::threads::TaskEnded::Panicked(payload))) => {
-                return publication_500(&*payload);
+                let reference = crate::core::classify_and_log_panic(&*payload);
+                publication_ends.end(crate::threads::OwnerEnd::Panicked {
+                    role: "session publication",
+                    reference: reference.clone(),
+                });
+                return publication_500(&reference);
             }
             Err(crate::threads::Unjoined::Ended(crate::threads::TaskEnded::Cancelled(_))) => {
                 return entry_unavailable();
@@ -11531,13 +11553,13 @@ mod recursion_session_isolation_tests {
     async fn a_recursion_trip_in_update_ends_only_its_session() {
         // The tripping session: its update raises the exact recursion-guard trip
         // message inside the spawned task, mirroring an unbounded `update`.
-        let tripping = tokio::spawn(async {
+        let tripping = crate::threads::raw_for_tests::spawn(async {
             let _g = crate::core::recursion_guard();
             panic!("maximum recursion depth exceeded");
         });
 
         // A healthy sibling session driven concurrently on its own spawned task.
-        let healthy = tokio::spawn(async { 21_i64 * 2 });
+        let healthy = crate::threads::raw_for_tests::spawn(async { 21_i64 * 2 });
 
         let tripping_result = tripping.await;
         let healthy_result = healthy.await;
@@ -17552,7 +17574,8 @@ mod route_entry_cmd_tests {
             let paused = Arc::new(PausedAfterInstall::new(|m| m.log.is_empty()));
             let store: Store = paused.clone();
             let app = router(store.clone());
-            let request = tokio::spawn(async move { get_via(app, "/", None).await });
+            let request =
+                crate::threads::raw_for_tests::spawn(async move { get_via(app, "/", None).await });
             paused.entered.notified().await;
             let _ = store
                 .evict_unconnected(crate::retained::Bytes::new(u64::MAX))
@@ -18953,8 +18976,9 @@ mod route_entry_cmd_tests {
             let store: Store = gated.clone();
             let app = router(store.clone());
             let cookie = cold_sid.clone();
-            let request =
-                tokio::spawn(async move { get_via(app, "/", Some(cookie.as_str())).await });
+            let request = crate::threads::raw_for_tests::spawn(async move {
+                get_via(app, "/", Some(cookie.as_str())).await
+            });
             gated.entered.notified().await;
             request.abort();
             assert!(
@@ -22646,7 +22670,7 @@ mod shutdown_work_tests {
     ) -> (
         SessionHandle<i64, i64>,
         Sender<i64>,
-        tokio::task::JoinHandle<()>,
+        crate::threads::raw_for_tests::RawJoin<()>,
     ) {
         let scope = pubsub::SessionScope::new(new_sid());
         let (msg_tx, msg_rx) = mpsc::channel::<i64>(8);
@@ -22698,7 +22722,7 @@ mod shutdown_work_tests {
             .and_then(|s| crate::js_port::session_open(&s));
         entry.lock().unwrap_or_else(|e| e.into_inner()).port_life =
             port_lease.as_ref().map(crate::js_port::PortLease::life);
-        let driver = tokio::spawn(drive_session(
+        let driver = crate::threads::raw_for_tests::spawn(drive_session(
             Arc::downgrade(&entry),
             msg_rx,
             msg_tx.clone(),
@@ -22743,7 +22767,7 @@ mod shutdown_work_tests {
         let reached = tokio::time::timeout(BUDGET, store.entered.notified()).await;
         assert!(reached.is_ok(), "the turn reaches its checkpoint write");
         assert_eq!(armed.work_in_flight(), 1, "the turn holds one unit of work");
-        let cancel = tokio::spawn(async move {
+        let cancel = crate::threads::raw_for_tests::spawn(async move {
             let _settled = armed.cancel_work().await;
             armed
         });
@@ -22857,7 +22881,7 @@ mod shutdown_work_tests {
     async fn a_running_sweep_holds_the_close_until_it_returns() {
         let (armed, _signals) = owner();
         let store = GatedStore::new();
-        let sweeper = tokio::spawn(sweep_sessions(
+        let sweeper = crate::threads::raw_for_tests::spawn(sweep_sessions(
             Arc::clone(&store) as Arc<dyn SessionStore<i64, i64>>,
             armed.drain(),
             Duration::from_secs(3600),
@@ -22869,7 +22893,7 @@ mod shutdown_work_tests {
             1,
             "the sweep holds one unit of work"
         );
-        let cancel = tokio::spawn(async move {
+        let cancel = crate::threads::raw_for_tests::spawn(async move {
             let _settled = armed.cancel_work().await;
             armed
         });

@@ -327,20 +327,6 @@ const fn carry_server_request<F: std::future::Future>(task: F) -> F {
     task
 }
 
-/// Spawn `task` on the runtime inside every scope its caller runs in.
-///
-/// The bare-handle start of the callers not yet behind
-/// [`crate::threads::TaskHandle`]; every other task start goes through
-/// [`crate::threads::spawn_task`].
-#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-pub(crate) fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    crate::threads::spawn_unmigrated(task)
-}
-
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn block_on<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A>
 where
@@ -576,7 +562,8 @@ fn poll_on_current_thread<E, A>(future: IpeTask<E, A>) -> IpeResult<E, A> {
 // hands the thread to `event_loop.run` (pre-webview `andThen` I/O, etc.),
 // because `block_on` on a `current_thread` runtime cooperatively polls the
 // whole future tree on this one thread. `enable_all()` keeps timers + I/O
-// drivers available.
+// drivers available. The future is carried through `on_behalf_of_caller`, as
+// `block_on`'s is, so the entry runs in every scope its caller runs in.
 //
 // TOTALITY: runtime-init failure returns `Err` (no unwrap/expect/panic). There
 // is no spawn here, so there is no `.join()` panic-catch; the poll runs inside
@@ -595,6 +582,7 @@ where
         Ok(r) => r,
         Err(e) => return IpeResult::Err(runtime_init_refused(&e)),
     };
+    let future = on_behalf_of_caller(future);
     drive_entry_caught(move || rt.block_on(future))
 }
 
@@ -1770,7 +1758,7 @@ mod parallel_abort_tests {
     // nothing foreign ran, so the text must not point the reader at FFI.
     #[tokio::test]
     async fn cancelled_parallel_child_is_named_a_cancel() {
-        let handle = tokio::spawn(std::future::pending::<()>());
+        let handle = crate::threads::raw_for_tests::spawn(std::future::pending::<()>());
         handle.abort();
         let joined = handle.await;
         assert!(

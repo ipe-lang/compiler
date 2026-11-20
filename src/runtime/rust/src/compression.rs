@@ -329,7 +329,7 @@ mod tests {
         let ticks = rt.block_on(async move {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let counter2 = counter.clone();
-            let ticker = tokio::spawn(async move {
+            let ticker = crate::threads::raw_for_tests::spawn(async move {
                 loop {
                     counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::task::yield_now().await;
@@ -363,7 +363,7 @@ mod tests {
         let ticks = rt.block_on(async move {
             let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let counter2 = counter.clone();
-            let ticker = tokio::spawn(async move {
+            let ticker = crate::threads::raw_for_tests::spawn(async move {
                 loop {
                     counter2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tokio::task::yield_now().await;

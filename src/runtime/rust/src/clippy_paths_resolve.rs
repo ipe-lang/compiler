@@ -56,6 +56,12 @@ const _TOKIO: () = {
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::runtime::Handle::spawn_blocking::<fn(), ()>;
     #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::spawn::<::std::future::Ready<()>>;
+    #[expect(clippy::disallowed_methods)]
+    let _ = ::tokio::task::spawn::<::std::future::Ready<()>>;
+    #[expect(clippy::disallowed_types)]
+    let _: Option<::tokio::task::JoinHandle<()>> = None;
+    #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::runtime::Handle::spawn::<::std::future::Ready<()>>;
     #[expect(clippy::disallowed_methods)]
     let _ = ::tokio::runtime::Runtime::spawn::<::std::future::Ready<()>>;

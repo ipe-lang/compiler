@@ -968,14 +968,14 @@ mod tests {
             .await
             .expect("bind an accept-then-close listener");
         let addr = listener.local_addr().expect("listener local addr");
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             if let Ok((socket, _)) = listener.accept().await {
                 drop(socket);
             }
         });
 
         let url = format!("http://{addr}");
-        tokio::spawn(batcher(
+        crate::threads::raw_for_tests::spawn(batcher(
             rx,
             client(&url),
             Pipeline {
@@ -1024,7 +1024,7 @@ mod tests {
         let leak_app = Router::new()
             .fallback(any(leak))
             .with_state(leak_hits.clone());
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
@@ -1045,7 +1045,7 @@ mod tests {
         let parent_app = Router::new()
             .fallback(any(redirect))
             .with_state(leak_base.clone());
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(parent_listener, parent_app).await;
         });
 
@@ -1108,7 +1108,7 @@ mod tests {
         let port = listener.local_addr().expect("listener local addr").port();
         let received = std::sync::Arc::new(AtomicBool::new(false));
         let seen = std::sync::Arc::clone(&received);
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             tokio::time::sleep(accept_after).await;
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
@@ -1170,7 +1170,7 @@ mod tests {
         let (port, received) = marker_ingest(Duration::from_millis(1_500), || {}).await;
         let (tx, rx) = mpsc::channel::<Entry>(4);
         tx.try_send(marker_log()).expect("queue the final batch");
-        tokio::spawn(idle_batcher(rx, port));
+        crate::threads::raw_for_tests::spawn(idle_batcher(rx, port));
 
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -1202,7 +1202,7 @@ mod tests {
             0,
             "the queue must be full when the drain starts"
         );
-        tokio::spawn(idle_batcher(rx, port));
+        crate::threads::raw_for_tests::spawn(idle_batcher(rx, port));
 
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -1303,7 +1303,7 @@ mod tests {
         let token = IngestToken::mint().expect("mint an ingest token");
         enable_to_console(port, token).await;
         offer_log(1, "info", MARKER);
-        let exit = tokio::spawn(async {
+        let exit = crate::threads::raw_for_tests::spawn(async {
             crate::system::system_exit(0);
         });
         let _ = exit.await;
@@ -1366,7 +1366,7 @@ mod tests {
         let app = Router::new()
             .fallback(any(gate))
             .with_state((want, accepted.clone()));
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(listener, app).await;
         });
         (
@@ -1394,7 +1394,7 @@ mod tests {
         .expect("queue");
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<()>();
         tx.try_send(Entry::Flush(ack_tx)).expect("queue");
-        tokio::spawn(batcher(rx, client(&url), pipeline));
+        crate::threads::raw_for_tests::spawn(batcher(rx, client(&url), pipeline));
         tokio::time::timeout(Duration::from_secs(5), ack_rx)
             .await
             .expect("flush ack in time")

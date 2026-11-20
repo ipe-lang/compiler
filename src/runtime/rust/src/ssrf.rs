@@ -1533,7 +1533,7 @@ mod pinned_relay {
             let Ok(target) = server.local_addr() else {
                 return;
             };
-            let echo = tokio::spawn(async move {
+            let echo = crate::threads::raw_for_tests::spawn(async move {
                 let Ok((mut conn, _)) = server.accept().await else {
                     return;
                 };

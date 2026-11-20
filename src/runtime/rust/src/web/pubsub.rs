@@ -426,7 +426,9 @@ mod tests {
             sub_subscribe_topic::<String, String, _>(topic.to_string(), |p| p)
         });
         let handle = match sub {
-            IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
+            IpeSub::Source(spawn) => {
+                crate::tea::start_source(spawn(emit), &crate::threads::TripSink::new())
+            }
             _ => unreachable!("subscribeTopic builds a Source"),
         };
         tokio::time::sleep(std::time::Duration::from_millis(20)).await; // let it subscribe

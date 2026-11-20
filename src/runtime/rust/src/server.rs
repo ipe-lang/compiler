@@ -6238,7 +6238,7 @@ mod tests {
                 }
             }),
         );
-        let served = tokio::spawn(serve_app(app, router, armed));
+        let served = crate::threads::raw_for_tests::spawn(serve_app(app, router, armed));
         let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
             .await
             .expect("the app accepts");
@@ -6297,8 +6297,12 @@ mod tests {
                 }
             }),
         );
-        let idle = tokio::spawn(serve_app(idle_app, axum::Router::new(), idle_site));
-        let busy = tokio::spawn(serve_app(busy_app, router, busy_site));
+        let idle = crate::threads::raw_for_tests::spawn(serve_app(
+            idle_app,
+            axum::Router::new(),
+            idle_site,
+        ));
+        let busy = crate::threads::raw_for_tests::spawn(serve_app(busy_app, router, busy_site));
         let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
             .await
             .expect("the app accepts");
@@ -6561,7 +6565,7 @@ mod tests {
                 }
             }),
         );
-        let served = tokio::spawn(serve_app(app, router, armed));
+        let served = crate::threads::raw_for_tests::spawn(serve_app(app, router, armed));
         let mut client = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port))
             .await
             .expect("the app accepts");
@@ -11271,7 +11275,10 @@ mod tests {
     }
 
     /// `Server.listen` on a free loopback port with one `GET /` route, spawned.
-    fn spawn_listen() -> Option<(u16, tokio::task::JoinHandle<IpeResult<String, ()>>)> {
+    fn spawn_listen() -> Option<(
+        u16,
+        crate::threads::raw_for_tests::RawJoin<IpeResult<String, ()>>,
+    )> {
         let port = free_loopback_port()?;
         crate::system::locked_set_var("IPE_HTTP_BIND", "127.0.0.1");
         crate::system::locked_remove_var(crate::env_registry::listen::SERVER_PORT.name());
@@ -11280,7 +11287,8 @@ mod tests {
             Box::pin(ready(ok_res::<String, _>(server_text("ok".to_owned()))))
                 as IpeTask<String, ServerResponse>
         });
-        let task = tokio::spawn(server_listen(i64::from(port), vec![route]));
+        let task =
+            crate::threads::raw_for_tests::spawn(server_listen(i64::from(port), vec![route]));
         Some((port, task))
     }
 
@@ -11379,8 +11387,8 @@ mod tests {
                 req.path
             ))))) as IpeTask<String, ServerResponse>
         });
-        let task: tokio::task::JoinHandle<IpeResult<String, ()>> =
-            tokio::spawn(server_listen(i64::from(port), vec![route]));
+        let task: crate::threads::raw_for_tests::RawJoin<IpeResult<String, ()>> =
+            crate::threads::raw_for_tests::spawn(server_listen(i64::from(port), vec![route]));
         let ip = format!("127.0.0.1:{port}");
         for path in [
             "/%zz",
@@ -11532,7 +11540,7 @@ mod tests {
             heartbeat_secs: 30,
         };
         let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let served = tokio::spawn(ws_loop(
+        let served = crate::threads::raw_for_tests::spawn(ws_loop(
             StalledSocket,
             cfg,
             id,
@@ -11685,7 +11693,7 @@ mod tests {
             heartbeat_secs: 30,
         };
         let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let served = tokio::spawn(ws_loop(
+        let served = crate::threads::raw_for_tests::spawn(ws_loop(
             RecordingSocket(Arc::new(std::sync::Mutex::new(Vec::new()))),
             cfg,
             id,
@@ -12336,7 +12344,15 @@ mod tests {
             };
             let id = WS_NEXT_ID.fetch_add(1, Ordering::Relaxed);
             let socket = MemSocket { inbound, outbound };
-            tokio::spawn(ws_loop(socket, cfg, id, ceilings, credentials, gate, drain));
+            crate::threads::raw_for_tests::spawn(ws_loop(
+                socket,
+                cfg,
+                id,
+                ceilings,
+                credentials,
+                gate,
+                drain,
+            ));
             WsPeer {
                 id,
                 to_server,

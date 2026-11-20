@@ -508,7 +508,7 @@ mod tests {
             .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(capture)).with_state(rec.clone());
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(listener, app).await;
         });
 
@@ -586,7 +586,7 @@ mod tests {
         let leak_app = Router::new()
             .fallback(any(leak))
             .with_state(leak_hits.clone());
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(leak_listener, leak_app).await;
         });
 
@@ -607,7 +607,7 @@ mod tests {
         let hub_app = Router::new()
             .fallback(any(redirect))
             .with_state(leak_base.clone());
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(hub_listener, hub_app).await;
         });
 
@@ -667,7 +667,7 @@ mod tests {
             .expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let app = Router::new().fallback(any(refuse)).with_state(hits.clone());
-        tokio::spawn(async move {
+        crate::threads::raw_for_tests::spawn(async move {
             let _ = crate::server::serve_fixture(listener, app).await;
         });
         let base = format!("http://127.0.0.1:{port}");

@@ -723,7 +723,7 @@ pub mod server {
                 .await
                 .expect("bind an ephemeral loopback listener");
             let addr = listener.local_addr().expect("listener has a local addr");
-            let server = tokio::spawn(async move {
+            let server = crate::threads::raw_for_tests::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept the test client");
                 serve_conn(stream, &ack_handler).await
             });
@@ -790,7 +790,7 @@ pub mod server {
                 .await
                 .expect("bind an ephemeral loopback listener");
             let addr = listener.local_addr().expect("listener has a local addr");
-            let server = tokio::spawn(async move {
+            let server = crate::threads::raw_for_tests::spawn(async move {
                 let (stream, _) = listener.accept().await.expect("accept the test client");
                 serve_conn(stream, &ack_handler).await
             });
@@ -851,7 +851,7 @@ pub mod server {
             // isolation via the shared `spawn_conn`, with a short deadline so the
             // hung peer is dropped promptly.
             let accept_handler = Arc::clone(&handler);
-            let accept = tokio::spawn(async move {
+            let accept = crate::threads::raw_for_tests::spawn(async move {
                 let deadline = Duration::from_millis(200);
                 loop {
                     match listener.accept().await {

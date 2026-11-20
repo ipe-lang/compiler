@@ -350,6 +350,8 @@ enum WsFailure {
     HttpStatus(u16),
     /// The handshake's HTTP was malformed.
     HttpFormat,
+    /// The socket's task could not start.
+    TaskRefused,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -389,7 +391,8 @@ impl WsFailure {
             | Self::AttackAttempt
             | Self::Url
             | Self::HttpStatus(_)
-            | Self::HttpFormat => false,
+            | Self::HttpFormat
+            | Self::TaskRefused => false,
         }
     }
 
@@ -423,6 +426,7 @@ impl std::fmt::Display for WsFailure {
             Self::Url => f.write_str("the URL cannot be dialled"),
             Self::HttpStatus(status) => write!(f, "server answered HTTP {status}"),
             Self::HttpFormat => f.write_str("malformed HTTP handshake"),
+            Self::TaskRefused => f.write_str("the socket task could not start"),
         }
     }
 }
@@ -757,7 +761,7 @@ where
         tokio_tungstenite::client_async_with_config(req, stream, Some(ws_config(ceiling)))
             .await
             .map_err(|e| WsFailure::of(&e))?;
-    Ok(start_socket(socket, ceiling, ping))
+    start_socket(socket, ceiling, ping)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1195,12 +1199,17 @@ async fn run_socket<S>(
 
 /// Start the task of an open `socket` whose messages are capped at `ceiling`,
 /// and register it; returns its id.
+///
+/// # Errors
+///
+/// [`WsFailure::TaskRefused`] when the task cannot start; nothing is
+/// registered and the socket is dropped.
 #[cfg(not(target_arch = "wasm32"))]
 fn start_socket<S>(
     socket: tokio_tungstenite::WebSocketStream<S>,
     ceiling: usize,
     ping: PingCadence,
-) -> i64
+) -> Result<i64, WsFailure>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -1209,15 +1218,20 @@ where
     let (frames_tx, _) = tokio::sync::broadcast::channel::<WsEvent>(64);
     let closing = std::sync::Arc::new(tokio::sync::Notify::new());
     let (registered_tx, registered) = tokio::sync::oneshot::channel();
-    tokio::spawn(run_socket(
-        id,
-        socket,
-        cmd_rx,
-        frames_tx.clone(),
-        std::sync::Arc::clone(&closing),
-        ping,
-        registered,
-    ));
+    crate::threads::spawn_service(
+        "WebSocket socket",
+        "socket I/O, which runs no Ipê code",
+        run_socket(
+            id,
+            socket,
+            cmd_rx,
+            frames_tx.clone(),
+            std::sync::Arc::clone(&closing),
+            ping,
+            registered,
+        ),
+    )
+    .map_err(|_| WsFailure::TaskRefused)?;
     registry().lock().unwrap_or_else(|e| e.into_inner()).insert(
         id,
         ClientEntry {
@@ -1228,7 +1242,7 @@ where
         },
     );
     let _ = registered_tx.send(());
-    id
+    Ok(id)
 }
 
 /// WebSocket.connect : String -> Task Error Int (raw id; Ipê wraps in WebSocket)
@@ -1835,7 +1849,7 @@ mod tests {
     async fn a_message_past_the_ceiling_is_a_capacity_failure() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let server = tokio::spawn(async move {
+        let server = crate::threads::raw_for_tests::spawn(async move {
             let mut socket = tokio_tungstenite::accept_async(server_io).await.ok()?;
             for len in [16, 17] {
                 socket
@@ -2097,7 +2111,7 @@ mod tests {
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut subs = crate::tea::SubRuntime::new(Inbox(tx));
+        let mut subs = crate::tea::SubRuntime::new(Inbox(tx), crate::threads::TripSink::new());
         let on_message = || sub_subscribe_ws_message(id, |m: WsClientMessage| m);
         subs.reconcile(on_message());
         subs.reconcile(on_message());
@@ -2147,14 +2161,14 @@ mod tests {
         C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-        let peer = tokio::spawn(tokio_tungstenite::accept_async(server));
+        let peer = crate::threads::raw_for_tests::spawn(tokio_tungstenite::accept_async(server));
         let req = "ws://peer.example/".into_client_request().ok()?;
         let (socket, _) =
             tokio_tungstenite::client_async_with_config(req, client, Some(ws_config(ceiling)))
                 .await
                 .ok()?;
         let peer = peer.await.ok()?.ok()?;
-        Some((start_socket(socket, ceiling, PingCadence::Off), peer))
+        Some((start_socket(socket, ceiling, PingCadence::Off).ok()?, peer))
     }
 
     /// A stream whose writes fail once `broken` is set; reads pass through.

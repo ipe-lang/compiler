@@ -2830,7 +2830,9 @@ mod tests {
                 js_subscribe::<i64, i64, _>(decoder, |a| a)
             });
             let handle = match sub {
-                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
+                IpeSub::Source(spawn) => {
+                    crate::tea::start_source(spawn(emit), &crate::threads::TripSink::new())
+                }
                 _ => unreachable!("js_subscribe builds a Source"),
             };
             (handle, got)
@@ -2991,7 +2993,7 @@ mod tests {
             let close_fut = with_session(&SessionScope::new(sid.to_string()), || {
                 js_close_session::<i64, i64>(handle, 1_i64, int_decoder())
             });
-            let task = tokio::spawn(close_fut);
+            let task = crate::threads::raw_for_tests::spawn(close_fut);
             // Yield so the close future runs up to (and past) the outbound send.
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -3153,7 +3155,9 @@ mod tests {
                 Arc::new(move |m| got2.lock().unwrap_or_else(|e| e.into_inner()).push(m));
             let sub = js_subscribe::<i64, i64, _>(int_decoder(), |a| a);
             let h = match sub {
-                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
+                IpeSub::Source(spawn) => {
+                    crate::tea::start_source(spawn(emit), &crate::threads::TripSink::new())
+                }
                 _ => unreachable!(),
             };
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3506,7 +3510,9 @@ mod tests {
                 js_session_frames::<i64, i64, _>(handle, int_decoder(), |a| a)
             });
             let h = match sub {
-                IpeSub::Source(spawn) => crate::tea::start_source(spawn(emit)),
+                IpeSub::Source(spawn) => {
+                    crate::tea::start_source(spawn(emit), &crate::threads::TripSink::new())
+                }
                 _ => unreachable!("js_session_frames builds a Source"),
             };
             (h, got)
@@ -3609,7 +3615,7 @@ mod tests {
             // Park a close waiter, then push the overflowing frame; the close Task
             // must resolve Err (session terminated, not a silent drop).
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session(
+            let close = crate::threads::raw_for_tests::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
                 move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
             ));
@@ -3663,7 +3669,7 @@ mod tests {
             let lease = session_open(&sid);
             let (handle, token, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session(
+            let close = crate::threads::raw_for_tests::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
                 move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
             ));
@@ -3688,7 +3694,7 @@ mod tests {
             let lease = session_open(&sid);
             let (handle, token, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session(
+            let close = crate::threads::raw_for_tests::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
                 move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
             ));
@@ -3717,7 +3723,7 @@ mod tests {
             let lease = session_open(&sid);
             let (handle, token, _out) = open_session_capturing(&sid).await;
             let sid_clone = sid.clone();
-            let close = tokio::spawn(with_session(
+            let close = crate::threads::raw_for_tests::spawn(with_session(
                 &SessionScope::new(sid.to_string()),
                 move || js_close_session::<i64, i64>(handle, 0_i64, int_decoder()),
             ));

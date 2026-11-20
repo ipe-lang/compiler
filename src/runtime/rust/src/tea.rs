@@ -683,12 +683,6 @@ pub(crate) trait SubSink<M>: Clone + Send + Sync + 'static {
     fn emit(&self, msg: M);
 }
 
-/// The guard that aborts `task` when its owner drops it.
-#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-fn abort_on_drop(task: &tokio::task::JoinHandle<()>) -> crate::task::AbortOnDrop {
-    crate::task::AbortOnDrop::new(task.abort_handle())
-}
-
 /// A subscription source the loop has started.
 ///
 /// Every requested source is kept, so [`SubRuntime::live`] counts it whether or
@@ -701,19 +695,37 @@ pub(crate) enum RunningSource {
     Untracked,
 }
 
+/// The work a subscription source's task does.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+const SOURCE_ROLE: &str = "subscription source";
+
 /// Start `task` inside every scope the caller runs in.
+///
+/// The body runs Ipê code, so its trip or panic, or a refused start, is
+/// delivered to the owner of `ends`, which ends its loop with the typed error.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 #[must_use]
-pub(crate) fn start_source(task: SourceTask) -> RunningSource {
-    match task {
-        SourceTask::Tracked(body) => RunningSource::Tracked {
-            _task: abort_on_drop(&crate::task::spawn_in_current_scope(body)),
-        },
-        SourceTask::Detached(body) => {
-            drop(crate::task::spawn_in_current_scope(body));
+pub(crate) fn start_source(task: SourceTask, ends: &crate::threads::TripSink) -> RunningSource {
+    let (body, tracked) = match task {
+        SourceTask::Tracked(body) => (body, true),
+        SourceTask::Detached(body) => (body, false),
+        SourceTask::Idle => return RunningSource::Untracked,
+    };
+    match crate::threads::spawn_task(SOURCE_ROLE, crate::threads::TaskScope::Caller, body) {
+        Ok(started) => {
+            let stop = crate::task::AbortOnDrop::new(started.abort_handle());
+            started.detach(crate::threads::Detached::IpeOwned(ends.clone()));
+            if tracked {
+                RunningSource::Tracked { _task: stop }
+            } else {
+                stop.defuse();
+                RunningSource::Untracked
+            }
+        }
+        Err(refused) => {
+            ends.end(crate::threads::OwnerEnd::Refused(refused));
             RunningSource::Untracked
         }
-        SourceTask::Idle => RunningSource::Untracked,
     }
 }
 
@@ -721,11 +733,13 @@ pub(crate) fn start_source(task: SourceTask) -> RunningSource {
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 type TickMsgs<M> = std::sync::Arc<std::sync::Mutex<Vec<M>>>;
 
-/// A native `Sub.every` ticker task.
+/// A native `Sub.every` ticker task, stopped when this is dropped.
+///
+/// `None` when its start was refused; the refusal ended the loop.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 struct NativeEvery<M> {
     msgs: TickMsgs<M>,
-    _task: crate::task::AbortOnDrop,
+    _task: Option<crate::threads::TaskHandle<()>>,
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -748,6 +762,7 @@ impl<M> EveryTimer<M> for NativeEvery<M> {
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) struct SubRuntime<M, S> {
     sink: S,
+    ends: crate::threads::TripSink,
     every: EveryTimers<NativeEvery<M>>,
     sources: Vec<RunningSource>,
 }
@@ -755,9 +770,13 @@ pub(crate) struct SubRuntime<M, S> {
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
     /// A runtime with nothing subscribed, delivering into `sink`.
-    pub(crate) fn new(sink: S) -> Self {
+    ///
+    /// A source's trip or panic, or a refused start, is delivered to the
+    /// owner of `ends`.
+    pub(crate) fn new(sink: S, ends: crate::threads::TripSink) -> Self {
         Self {
             sink,
+            ends,
             every: EveryTimers::default(),
             sources: Vec::new(),
         }
@@ -772,13 +791,14 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
     /// Re-evaluate against the timers and sources of an already flattened plan.
     pub(crate) fn apply(&mut self, every: EveryPlan<M>, sources: Vec<SubSpawn<M>>) {
         let sink = &self.sink;
+        let ends = &self.ends;
         self.every.reconcile(every, |interval, msgs| {
             let msgs: TickMsgs<M> = std::sync::Arc::new(std::sync::Mutex::new(msgs));
             let tick_msgs = std::sync::Arc::clone(&msgs);
             let sink = sink.clone();
             let period = std::time::Duration::from_millis(interval.millis());
             // First tick one period after the interval is first requested.
-            let task = crate::task::spawn_in_current_scope(async move {
+            let ticker = async move {
                 loop {
                     tokio::time::sleep(period).await;
                     let batch = tick_msgs
@@ -791,18 +811,27 @@ impl<M: Clone + Send + 'static, S: SubSink<M>> SubRuntime<M, S> {
                         }
                     }
                 }
-            });
-            NativeEvery {
-                msgs,
-                _task: abort_on_drop(&task),
-            }
+            };
+            let started = crate::threads::spawn_task(
+                "Sub.every timer",
+                crate::threads::TaskScope::Caller,
+                ticker,
+            );
+            let task = match started {
+                Ok(task) => Some(task),
+                Err(refused) => {
+                    ends.end(crate::threads::OwnerEnd::Refused(refused));
+                    None
+                }
+            };
+            NativeEvery { msgs, _task: task }
         });
         self.sources.clear();
         for spawn in sources {
             let sink = self.sink.clone();
             let emit: std::sync::Arc<dyn Fn(M) + Send + Sync> =
                 std::sync::Arc::new(move |msg| sink.emit(msg));
-            self.sources.push(start_source(spawn(emit)));
+            self.sources.push(start_source(spawn(emit), &self.ends));
         }
     }
 
@@ -848,6 +877,24 @@ pub(crate) enum CliEvent<M> {
     Msg(M),
     PerformDone(M),
     Eof,
+    /// A task the loop started tripped, panicked or could not start: the
+    /// loop ends with its typed error.
+    Ended(crate::threads::OwnerEnd),
+}
+
+/// The loop's next event, the first end its tasks delivered taking precedence.
+///
+/// `None` once every sender is gone.
+#[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
+pub(crate) async fn next_cli_event<M>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<CliEvent<M>>,
+    ends: &crate::threads::TripOwner,
+) -> Option<CliEvent<M>> {
+    tokio::select! {
+        biased;
+        end = ends.ended() => Some(CliEvent::Ended(end)),
+        ev = rx.recv() => ev,
+    }
 }
 
 /// The most terminal input events the loop may hold queued but not yet taken.
@@ -1088,9 +1135,12 @@ pub(crate) struct SubManager<M> {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "tui"))]
 impl<M: Clone + Send + 'static> SubManager<M> {
-    pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<CliEvent<M>>) -> Self {
+    pub(crate) fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<CliEvent<M>>,
+        ends: crate::threads::TripSink,
+    ) -> Self {
         SubManager {
-            subs: SubRuntime::new(tx),
+            subs: SubRuntime::new(tx, ends),
             key_handlers: Vec::new(),
             line_handlers: Vec::new(),
         }
@@ -1143,8 +1193,9 @@ impl<M: Clone + Send + 'static> SubManager<M> {
 pub(crate) fn cli_run_cmd<M: Send + 'static>(
     cmd: IpeCmd<M>,
     tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<M>>,
+    ends: &crate::threads::TripSink,
 ) {
-    cli_run_cmd_tracked(cmd, tx, None);
+    cli_run_cmd_tracked(cmd, tx, None, ends);
 }
 
 /// As `cli_run_cmd`, but when `outstanding` is `Some`, each spawned `Perform`
@@ -1155,6 +1206,10 @@ pub(crate) fn cli_run_cmd<M: Send + 'static>(
 /// unbounded ticker/subscription `Msg`s (which never touch the counter) keep
 /// the loop alive.
 ///
+/// A `Perform` whose task trips, panics or cannot start delivers that end to
+/// the owner of `ends`, which ends the loop with the typed error. Such an
+/// effect stays outstanding, so EOF never ends the loop ahead of its end.
+///
 /// Both callers (`cli_run_cmd`, the Tui driver's untracked wrapper, and
 /// `console_app`) are `feature = "tui"`-gated, so this shares the gate — a
 /// tui-less `tokio` build would otherwise flag it as dead code under
@@ -1164,61 +1219,34 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
     cmd: IpeCmd<M>,
     tx: &tokio::sync::mpsc::UnboundedSender<CliEvent<M>>,
     outstanding: Option<&std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    ends: &crate::threads::TripSink,
 ) {
     match cmd {
         IpeCmd::None => {}
         IpeCmd::Batch(items) => {
             for c in items {
-                cli_run_cmd_tracked(c, tx, outstanding);
+                cli_run_cmd_tracked(c, tx, outstanding, ends);
             }
         }
         IpeCmd::Perform(body) => {
             let tx = tx.clone();
             // A tracked Perform is counted as outstanding at spawn and delivers a
-            // `PerformDone`; an untracked one (Tui) delivers a plain `Msg`.
-            let counter = outstanding.cloned();
-            if let Some(c) = &counter {
+            // `PerformDone`, the loop decrementing the count as it takes it; an
+            // untracked one (Tui) delivers a plain `Msg`.
+            let tracked = outstanding.is_some();
+            if let Some(c) = outstanding {
                 c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            // Fire-and-forget: a panic inside the composed task→toMsg thunk aborts
-            // only this task and is intentionally swallowed — that is the
-            // Task-boundary recover contract (an effectful task that faults must
-            // not crash the TEA loop). On a fault the JoinHandle is dropped and
-            // no event is sent; the Cli loop's counter would then never be
-            // decremented for this effect, so the spawned task decrements the
-            // counter on the fault path (drop guard) to preserve the EOF
-            // invariant. Structured-warn observability on this path is a known
-            // follow-up (would require awaiting the JoinHandle's JoinError).
-            crate::task::spawn_in_current_scope(async move {
-                // Decrement on any exit from this task (normal or panic-unwind)
-                // so a faulting effect can never wedge the EOF-drain invariant.
-                struct OutstandingGuard(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
-                impl Drop for OutstandingGuard {
-                    fn drop(&mut self) {
-                        if let Some(c) = &self.0 {
-                            c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
-                }
-                match counter {
-                    Some(c) => {
-                        // Counter decremented by the loop on `PerformDone` dequeue
-                        // (below) for the delivered case; the guard covers only the
-                        // panic-unwind case where no event reaches the loop.
-                        let mut guard = OutstandingGuard(Some(c));
-                        let msg = body.run().await;
-                        guard.0 = None; // delivered → loop owns the decrement
-                        // A send failure means the loop already exited (rx
-                        // dropped); the leaked count is then unobservable, so it
-                        // is intentionally not decremented here.
-                        let _ = tx.send(CliEvent::PerformDone(msg));
-                    }
-                    None => {
-                        let msg = body.run().await;
-                        let _ = tx.send(CliEvent::Msg(msg));
-                    }
-                }
-            });
+            let effect = async move {
+                let msg = body.run().await;
+                // A send failure means the loop already ended.
+                let _ = tx.send(if tracked {
+                    CliEvent::PerformDone(msg)
+                } else {
+                    CliEvent::Msg(msg)
+                });
+            };
+            start_cmd(effect, ends);
         }
         IpeCmd::Publish(thunk) => {
             // No Web session in a Cli program; publish with an empty origin
@@ -1226,6 +1254,49 @@ pub(crate) fn cli_run_cmd_tracked<M: Send + 'static>(
             let _ = thunk("");
         }
     }
+}
+
+/// Starts a `Cmd.perform` effect in its caller's scopes, detached to the
+/// owner of `ends`: the effect runs Ipê code, so its trip or panic, or a
+/// refused start, ends that owner's loop with the typed error.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+fn start_cmd<F>(effect: F, ends: &crate::threads::TripSink)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    match crate::threads::spawn_task("Cmd.perform", crate::threads::TaskScope::Caller, effect) {
+        Ok(task) => task.detach(crate::threads::Detached::IpeOwned(ends.clone())),
+        Err(refused) => ends.end(crate::threads::OwnerEnd::Refused(refused)),
+    }
+}
+
+/// A loop's own trip sink and its one owner.
+///
+/// # Errors
+///
+/// Never for a fresh sink; a taken one is refused as unavailable.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub(crate) fn loop_ends()
+-> Result<(crate::threads::TripSink, crate::threads::TripOwner), crate::IpeError> {
+    let ends = crate::threads::TripSink::new();
+    let owner = ends
+        .owner()
+        .map_err(|taken| crate::IpeError::unavailable(taken.to_string()))?;
+    Ok((ends, owner))
+}
+
+/// The run's result: `Ok` unless a task it started ended it.
+///
+/// An end recorded after the loop last looked still ends the run typed.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+pub(crate) fn run_result<E: crate::FromIpeError>(
+    ended: Option<crate::threads::OwnerEnd>,
+    owner: &crate::threads::TripOwner,
+) -> IpeResult<E, ()> {
+    ended.or_else(|| owner.recorded()).map_or_else(
+        || ok_res(()),
+        |end| IpeResult::Err(E::from_ipe_error(end.to_ipe_error())),
+    )
 }
 
 // ─── Ipe.Terminal — line-oriented TEA loop ─────────────────────────────────────
@@ -1270,7 +1341,7 @@ pub fn console_app<
     #[cfg(feature = "debugger")] codec: Codec,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + crate::FromUnavailable + Send + 'static,
+    E: From<String> + crate::FromUnavailable + crate::FromIpeError + Send + 'static,
     Model: Clone + Send + crate::stringify::IpeStringify + 'static,
     Msg: Clone + Send + crate::stringify::IpeStringify + 'static,
     FInit: Fn(()) -> (Model, IpeCmd<Msg>) + Send + 'static,
@@ -1295,6 +1366,11 @@ where
         // refused relay is logged once and leaves each signal its default.
         let _ = crate::system::exit_signals::install();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
+        // The loop's tasks deliver a trip, a panic or a refused start here.
+        let (ends, owner) = match loop_ends() {
+            Ok(pair) => pair,
+            Err(taken) => return IpeResult::Err(E::from_ipe_error(taken)),
+        };
 
         // Blocking stdin reader → raw Line events, then Eof. The line handlers are
         // applied in the main task (keeps them off the blocking thread).
@@ -1341,8 +1417,8 @@ where
         // feature is off.
         #[cfg(feature = "debugger")]
         let recorder = crate::debugger::record_sink::start(model.clone(), codec);
-        cli_run_cmd_tracked(cmd0, &tx, Some(&outstanding));
-        let mut submgr = SubManager::new(tx.clone());
+        cli_run_cmd_tracked(cmd0, &tx, Some(&outstanding), &ends);
+        let mut submgr = SubManager::new(tx.clone(), ends.clone());
         submgr.update(subscriptions(model.clone()));
         // Inline render (a closure borrowing `view` would make the future non-Send).
         // Fallible writes (NOT print!/println!, which panic on a broken pipe).
@@ -1388,8 +1464,13 @@ where
             line_state.emit(&mut std::io::stdout().lock(), &frame);
         }
 
-        while let Some(ev) = rx.recv().await {
+        let mut ended = None;
+        while let Some(ev) = next_cli_event(&mut rx, &owner).await {
             let msgs: Vec<Msg> = match ev {
+                CliEvent::Ended(end) => {
+                    ended = Some(end);
+                    break;
+                }
                 // Every active line handler sees the line; none → unobserved.
                 // The permit returns to the reader's budget as the line is taken.
                 // A newline-ended line's echo ended the open prompt line,
@@ -1453,7 +1534,7 @@ where
             let frame = crate::tui::write_frame(&view(model.clone()), &surface, &mut line_state);
             line_state.emit(&mut std::io::stdout().lock(), &frame);
             for cmd in cmds {
-                cli_run_cmd_tracked(cmd, &tx, Some(&outstanding));
+                cli_run_cmd_tracked(cmd, &tx, Some(&outstanding), &ends);
             }
             // After folding an effect's result, if EOF was already seen and no
             // effects remain outstanding, terminate as EOF would have.
@@ -1473,7 +1554,7 @@ where
         if let Some(recording) = recorder {
             recording.finish();
         }
-        ok_res(())
+        run_result(ended, &owner)
     })
 }
 
@@ -1664,6 +1745,24 @@ enum WorkerEvent<M> {
     Msg(M),
     /// A one-shot `Cmd.perform` effect delivered its result.
     PerformDone(M),
+    /// A task the loop started tripped, panicked or could not start: the
+    /// loop ends with its typed error.
+    Ended(crate::threads::OwnerEnd),
+}
+
+/// The worker's next event, the first end its tasks delivered taking precedence.
+///
+/// `None` once every sender is gone.
+#[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
+async fn next_worker_event<M>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<WorkerEvent<M>>,
+    ends: &crate::threads::TripOwner,
+) -> Option<WorkerEvent<M>> {
+    tokio::select! {
+        biased;
+        end = ends.ended() => Some(WorkerEvent::Ended(end)),
+        ev = rx.recv() => ev,
+    }
 }
 
 /// Fire a worker `Cmd`: None/Batch recurse; Perform spawns the composed
@@ -1672,40 +1771,33 @@ enum WorkerEvent<M> {
 /// results before the loop terminates. `Publish` has no Web session here, so it
 /// fires with an empty origin (no subscriber matches → no-op), matching the Cli
 /// loop's co-located behaviour.
+///
+/// A `Perform` whose task trips, panics or cannot start delivers that end to
+/// the owner of `ends` and stays outstanding, so the worker never settles
+/// ahead of its end.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 fn worker_run_cmd<M: Send + 'static>(
     cmd: IpeCmd<M>,
     tx: &tokio::sync::mpsc::UnboundedSender<WorkerEvent<M>>,
     outstanding: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ends: &crate::threads::TripSink,
 ) {
     match cmd {
         IpeCmd::None => {}
         IpeCmd::Batch(items) => {
             for c in items {
-                worker_run_cmd(c, tx, outstanding);
+                worker_run_cmd(c, tx, outstanding, ends);
             }
         }
         IpeCmd::Perform(body) => {
             let tx = tx.clone();
-            let counter = outstanding.clone();
-            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            crate::task::spawn_in_current_scope(async move {
-                // Decrement on any exit (normal or panic-unwind) so a faulting
-                // effect can never wedge the drain invariant — the same
-                // Task-boundary recover contract the Cli loop uses.
-                struct OutstandingGuard(Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>);
-                impl Drop for OutstandingGuard {
-                    fn drop(&mut self) {
-                        if let Some(c) = &self.0 {
-                            c.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-                        }
-                    }
-                }
-                let mut guard = OutstandingGuard(Some(counter));
+            outstanding.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let effect = async move {
                 let msg = body.run().await;
-                guard.0 = None; // delivered → loop owns the decrement
+                // A send failure means the loop already ended.
                 let _ = tx.send(WorkerEvent::PerformDone(msg));
-            });
+            };
+            start_cmd(effect, ends);
         }
         IpeCmd::Publish(thunk) => {
             let _ = thunk("");
@@ -1763,7 +1855,7 @@ pub fn worker_app<
     #[cfg(feature = "debugger")] codec: Codec,
 ) -> IpeTask<E, ()>
 where
-    E: From<String> + Send + 'static,
+    E: From<String> + crate::FromIpeError + Send + 'static,
     Model: Clone + Send + crate::stringify::IpeStringify + 'static,
     Msg: Clone + Send + crate::stringify::IpeStringify + 'static,
     FInit: Fn(()) -> (Model, IpeCmd<Msg>) + Send + 'static,
@@ -1788,6 +1880,11 @@ where
         let _ = crate::system::exit_signals::install();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WorkerEvent<Msg>>();
         let outstanding = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The worker's tasks deliver a trip, a panic or a refused start here.
+        let (ends, owner) = match loop_ends() {
+            Ok(pair) => pair,
+            Err(taken) => return IpeResult::Err(E::from_ipe_error(taken)),
+        };
 
         let (mut model, cmd0) = init(());
         // Time-travel recorder above the view-less worker sink: cfg-gated,
@@ -1797,8 +1894,8 @@ where
         // for replay/inspection only.
         #[cfg(feature = "debugger")]
         let recorder = crate::debugger::record_sink::start(model.clone(), codec);
-        worker_run_cmd(cmd0, &tx, &outstanding);
-        let mut subs = SubRuntime::new(tx.clone());
+        worker_run_cmd(cmd0, &tx, &outstanding, &ends);
+        let mut subs = SubRuntime::new(tx.clone(), ends.clone());
         subs.reconcile(subscriptions(model.clone()));
         let mut live_subs = subs.live();
 
@@ -1809,11 +1906,16 @@ where
             if let Some(recording) = recorder {
                 recording.finish();
             }
-            return ok_res(());
+            return run_result(None, &owner);
         }
 
-        while let Some(ev) = rx.recv().await {
+        let mut ended = None;
+        while let Some(ev) = next_worker_event(&mut rx, &owner).await {
             let msg = match ev {
+                WorkerEvent::Ended(end) => {
+                    ended = Some(end);
+                    break;
+                }
                 WorkerEvent::Msg(m) => m,
                 WorkerEvent::PerformDone(m) => {
                     outstanding.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -1828,7 +1930,7 @@ where
             #[cfg(not(feature = "debugger"))]
             let (next, cmd) = update(msg, model);
             model = next;
-            worker_run_cmd(cmd, &tx, &outstanding);
+            worker_run_cmd(cmd, &tx, &outstanding, &ends);
             subs.reconcile(subscriptions(model.clone()));
             live_subs = subs.live();
             // The model has settled: no live subscription can deliver again and no
@@ -1846,7 +1948,7 @@ where
         if let Some(recording) = recorder {
             recording.finish();
         }
-        ok_res(())
+        run_result(ended, &owner)
     })
 }
 
@@ -1945,7 +2047,7 @@ mod map_tests {
             let IpeSub::Source(spawn) = mapped else {
                 return None;
             };
-            let _running = start_source(spawn(emit));
+            let _running = start_source(spawn(emit), &crate::threads::TripSink::new());
             tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
                 .await
                 .ok()
@@ -2182,6 +2284,78 @@ mod worker_appearance_na_tests {
     }
 }
 
+// A Cmd's task that trips ends its run with the trip's typed error, rather than
+// settling the run as if the effect had finished.
+#[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
+mod cmd_trip_tests {
+    use super::*;
+
+    use crate::core::RuntimeTrip;
+    use crate::error::IpeError;
+    use crate::stringify::IpeStringify;
+
+    #[derive(Clone)]
+    struct TModel;
+    #[derive(Clone)]
+    struct TMsg;
+
+    impl IpeStringify for TModel {
+        fn ipe_show(&self) -> String {
+            "TModel".to_owned()
+        }
+    }
+    impl IpeStringify for TMsg {
+        fn ipe_show(&self) -> String {
+            "TMsg".to_owned()
+        }
+    }
+
+    /// A task whose first poll trips.
+    fn tripping_task() -> IpeTask<IpeError, ()> {
+        Box::pin(std::future::poll_fn(
+            |_| -> std::task::Poll<IpeResult<IpeError, ()>> {
+                crate::core::trip(RuntimeTrip::RecursionLimit)
+            },
+        ))
+    }
+
+    fn t_init((): ()) -> (TModel, IpeCmd<TMsg>) {
+        (TModel, cmd_perform(tripping_task(), |_| TMsg))
+    }
+    fn t_update(_: TMsg, model: TModel) -> (TModel, IpeCmd<TMsg>) {
+        (model, IpeCmd::None)
+    }
+    fn t_subs(_: TModel) -> IpeSub<TMsg> {
+        IpeSub::None
+    }
+
+    #[test]
+    fn a_cmd_whose_task_trips_ends_the_worker_run_with_the_typed_error() {
+        let worker: IpeTask<IpeError, ()> = worker_app(
+            t_init,
+            t_update,
+            t_subs,
+            #[cfg(feature = "debugger")]
+            crate::debugger::session_log::TraceOnly(
+                crate::debugger::session_log::Unreplayable::MsgNotEncodable,
+            ),
+        );
+        let bounded: IpeTask<IpeError, ()> = Box::pin(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(30), worker)
+                .await
+                .unwrap_or_else(|_| {
+                    IpeResult::Err(IpeError::unavailable("the run never ended".to_owned()))
+                })
+        });
+        let result = crate::task::block_on(bounded);
+        let expected = RuntimeTrip::RecursionLimit.to_ipe_error();
+        assert!(
+            matches!(&result, IpeResult::Err(err) if *err == expected),
+            "a tripped Cmd must end the run with the trip's typed error: {result:?}"
+        );
+    }
+}
+
 // A shape app's `fn main` hands `ipe_main` to `run_blocking_entry` unbuilt, so
 // a trip raised while `ipe_main` builds the leaf ends typed, on every leaf.
 #[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
@@ -2266,7 +2440,7 @@ mod sub_reconcile_tests {
 
     fn runtime() -> (Runtime, UnboundedReceiver<WorkerEvent<Tick>>) {
         let (tx, rx) = unbounded_channel();
-        (SubRuntime::new(tx), rx)
+        (SubRuntime::new(tx, crate::threads::TripSink::new()), rx)
     }
 
     fn every(ms: i64, msg: Tick) -> IpeSub<Tick> {
@@ -2396,7 +2570,7 @@ mod input_dispatch_tests {
 
     fn manager() -> SubManager<Msg> {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<CliEvent<Msg>>();
-        SubManager::new(tx)
+        SubManager::new(tx, crate::threads::TripSink::new())
     }
 
     #[test]
@@ -2596,7 +2770,7 @@ mod source_scope_tests {
 
     fn runtime() -> (Runtime, UnboundedReceiver<WorkerEvent<Seen>>) {
         let (tx, rx) = unbounded_channel();
-        (SubRuntime::new(tx), rx)
+        (SubRuntime::new(tx, crate::threads::TripSink::new()), rx)
     }
 
     /// A source whose body waits for `gate`, then emits what it observes.
@@ -2753,26 +2927,24 @@ mod source_spawn_scan_tests {
     ];
 
     /// Every task-starting name the production text of these files may hold,
-    /// by file, enclosing fn and name: the loop's own starts through the scope
-    /// carrier, its stdin reader thread, the source closure the loop and
-    /// `sub_map` invoke (a binding named `spawn`), and the one task a socket
-    /// runs on, which runs no user code. Sorted.
-    const ADMITTED_SPAWNS: [(&str, &str, &str); 15] = [
+    /// by file, enclosing fn and name: the loop's own starts through the task
+    /// funnel, its stdin reader thread, the source closure the loop and
+    /// `sub_map` invoke (a binding named `spawn`), and the one service task a
+    /// socket runs on, which runs no user code. Sorted.
+    const ADMITTED_SPAWNS: [(&str, &str, &str); 13] = [
         ("tea.rs", "add", "spawn"),
         ("tea.rs", "add", "spawn"),
         ("tea.rs", "apply", "spawn"),
         ("tea.rs", "apply", "spawn"),
-        ("tea.rs", "apply", "spawn_in_current_scope"),
-        ("tea.rs", "cli_run_cmd_tracked", "spawn_in_current_scope"),
+        ("tea.rs", "apply", "spawn_task"),
         ("tea.rs", "console_app", "spawn_named"),
-        ("tea.rs", "start_source", "spawn_in_current_scope"),
-        ("tea.rs", "start_source", "spawn_in_current_scope"),
+        ("tea.rs", "start_cmd", "spawn_task"),
+        ("tea.rs", "start_source", "spawn_task"),
         ("tea.rs", "sub_map_arc", "spawn"),
         ("tea.rs", "sub_map_arc", "spawn"),
         ("tea.rs", "sub_map_rc", "spawn"),
         ("tea.rs", "sub_map_rc", "spawn"),
-        ("tea.rs", "worker_run_cmd", "spawn_in_current_scope"),
-        ("ws_client.rs", "start_socket", "spawn"),
+        ("ws_client.rs", "start_socket", "spawn_service"),
     ];
 
     /// Source files under `src/` that build a subscription source and are not
@@ -3111,12 +3283,12 @@ mod source_spawn_scan_tests {
         let tea = production(&code_only(include_str!("tea.rs")));
         let scoped: Vec<&str> = spawn_idents(&tea)
             .into_iter()
-            .filter(|&(_, word)| word == "spawn_in_current_scope")
+            .filter(|&(_, word)| word == "spawn_task")
             .map(|(name, _)| name)
             .collect();
         assert!(
             scoped.contains(&"start_source") && scoped.contains(&"apply"),
-            "the loop starts sources and timers through the scope carrier: {scoped:?}"
+            "the loop starts sources and timers through the task funnel: {scoped:?}"
         );
 
         let source_types: Vec<&str> = tea

@@ -58,6 +58,7 @@ fn reactor_handle_survives_across_two_block_on_entries() -> Result<(), String> {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // models the emitted FFI async wrapper, which starts the foreign future raw
 fn abort_on_drop_cancels_the_spawned_foreign_task() {
     let side_effect = Arc::new(AtomicBool::new(false));
     let observed = Arc::clone(&side_effect);
@@ -94,6 +95,7 @@ fn abort_on_drop_cancels_the_spawned_foreign_task() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // models the emitted FFI async wrapper, which starts the foreign future raw
 fn panicking_spawned_foreign_task_folds_to_a_typed_err() {
     // The emitted async wrapper's join-error arm: a panic at poll time inside
     // the spawned foreign future becomes a `JoinError`, folded to the redacted
@@ -250,6 +252,7 @@ fn spawn_guarded_folds_a_poll_panic_to_the_redacted_funnel() {
 }
 
 #[test]
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // models the emitted FFI async wrapper, which starts the foreign future raw
 fn defused_guard_lets_the_join_outcome_through() {
     let wrapper: IpeTask<String, i64> = Box::pin(async move {
         let handle = tokio::task::spawn(async move { 7_i64 });

@@ -17,9 +17,10 @@
 //! The same walk keys every async-task start and join on its operation: a call,
 //! a path or a method named in [`TASK_OPS`], on any receiver and outside the
 //! [`FUNNEL_FILES`], is a site that [`TASK_SITES`] must list exactly, so a task
-//! starts and joins only through `threads::spawn_task` and `IpeJoinSet`. An
-//! `#[allow]` or `#[expect]` of `clippy::disallowed_types` outside the funnel
-//! is refused, since it would silence the type-resolved `JoinSet` ban.
+//! starts and joins only through `threads::spawn_task`, `threads::spawn_service`
+//! and `IpeJoinSet`. An `#[allow]` or `#[expect]` of `clippy::disallowed_types`
+//! outside the funnel is refused, since it would silence the type-resolved
+//! `JoinSet` and `JoinHandle` bans.
 //!
 //! A `#[cfg(...)]` proven test-only removes exactly the node it is attached to;
 //! a `use` names nothing; comments and string literals are never code. A macro
@@ -94,8 +95,6 @@ const TASK_OPS: &[&str] = &[
     "try_join_next",
     "join_next_with_id",
     "join_all",
-    "spawn_unmigrated",
-    "spawn_in_current_scope",
 ];
 
 /// The files that hold the task funnel; their task operations are its own.
@@ -155,27 +154,12 @@ impl<'ast> Visit<'ast> for DeclaresOrExpands {
     }
 }
 
-/// The files whose raw task sites the next migration slice moves onto the
-/// funnel; only they may hold a [`TaskRoute::Unmigrated`] row.
-const UNMIGRATED_FILES: &[&str] = &[
-    "tea.rs",
-    "system.rs",
-    "web/console_proxy.rs",
-    "task.rs",
-    "ws_client.rs",
-];
-
-/// The directory prefix whose files the next migration slice also moves.
-const UNMIGRATED_DIR: &str = "debugger/";
-
 /// How a ledgered task site stands to the funnel.
 #[derive(Debug, Clone, Copy)]
 enum TaskRoute {
     /// The name is not a task operation here (an OS-thread or child-process
     /// start, a closure parameter called `spawn`); the text says what it is.
     NotATask(&'static str),
-    /// A raw start the next migration slice moves onto the funnel.
-    Unmigrated,
     /// A task on a target with no unwind, so no trip can be typed there; the
     /// text says why.
     NoUnwind(&'static str),
@@ -205,13 +189,6 @@ const SOURCE_START: &str = "a Sub source's start closure, called by its binding'
 const TASK_SITES: &[TaskSite] = &[
     TaskSite {
         file: "system.rs",
-        function: OUTSIDE_FN,
-        op: "spawn",
-        count: 1,
-        route: TaskRoute::Unmigrated,
-    },
-    TaskSite {
-        file: "system.rs",
         function: "request_spawn",
         op: "spawn",
         count: 1,
@@ -239,13 +216,6 @@ const TASK_SITES: &[TaskSite] = &[
         route: TaskRoute::NotATask("`std::thread::Builder::spawn`, the spawner's OS thread"),
     },
     TaskSite {
-        file: "task.rs",
-        function: "spawn_in_current_scope",
-        op: "spawn_unmigrated",
-        count: 1,
-        route: TaskRoute::Unmigrated,
-    },
-    TaskSite {
         file: "tea.rs",
         function: "add",
         op: "spawn",
@@ -261,27 +231,6 @@ const TASK_SITES: &[TaskSite] = &[
     },
     TaskSite {
         file: "tea.rs",
-        function: "apply",
-        op: "spawn_in_current_scope",
-        count: 1,
-        route: TaskRoute::Unmigrated,
-    },
-    TaskSite {
-        file: "tea.rs",
-        function: "cli_run_cmd_tracked",
-        op: "spawn_in_current_scope",
-        count: 1,
-        route: TaskRoute::Unmigrated,
-    },
-    TaskSite {
-        file: "tea.rs",
-        function: "start_source",
-        op: "spawn_in_current_scope",
-        count: 2,
-        route: TaskRoute::Unmigrated,
-    },
-    TaskSite {
-        file: "tea.rs",
         function: "sub_map_arc",
         op: "spawn",
         count: 1,
@@ -293,13 +242,6 @@ const TASK_SITES: &[TaskSite] = &[
         op: "spawn",
         count: 1,
         route: TaskRoute::NotATask(SOURCE_START),
-    },
-    TaskSite {
-        file: "tea.rs",
-        function: "worker_run_cmd",
-        op: "spawn_in_current_scope",
-        count: 1,
-        route: TaskRoute::Unmigrated,
     },
     TaskSite {
         file: "wasm/mod.rs",
@@ -328,13 +270,6 @@ const TASK_SITES: &[TaskSite] = &[
         op: "spawn",
         count: 1,
         route: TaskRoute::NotATask(SOURCE_START),
-    },
-    TaskSite {
-        file: "ws_client.rs",
-        function: "start_socket",
-        op: "spawn",
-        count: 1,
-        route: TaskRoute::Unmigrated,
     },
 ];
 
@@ -1030,11 +965,6 @@ fn disallowed_type_allows(name: &str, src: &str) -> usize {
     walk.0
 }
 
-/// Whether `file` is one the next migration slice moves onto the funnel.
-fn awaits_migration(file: &str) -> bool {
-    UNMIGRATED_FILES.contains(&file) || file.starts_with(UNMIGRATED_DIR)
-}
-
 /// Every difference between the task sites of `sources` and `ledger`.
 fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<String> {
     let mut counts: BTreeMap<(String, String, &'static str), usize> = BTreeMap::new();
@@ -1057,7 +987,8 @@ fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<Str
         if allows > 0 {
             out.push(format!(
                 "{file}: {allows} attribute(s) silence `clippy::disallowed_types`, which bans \
-                 a raw `JoinSet` outside `threads.rs`: join through `threads::IpeJoinSet`"
+                 a raw `JoinSet` or `JoinHandle` outside `threads.rs`: start through \
+                 `threads::spawn_task` and join a set through `threads::IpeJoinSet`"
             ));
         }
         let found = scan(file, src);
@@ -1098,17 +1029,13 @@ fn task_violations(sources: &[(String, String)], ledger: &[TaskSite]) -> Vec<Str
             ));
         }
         match site.route {
-            TaskRoute::Unmigrated if !awaits_migration(site.file) => out.push(format!(
-                "{}: `{}` `{}` is ledgered unmigrated outside the files the next slice migrates",
-                site.file, site.function, site.op
-            )),
             TaskRoute::NotATask(what) | TaskRoute::NoUnwind(what) if what.trim().is_empty() => {
                 out.push(format!(
                     "{}: `{}` must say why its `{}` is not a funnel start",
                     site.file, site.function, site.op
                 ));
             }
-            TaskRoute::Unmigrated | TaskRoute::NotATask(_) | TaskRoute::NoUnwind(_) => {}
+            TaskRoute::NotATask(_) | TaskRoute::NoUnwind(_) => {}
         }
     }
     out
@@ -1121,8 +1048,15 @@ const CARRIED_SCOPES: &[&str] = &[
     "carry_server_request",
 ];
 
-/// Every scope the caller carrier of `task.rs` drops, and every carry the
-/// `block_on` entry thread skips.
+/// The entries that drive a future outside any caller task, each with the call
+/// that starts the drive: each must carry its future through the caller carrier.
+const ENTRIES: &[(&str, &str)] = &[
+    ("block_on", "spawn_sized"),
+    ("block_on_current_thread", "drive_entry_caught"),
+];
+
+/// Every scope the caller carrier of `task.rs` drops, and every carry an
+/// [`ENTRIES`] entry skips.
 fn carrier_gaps(sources: &[(String, String)]) -> Vec<String> {
     let Some((_, src)) = sources.iter().find(|(name, _)| name == "task.rs") else {
         return vec!["task.rs: not read, so the caller carrier cannot be checked".to_owned()];
@@ -1139,7 +1073,9 @@ fn carrier_gaps(sources: &[(String, String)]) -> Vec<String> {
             )
         })
         .collect();
-    out.extend(block_on_carry_gaps(src));
+    for (entry, start) in ENTRIES {
+        out.extend(entry_carry_gaps(src, entry, start));
+    }
     out
 }
 
@@ -1197,7 +1133,8 @@ impl<'ast> Visit<'ast> for Rebinds<'_> {
     }
 }
 
-/// Whether `stmt` is `let <param> = on_behalf_of_caller(<param>);`.
+/// Whether `stmt` is `let <param> = on_behalf_of_caller(<param>);`, the
+/// carrier named by its bare identifier.
 fn carries_param(stmt: &Stmt, param: &syn::Ident) -> bool {
     let Stmt::Local(local) = stmt else {
         return false;
@@ -1211,50 +1148,61 @@ fn carries_param(stmt: &Stmt, param: &syn::Ident) -> bool {
     let Expr::Call(call) = &*init.expr else {
         return false;
     };
-    let carrier = matches!(&*call.func, Expr::Path(f) if f.path.segments.last().is_some_and(|s| s.ident == "on_behalf_of_caller"));
+    let carrier = matches!(&*call.func, Expr::Path(f) if f.qself.is_none() && f.path.is_ident("on_behalf_of_caller"));
     let mut args = call.args.iter();
     let of_param =
         matches!((args.next(), args.next()), (Some(Expr::Path(a)), None) if a.path.is_ident(param));
     bound.ident == *param && bound.subpat.is_none() && carrier && of_param
 }
 
-/// Every way the `block_on` entry of `src` can start its entry thread on a
-/// future that does not carry the caller's scope.
+/// Every way the `entry` of `src` can drive, through `start`, a future that
+/// does not carry the caller's scope.
 ///
-/// Exactly one top-level `block_on` spawns through `spawn_sized`, once, and a
-/// statement before that spawn shadows its future parameter with
-/// `on_behalf_of_caller` of itself, with no rebinding of the name between.
-fn block_on_carry_gaps(src: &str) -> Vec<String> {
+/// Exactly one top-level `entry` calls `start`, once; its body declares no item
+/// (a nested `fn` or `use` could shadow the carrier); and a statement before
+/// that call shadows its future parameter with `on_behalf_of_caller` of itself,
+/// with no rebinding of the name between.
+fn entry_carry_gaps(src: &str, entry: &str, start: &str) -> Vec<String> {
     let Ok(file) = syn::parse_file(src) else {
-        return vec!["task.rs: does not parse, so `block_on` cannot be checked".to_owned()];
+        return vec![format!(
+            "task.rs: does not parse, so `{entry}` cannot be checked"
+        )];
     };
     let entries: Vec<&ItemFn> = file
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Fn(f)
-                if f.sig.ident == "block_on" && calls_named(&f.block.stmts, "spawn_sized") > 0 =>
-            {
+            Item::Fn(f) if f.sig.ident == entry && calls_named(&f.block.stmts, start) > 0 => {
                 Some(f)
             }
             _ => None,
         })
         .collect();
-    let [entry] = entries.as_slice() else {
+    let [found] = entries.as_slice() else {
         return vec![format!(
-            "task.rs: {} top-level `block_on` entries start their thread through \
-             `spawn_sized`; exactly one must, so its carry can be checked",
+            "task.rs: {} top-level `{entry}` entries drive their future through `{start}`; \
+             exactly one must, so its carry can be checked",
             entries.len()
         )];
     };
-    let stmts = &entry.block.stmts;
-    let spawns = calls_named(stmts, "spawn_sized");
-    if spawns != 1 {
+    let stmts = &found.block.stmts;
+    let items = stmts
+        .iter()
+        .filter(|stmt| matches!(stmt, Stmt::Item(_)))
+        .count();
+    if items > 0 {
         return vec![format!(
-            "task.rs: `block_on` calls `spawn_sized` {spawns} times; one carried start is checked"
+            "task.rs: `{entry}` declares {items} item(s) in its body, which could shadow \
+             the carrier: declare them outside the entry"
         )];
     }
-    let param = entry.sig.inputs.first().and_then(|arg| match arg {
+    let starts = calls_named(stmts, start);
+    if starts != 1 {
+        return vec![format!(
+            "task.rs: `{entry}` calls `{start}` {starts} times; one carried start is checked"
+        )];
+    }
+    let param = found.sig.inputs.first().and_then(|arg| match arg {
         syn::FnArg::Typed(typed) => match &*typed.pat {
             Pat::Ident(p) => Some(p.ident.clone()),
             _ => None,
@@ -1262,23 +1210,23 @@ fn block_on_carry_gaps(src: &str) -> Vec<String> {
         syn::FnArg::Receiver(_) => None,
     });
     let Some(param) = param else {
-        return vec!["task.rs: `block_on` takes no named future to carry".to_owned()];
+        return vec![format!("task.rs: `{entry}` takes no named future to carry")];
     };
     let carried = stmts.iter().position(|stmt| carries_param(stmt, &param));
-    let spawned = stmts
+    let started = stmts
         .iter()
-        .position(|stmt| calls_named(std::slice::from_ref(stmt), "spawn_sized") > 0);
-    let (Some(carried), Some(spawned)) = (carried, spawned) else {
+        .position(|stmt| calls_named(std::slice::from_ref(stmt), start) > 0);
+    let (Some(carried), Some(started)) = (carried, started) else {
         return vec![format!(
-            "task.rs: `block_on` never carries its future through \
-             `let {param} = on_behalf_of_caller({param});`, so its entry thread drops \
-             the caller's scope"
+            "task.rs: `{entry}` never carries its future through \
+             `let {param} = on_behalf_of_caller({param});`, so it drives the future \
+             outside the caller's scope"
         )];
     };
-    if carried >= spawned {
+    if carried >= started {
         return vec![format!(
-            "task.rs: `block_on` carries `{param}` after the `spawn_sized` start, so the \
-             entry thread runs the uncarried future"
+            "task.rs: `{entry}` carries `{param}` after the `{start}` call, so it drives \
+             the uncarried future"
         )];
     }
     let mut rebinds = Rebinds {
@@ -1286,15 +1234,15 @@ fn block_on_carry_gaps(src: &str) -> Vec<String> {
         found: false,
     };
     for stmt in stmts
-        .get(carried.saturating_add(1)..spawned)
+        .get(carried.saturating_add(1)..started)
         .unwrap_or_default()
     {
         rebinds.visit_stmt(stmt);
     }
     if rebinds.found {
         return vec![format!(
-            "task.rs: `block_on` rebinds `{param}` between its carry and the `spawn_sized` \
-             start, so the entry thread may run an uncarried future"
+            "task.rs: `{entry}` rebinds `{param}` between its carry and the `{start}` call, \
+             so it may drive an uncarried future"
         )];
     }
     Vec::new()
@@ -1535,7 +1483,7 @@ const SOCKET_ONLY: &[TaskSite] = &[TaskSite {
     function: "start_socket",
     op: "spawn",
     count: 1,
-    route: TaskRoute::Unmigrated,
+    route: TaskRoute::NotATask("a fixture's ledgered site"),
 }];
 
 #[test]
@@ -1592,22 +1540,7 @@ mod tests { fn t() { tokio::spawn(async {}); } }
 }
 
 #[test]
-fn an_unmigrated_row_outside_the_next_slice_or_a_stale_row_is_refused() {
-    let ledger = &[TaskSite {
-        file: "db.rs",
-        function: "close_within",
-        op: "join_next",
-        count: 1,
-        route: TaskRoute::Unmigrated,
-    }];
-    let src = "async fn close_within(set: &mut S) { let _ = set.join_next().await; }";
-    let found = task_violations(&sources(&[("db.rs", src)]), ledger);
-    assert!(
-        found
-            .iter()
-            .any(|v| v.contains("ledgered unmigrated outside the files the next slice migrates")),
-        "{found:#?}"
-    );
+fn a_stale_or_unexplained_row_is_refused() {
     let stale = task_violations(
         &sources(&[("ws_client.rs", "fn start_socket() {}")]),
         SOCKET_ONLY,
@@ -1615,6 +1548,21 @@ fn an_unmigrated_row_outside_the_next_slice_or_a_stale_row_is_refused() {
     assert!(
         stale.iter().any(|v| v.contains("(stale entry)")),
         "{stale:#?}"
+    );
+    let unexplained = &[TaskSite {
+        file: "db.rs",
+        function: "close_within",
+        op: "join_next",
+        count: 1,
+        route: TaskRoute::NotATask(" "),
+    }];
+    let src = "async fn close_within(set: &mut S) { let _ = set.join_next().await; }";
+    let found = task_violations(&sources(&[("db.rs", src)]), unexplained);
+    assert!(
+        found
+            .iter()
+            .any(|v| v.contains("must say why its `join_next` is not a funnel start")),
+        "{found:#?}"
     );
 }
 
@@ -1628,24 +1576,30 @@ fn block_on(future: F) {
     let future = on_behalf_of_caller(future);
     crate::threads::spawn_sized(move || future);
 }
+fn block_on_current_thread(future: F) {
+    let future = on_behalf_of_caller(future);
+    drive_entry_caught(move || rt.block_on(future))
+}
 ";
     let found = carrier_gaps(&sources(&[("task.rs", carried)]));
     assert!(found.is_empty(), "{found:#?}");
     let dropped = r"
 fn on_behalf_of_caller<F>(task: F) -> F { carry_web_session(carry_request_streams(task)) }
 fn block_on(future: F) { crate::threads::spawn_sized(move || future); }
+fn block_on_current_thread(future: F) { drive_entry_caught(move || rt.block_on(future)) }
 ";
     let gaps = carrier_gaps(&sources(&[("task.rs", dropped)]));
     for needle in [
         "never calls `carry_server_request`",
         "`block_on` never carries its future",
+        "`block_on_current_thread` never carries its future",
     ] {
         assert!(
             gaps.iter().any(|v| v.contains(needle)),
             "{needle} must be refused: {gaps:#?}"
         );
     }
-    assert_eq!(gaps.len(), 2, "{gaps:#?}");
+    assert_eq!(gaps.len(), 3, "{gaps:#?}");
 }
 
 #[test]
@@ -1656,7 +1610,7 @@ fn a_block_on_carry_out_of_order_or_off_its_future_is_refused() {
                 crate::threads::spawn_sized(move || future);
                 let future = on_behalf_of_caller(future);
             }",
-            "after the `spawn_sized` start",
+            "after the `spawn_sized` call",
         ),
         (
             "fn block_on(future: F) {
@@ -1696,9 +1650,32 @@ fn a_block_on_carry_out_of_order_or_off_its_future_is_refused() {
             fn block_on(future: F) { crate::threads::spawn_sized(move || future); }",
             "2 top-level `block_on` entries",
         ),
+        (
+            "fn block_on(future: F) {
+                let future = task::on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "never carries its future",
+        ),
+        (
+            "fn block_on(future: F) {
+                use raw as on_behalf_of_caller;
+                let future = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "declares 1 item(s) in its body",
+        ),
+        (
+            "fn block_on(future: F) {
+                fn on_behalf_of_caller(f: F) -> F { f }
+                let future = on_behalf_of_caller(future);
+                crate::threads::spawn_sized(move || future);
+            }",
+            "declares 1 item(s) in its body",
+        ),
     ];
     for (src, needle) in refused {
-        let gaps = block_on_carry_gaps(src);
+        let gaps = entry_carry_gaps(src, "block_on", "spawn_sized");
         assert!(
             gaps.len() == 1 && gaps.iter().any(|g| g.contains(needle)),
             "`{needle}` must be refused:\n{src}\n{gaps:#?}"

@@ -1455,7 +1455,7 @@ mod tests {
         assert!(addr.is_ok(), "listener address");
         let Ok(addr) = addr else { return };
         // Accept and hold every connection open without ever replying.
-        let holder = tokio::spawn(async move {
+        let holder = crate::threads::raw_for_tests::spawn(async move {
             let mut held = Vec::new();
             while let Ok((sock, _)) = listener.accept().await {
                 held.push(sock);
@@ -1986,9 +1986,9 @@ mod tests {
                 .await
                 .expect("bind loopback");
             let addr = listener.local_addr().expect("listener address");
-            tokio::spawn(async move {
+            crate::threads::raw_for_tests::spawn(async move {
                 while let Ok((mut sock, _)) = listener.accept().await {
-                    tokio::spawn(async move {
+                    crate::threads::raw_for_tests::spawn(async move {
                         let mut buf = vec![0u8; 4096];
                         let n = sock.read(&mut buf).await.unwrap_or(0);
                         let head = std::str::from_utf8(buf.get(..n).unwrap_or_default())
@@ -2042,9 +2042,9 @@ mod tests {
                 .await
                 .expect("bind loopback");
             let addr = listener.local_addr().expect("listener address");
-            tokio::spawn(async move {
+            crate::threads::raw_for_tests::spawn(async move {
                 while let Ok((mut sock, _)) = listener.accept().await {
-                    tokio::spawn(async move {
+                    crate::threads::raw_for_tests::spawn(async move {
                         let mut buf = vec![0u8; 4096];
                         let _ = sock.read(&mut buf).await;
                         let _ = sock.write_all(reply.as_bytes()).await;

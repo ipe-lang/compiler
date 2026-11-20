@@ -1021,6 +1021,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::threads::raw_for_tests::RawJoin;
     use futures_util::{FutureExt, stream};
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1028,7 +1029,6 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Notify;
-    use tokio::task::JoinHandle;
     use tokio::time::Instant;
 
     /// A deterministic key source: the n-th draw is the key `n`.
@@ -1236,7 +1236,10 @@ mod tests {
         if let IpeSub::Source(spawn) = sub {
             let emit: Arc<dyn Fn(ChunkEvent<IpeError>) + Send + Sync> =
                 Arc::new(move |event: ChunkEvent<IpeError>| sink.lock().unwrap().push(event));
-            drop(crate::tea::start_source(spawn(emit)));
+            drop(crate::tea::start_source(
+                spawn(emit),
+                &crate::threads::TripSink::new(),
+            ));
         }
         events
     }
@@ -1273,7 +1276,7 @@ mod tests {
         let reg = new_reg::<FakeConn>();
         let calls = Arc::new(AtomicUsize::new(0));
         let (sid, dropped) = park(reg, scripted(vec![Beat::Stall]));
-        let drain = tokio::spawn(for_each_chunk_in(
+        let drain = crate::threads::raw_for_tests::spawn(for_each_chunk_in(
             reg,
             sid.key,
             ms(7_200_000),
@@ -1311,7 +1314,12 @@ mod tests {
                 })
             }
         };
-        let drain = tokio::spawn(for_each_chunk_in(reg, sid.key, ms(7_200_000), body));
+        let drain = crate::threads::raw_for_tests::spawn(for_each_chunk_in(
+            reg,
+            sid.key,
+            ms(7_200_000),
+            body,
+        ));
         entered.notified().await;
         assert!(with_registry(reg, |r| r.close(sid.key)).is_ok());
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1405,7 +1413,7 @@ mod tests {
             stream::repeat_with(|| Ok::<String, String>("x".to_owned())).take(UNYIELDING_CHUNKS),
         );
         let (sid, dropped) = park(reg, upstream);
-        let drain = tokio::spawn(for_each_chunk_in(
+        let drain = crate::threads::raw_for_tests::spawn(for_each_chunk_in(
             reg,
             sid.key,
             ms(7_200_000),
@@ -1560,10 +1568,10 @@ mod tests {
     }
 
     /// Accepts one connection, writes `reply`, then holds the socket.
-    async fn serve_once(reply: &'static [u8]) -> (u16, JoinHandle<TcpStream>) {
+    async fn serve_once(reply: &'static [u8]) -> (u16, RawJoin<TcpStream>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let held = tokio::spawn(async move {
+        let held = crate::threads::raw_for_tests::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             if !reply.is_empty() {
                 socket.write_all(reply).await.unwrap();
@@ -1632,7 +1640,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         // Chunked headers, no chunks; then read until the client closes.
-        let server = tokio::spawn(async move {
+        let server = crate::threads::raw_for_tests::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             let head = b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n";
             socket.write_all(head).await.unwrap();
@@ -1658,7 +1666,7 @@ mod tests {
         assert!(sid.is_some());
         let Some(sid) = sid else { return };
         let calls = Arc::new(AtomicUsize::new(0));
-        let drain = tokio::spawn(for_each_chunk_in(
+        let drain = crate::threads::raw_for_tests::spawn(for_each_chunk_in(
             reg,
             sid.key,
             ms(60_000),
@@ -1749,7 +1757,7 @@ mod tests {
     fn start_pump(
         reg: &mut StreamRegistry<FakeConn>,
         idle: IdleCeiling,
-    ) -> (StreamKey, JoinHandle<DrainEnd<String, String>>) {
+    ) -> (StreamKey, RawJoin<DrainEnd<String, String>>) {
         let permit = reg.reserve().unwrap();
         let body = scripted(vec![Beat::Stall]);
         let sid = reg.open(FakeConn { body, permit }, os_entropy).unwrap();
@@ -1761,7 +1769,9 @@ mod tests {
             cancel: claimed.cancel,
             idle,
         };
-        let task = tokio::spawn(pump.run(|_chunk| std::future::ready(Ok::<(), String>(()))));
+        let task = crate::threads::raw_for_tests::spawn(
+            pump.run(|_chunk| std::future::ready(Ok::<(), String>(()))),
+        );
         (sid.key, task)
     }
 
