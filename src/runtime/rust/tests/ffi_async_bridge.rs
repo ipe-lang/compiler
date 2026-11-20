@@ -4,18 +4,18 @@
 //!    reactor-registered handle (FFI client, listener, timer) constructed in
 //!    one `block_on` stays usable in a later one — a fresh runtime per entry
 //!    would leave the handle on a dead reactor.
-//! 2. `AbortOnDrop` — the guard the emitted async FFI wrapper arms around its
-//!    spawned foreign task — aborts the inner task when the wrapper future is
-//!    dropped before completion (`Task.parallel` early-cancel), so a
+//! 2. `ffi_spawn_guarded` — the one task start every emitted async FFI
+//!    wrapper goes through — aborts the foreign task when the wrapper future
+//!    is dropped before completion (`Task.parallel` early-cancel), so a
 //!    cancelled foreign call cannot keep producing side effects.
-//! 3. A poll-time panic inside the spawned foreign future surfaces as the
-//!    wrapper's typed `Err` through the join-error arm and the redacting
-//!    foreign-error funnel — never a process abort, never a silent hang.
+//! 3. A poll-time panic inside the foreign future surfaces as the wrapper's
+//!    typed `Err` through the redacting panic funnel — never a process abort,
+//!    never a silent hang.
 // `tokio` is a native-only dependency: the feature names it, wasm32 has no crate.
 #![cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 
 use ipe_runtime_rust::{
-    AbortOnDrop, IpeError, IpeErrorKind, IpeResult, IpeTask, block_on, ffi_spawn_guarded,
+    IpeError, IpeErrorKind, IpeResult, IpeTask, block_on, ffi_spawn_guarded,
     ipe_error_from_foreign, ok_res,
 };
 use std::sync::Arc;
@@ -54,78 +54,6 @@ fn reactor_handle_survives_across_two_block_on_entries() -> Result<(), String> {
         other => Err(format!(
             "listener bound in entry 1 must accept in entry 2 (shared reactor): {other:?}"
         )),
-    }
-}
-
-#[test]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // models the emitted FFI async wrapper, which starts the foreign future raw
-fn abort_on_drop_cancels_the_spawned_foreign_task() {
-    let side_effect = Arc::new(AtomicBool::new(false));
-    let observed = Arc::clone(&side_effect);
-    // The emitted async wrapper shape: spawn, arm the guard, await, defuse.
-    let wrapper: IpeTask<String, i64> = Box::pin(async move {
-        let handle = tokio::task::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(60)).await;
-            side_effect.store(true, Ordering::SeqCst);
-            1_i64
-        });
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        let joined = handle.await;
-        guard.defuse();
-        match joined {
-            Ok(v) => ok_res(v),
-            Err(e) => IpeResult::Err(format!("{e:?}")),
-        }
-    });
-    let outcome: IpeResult<String, bool> = block_on(Box::pin(async move {
-        // Cancel the wrapper mid-flight: the timeout drops the wrapper future
-        // before the inner sleep completes, so the guard must abort the spawn.
-        let cancelled = tokio::time::timeout(Duration::from_millis(5), wrapper).await;
-        if cancelled.is_ok() {
-            return IpeResult::Err("wrapper completed before the cancel window".to_owned());
-        }
-        // Give a leaked (non-aborted) inner task time to run its side effect.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        ok_res(observed.load(Ordering::SeqCst))
-    }));
-    assert!(
-        matches!(outcome, IpeResult::Ok(false)),
-        "the aborted foreign task must not produce its side effect: {outcome:?}"
-    );
-}
-
-#[test]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // models the emitted FFI async wrapper, which starts the foreign future raw
-fn panicking_spawned_foreign_task_folds_to_a_typed_err() {
-    // The emitted async wrapper's join-error arm: a panic at poll time inside
-    // the spawned foreign future becomes a `JoinError`, folded to the redacted
-    // funnel message (generic text + correlation id) — the raw panic payload
-    // never rides the Ipê-visible error value.
-    let wrapper: IpeTask<IpeError, i64> = Box::pin(async move {
-        let handle: tokio::task::JoinHandle<i64> =
-            tokio::task::spawn(async move { panic!("foreign poll-time panic") });
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        let joined = handle.await;
-        guard.defuse();
-        match joined {
-            Ok(v) => ok_res(v),
-            Err(join_err) => IpeResult::Err(ipe_error_from_foreign(join_err)),
-        }
-    });
-    match block_on(wrapper) {
-        IpeResult::Err(IpeError::Error(kind, info)) => {
-            assert_eq!(
-                kind,
-                IpeErrorKind::Ffi,
-                "a foreign join error is kinded Ffi"
-            );
-            assert!(
-                info.message.starts_with("external operation failed (ref "),
-                "join error must fold to the redacted funnel message: {}",
-                info.message
-            );
-        }
-        IpeResult::Ok(v) => panic!("expected a typed Err, got Ok({v})"),
     }
 }
 
@@ -249,20 +177,4 @@ fn spawn_guarded_folds_a_poll_panic_to_the_redacted_funnel() {
         }
         IpeResult::Ok(v) => panic!("expected a typed Err, got Ok({v})"),
     }
-}
-
-#[test]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)] // models the emitted FFI async wrapper, which starts the foreign future raw
-fn defused_guard_lets_the_join_outcome_through() {
-    let wrapper: IpeTask<String, i64> = Box::pin(async move {
-        let handle = tokio::task::spawn(async move { 7_i64 });
-        let guard = AbortOnDrop::new(handle.abort_handle());
-        let joined = handle.await;
-        guard.defuse();
-        match joined {
-            Ok(v) => ok_res(v),
-            Err(e) => IpeResult::Err(format!("{e:?}")),
-        }
-    });
-    assert!(matches!(block_on(wrapper), IpeResult::Ok(7)));
 }

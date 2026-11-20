@@ -4783,10 +4783,12 @@ pub(crate) mod exit_signals {
     /// The relay thread: register the listeners on its own runtime, report
     /// them, then decide every request.
     fn run_relay(listen: Listen, ready: &std::sync::mpsc::SyncSender<Result<(), RelayRefused>>) {
-        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-        else {
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        // Unix signal listeners register with the IO driver; Windows console
+        // events need no driver, and tokio builds none there without `net`.
+        #[cfg(unix)]
+        builder.enable_io();
+        let Ok(runtime) = builder.build() else {
             let _ = ready.send(Err(RelayRefused::Runtime));
             return;
         };
