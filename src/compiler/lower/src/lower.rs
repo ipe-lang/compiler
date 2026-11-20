@@ -40892,7 +40892,7 @@ mod tests {
                 .any(|ty| matches!(ty, Ty::Record(_, ipe_types::RowTail::Open(_)))),
             "the update's base must read back as an open record"
         );
-        let lowered = crate::lower(&m, &types, &mut i, "", "");
+        let lowered = crate::lower(&m, &types, &mut i, "", "", crate::Roots::Entry);
         assert!(
             lowered.is_ok(),
             "a row-polymorphic record update must lower, got {:?}",
@@ -41407,7 +41407,7 @@ mod tests {
         let parsed = ipe_parse::parse_module(&src, &mut i).expect("source must parse");
         let m = ipe_canon::canonicalise(&parsed, &mut i).expect("source must resolve");
         let types = ipe_types::infer(&m, &mut i).expect("the ceiling-deep chain must type-check");
-        let lowered = crate::lower(&m, &types, &mut i, "", "");
+        let lowered = crate::lower(&m, &types, &mut i, "", "", crate::Roots::Entry);
         assert!(
             lowered.is_ok(),
             "a lambda chain at the type depth ceiling must lower, got {:?}",
