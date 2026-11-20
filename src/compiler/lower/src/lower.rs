@@ -27707,6 +27707,29 @@ impl<'a> Lowerer<'a> {
         Ok(value)
     }
 
+    /// Refuse an eta-expanded `succeed` whose payload parameter (`payload`)
+    /// the factory cannot reproduce by `.clone()`; every other callee passes.
+    ///
+    /// # Errors
+    /// IPE-L0135 ([`Feature::NonCloneValueReuse`]) at `span`, as
+    /// [`Self::refuse_nonclone_succeed_payload`].
+    fn refuse_nonclone_eta_succeed(
+        &self,
+        callee: &Callee,
+        payload: Option<&Ty>,
+        span: Span,
+    ) -> DResult<()> {
+        match (callee, payload) {
+            (
+                Callee::Kernel(
+                    KernelFn::JsonDecSucceed | KernelFn::DbDecSucceed | KernelFn::ConfigSucceed,
+                ),
+                Some(payload),
+            ) => self.refuse_nonclone_succeed_payload(payload, span),
+            (Callee::Kernel(_) | Callee::Func(_) | Callee::Ffi { .. }, _) => Ok(()),
+        }
+    }
+
     /// Refuse a `succeed` payload type the factory cannot reproduce by
     /// `.clone()`.
     ///
@@ -27955,15 +27978,7 @@ impl<'a> Lowerer<'a> {
         // A point-free `succeed` reaches its payload factory through the eta
         // parameter, which the factory reproduces by `.clone()` exactly as a
         // saturated call's payload: the same IPE-L0135 refusal applies.
-        if matches!(
-            resolved,
-            Callee::Kernel(
-                KernelFn::JsonDecSucceed | KernelFn::DbDecSucceed | KernelFn::ConfigSucceed
-            )
-        ) && let Some(payload) = arg_tys.first()
-        {
-            self.refuse_nonclone_succeed_payload(payload, call_span)?;
-        }
+        self.refuse_nonclone_eta_succeed(&resolved, arg_tys.first().copied(), call_span)?;
 
         let supplied = lowered_args.len();
         // The missing parameters are argument positions `supplied..arity`.
