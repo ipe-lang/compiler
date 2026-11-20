@@ -10105,9 +10105,11 @@ mod base_path_tests {
         );
         assert!(
             full.contains("__ipeKeepFocus(function() {\n    applyFn();")
+                && full.contains("  }, null);")
                 && diff
-                    .contains("__ipeKeepFocus(function() {\n    __ipeApplyPatches(frame.patches);"),
-            "each adopt function commits its frame inside the focus keep"
+                    .contains("__ipeKeepFocus(function() {\n    __ipeApplyPatches(frame.patches);")
+                && diff.contains("  }, frame.patches);"),
+            "each adopt function commits its frame inside the focus keep; a whole-body swap arms no drop check"
         );
         let patch_calls: Vec<&str> = js
             .lines()
@@ -10125,24 +10127,61 @@ mod base_path_tests {
                 js.matches("__ipeRestoreFocus(").count(),
                 keep.matches("__ipeRestoreFocus(").count()
             ),
-            (3, 2),
-            "`__ipeRestoreFocus` is called only by the keep, at its two check points"
+            (3, 1),
+            "`__ipeRestoreFocus` is called only by the keep's check and the drop check"
         );
         assert!(
             !swap.contains("__ipeRestoreFocus") && !swap.contains("__ipeNode.focus("),
             "a swap restores no focus itself"
         );
+        let cleared = keep.find("__ipeFocusPending = null;");
+        let run = keep.find("run();");
         assert!(
-            keep.contains("if (__ipeFocusKeep !== rec) return;")
-                && keep
-                    .matches("window.requestAnimationFrame(function() {")
-                    .count()
-                    == 2,
-            "the deferred check runs two animation frames on, for the newest frame only"
+            matches!((cleared, run), (Some(c), Some(r)) if c < r)
+                && !js.contains("requestAnimationFrame")
+                && !js.contains("__ipeFocusKeep"),
+            "the commit clears the armed drop check before it runs, and no check counts animation frames"
+        );
+        let drop = js
+            .split_once("__ipeDoc.on(__IPE_FOCUS_DROP_EVENT, function(ev) {")
+            .and_then(|(_, rest)| rest.split_once("\n}, true);\n"))
+            .map_or("", |(body, _)| body);
+        assert!(
+            drop.contains("__ipeFocusDropAnswers(")
+                && drop.contains("__ipeFocusPending = null;")
+                && drop.contains("setTimeout(")
+                && drop.contains("__ipeFocusSettleDue(pending.rec)")
+                && drop.contains("__ipeRestoreFocus(pending.rec.chain)")
+                && !drop.contains("queueMicrotask")
+                && !drop.contains("Promise"),
+            "the drop check is taken once and runs the keep's check in a posted task, never a microtask"
         );
         assert!(
             settle.contains("return !held && __ipeFocusEpoch === rec.epoch && __ipeEpoch === rec.frame &&\n      !__ipeRuntimeFocusing;"),
             "the keep refuses focus held, a user focus move, a newer frame and a runtime move"
+        );
+    }
+
+    /// `client.js` answers a focus drop by the runtime's own drop event and
+    /// decides by the runtime's own predicates.
+    #[test]
+    fn client_focus_drop_event_matches_the_runtime() {
+        let js = super::CLIENT_JS;
+        let open = "var __IPE_FOCUS_DROP_EVENT = \"";
+        let event = js
+            .find(open)
+            .and_then(|at| js.get(at + open.len()..))
+            .and_then(|rest| rest.get(..rest.find('"')?));
+        assert_eq!(event, Some(crate::dom::focus::FOCUS_DROP_EVENT));
+        assert_eq!(
+            js_function(js, "__ipeFocusArms").unwrap_or_default(),
+            "\nfunction __ipeFocusArms(chain, patched, heldUnchanged, focusHeld) {\n  return focusHeld && heldUnchanged && chain.some(function(link) { return patched(link.id); });",
+            "`__ipeFocusArms` is `dom::focus::arms`"
+        );
+        assert_eq!(
+            js_function(js, "__ipeFocusDropAnswers").unwrap_or_default(),
+            "\nfunction __ipeFocusDropAnswers(targetIsHeld, relatedIsNull) {\n  return targetIsHeld && relatedIsNull;",
+            "`__ipeFocusDropAnswers` is `dom::focus::drop_answers`"
         );
     }
 

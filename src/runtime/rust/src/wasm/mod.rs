@@ -40,7 +40,8 @@ use crate::dom::{
     HandlerIndex, WebReq, build_index,
     diff::{AUTOFOCUS_SPENT_GLOBAL, Patch, StampedId, diff, focus_target},
     focus::{
-        FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, chain_from_ancestry, landing, settle_due,
+        FOCUS_DROP_EVENT, FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, arms, chain_from_ancestry,
+        drop_answers, landing, settle_due,
     },
     keep::{AUTHORITY_ATTRS, Control, Field, Keep, is_authority_attr, keep},
 };
@@ -534,6 +535,19 @@ thread_local! {
     static FOCUS_EPOCH_INSTALLED: Cell<bool> = const { Cell::new(false) };
     /// The token of the newest frame committed, compared for equality only.
     static FRAME_TOKEN: Cell<u64> = const { Cell::new(0) };
+    /// The drop check the newest frame armed, if any; taken by its one drop.
+    static FOCUS_PENDING: Cell<Option<Pending>> = const { Cell::new(None) };
+}
+
+/// A drop check a frame armed after its synchronous check.
+///
+/// The next drop of `held` to nothing posts one settle of `rec` over `chain`.
+struct Pending {
+    chain: Vec<FocusLink>,
+    rec: Recorded,
+    /// The node focused before the frame and still focused after it.
+    held: web_sys::Element,
+    queued: QueuedCause,
 }
 
 /// The events that count a focus move. A key press is not one: it is what
@@ -601,8 +615,54 @@ fn install_focus_epoch(document: &web_sys::Document) -> Result<(), MountRefusal>
         // The counting listeners live for the whole tab lifetime.
         closure.forget();
     }
+    let dropped = Closure::<dyn Fn(web_sys::Event)>::new(|ev: web_sys::Event| on_focus_drop(&ev));
+    document
+        .add_event_listener_with_callback_and_bool(
+            FOCUS_DROP_EVENT,
+            dropped.as_ref().unchecked_ref(),
+            true,
+        )
+        .map_err(|e| listener_refusal(FOCUS_DROP_EVENT, &e))?;
+    // The drop listener lives for the whole tab lifetime.
+    dropped.forget();
     FOCUS_EPOCH_INSTALLED.with(|c| c.set(true));
     Ok(())
+}
+
+/// Answers the armed drop check when `ev` drops its held node to nothing.
+///
+/// The check is taken (one-shot) and runs in a posted task, after the whole
+/// focus change: a `focusin` the same change raises has bumped the epoch by
+/// then, so a move to another node is never taken back. A microtask would run
+/// between `focusout` and `focusin` and read a Tab as a drop.
+fn on_focus_drop(ev: &web_sys::Event) {
+    let Some(pending) = FOCUS_PENDING.take() else {
+        return;
+    };
+    let target_is_held = ev
+        .target()
+        .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        .is_some_and(|target| target == pending.held);
+    // `relatedTarget` read by name: a `FocusEvent` web-sys feature would widen
+    // the list the emitted manifest mirrors. An unreadable one is not null.
+    let related_is_null = js_sys::Reflect::get(ev, &JsValue::from_str("relatedTarget"))
+        .is_ok_and(|related| related.is_null() || related.is_undefined());
+    if !drop_answers(target_is_held, related_is_null) {
+        FOCUS_PENDING.set(Some(pending));
+        return;
+    }
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Pending {
+        chain, rec, queued, ..
+    } = pending;
+    let task = Closure::once_into_js(move || {
+        if let Ok(document) = document() {
+            keep_focus(&document, &chain, rec, &queued);
+        }
+    });
+    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(task.unchecked_ref(), 0);
 }
 
 /// Where focus stands in this document now.
@@ -2320,9 +2380,10 @@ fn commit_frame(patches: &[Patch], target: Option<&StampedId>, queued: &QueuedCa
 /// Applies `patches` (the `Vec<Patch>` the SSE wire serialises, through typed
 /// web-sys calls, each target found by its `ipe-id` as in `client.js`), then
 /// focuses `target`. Focus the frame left on the body is put back by the rule
-/// of [`crate::dom::focus`] at once and again two animation frames later,
-/// after the browser's own fixup for a node a patch made unfocusable; a
-/// restore moves a pending user mark in `queued` onto the landing node.
+/// of [`crate::dom::focus`] at once; when the frame patched the focused node's
+/// chain and focus held, the browser's own later drop of that node to nothing
+/// is answered once, by the drop event it raises. A restore moves a pending
+/// user mark in `queued` onto the landing node.
 pub fn apply_frame(
     document: &web_sys::Document,
     patches: &[Patch],
@@ -2372,10 +2433,12 @@ pub fn apply_frame(
         }
     }
 
-    let chain = document
-        .active_element()
+    let before = document.active_element();
+    let chain = before
+        .clone()
         .and_then(|focused| view_chain(document, focused));
     let focus_epoch = FOCUS_EPOCH.with(Cell::get);
+    FOCUS_PENDING.set(None);
     apply(document, patches);
     if let Some(target) = target {
         focus_stamped(document, target.as_str());
@@ -2390,7 +2453,26 @@ pub fn apply_frame(
     };
     let rec = Recorded { focus_epoch, frame };
     keep_focus(document, &chain, rec, queued);
-    settle_later(chain, rec, queued.clone());
+    let held = document.active_element();
+    let armed = arms(
+        &chain,
+        |id| patches.iter().any(|p| p.id == id),
+        held.is_some() && held == before,
+        !focus_on_body(document),
+    );
+    // The drop listener is installed here too: a frame can commit before a
+    // mount installed the focus-move listeners.
+    if armed
+        && let Some(held) = held
+        && install_focus_epoch(document).is_ok()
+    {
+        FOCUS_PENDING.set(Some(Pending {
+            chain,
+            rec,
+            held,
+            queued: queued.clone(),
+        }));
+    }
 }
 
 /// The view chain of `focused` below the body, the wasm mount container.
@@ -2438,24 +2520,6 @@ fn keep_focus(
             return;
         }
     }
-}
-
-/// Runs [`keep_focus`] for `rec` two animation frames on; with no animation
-/// frame the deferred check is skipped.
-fn settle_later(chain: Vec<FocusLink>, rec: Recorded, queued: QueuedCause) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    let again = window.clone();
-    let second = Closure::once_into_js(move || {
-        if let Ok(document) = document() {
-            keep_focus(&document, &chain, rec, &queued);
-        }
-    });
-    let first = Closure::once_into_js(move || {
-        let _ = again.request_animation_frame(second.unchecked_ref());
-    });
-    let _ = window.request_animation_frame(first.unchecked_ref());
 }
 
 /// Write one patched attribute onto the live `el`: `Some` sets, `None`

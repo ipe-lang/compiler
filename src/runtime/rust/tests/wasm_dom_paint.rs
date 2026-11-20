@@ -341,7 +341,7 @@ async fn a_swap_that_drops_focus_lands_on_the_nearest_stamped_host() {
 }
 
 #[wasm_bindgen_test]
-async fn an_in_place_untab_lands_on_the_ancestor_at_the_deferred_check() {
+async fn an_in_place_untab_lands_on_the_ancestor_at_commit() {
     let doc = document();
     assert!(doc.is_some(), "run_in_browser must provide a document");
     let Some(doc) = doc else { return };
@@ -355,8 +355,92 @@ async fn an_in_place_untab_lands_on_the_ancestor_at_the_deferred_check() {
     assert!(focus_on(&doc, "fku-row"));
     let untab = [patch("fku_0_div_0_div", None, &[("tabindex", None)])];
     apply_frame(&doc, &untab, None, &QueuedCause::default());
+    assert_eq!(focused_id(&doc), "fku-host");
     frames(3).await;
     assert_eq!(focused_id(&doc), "fku-host");
+    root.remove();
+}
+
+/// Resolves after one task the event loop ran after every task posted so far.
+async fn a_task() {
+    let tick = js_sys::Promise::new(&mut |resolve: js_sys::Function, _reject| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+        } else {
+            let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(tick).await;
+}
+
+/// Swaps `window.requestAnimationFrame` for `with`; the previous value.
+fn swap_animation_frames(with: &wasm_bindgen::JsValue) -> Option<wasm_bindgen::JsValue> {
+    let window = web_sys::window()?;
+    let key = wasm_bindgen::JsValue::from_str("requestAnimationFrame");
+    let was = js_sys::Reflect::get(&window, &key).ok()?;
+    js_sys::Reflect::set(&window, &key, with)
+        .ok()
+        .filter(|set| *set)
+        .map(|_| was)
+}
+
+#[wasm_bindgen_test]
+async fn a_control_disabled_in_place_lands_on_the_ancestor_whenever_the_browser_drops_it() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "fkd",
+        r#"<div ipe-id="fkd_0_div" id="fkd-host" tabindex="-1"><button ipe-id="fkd_0_div_0_button" id="fkd-btn">go</button></div>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    assert!(focus_on(&doc, "fkd-btn"));
+    // No animation frame runs for this commit: the drop is answered by the
+    // event the browser raises, whenever it raises it.
+    let stub = js_sys::Function::new_no_args("return 0;");
+    let was = swap_animation_frames(&stub);
+    assert!(was.is_some(), "the animation frame stub must install");
+    let Some(was) = was else { return };
+    let disable = [patch("fkd_0_div_0_button", None, &[("disabled", Some(""))])];
+    apply_frame(&doc, &disable, None, &QueuedCause::default());
+    assert!(swap_animation_frames(&was).is_some());
+    // The browser's own drop: `blur` raises the same `focusout` with no
+    // `relatedTarget`.
+    if let Some(button) =
+        by_id(&doc, "fkd-btn").and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = button.blur();
+    }
+    a_task().await;
+    assert_eq!(focused_id(&doc), "fkd-host");
+    root.remove();
+}
+
+#[wasm_bindgen_test]
+async fn a_script_blur_after_an_untouched_frame_stays_on_the_body() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "fkb",
+        r#"<div ipe-id="fkb_0_div" id="fkb-host" tabindex="-1"><button ipe-id="fkb_0_div_0_button" id="fkb-btn">go</button></div><p ipe-id="fkb_1_p" id="fkb-side">a</p>"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    assert!(focus_on(&doc, "fkb-btn"));
+    let side = [patch("fkb_1_p", None, &[("class", Some("lit"))])];
+    apply_frame(&doc, &side, None, &QueuedCause::default());
+    assert_eq!(focused_id(&doc), "fkb-btn");
+    if let Some(button) =
+        by_id(&doc, "fkb-btn").and_then(|el| el.dyn_into::<web_sys::HtmlElement>().ok())
+    {
+        let _ = button.blur();
+    }
+    a_task().await;
+    assert_eq!(focused_id(&doc), "");
     root.remove();
 }
 
@@ -379,7 +463,7 @@ async fn focus_the_user_placed_elsewhere_is_never_taken() {
     assert!(focus_on(&doc, "fke-row"));
     let untab = [patch("fke_0_div_0_div", None, &[("tabindex", None)])];
     apply_frame(&doc, &untab, None, &QueuedCause::default());
-    // The user moves focus out of the view before the deferred check.
+    // The user moves focus out of the view after the commit.
     assert!(focus_on(&doc, "fke-held"));
     frames(3).await;
     assert_eq!(focused_id(&doc), "fke-held");
