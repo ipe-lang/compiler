@@ -3025,7 +3025,7 @@ fn run_upgrade_binary(
     let confirmed = if should_prompt {
         use std::io::Write as _;
         crate::screen::prompt(&format!("{}{} ", style::GUTTER, text::upgrade_confirm()));
-        let _ = std::io::stdout().flush();
+        let _ = std::io::Write::flush(&mut crate::progress::Door::Stdout);
         crate::prompt_reply::read_stdin_yes_no().consents(true, false)
     } else {
         // Non-TTY stdout or --yes: treat as confirmed.

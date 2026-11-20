@@ -1545,7 +1545,7 @@ fn open_picked(miss: DocMiss, scope: &ProjectScope) -> Result<(), CliError> {
     crate::screen::report_error(&CliError::DocNotFound { miss });
     let picked = crate::doc_pick::pick(
         &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
+        &mut crate::progress::Door::Stderr,
         terms.len(),
     );
     let chosen = match picked {

@@ -27,6 +27,7 @@
 
 use std::io::{IsTerminal, Write};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -150,6 +151,371 @@ fn spinner_frame(frame_index: usize) -> &'static str {
     frames.get(i).copied().unwrap_or(frames[0])
 }
 
+/// How many terminal stages may hold the row at once.
+///
+/// A stage started past it renders plain lines and owns no row.
+const MAX_LIVE_STAGES: usize = 4;
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if no terminal stage could ever own the row [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(MAX_LIVE_STAGES > 0);
+
+/// Whether the cursor is known to sit at column 0.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Cursor {
+    /// The last byte written ended a line, or a stage line is painted.
+    Clean,
+    /// Foreign text without a newline, or an inherited child, left the cursor
+    /// somewhere unknown, so nothing repaints over it.
+    Dirty,
+}
+
+/// A live terminal stage as the row sees it.
+trait RowPaint: Send + Sync {
+    /// Erase this stage's painted line, if it painted one.
+    fn clear(&self);
+    /// Paint this stage's running line at its current frame.
+    fn repaint(&self);
+}
+
+/// One live terminal stage on the row.
+struct Entry {
+    id: u64,
+    painter: Arc<dyn RowPaint>,
+}
+
+/// Who owns the terminal row: the live stages, bottom to top, and the cursor.
+struct RowState {
+    live: Vec<Entry>,
+    cursor: Cursor,
+    /// How many inherited children hold the terminal.
+    handed: usize,
+    /// Wraps; unique among the at most [`MAX_LIVE_STAGES`] live ids.
+    next_id: u64,
+}
+
+impl RowState {
+    const EMPTY: Self = Self {
+        live: Vec::new(),
+        cursor: Cursor::Clean,
+        handed: 0,
+        next_id: 0,
+    };
+
+    /// Whether a stage line may be painted over the current row.
+    fn may_paint(&self) -> bool {
+        self.cursor == Cursor::Clean && self.handed == 0
+    }
+
+    /// Whether the stage `id` is the top live stage.
+    fn is_top(&self, id: u64) -> bool {
+        self.live.last().is_some_and(|top| top.id == id)
+    }
+
+    /// Erase the top stage's painted line.
+    fn clear_top(&self) {
+        if let Some(top) = self.live.last() {
+            top.painter.clear();
+        }
+    }
+
+    /// Paint the top stage's line when the row allows it.
+    fn repaint_top(&self) {
+        if self.may_paint()
+            && let Some(top) = self.live.last()
+        {
+            top.painter.repaint();
+        }
+    }
+
+    /// Record where the cursor is after a write that ended a line or did not.
+    fn settle_cursor(&mut self, ended_line: bool) {
+        self.cursor = if ended_line && self.handed == 0 {
+            Cursor::Clean
+        } else {
+            Cursor::Dirty
+        };
+    }
+
+    /// Whether every live slot is taken.
+    fn full(&self) -> bool {
+        self.live.len() >= MAX_LIVE_STAGES
+    }
+
+    /// Put `painter` on top, parking the stage beneath it; returns its id.
+    fn register(&mut self, painter: Arc<dyn RowPaint>) -> u64 {
+        if self.live.is_empty() {
+            self.cursor = if self.handed == 0 {
+                Cursor::Clean
+            } else {
+                Cursor::Dirty
+            };
+        }
+        self.clear_top();
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.live.push(Entry { id, painter });
+        id
+    }
+
+    /// Take the stage `id` off the row, clearing the top it sat under.
+    fn remove(&mut self, id: u64) {
+        if !self.is_top(id) {
+            self.clear_top();
+        }
+        self.live.retain(|entry| entry.id != id);
+    }
+
+    /// Write foreign `bytes` to `raw` without sharing a row with a stage line.
+    fn foreign(&mut self, raw: &mut dyn Write, bytes: &[u8]) -> std::io::Result<()> {
+        if self.live.is_empty() {
+            return raw.write_all(bytes).and_then(|()| raw.flush());
+        }
+        self.clear_top();
+        let written = raw.write_all(bytes).and_then(|()| raw.flush());
+        self.settle_cursor(written.is_ok() && bytes.last() == Some(&b'\n'));
+        self.repaint_top();
+        written
+    }
+}
+
+/// The process's terminal row.
+///
+/// Lock order: the row, then a stage's painter, then a std stream's own lock.
+/// No code holds a std stream lock while it takes the row, and nothing inside
+/// the row's critical section writes through a [`Door`] or `screen`.
+struct Row(Mutex<RowState>);
+
+impl Row {
+    fn lock(&self) -> MutexGuard<'_, RowState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl std::fmt::Debug for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Row")
+    }
+}
+
+#[cfg(not(test))]
+static ROW: Row = Row(Mutex::new(RowState::EMPTY));
+
+/// The terminal row every stage, door and hand-over shares.
+#[cfg(not(test))]
+fn row() -> &'static Row {
+    &ROW
+}
+
+/// One row per test thread, so tests run in parallel never share a row.
+#[cfg(test)]
+fn row() -> &'static Row {
+    thread_local! {
+        static TEST_ROW: &'static Row = Box::leak(Box::new(Row(Mutex::new(RowState::EMPTY))));
+    }
+    TEST_ROW.with(|row| *row)
+}
+
+/// A stdout or stderr writer that never shares a row with a stage line.
+///
+/// Off a terminal the bytes go straight through. On a terminal a live stage's
+/// line is cleared first and repainted after a write that ends a line.
+#[derive(Clone, Debug)]
+pub enum Door {
+    /// The process's stdout.
+    Stdout,
+    /// The process's stderr.
+    Stderr,
+    /// A captured stream that is (`true`) or is not a terminal.
+    #[cfg(test)]
+    Test(testing::Capture, bool),
+}
+
+impl Door {
+    /// Whether this door's own stream is a terminal.
+    fn is_terminal(&self) -> bool {
+        static STDOUT: OnceLock<bool> = OnceLock::new();
+        static STDERR: OnceLock<bool> = OnceLock::new();
+        match self {
+            Self::Stdout => *STDOUT.get_or_init(|| std::io::stdout().is_terminal()),
+            Self::Stderr => *STDERR.get_or_init(|| std::io::stderr().is_terminal()),
+            #[cfg(test)]
+            Self::Test(_, terminal) => *terminal,
+        }
+    }
+
+    /// Run `f` over this door's raw stream.
+    fn with_raw<T>(&self, f: impl FnOnce(&mut dyn Write) -> T) -> T {
+        match self {
+            Self::Stdout => f(&mut std::io::stdout().lock()),
+            Self::Stderr => f(&mut std::io::stderr().lock()),
+            #[cfg(test)]
+            Self::Test(capture, _) => f(&mut capture.clone()),
+        }
+    }
+
+    /// Write `bytes` whole, arbitrated by the row on a terminal.
+    fn put(&self, bytes: &[u8]) -> std::io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if !self.is_terminal() {
+            return self.with_raw(|raw| raw.write_all(bytes));
+        }
+        let mut state = row().lock();
+        self.with_raw(|raw| state.foreign(raw, bytes))
+    }
+}
+
+impl Write for Door {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.put(buf)?;
+        Ok(buf.len())
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.put(buf)
+    }
+
+    fn write_fmt(&mut self, args: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        self.put(std::fmt::format(args).as_bytes())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.with_raw(Write::flush)
+    }
+}
+
+/// Hand the terminal to an inherited child until the guard drops.
+///
+/// The top stage's line is cleared and nothing paints while any guard lives.
+/// The child's last byte is unknown, so the row stays dirty after the drop
+/// until a write ends a line.
+#[must_use = "the terminal is handed over only while the guard lives"]
+pub fn hand_over() -> HandOver {
+    let row = row();
+    let mut state = row.lock();
+    state.clear_top();
+    state.handed = state.handed.saturating_add(1);
+    state.cursor = Cursor::Dirty;
+    drop(state);
+    HandOver { row }
+}
+
+/// The terminal held by an inherited child; see [`hand_over`].
+#[derive(Debug)]
+pub struct HandOver {
+    row: &'static Row,
+}
+
+impl Drop for HandOver {
+    fn drop(&mut self) {
+        let mut state = self.row.lock();
+        state.handed = state.handed.saturating_sub(1);
+        state.cursor = Cursor::Dirty;
+    }
+}
+
+/// A stage's running line and the writer it is painted on.
+struct Paint<W> {
+    writer: W,
+    label: TerminalLine,
+    frame: usize,
+    /// Whether the running line is on the row now.
+    painted: bool,
+    /// Set by a failed write; nothing more is written.
+    broken: bool,
+}
+
+impl<W: Write> Paint<W> {
+    /// Write `bytes` whole and flush, latching `broken` on an error.
+    fn put(&mut self, bytes: &[u8]) {
+        if self.broken {
+            return;
+        }
+        if self
+            .writer
+            .write_all(bytes)
+            .and_then(|()| self.writer.flush())
+            .is_err()
+        {
+            self.broken = true;
+        }
+    }
+
+    /// Paint the running line at the current frame.
+    fn paint(&mut self) {
+        let line = running_line(Mode::Terminal, &self.label, self.frame);
+        self.put(line.as_bytes());
+        self.painted = true;
+    }
+
+    /// Erase the running line, if painted.
+    fn clear(&mut self) {
+        if self.painted {
+            self.put(format!("\r{CLEAR_TO_EOL}").as_bytes());
+            self.painted = false;
+        }
+    }
+}
+
+/// A terminal stage's paint, shared by the stage and the row.
+struct Painter<W> {
+    cell: Mutex<Paint<W>>,
+}
+
+impl<W> Painter<W> {
+    fn new(writer: W, label: TerminalLine) -> Self {
+        Self {
+            cell: Mutex::new(Paint {
+                writer,
+                label,
+                frame: 0,
+                painted: false,
+                broken: false,
+            }),
+        }
+    }
+
+    fn paint(&self) -> MutexGuard<'_, Paint<W>> {
+        self.cell.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<W: Write + Send> RowPaint for Painter<W> {
+    fn clear(&self) {
+        self.paint().clear();
+    }
+
+    fn repaint(&self) {
+        self.paint().paint();
+    }
+}
+
+/// How a stage ends: an outcome line, or a bare settle on drop.
+enum End {
+    Outcome(Outcome, TerminalLine),
+    Bare,
+}
+
+/// What a stage paints on.
+enum Body<W> {
+    /// One plain line per event; `row` is set for a terminal stage started
+    /// past [`MAX_LIVE_STAGES`], whose lines still go through the row.
+    Plain {
+        writer: W,
+        row: Option<&'static Row>,
+    },
+    /// A terminal stage that owns a place on the row.
+    Live {
+        row: &'static Row,
+        id: u64,
+        painter: Arc<Painter<W>>,
+    },
+    /// Settled.
+    Done,
+}
+
 /// A single running stage bound to an output stream.
 ///
 /// Construct with [`Stage::start`], which paints the running line immediately;
@@ -158,20 +524,13 @@ fn spinner_frame(frame_index: usize) -> &'static str {
 /// an explicit outcome settles its running line with a newline on a terminal so
 /// the cursor does not sit mid-line — it makes no unproven success claim.
 ///
-/// The stage does not animate on its own; a caller that wants motion calls
-/// [`Stage::tick`] between units of work. A non-animating caller still gets a
-/// correct, readable first frame and a clean rewrite to the outcome.
-pub struct Stage<W: Write> {
-    writer: W,
-    mode: Mode,
-    label: TerminalLine,
-    frame_index: usize,
-    /// Set once an outcome (or an explicit settle) has been written, so `Drop`
-    /// does not settle a line the caller already closed.
-    finished: bool,
+/// A terminal stage shares the row with every other writer: a nested stage
+/// parks it, and a [`Door`] write clears it first.
+pub struct Stage<W: Write + Send + 'static> {
+    body: Body<W>,
 }
 
-impl<W: Write + IsTerminal> Stage<W> {
+impl<W: Write + IsTerminal + Send + 'static> Stage<W> {
     /// Begin a stage on `writer` with the given running `label`, painting the
     /// running line at once.
     ///
@@ -184,36 +543,45 @@ impl<W: Write + IsTerminal> Stage<W> {
     }
 }
 
-impl<W: Write> Stage<W> {
-    /// Begin a stage on `writer` in an explicit [`Mode`], painting the running
-    /// line at once; `label` is parsed into a [`TerminalLine`] here. Used where the destination's terminal-ness is already known
-    /// (or fixed, as in tests) rather than derived from the writer.
-    pub fn with_mode(mut writer: W, mode: Mode, label: impl Into<String>) -> Self {
+impl<W: Write + Send + 'static> Stage<W> {
+    /// Begin a stage on `writer` in an explicit [`Mode`], painting the running line at once.
+    ///
+    /// `label` is parsed into a [`TerminalLine`] here. Used where the
+    /// destination's terminal-ness is already known (or fixed, as in tests)
+    /// rather than derived from the writer.
+    pub fn with_mode(writer: W, mode: Mode, label: impl Into<String>) -> Self {
         let label = TerminalLine::sanitize(&label.into());
-        let _ = write!(writer, "{}", running_line(mode, &label, 0));
-        let _ = writer.flush();
-        Self {
-            writer,
-            mode,
-            label,
-            frame_index: 0,
-            finished: false,
-        }
+        let body = match mode {
+            Mode::Plain => {
+                let mut writer = writer;
+                emit(&mut writer, None, &running_line(Mode::Plain, &label, 0));
+                Body::Plain { writer, row: None }
+            }
+            Mode::Terminal => Self::enter(row(), writer, label),
+        };
+        Self { body }
     }
 
-    /// Advance the spinner by one frame (terminal only; a no-op in plain mode,
-    /// which already emitted its single line at [`start`](Self::start)).
-    pub fn tick(&mut self) {
-        if self.mode != Mode::Terminal {
-            return;
+    /// Register a terminal stage on `row`, or a plain one past the ceiling.
+    fn enter(row: &'static Row, mut writer: W, label: TerminalLine) -> Body<W> {
+        let mut state = row.lock();
+        if state.full() {
+            let _ = state.foreign(&mut writer, running_line(Mode::Plain, &label, 0).as_bytes());
+            return Body::Plain {
+                writer,
+                row: Some(row),
+            };
         }
-        self.frame_index = self.frame_index.wrapping_add(1);
-        let _ = write!(
-            self.writer,
-            "{}",
-            running_line(self.mode, &self.label, self.frame_index)
-        );
-        let _ = self.writer.flush();
+        let painter = Arc::new(Painter::new(writer, label));
+        let id = state.register(Arc::clone(&painter) as Arc<dyn RowPaint>);
+        if state.cursor == Cursor::Dirty && state.handed == 0 {
+            painter.paint().put(b"\n");
+            state.cursor = Cursor::Clean;
+        }
+        if state.may_paint() {
+            painter.paint().paint();
+        }
+        Body::Live { row, id, painter }
     }
 
     /// Replace the running label with `label`, parsed into a [`TerminalLine`]
@@ -222,13 +590,21 @@ impl<W: Write> Stage<W> {
     /// Terminal: the running line is redrawn in place. Plain: the new label is
     /// one more line, so a caller that relabels often bounds how many it emits.
     pub fn relabel(&mut self, label: impl Into<String>) {
-        self.label = TerminalLine::sanitize(&label.into());
-        let _ = write!(
-            self.writer,
-            "{}",
-            running_line(self.mode, &self.label, self.frame_index)
-        );
-        let _ = self.writer.flush();
+        let label = TerminalLine::sanitize(&label.into());
+        match &mut self.body {
+            Body::Plain { writer, row } => {
+                emit(writer, *row, &running_line(Mode::Plain, &label, 0));
+            }
+            Body::Live { row, id, painter } => {
+                let state = row.lock();
+                let mut paint = painter.paint();
+                paint.label = label;
+                if state.is_top(*id) && state.may_paint() {
+                    paint.paint();
+                }
+            }
+            Body::Done => {}
+        }
     }
 
     /// Write `block`, a newline-ended block of already-sanitised lines, above
@@ -238,57 +614,102 @@ impl<W: Write> Stage<W> {
     /// running line redrawn beneath it, so foreign output and the stage never
     /// share a row. Plain: the block is written as is.
     pub fn write_above(&mut self, block: &TerminalSafe) {
-        if self.mode == Mode::Terminal {
-            let _ = write!(self.writer, "\r{CLEAR_TO_EOL}");
+        match &mut self.body {
+            Body::Plain { writer, row } => emit(writer, *row, block.as_str()),
+            Body::Live { row, painter, .. } => {
+                let mut state = row.lock();
+                state.clear_top();
+                {
+                    let mut paint = painter.paint();
+                    if state.cursor == Cursor::Dirty {
+                        paint.put(b"\n");
+                    }
+                    paint.put(block.as_str().as_bytes());
+                }
+                state.settle_cursor(block.as_str().ends_with('\n'));
+                state.repaint_top();
+            }
+            Body::Done => {}
         }
-        let _ = self.writer.write_all(block.as_str().as_bytes());
-        if self.mode == Mode::Terminal {
-            let _ = write!(
-                self.writer,
-                "{}",
-                running_line(self.mode, &self.label, self.frame_index)
-            );
-        }
-        let _ = self.writer.flush();
     }
 
     /// Finish the stage as a success, rewriting the running line to a
     /// light-green check and `msg`.
     pub fn success(mut self, msg: impl AsRef<str>) {
-        self.finished = true;
-        let _ = write!(
-            self.writer,
-            "{}",
-            success_line(self.mode, &TerminalLine::sanitize(msg.as_ref()))
-        );
-        let _ = self.writer.flush();
+        self.settle(&End::Outcome(
+            Outcome::Success,
+            TerminalLine::sanitize(msg.as_ref()),
+        ));
     }
 
     /// Finish the stage as a failure, rewriting the running line to a light-red
-    /// cross and `msg`. Whether the command then stops or continues is the
-    /// caller's decision — this only renders the line.
+    /// cross and `msg`.
+    ///
+    /// Whether the command then stops or continues is the caller's decision —
+    /// this only renders the line.
     pub fn failure(mut self, msg: impl AsRef<str>) {
-        self.finished = true;
-        let _ = write!(
-            self.writer,
-            "{}",
-            failure_line(self.mode, &TerminalLine::sanitize(msg.as_ref()))
-        );
-        let _ = self.writer.flush();
+        self.settle(&End::Outcome(
+            Outcome::Failure,
+            TerminalLine::sanitize(msg.as_ref()),
+        ));
+    }
+
+    /// Write how the stage ends and give its row to the stage beneath.
+    fn settle(&mut self, end: &End) {
+        match std::mem::replace(&mut self.body, Body::Done) {
+            Body::Plain { mut writer, row } => {
+                if let End::Outcome(outcome, msg) = end {
+                    emit(&mut writer, row, &outcome_line(Mode::Plain, *outcome, msg));
+                }
+            }
+            Body::Live { row, id, painter } => {
+                let mut state = row.lock();
+                state.remove(id);
+                {
+                    let mut paint = painter.paint();
+                    let dirty = state.cursor == Cursor::Dirty;
+                    match end {
+                        End::Outcome(outcome, msg) => {
+                            if dirty {
+                                paint.put(b"\n");
+                            }
+                            paint.put(outcome_line(Mode::Terminal, *outcome, msg).as_bytes());
+                            paint.painted = false;
+                            state.settle_cursor(true);
+                        }
+                        End::Bare => {
+                            if paint.painted || dirty {
+                                paint.put(b"\n");
+                                paint.painted = false;
+                                state.settle_cursor(true);
+                            }
+                        }
+                    }
+                }
+                state.repaint_top();
+            }
+            Body::Done => {}
+        }
     }
 }
 
-impl<W: Write> Drop for Stage<W> {
+impl<W: Write + Send + 'static> Drop for Stage<W> {
     /// Settle an unfinished stage on a terminal with a bare newline so the
     /// cursor leaves the running line rather than sitting on it — without
     /// claiming any outcome. Plain mode already emitted a complete line.
     fn drop(&mut self) {
-        if self.finished || self.mode != Mode::Terminal {
-            return;
-        }
-        let _ = writeln!(self.writer);
-        let _ = self.writer.flush();
+        self.settle(&End::Bare);
     }
+}
+
+/// Write `text` to a plain stage's `writer`, through `row` when it has one.
+fn emit<W: Write>(writer: &mut W, row: Option<&'static Row>, text: &str) {
+    let _ = match row {
+        Some(row) => row.lock().foreign(writer, text.as_bytes()),
+        None => writer
+            .write_all(text.as_bytes())
+            .and_then(|()| writer.flush()),
+    };
 }
 
 /// Whether a slow step shows a spinner while it runs.
@@ -440,10 +861,47 @@ fn tick<W: Write>(
     writer
 }
 
+/// Writers tests read back after a stage or a door wrote to them.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex, PoisonError};
+
+    /// A writer whose bytes the test still holds after the stage drops it.
+    #[derive(Clone, Default, Debug)]
+    pub(crate) struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        /// Everything written so far, lossily decoded.
+        pub(crate) fn text(&self) -> String {
+            let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            String::from_utf8_lossy(&bytes).into_owned()
+        }
+
+        /// How many clones of this capture are alive, this one included.
+        pub(crate) fn handles(&self) -> usize {
+            Arc::strong_count(&self.0)
+        }
+    }
+
+    impl Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
+    use super::testing::Capture;
     use super::*;
 
     #[test]
@@ -532,12 +990,12 @@ mod tests {
     fn stage_writes_running_then_success_to_its_buffer() {
         // A Vec<u8> is not a terminal, so drive the stage in plain mode
         // explicitly: a running line at start, then the success line.
-        let mut buf: Vec<u8> = Vec::new();
+        let buf = Capture::default();
         {
-            let stage = Stage::with_mode(&mut buf, Mode::Plain, "Resolving the latest release…");
+            let stage = Stage::with_mode(buf.clone(), Mode::Plain, "Resolving the latest release…");
             stage.success("Found ipe-v0.1.36");
         }
-        let text = String::from_utf8(buf).expect("stage output is utf-8");
+        let text = buf.text();
         assert_eq!(
             text,
             "  Resolving the latest release…\n  ✓ Found ipe-v0.1.36\n"
@@ -546,12 +1004,13 @@ mod tests {
 
     #[test]
     fn stage_writes_failure_line() {
-        let mut buf: Vec<u8> = Vec::new();
+        let buf = Capture::default();
         {
-            let stage = Stage::with_mode(&mut buf, Mode::Plain, "Checking for prebuilt binaries…");
+            let stage =
+                Stage::with_mode(buf.clone(), Mode::Plain, "Checking for prebuilt binaries…");
             stage.failure("No prebuilt binary — build from source");
         }
-        let text = String::from_utf8(buf).expect("stage output is utf-8");
+        let text = buf.text();
         assert_eq!(
             text,
             "  Checking for prebuilt binaries…\n  ✗ No prebuilt binary — build from source\n"
@@ -562,33 +1021,33 @@ mod tests {
     fn dropped_plain_stage_leaves_only_its_running_line() {
         // In plain mode a stage dropped without an outcome makes no success
         // claim and adds no extra newline — just the running line it emitted.
-        let mut buf: Vec<u8> = Vec::new();
+        let buf = Capture::default();
         {
-            let _stage = Stage::with_mode(&mut buf, Mode::Plain, "Working…");
+            let _stage = Stage::with_mode(buf.clone(), Mode::Plain, "Working…");
         }
-        let text = String::from_utf8(buf).expect("stage output is utf-8");
+        let text = buf.text();
         assert_eq!(text, "  Working…\n");
     }
 
     /// Foreign label and outcome text reach a plain stage as one terminal line each.
     #[test]
     fn a_relabel_redraws_in_place_on_a_terminal_and_adds_a_line_in_plain() {
-        let mut buf = Vec::new();
+        let buf = Capture::default();
         {
-            let mut stage = Stage::with_mode(&mut buf, Mode::Plain, "first");
+            let mut stage = Stage::with_mode(buf.clone(), Mode::Plain, "first");
             stage.relabel("second\x1b[2J");
             stage.success("done");
         }
-        let out = String::from_utf8(buf).expect("utf8");
+        let out = buf.text();
         assert_eq!(out.lines().count(), 3, "{out:?}");
         assert!(!out.contains('\x1b'), "{out:?}");
 
-        let mut buf = Vec::new();
+        let buf = Capture::default();
         {
-            let mut stage = Stage::with_mode(&mut buf, Mode::Terminal, "first");
+            let mut stage = Stage::with_mode(buf.clone(), Mode::Terminal, "first");
             stage.relabel("second\x1b]0;x\x07");
         }
-        let out = String::from_utf8(buf).expect("utf8");
+        let out = buf.text();
         assert!(out.contains("second"), "{out:?}");
         assert!(!out.contains("\x1b]"), "{out:?}");
         // Two in-place frames and the settling newline of the drop.
@@ -597,12 +1056,12 @@ mod tests {
 
     #[test]
     fn a_block_written_above_a_terminal_stage_never_shares_its_row() {
-        let mut buf = Vec::new();
+        let buf = Capture::default();
         {
-            let mut stage = Stage::with_mode(&mut buf, Mode::Terminal, "running");
+            let mut stage = Stage::with_mode(buf.clone(), Mode::Terminal, "running");
             stage.write_above(&TerminalSafe::sanitize(" warning: x\n"));
         }
-        let out = String::from_utf8(buf).expect("utf8");
+        let out = buf.text();
         let cleared = format!("\r{CLEAR_TO_EOL} warning: x\n");
         assert!(out.contains(&cleared), "{out:?}");
         let after = out.split(&cleared).nth(1).unwrap_or_default();
@@ -614,24 +1073,24 @@ mod tests {
 
     #[test]
     fn plain_stage_lines_are_terminal_lines() {
-        let mut buf: Vec<u8> = Vec::new();
+        let buf = Capture::default();
         {
-            let stage = Stage::with_mode(&mut buf, Mode::Plain, "x\u{202E}y\n\x1b[2J");
+            let stage = Stage::with_mode(buf.clone(), Mode::Plain, "x\u{202E}y\n\x1b[2J");
             stage.failure("a\u{200B}b\nc");
         }
-        let text = String::from_utf8(buf).expect("stage output is utf-8");
+        let text = buf.text();
         assert_eq!(text, "  xy\n  ✗ abc\n");
     }
 
     /// On a terminal the only escapes are the palette's own and each line settles once.
     #[test]
     fn terminal_stage_lines_carry_only_palette_escapes() {
-        let mut buf: Vec<u8> = Vec::new();
+        let buf = Capture::default();
         {
-            let stage = Stage::with_mode(&mut buf, Mode::Terminal, "x\u{202E}y\n\x1b[2J");
+            let stage = Stage::with_mode(buf.clone(), Mode::Terminal, "x\u{202E}y\n\x1b[2J");
             stage.failure("a\u{200B}b\nc\x1b]8;;https://evil\x07");
         }
-        let mut text = String::from_utf8(buf).expect("stage output is utf-8");
+        let mut text = buf.text();
         assert!(
             !text.contains('\u{202E}') && !text.contains('\u{200B}'),
             "{text:?}"
@@ -843,5 +1302,113 @@ mod tests {
         let label = crate::text::doc_lookup_pending();
         assert_eq!(TerminalLine::sanitize(label).as_str(), label);
         assert!(!label.contains('\n'));
+    }
+
+    /// A terminal stage on `capture` whose frames never move on their own.
+    fn terminal(capture: &Capture, label: &str) -> Stage<Capture> {
+        Stage::with_mode(capture.clone(), Mode::Terminal, label)
+    }
+
+    /// The running line `label` paints at frame 0.
+    fn frame0(label: &str) -> String {
+        running_line(Mode::Terminal, &TerminalLine::from(label), 0)
+    }
+
+    /// Write `text` through `door`.
+    fn door_write(mut door: Door, text: &str) {
+        let written = door.write_all(text.as_bytes());
+        assert!(written.is_ok(), "{written:?}");
+    }
+
+    #[test]
+    fn a_door_line_clears_the_row_and_repaints_below() {
+        let capture = Capture::default();
+        let stage = terminal(&capture, "running");
+        door_write(Door::Test(capture.clone(), true), "x\n");
+        let painted = frame0("running");
+        assert_eq!(
+            capture.text(),
+            format!("{painted}{}x\n{painted}", cleared()),
+            "the line is cleared, written, and the stage repainted below"
+        );
+        drop(stage);
+    }
+
+    #[test]
+    fn an_unterminated_door_write_stops_the_ticker() {
+        let capture = Capture::default();
+        let mut stage = terminal(&capture, "running");
+        door_write(Door::Test(capture.clone(), true), "Accept? ");
+        stage.relabel("next");
+        let after_prompt = || {
+            let text = capture.text();
+            text.split_once("Accept? ")
+                .map(|(_, after)| after.to_owned())
+        };
+        let Some(after) = after_prompt() else {
+            assert!(after_prompt().is_some(), "the prompt reached the stream");
+            return;
+        };
+        assert!(
+            after.is_empty(),
+            "nothing paints over an unterminated prompt: {after:?}"
+        );
+        stage.success("done");
+        let Some(after) = after_prompt() else { return };
+        assert!(
+            after.starts_with("\n\r"),
+            "the outcome starts on its own line: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_handed_over_terminal_is_never_painted() {
+        let capture = Capture::default();
+        let mut stage = terminal(&capture, "running");
+        let before = capture.text();
+        let guard = hand_over();
+        assert_eq!(
+            capture.text(),
+            format!("{before}{}", cleared()),
+            "the painted line is cleared before the child runs"
+        );
+        stage.relabel("child running");
+        let held = capture.text();
+        assert!(!held.contains("child running"), "{held:?}");
+        drop(guard);
+        stage.relabel("child done");
+        assert_eq!(capture.text(), held, "the row stays dirty after the child");
+        door_write(Door::Test(capture.clone(), true), "tail\n");
+        let text = capture.text();
+        assert!(
+            text.ends_with(&frame0("child done")),
+            "a line-ending write makes the row clean again: {text:?}"
+        );
+        drop(stage);
+    }
+
+    #[test]
+    fn a_door_to_a_non_terminal_never_disturbs_the_row() {
+        for (door_terminal, stage_live) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            let capture = Capture::default();
+            let stage = stage_live.then(|| terminal(&capture, "running"));
+            door_write(Door::Test(capture.clone(), door_terminal), "x\n");
+            let text = capture.text();
+            let arbitrated = text.contains(&cleared());
+            assert_eq!(
+                arbitrated,
+                door_terminal && stage_live,
+                "door terminal {door_terminal}, stage live {stage_live}: {text:?}"
+            );
+            let repaints = text.matches(&frame0("running")).count();
+            assert_eq!(
+                repaints,
+                usize::from(stage_live) + usize::from(door_terminal && stage_live),
+                "{text:?}"
+            );
+            drop(stage);
+        }
     }
 }

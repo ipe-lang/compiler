@@ -1624,7 +1624,7 @@ enum Answer {
 fn ask(prompt: &str) -> Answer {
     use std::io::Write as _;
     crate::screen::prompt(&format!("{prompt} [Y/n] "));
-    let _ = std::io::stdout().flush();
+    let _ = std::io::Write::flush(&mut crate::progress::Door::Stdout);
     // EOF, a read error, or a refused line: no answer we can trust — decline
     // rather than assume consent to a trust action.
     if crate::prompt_reply::read_stdin_yes_no().consents(true, false) {

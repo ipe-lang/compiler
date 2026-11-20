@@ -799,7 +799,7 @@ pub fn emit_machine_error(
         _ => machine_output::machine_error(format, command, err.machine_kind(), &err.to_string()),
     };
     // Best-effort write; if stderr is closed we still exit non-zero.
-    let _ = std::io::stderr().write_all(rendered.as_bytes());
+    let _ = crate::progress::Door::Stderr.write_all(rendered.as_bytes());
     CliError::DiagnosticJsonEmitted
 }
 
