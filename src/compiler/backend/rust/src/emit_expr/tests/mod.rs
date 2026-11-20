@@ -301,3 +301,38 @@ fn flag_off_nested_lambda_emit_is_unchanged() -> DResult<()> {
     );
     Ok(())
 }
+
+/// A kernel reaches emit only as a saturated call: a `FuncValue` over any
+/// kernel is refused at every function-value emit site rather than boxed as a
+/// bare runtime `fn` whose shape the Ipê arrow does not promise.
+#[test]
+fn no_kernel_is_emitted_as_a_bare_function_value() -> DResult<()> {
+    let interner = Interner::new();
+    let backend = RustBackend::new(&interner);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let generics = GenericScope::new(&[]);
+    let ty = IrType::Fun(vec![IrType::Str], Box::new(IrType::Str));
+    let boxed = KernelFn::ALL
+        .iter()
+        .copied()
+        .filter(|k| {
+            let value = Expr::FuncValue {
+                callee: Callee::Kernel(*k),
+                ty: ty.clone(),
+            };
+            !matches!(
+                super::func_value_name(&ctx, &Callee::Kernel(*k)),
+                Err(Diagnostic::CompilerBug { .. })
+            ) || !matches!(
+                super::emit_expr_at(&ctx, &value, 1, 0, generics),
+                Err(Diagnostic::CompilerBug { .. })
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        boxed.is_empty(),
+        "kernels emitted as a bare function value: {boxed:?}"
+    );
+    Ok(())
+}

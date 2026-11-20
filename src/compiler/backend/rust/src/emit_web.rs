@@ -1502,7 +1502,7 @@ fn emit_web_fn(
     match e {
         Expr::FuncValue { callee, .. } => {
             // Raw function-item reference: satisfies Send + Sync + 'static implicitly.
-            crate::emit_expr::callee_name(ctx, callee)
+            crate::emit_expr::func_value_name(ctx, callee)
         }
         // Inline lambda: emit the UNBOXED closure so it monomorphizes the generic
         // slot to its concrete closure type (auto Send + Sync from captures),

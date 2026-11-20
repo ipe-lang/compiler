@@ -330,30 +330,6 @@ impl<'t> MapperSpine<'t> {
     }
 }
 
-/// Whether a reference to `kernel` at solved type `ty` hands some mapper a
-/// FUNCTION-typed parameter that binds a stored element — the instance whose
-/// mapper must pass the carrier choke point
-/// (`Lowerer::retype_collection_element_param`).
-fn kernel_ref_binds_fn_element(kernel: KernelFn, ty: &Ty) -> bool {
-    let Some(shape) = kernel.scheme_shape() else {
-        return false;
-    };
-    let arity = kernel.def().arity;
-    arrow_params(ty)
-        .iter()
-        .take(usize::from(arity))
-        .enumerate()
-        .any(|(arg, mapper_ty)| {
-            arrow_params(mapper_ty)
-                .iter()
-                .take(scheme_mapper_arity(shape, arg))
-                .enumerate()
-                .any(|(param, param_ty)| {
-                    mapper_param_binds_fn_element(shape, arity, arg, param, param_ty)
-                })
-        })
-}
-
 /// Whether parameter `param` (solved type `ty`) of the mapper at kernel
 /// position `arg` receives a stored FUNCTION element — the parameter the
 /// carrier choke point re-carries to `Arc`.
@@ -23092,37 +23068,6 @@ impl<'a> Lowerer<'a> {
         )
     }
 
-    /// Returns the exact [`IrType::Fun`] for kernels that may appear as
-    /// first-class values and whose region type cannot be recovered from the Ipê
-    /// HM region map alone — most commonly because the return type is
-    /// `Value = any = Ty::Var`, which [`Self::ir_type_from_ty_json`] maps to the
-    /// opaque `IrType::Json` scalar (not `IrType::Fun`).
-    ///
-    /// The lookup is *only* consulted as a fallback inside the `VarKernel`
-    /// value-reference path when the region type does not produce a
-    /// `Fun` IR type.  Kernels handled by the arity-0 early-return (`JsonEncNull`)
-    /// and the generic-`A` kernel (`JsonEncList`, which is never used as a bare
-    /// value) are intentionally omitted.
-    fn kernel_native_ir_type(k: KernelFn) -> Option<IrType> {
-        Some(match k {
-            KernelFn::JsonEncString => IrType::Fun(vec![IrType::Str], Box::new(IrType::Json)),
-            KernelFn::JsonEncInt => IrType::Fun(vec![IrType::Int], Box::new(IrType::Json)),
-            KernelFn::JsonEncFloat => IrType::Fun(vec![IrType::Float], Box::new(IrType::Json)),
-            KernelFn::JsonEncBool => IrType::Fun(vec![IrType::Bool], Box::new(IrType::Json)),
-            KernelFn::JsonEncObject => IrType::Fun(
-                vec![IrType::List(Box::new(IrType::Tuple(vec![
-                    IrType::Str,
-                    IrType::Json,
-                ])))],
-                Box::new(IrType::Json),
-            ),
-            KernelFn::JsonEncEncode => {
-                IrType::Fun(vec![IrType::Int, IrType::Json], Box::new(IrType::Str))
-            }
-            _ => return None,
-        })
-    }
-
     /// Element-capability soundness gate: reject a `List`/`Dict`/`Set` kernel
     /// that cannot represent a function-carrying element when any of its
     /// collection parameters carries one.
@@ -23989,20 +23934,19 @@ impl<'a> Lowerer<'a> {
                 // whose argument the literal gate sees. See
                 // [`reject_unapplied_secret_from_string`].
                 reject_unapplied_secret_from_string(&callee, e.span)?;
-                // A kernel whose emit arm carries a bridge or a guard is emitted
-                // only as a saturated call: eta-expand the point-free reference
-                // (`List.map Sub.onKey hs`, `let on = Sub.onKey`) into
-                // `\x -> kernel x`, so that arm fires on every path. See
-                // `StdlibKernel::requires_saturated_emit`.
-                //
-                // A higher-order kernel whose mapper binds a stored FUNCTION
-                // element at this instance takes the same eta route, so its
-                // mapper eta parameter reaches the carrier choke point
+                // A kernel is emitted only as a saturated call: its emit arm (a
+                // payload factory, a record bridge, an input guard, an inline
+                // body, a name with no runtime `fn`) is what makes the runtime
+                // agree with the Ipê arrow, and a bare `Box::new(<runtime fn>)`
+                // would bypass it. Every point-free reference
+                // (`List.map PubSub.topic ns`, `let g = Http.get in g u`) is
+                // eta-expanded into `\x -> kernel x`, so the saturated arm fires
+                // on every path, and a higher-order kernel's mapper eta parameter
+                // reaches the carrier choke point
                 // ([`Self::retype_collection_element_param`]) exactly as a
-                // saturated call's mapper does.
-                if let Callee::Kernel(k) = &callee
-                    && (k.requires_saturated_emit() || kernel_ref_binds_fn_element(*k, ty))
-                {
+                // saturated call's mapper does. The backend refuses a kernel
+                // `FuncValue` outright.
+                if let Callee::Kernel(_) = &callee {
                     let arity = self.callee_arity(&callee)?;
                     return self.eta_expand_partial(
                         e,
@@ -24014,16 +23958,7 @@ impl<'a> Lowerer<'a> {
                         e.span,
                     );
                 }
-                // For kernel callees use the JSON-aware type resolver so that
-                // a `Value = any = Ty::Var` in the argument / return position
-                // of a JSON kernel (e.g. `JsonEnc.string : String -> Value`)
-                // maps to `IrType::Json` rather than failing with Polymorphism.
-                // User top-level bindings keep the strict resolver.
-                let ty_ir = if matches!(&callee, Callee::Kernel(_)) {
-                    self.ir_type_from_ty_json(ty, e.span)?
-                } else {
-                    self.ir_type_from_ty(ty, e.span)?
-                };
+                let ty_ir = self.ir_type_from_ty(ty, e.span)?;
                 // T6: arity-exact invariant — when def-arity is less
                 // than the flattened `Fun` param count at this reify site, the
                 // callee is curried and cannot be boxed directly into
@@ -24033,8 +23968,8 @@ impl<'a> Lowerer<'a> {
                 // A def-arity GREATER than the flattened count is a compiler bug
                 // (the solver should have caught it), surfaced here as a bug()
                 // rather than emitting broken Rust.
-                // Kernels are arity-exact by construction; the adapter never fires
-                // for them (their `callee_arity` matches their native signature).
+                // Kernels never reach it: every kernel reference is eta-expanded
+                // above.
                 if let IrType::Fun(params, ret) = &ty_ir {
                     let def_arity = self.callee_arity(&callee)?;
                     if def_arity < params.len() {
@@ -24051,21 +23986,6 @@ impl<'a> Lowerer<'a> {
                 if let fun @ IrType::Fun(_, _) = ty_ir {
                     Ok(Expr::FuncValue { callee, ty: fun })
                 } else {
-                    // When a kernel with arity > 0 has an unresolved region
-                    // type (e.g. `Value = any = Ty::Var` → `IrType::Json`),
-                    // the kernel is being used as a first-class function
-                    // value.  Fall back to the kernel's known native
-                    // signature so the backend emits a properly typed
-                    // `FuncValue` (`Box::new(name)`) instead of a spurious
-                    // zero-argument call (`name()`).
-                    if let Callee::Kernel(k) = &callee {
-                        let arity = self.callee_arity(&callee)?;
-                        if arity > 0
-                            && let Some(fun_ty) = Self::kernel_native_ir_type(*k)
-                        {
-                            return Ok(Expr::FuncValue { callee, ty: fun_ty });
-                        }
-                    }
                     // A nullary top-level constant or zero-arg kernel
                     // referenced as a value is its own zero-argument call
                     // (`x` → `x()`), its message slot pinned like any call's.

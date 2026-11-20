@@ -312,25 +312,36 @@ pub fn emit_func_value(
     ty: &IrType,
     generics: GenericScope,
 ) -> DResult<String> {
-    // A kernel whose emit arm carries a bridge or guard is never a bare function
-    // value: the lowerer eta-expands every point-free reference to it.
-    if let Callee::Kernel(k) = callee
-        && k.requires_saturated_emit()
-    {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::emit_func_value",
-            detail: format!(
-                "{k:?} reached as a bare function value; the lowerer must eta-expand \
-                 it so its saturated emit arm fires"
-            ),
-        });
-    }
-    let name = callee_name(ctx, callee)?;
+    let name = func_value_name(ctx, callee)?;
     let typed = render_type(ctx, ty, generics)?;
     let ctor = if wants_arc_ctor(ty) { "Arc" } else { "Box" };
     Ok(format!(
         "{{ let __ipe_fn: {typed} = {ctor}::new({name}); __ipe_fn }}"
     ))
+}
+
+/// The Rust name a function-value reference to `callee` boxes.
+///
+/// A kernel is never a function value: its saturated emit arm (a payload
+/// factory, a record bridge, an input guard, an inline body, a name with no
+/// runtime `fn`) is what makes the runtime agree with its Ipê arrow, so the
+/// lowerer eta-expands every point-free kernel reference into a saturated call.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] for a kernel callee, which would otherwise box a
+/// runtime `fn` whose shape the Ipê arrow does not promise.
+pub fn func_value_name(ctx: &EmitCtx, callee: &Callee) -> DResult<String> {
+    match callee {
+        Callee::Kernel(k) => Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::func_value_name",
+            detail: format!(
+                "{k:?} reached as a bare function value; the lowerer must eta-expand \
+                 every kernel reference so its saturated emit arm fires"
+            ),
+        }),
+        Callee::Func(_) | Callee::Ffi { .. } => callee_name(ctx, callee),
+    }
 }
 
 /// Emit the unboxed inner `move |p0: T0, …| -> R { <body> }` closure expression.

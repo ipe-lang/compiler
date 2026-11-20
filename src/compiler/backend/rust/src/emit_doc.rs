@@ -862,7 +862,7 @@ fn build_func_value(
     ty: &IrType,
     generics: GenericScope,
 ) -> DResult<Doc> {
-    let name = callee_name(ctx, callee)?;
+    let name = crate::emit_expr::func_value_name(ctx, callee)?;
     let typed = render_type(ctx, ty, generics)?;
     let ctor = if wants_arc_ctor(ty) { "Arc" } else { "Box" };
     let rhs = Doc::owned(format!("{ctor}::new({name})"))?;

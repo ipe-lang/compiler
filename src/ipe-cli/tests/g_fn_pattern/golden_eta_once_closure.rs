@@ -1263,3 +1263,96 @@ fn point_free_decode_succeed_of_a_string_builds_and_runs() {
         outcome.stdout
     );
 }
+
+/// Point-free references to kernels whose runtime `fn` differs from the Ipê
+/// arrow: a topic name with no runtime `fn`, a retry-policy builder over the
+/// emitted policy struct, network and process tasks over a record bridge, a
+/// map lookup, and a JSON encoder over the opaque `Value`. Each is eta-expanded
+/// into a saturated call, so the emitted program builds.
+const KERNEL_POINT_FREE: &str = r#"module Main exposing (main)
+
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Http as Http exposing (HttpResponse)
+import Ipe.Io as Io
+import Ipe.Json.Encode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Process as Process
+import Ipe.PubSub as PubSub exposing (Topic)
+import Ipe.String as String
+import Ipe.Task as Task exposing (RetryPolicy)
+import Ipe.Url exposing (Url)
+
+
+topics : List (Topic String)
+topics =
+    List.map PubSub.topic [ "a", "b" ]
+
+
+policies : List (RetryPolicy Error)
+policies =
+    List.map Task.withJitter [ Task.defaultRetryPolicy ]
+
+
+fetches : List Url -> List (Task Error HttpResponse)
+fetches us =
+    List.map Http.get us
+
+
+runs : List (Task Error { exitCode : Int, stdout : String, stderr : String })
+runs =
+    let
+        run =
+            Process.runWith
+    in
+    List.map run []
+
+
+found : Maybe Int
+found =
+    let
+        get =
+            Dict.get
+    in
+    get "k" (Dict.fromList [ ( "k", 7 ) ])
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join ","
+            [ String.fromInt (List.length topics)
+            , String.fromInt (List.length policies)
+            , String.fromInt (List.length (fetches []))
+            , String.fromInt (List.length runs)
+            , String.fromInt (Maybe.withDefault 0 found)
+            , JsonEnc.encode 0 (JsonEnc.list JsonEnc.string [ "x" ])
+            ]
+        )
+"#;
+
+#[test]
+fn point_free_kernel_references_build_and_run() {
+    let (built, out) = build_source("kernel_point_free", KERNEL_POINT_FREE);
+    assert!(
+        built.is_ok(),
+        "point-free kernel references must pass ipe: {:?}",
+        built.err()
+    );
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let outcome = crate::support::build_and_run_emitted("kernel_point_free", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "point-free kernel references must build and exit 0; stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("2,1,0,0,7,[\"x\"]\n"),
+        "each reference must reach its saturated arm; got: {:?}",
+        outcome.stdout
+    );
+}

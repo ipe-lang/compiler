@@ -18289,25 +18289,6 @@ impl StdlibKernel {
         }
     }
 
-    /// Whether this kernel is emittable only as a saturated call.
-    ///
-    /// Such a kernel's emit arm carries a bridge or a guard (the input
-    /// subscriptions' `KeyEvent` bridge and surface check, `Task.loop`'s bridge
-    /// from the emitted `Step` enum to the runtime `LoopStep`, `succeed`'s
-    /// payload factory over the runtime `decode_succeed`'s `Fn() -> A`
-    /// parameter) that a point-free first-class reference would bypass, so the
-    /// lowerer eta-expands every point-free reference to it into
-    /// `\x -> kernel x` and the backend refuses to box it as a bare function
-    /// value.
-    #[must_use]
-    pub const fn requires_saturated_emit(self) -> bool {
-        self.input_surface().is_some()
-            || matches!(
-                self,
-                Self::TaskLoop | Self::JsonDecSucceed | Self::DbDecSucceed | Self::ConfigSucceed
-            )
-    }
-
     /// `true` when this variant belongs to the `Ipe.CssSafety` leaf
     /// security-kernel family (the `Ipe.Css` backing): `safe_value` /
     /// `safe_prop_name` / `safe_selector` / `strip_style_close_kernel`.
@@ -20245,9 +20226,6 @@ mod tests {
         assert!(StdlibKernel::TaskLoop.available_on(Target::WasmWasi));
         assert!(StdlibKernel::TaskLoop.available_on(Target::WasmClient));
         assert!(StdlibKernel::TaskLoop.requires_async_runtime());
-        // Its emit arm carries the `Step` bridge, so a point-free reference is
-        // eta-expanded rather than boxed as a bare runtime function.
-        assert!(StdlibKernel::TaskLoop.requires_saturated_emit());
         // Its step is a direct function slot a stored `Arc<dyn Fn>` read is
         // converted at.
         assert_eq!(
