@@ -211,7 +211,7 @@ enum ControlModelDisclosure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProgramModel {
     /// The program's name.
-    program: String,
+    program: crate::program_name::ProgramName,
     /// The program's entry module.
     module: Vec<String>,
     /// The control model the program's `main` pins.
@@ -557,7 +557,11 @@ fn audit_gate(
     standing: PublisherStanding<'_>,
 ) -> Result<AuditedPackage, CliError> {
     let manifest = prepared.manifest();
-    reserved_namespace_ownership(&manifest.name, prepared.snapshot.modules(), standing)?;
+    reserved_namespace_ownership(
+        manifest.name.as_str(),
+        prepared.snapshot.modules(),
+        standing,
+    )?;
     provenance_panic_scan(&prepared.sources)?;
 
     // The whole-tree inferred capability union — computed once and shared by the
@@ -703,7 +707,7 @@ fn disclosure_programs_json(disclosure: &Disclosure) -> String {
         .programs()
         .map(|program| {
             json::object(&[
-                ("name", json::string(&program.program)),
+                ("name", json::string(program.program.as_str())),
                 ("controlModel", json::string(program.model.word())),
             ])
         })
@@ -953,7 +957,7 @@ fn prepare(snapshot: PackageSnapshot) -> Result<Prepared, CliError> {
 
     // `audit_scratch_dir` creates the directory exclusively with 128-bit OS
     // entropy — no stale-dir removal needed; a fresh exclusive dir is always empty.
-    let emitted_dir = audit_scratch_dir(&manifest.name)?;
+    let emitted_dir = audit_scratch_dir(manifest.name.as_str())?;
     // The FFI interface modules and `src/ffi.rs` text are assembled AFTER the
     // regeneration above, so the set holds the gate-owned bindings.
     let sources = crate::driver::PackageSourceSet::from_snapshot(&snapshot)?;
@@ -1349,7 +1353,7 @@ fn capability_consistency(
                     &format!(
                         "package audit: note — `{}` exercises the `native-ffi` capability; its \
                      native effects cannot be inferred from Ipê alone.",
-                        shown_name(&manifest.name)
+                        shown_name(manifest.name.as_str())
                     ),
                 )
                 .emit();
@@ -1470,7 +1474,7 @@ fn unparsed(program: &CapturedProgram<'_>) -> CliError {
             "program `{}`'s entry source (`{}`) does not parse, so its control model cannot be \
              derived. A program whose self-driving model the audit cannot state is refused \
              rather than certified with an assumed model.",
-            shown_name(&program.name),
+            shown_name(program.name.as_str()),
             program.path.display()
         ),
     )
@@ -1480,7 +1484,7 @@ fn unparsed(program: &CapturedProgram<'_>) -> CliError {
 #[derive(Debug)]
 struct CapturedProgram<'s> {
     /// The program's name.
-    name: String,
+    name: crate::program_name::ProgramName,
     /// The program's entry module.
     module: Vec<String>,
     /// The entry file's path, for a refusal to name.
@@ -1520,7 +1524,7 @@ fn captured_programs<'s>(
             });
         };
         programs.push(CapturedProgram {
-            name: entry.name().as_str().to_owned(),
+            name: entry.name().clone(),
             module: entry.module().to_vec(),
             path,
             source,
@@ -1601,7 +1605,7 @@ fn disclosure_summary(name: &str, disclosure: &Disclosure) -> String {
         .map(|program| {
             format!(
                 "`{}`: {}",
-                shown_name(&program.program),
+                shown_name(program.program.as_str()),
                 program.model.word()
             )
         })
@@ -1671,7 +1675,7 @@ fn enforced_semver(
         ));
     };
     let new_version = PublishedVersion::from_semver(manifest_version)
-        .map_err(|refusal| refusal.for_package(&manifest.name))?;
+        .map_err(|refusal| refusal.for_package(manifest.name.as_str()))?;
 
     // A prerelease (`X.Y.Z-<pre>`) is, by semver §9, explicitly unstable and
     // exempt from the compatibility guarantee a release version carries. Range
@@ -1691,7 +1695,7 @@ fn enforced_semver(
                     "package audit: `{}` {new_version} is a prerelease — exempt from the \
                  enforced-semver API-compatibility bump (semver §9: a prerelease is unstable \
                  and is not resolved by a stable version requirement).",
-                    shown_name(&manifest.name)
+                    shown_name(manifest.name.as_str())
                 ),
             )
             .emit();
@@ -1704,7 +1708,7 @@ fn enforced_semver(
     // Unreadable ⇒ fail closed: a corrupt predecessor must not silently pass
     // as "first version" — propagate the error so the gate refuses.
     let Some(entry) =
-        crate::index::read_entry_lookup(&index_root, &manifest.name).absent_or_err()?
+        crate::index::read_entry_lookup(&index_root, manifest.name.as_str()).absent_or_err()?
     else {
         crate::screen::Screen::new(crate::screen::Stream::Stdout)
             .line(
@@ -1712,7 +1716,7 @@ fn enforced_semver(
                 &format!(
                     "package audit: `{}` has no previously published version in the index — \
                  skipping the enforced-semver check (first version).",
-                    shown_name(&manifest.name)
+                    shown_name(manifest.name.as_str())
                 ),
             )
             .emit();
@@ -1727,7 +1731,7 @@ fn enforced_semver(
                     "package audit: `{}` has no published stable version below {new_version} — \
                  skipping the enforced-semver check (first stable version; a prerelease \
                  carries no compatibility promise to diff against).",
-                    shown_name(&manifest.name)
+                    shown_name(manifest.name.as_str())
                 ),
             )
             .emit();
@@ -1737,8 +1741,11 @@ fn enforced_semver(
     // Fetch + hash-verify the predecessor's pinned source, then diff the two
     // public APIs. `fetch_and_verify_baseline` returns the checkout root the
     // predecessor's `src/` lives under.
-    let baseline =
-        crate::resolve::fetch_and_verify_index_version(&manifest.root, &manifest.name, previous)?;
+    let baseline = crate::resolve::fetch_and_verify_index_version(
+        &manifest.root,
+        manifest.name.as_str(),
+        previous,
+    )?;
 
     let report = crate::diff::check_semver_bump_over(
         &baseline,
@@ -2989,11 +2996,16 @@ mod tests {
 
     // ── Disclosure derivation (control model + capabilities) ────────────────
 
+    /// The program named `raw`, a name inside the grammar.
+    fn program_name(raw: &str) -> crate::program_name::ProgramName {
+        crate::program_name::ProgramName::parse(raw).expect("a program name")
+    }
+
     /// The disclosure of a package whose one program `test-pkg` (entry `Main`) runs `model`.
     fn single(model: crate::delivery::ControlModel) -> ControlModelDisclosure {
         ControlModelDisclosure::Programs(
             NonEmpty::from_vec(vec![ProgramModel {
-                program: "test-pkg".to_owned(),
+                program: program_name("test-pkg"),
                 module: vec!["Main".to_owned()],
                 model,
             }])
@@ -3020,12 +3032,12 @@ mod tests {
         let mut manifest = test_manifest(Path::new("/nonexistent/disclosure-two-programs"));
         manifest.programs = vec![
             crate::project::Program {
-                name: "board".to_owned(),
+                name: program_name("board"),
                 entry: "Main.ipe".to_owned(),
                 shape: None,
             },
             crate::project::Program {
-                name: "sync".to_owned(),
+                name: program_name("sync"),
                 entry: "Sync.ipe".to_owned(),
                 shape: None,
             },
@@ -3090,25 +3102,20 @@ mod tests {
         );
     }
 
-    /// A program or package name holding a line break and a backtick is shown escaped on one
-    /// line, so it cannot forge a second disclosure line or close its code span.
+    /// A package name holding a line break and a backtick is shown escaped on one line, so it
+    /// cannot forge a second disclosure line or close its code span.
+    ///
+    /// A program name cannot hold either: [`crate::program_name::ProgramName`] admits only the
+    /// name grammar, and the manifest reader refuses anything else at its field.
     #[test]
-    fn disclosure_summary_shows_hostile_names_escaped_on_one_line() {
-        let (mut manifest, sources) = two_program_package();
-        let hostile = "sync\n`forged`: tea";
-        if let Some(program) = manifest.programs.get_mut(1) {
-            hostile.clone_into(&mut program.name);
-        }
+    fn disclosure_summary_shows_a_hostile_package_name_escaped_on_one_line() {
+        let (manifest, sources) = two_program_package();
         let disclosure =
             derive_disclosure(&manifest, &sources, BTreeSet::new()).expect("derives both");
         let summary = disclosure_summary("two\r\n`pkg`", &disclosure);
         assert!(
             !summary.contains('\n') && !summary.contains('\r'),
             "no name breaks the line: {summary:?}"
-        );
-        assert!(
-            summary.contains(r"`sync\n\`forged\`: tea`: direct"),
-            "the program name is shown escaped: {summary}"
         );
         assert!(
             summary.contains(r"package audit: `two\r\n\`pkg\`` control model"),
@@ -3246,7 +3253,7 @@ mod tests {
                 programs.map(|programs| {
                     programs
                         .iter()
-                        .map(|program| (program.name.clone(), program.module.clone()))
+                        .map(|program| (program.name.as_str().to_owned(), program.module.clone()))
                         .collect()
                 })
             })
@@ -3525,7 +3532,7 @@ mod tests {
         let err = crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
             &manifest.control_models_accept,
-            &manifest.name,
+            manifest.name.as_str(),
         )
         .expect_err("a declared accept-set that omits the derived model is refused");
         assert!(err.to_string().contains("IPE-S0004"), "carries the code");
@@ -3546,7 +3553,7 @@ mod tests {
         crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
             &manifest.control_models_accept,
-            &manifest.name,
+            manifest.name.as_str(),
         )
         .expect("a Direct entry a declared accept-set covers passes");
     }
@@ -3571,7 +3578,7 @@ mod tests {
         crate::control_model_consent::gate(
             crate::delivery::ControlModel::Direct,
             &manifest.control_models_accept,
-            &manifest.name,
+            manifest.name.as_str(),
         )
         .expect("a clean Direct entry with no acceptsControl certifies unconstrained");
     }
@@ -3604,7 +3611,8 @@ mod tests {
         .expect("write baseline entry");
 
         let mut manifest = test_manifest(&index_root.join("proj"));
-        manifest.name = "test-pkg".to_owned();
+        manifest.name =
+            crate::package_name::PackageName::parse("test-pkg").expect("a package name");
         manifest.version = Some("0.0.0-smoke.2".parse().expect("valid prerelease"));
 
         let result = enforced_semver(&manifest, &ModuleSources::new(), Some(&index_root));
@@ -3672,7 +3680,8 @@ mod tests {
         write_index_versions(&index_root, &["0.0.1-rc.1"]);
 
         let mut manifest = test_manifest(&index_root.join("proj"));
-        manifest.name = "test-pkg".to_owned();
+        manifest.name =
+            crate::package_name::PackageName::parse("test-pkg").expect("a package name");
         manifest.version = Some("0.0.1".parse().expect("valid release"));
 
         let result = enforced_semver(&manifest, &ModuleSources::new(), Some(&index_root));
@@ -3736,7 +3745,7 @@ mod tests {
     fn test_manifest(root: &std::path::Path) -> ProjectManifest {
         use std::collections::{BTreeMap, BTreeSet};
         ProjectManifest {
-            name: "test-pkg".to_owned(),
+            name: crate::package_name::PackageName::parse("test-pkg").expect("a package name"),
             version: None,
             root: root.to_path_buf(),
             src_root: root.join("src"),

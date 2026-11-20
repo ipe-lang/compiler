@@ -4035,7 +4035,7 @@ pub fn emitted_bin_filename(crate_dir: &Path) -> Result<String, CliError> {
 fn friendly_artifact_name(manifest: Option<&project::ProjectManifest>) -> String {
     manifest.map_or_else(
         || ipe_backend_rust::SINGLE_FILE_CRATE_NAME.to_owned(),
-        |m| ipe_backend_rust::sanitize_cargo_name(&m.name),
+        |m| ipe_backend_rust::sanitize_cargo_name(m.name.as_str()),
     )
 }
 

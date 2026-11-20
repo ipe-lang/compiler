@@ -46,7 +46,7 @@ pub const UNDECLARED_DB_DRIVER: ipe_backend_rust::DbDriver = ipe_backend_rust::D
 #[derive(Clone, Debug)]
 pub struct ProjectManifest {
     /// The project name (from the manifest's `name` field).
-    pub name: String,
+    pub name: crate::package_name::PackageName,
     /// The package version (from the manifest's `version` field), parsed into a
     /// typed [`semver::Version`]. `None` when the manifest declares no version — the
     /// package gate's enforced-semver check needs one, so `ipe package audit`
@@ -801,7 +801,7 @@ impl ProjectManifest {
         Some(format!(
             "building program `{}` (1 of {total} — named selection of the other \
              {} is not yet supported)",
-            built.name,
+            built.name.as_str(),
             total - 1,
         ))
     }
@@ -818,7 +818,7 @@ impl ProjectManifest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Program {
     /// The program's target name (the program record's `name` field).
-    pub name: String,
+    pub name: crate::program_name::ProgramName,
     /// The entry module's source file, relative to the source root
     /// (the program record's `entry` field; defaults to `Main.ipe`).
     pub entry: String,

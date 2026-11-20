@@ -200,7 +200,7 @@ pub fn run_publish(rest: &[String]) -> Result<(), CliError> {
     //    existing entry (refusing a duplicate); `--fresh` writes a single-version
     //    entry (the new version only), used to reset the disposable reserved smoke
     //    probe so its index entry never accumulates.
-    let package_name = PackageName::parse(&manifest.name)?;
+    let package_name = manifest.name.clone();
     let index_root = crate::resolve::index_root()?;
     let entry_toml = if args.fresh {
         build_fresh_entry(&package_name, &claimed, blessing.as_ref(), &entry_version)?
@@ -386,7 +386,7 @@ fn compute_entry_draft(
     // Parse-don't-validate: the typed constructor rejects any value outside the
     // transport allow-list. Publish uses the same gate as the resolver so an
     // entry written by `publish` round-trips through `read_entry` without error.
-    let package_name = PackageName::parse(&manifest.name)?;
+    let package_name = manifest.name.clone();
     let source = SourceUrl::parse(&package_name, &raw_source)
         .map_err(|e| CliError::Usage(text::msg::publish_source_refused(&e)))?;
 
@@ -559,7 +559,8 @@ fn manifest_published_version(manifest: &ProjectManifest) -> Result<PublishedVer
         .version
         .clone()
         .ok_or_else(|| CliError::ProjectRefused(text::msg::publish_no_version(&manifest.name)))?;
-    PublishedVersion::from_semver(version).map_err(|refusal| refusal.for_package(&manifest.name))
+    PublishedVersion::from_semver(version)
+        .map_err(|refusal| refusal.for_package(manifest.name.as_str()))
 }
 
 /// Merge `new_version` into the package's existing index entry (or create a first
@@ -2121,7 +2122,7 @@ mod tests {
     fn a_build_metadata_version_is_refused_at_publish() {
         let root = temp_dir("build-metadata");
         let mut manifest = crate::project::ProjectManifest {
-            name: "http-extras".to_owned(),
+            name: PackageName::parse("http-extras").expect("a package name"),
             version: Some("1.2.0+build.5".parse().expect("valid semver with build")),
             root: root.clone(),
             src_root: root.join("src"),
@@ -2860,7 +2861,7 @@ mod tests {
     /// A publishable manifest rooted at `root`.
     fn publishable_manifest(root: &Path) -> crate::project::ProjectManifest {
         crate::project::ProjectManifest {
-            name: "lib".to_owned(),
+            name: PackageName::parse("lib").expect("a package name"),
             version: Some("1.0.0".parse().expect("valid release")),
             root: root.to_path_buf(),
             src_root: root.to_path_buf(),

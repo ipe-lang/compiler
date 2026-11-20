@@ -3397,13 +3397,13 @@ mod tests {
         let settings = watch_emit_settings(&resolved, false, false, crate::RuntimeEmit::Linked);
         let canonical = std::fs::canonicalize(fixture.path()).expect("canonical");
         let expected = ipe_backend_rust::crate_identity(
-            &ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
+            &ipe_backend_rust::sanitize_cargo_name(fixture.root().manifest().name.as_str()),
             &canonical,
         );
         assert_eq!(settings.crate_name.as_str(), expected.as_str());
         assert_ne!(
             settings.crate_name.as_str(),
-            ipe_backend_rust::sanitize_cargo_name(&fixture.root().manifest().name),
+            ipe_backend_rust::sanitize_cargo_name(fixture.root().manifest().name.as_str()),
             "the friendly name alone would share a cargo slot across projects"
         );
         assert_eq!(

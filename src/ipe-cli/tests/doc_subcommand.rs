@@ -833,7 +833,10 @@ fn a_project_module_shadows_stdlib_by_short_name_only() -> io::Result<()> {
 /// shape `ipe doc` reads as the current directory's package.
 fn package_dir(tag: &str) -> io::Result<PathBuf> {
     let dir = fresh_dir(tag)?;
-    fs::write(dir.join("package.ipe"), support::package_ipe(tag))?;
+    fs::write(
+        dir.join("package.ipe"),
+        support::package_ipe(&tag.replace('_', "-")),
+    )?;
     let src = dir.join("src");
     fs::create_dir_all(&src)?;
     fs::write(
@@ -934,7 +937,7 @@ fn a_reserved_miss_in_an_unresolvable_package_still_misses_cleanly() -> io::Resu
     let dir = fresh_dir("unresolvable_package")?;
     fs::write(
         dir.join("package.ipe"),
-        support::package_ipe("unresolvable_package"),
+        support::package_ipe("unresolvable-package"),
     )?;
     let (ok, stdout, stderr) = run_in(&dir, &["doc", "Ipe.Nope"]);
     assert!(!ok, "`ipe doc Ipe.Nope` must miss:\n{stdout}");
@@ -963,7 +966,7 @@ fn a_package_refusal_under_a_machine_format_is_the_machine_envelope() -> io::Res
     let unresolvable = fresh_dir("machine_refusal_unresolvable")?;
     fs::write(
         unresolvable.join("package.ipe"),
-        support::package_ipe("machine_refusal_unresolvable"),
+        support::package_ipe("machine-refusal-unresolvable"),
     )?;
     let cases: [(&Path, &[&str]); 4] = [
         (&ill_typed, &["Shapes"]),

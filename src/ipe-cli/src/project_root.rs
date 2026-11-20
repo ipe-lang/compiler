@@ -22,6 +22,7 @@ use crate::output_dir::OutputRefusal;
 use crate::output_dir::held::{EntryKind, HeldDir};
 use crate::owner_trust::{self, TrustedCache};
 use crate::package_manifest::{PACKAGE_IPE, parse_package_manifest_source};
+use crate::program_name::ProgramName;
 use crate::project::{IPE_TOML, ProjectManifest, parse_entry};
 use crate::text;
 use crate::verb::Verb;
@@ -71,18 +72,6 @@ impl<T> NonEmpty<T> {
     /// Every element, first to last.
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         std::iter::once(&self.first).chain(self.rest.iter())
-    }
-}
-
-/// The name of one program a project builds.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProgramName(String);
-
-impl ProgramName {
-    /// The name as text.
-    #[must_use]
-    pub const fn as_str(&self) -> &str {
-        self.0.as_str()
     }
 }
 
@@ -573,7 +562,7 @@ pub fn entry_set(
             .map_err(|refusal| CliError::manifest_entry_refused(&program.entry, &refusal))?;
         match locate(&module)? {
             Located::Found => programs.push(ResolvedEntry {
-                name: ProgramName(program.name.clone()),
+                name: program.name.clone(),
                 module,
             }),
             Located::Missing => {
@@ -597,7 +586,7 @@ pub fn entry_set(
         Located::Found => {
             return Ok(EntrySet::Programs(NonEmpty {
                 first: ResolvedEntry {
-                    name: ProgramName(manifest.name.clone()),
+                    name: ProgramName::from(&manifest.name),
                     module: main,
                 },
                 rest: Vec::new(),
