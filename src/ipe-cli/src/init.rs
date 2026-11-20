@@ -1197,32 +1197,39 @@ fn project_name_for(target_dir: &Path) -> Result<PackageName, CliError> {
     let dir = target_dir_name(target_dir)?;
     let name = derive_package_name(&dir).map_err(|why| {
         let reason = why.package_reason();
-        CliError::ProjectRefused(match why {
-            NameRefusal::TooLong => text::msg::init_no_derivable_name_unshown(&reason),
-            NameRefusal::Empty
-            | NameRefusal::BadStart
-            | NameRefusal::BadChar
-            | NameRefusal::DoubledDash
-            | NameRefusal::TrailingDash => {
-                text::msg::init_no_derivable_name(&shown_dir_name(&dir), &reason)
-            }
-        })
+        CliError::ProjectRefused(shown_dir_name(&dir).map_or_else(
+            || text::msg::init_no_derivable_name_unshown(&reason),
+            |shown| text::msg::init_no_derivable_name(&shown, &reason),
+        ))
     })?;
     if name != dir.as_str() {
         crate::screen::chatter(
             crate::screen::Stream::Stdout,
             crate::screen::Tone::Aux,
-            &text::msg::init_derived_name(&shown_dir_name(&dir), &name),
+            &derived_name_notice(&dir, &name),
         );
     }
     Ok(name)
 }
 
+/// The line `init` prints when it names the package `name`, derived from the
+/// directory name `dir`.
+fn derived_name_notice(dir: &str, name: &PackageName) -> text::Message {
+    shown_dir_name(dir).map_or_else(
+        || text::msg::init_derived_name_unshown(name),
+        |shown| text::msg::init_derived_name(&shown, name),
+    )
+}
+
 /// A directory name as one inert token: control characters and line breaks
 /// escaped as in [`str::escape_debug`], a backtick escaped so the name cannot
 /// close the code span it is shown in, and the result terminal-sanitised.
-fn shown_dir_name(dir: &str) -> style::TerminalSafe {
-    style::TerminalSafe::sanitize(&dir.escape_debug().to_string().replace('`', "\\`"))
+///
+/// `None` for a name longer than [`NameRefusal::MAX_LEN`] bytes: like an
+/// over-long manifest name value, it is not echoed.
+fn shown_dir_name(dir: &str) -> Option<style::TerminalSafe> {
+    (dir.len() <= NameRefusal::MAX_LEN)
+        .then(|| style::TerminalSafe::sanitize(&dir.escape_debug().to_string().replace('`', "\\`")))
 }
 
 /// The package name derived from directory name `dir`.
@@ -2480,6 +2487,26 @@ mod tests {
             matches!(&refused, Err(CliError::ProjectRefused(msg)) if !msg.contains(&long)),
             "a too-long directory name is not echoed: {refused:?}"
         );
+    }
+
+    #[test]
+    fn an_over_long_directory_name_is_not_echoed() {
+        let separators = "_".repeat(NameRefusal::MAX_LEN);
+        let refused = project_name_for(Path::new(&format!("{separators}\u{e9}")));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(msg))
+                if msg.contains("no package name can be derived") && !msg.contains(&separators)),
+            "a directory name over the bound is not echoed in the refusal: {refused:?}"
+        );
+        let dir = format!("{separators}shop");
+        let name = derive_package_name(&dir).expect("the separators drop away");
+        let notice = derived_name_notice(&dir, &name).to_string();
+        assert!(
+            notice.contains("`shop`") && !notice.contains(&separators),
+            "a directory name over the bound is not echoed in the notice: {notice}"
+        );
+        let notice = derived_name_notice("My_Shop", &name).to_string();
+        assert!(notice.contains("`My_Shop`"), "a short one is: {notice}");
     }
 
     // Every quit key a shape's hint advertises is one its `Main.ipe` handles:

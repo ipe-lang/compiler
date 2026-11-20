@@ -1714,6 +1714,8 @@ messages! {
     init_no_project_name(target) = "init-no-project-name";
     /// `ipe init` named the package by a name derived from the directory name.
     init_derived_name(dir: &crate::style::TerminalSafe, name) = "init-derived-name";
+    /// `ipe init` named the package by a name derived from a directory name too long to show.
+    init_derived_name_unshown(name) = "init-derived-name-unshown";
     /// `ipe init` could derive no package name from the directory name.
     init_no_derivable_name(dir: &crate::style::TerminalSafe, why) = "init-no-derivable-name";
     /// `ipe init` could derive no package name from a directory name too long to show.

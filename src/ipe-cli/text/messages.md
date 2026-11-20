@@ -2283,6 +2283,10 @@ init: cannot derive a project name from target {target}
 
 init: the directory name `{dir}` is not a package name, so the package is named `{name}`
 
+## init-derived-name-unshown
+
+init: the directory name is not a package name, so the package is named `{name}`
+
 ## init-no-derivable-name
 
 init: no package name can be derived from the directory name `{dir}`: {why} — rename the directory or pass a directory whose name is lowercase letters, digits, and `-`
