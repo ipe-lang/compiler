@@ -1234,10 +1234,26 @@ fn point_free_decode_succeed_of_a_task_is_refused() {
     );
 }
 
-/// A point-free and a let-bound `Decode.succeed` over `String` payloads pass
-/// ipe, and build and run correctly under `IPE_E2E=1` (THE SEAL).
+/// A point-free and a let-bound `Decode.succeed` over `String` payloads pass ipe.
+#[test]
+fn point_free_decode_succeed_of_a_string_passes_ipe() {
+    let (built, _) = build_source(
+        "decode_succeed_point_free_string",
+        DECODE_SUCCEED_POINT_FREE_STRING,
+    );
+    assert!(
+        built.is_ok(),
+        "a point-free `Decode.succeed` over a `String` must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// The same `String` payloads build and run correctly: gated on `IPE_E2E=1` (THE SEAL).
 #[test]
 fn point_free_decode_succeed_of_a_string_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
     let (built, out) = build_source(
         "decode_succeed_point_free_string",
         DECODE_SUCCEED_POINT_FREE_STRING,
@@ -1247,9 +1263,6 @@ fn point_free_decode_succeed_of_a_string_builds_and_runs() {
         "a point-free `Decode.succeed` over a `String` must pass ipe: {:?}",
         built.err()
     );
-    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        return;
-    }
     let outcome = crate::support::build_and_run_emitted("decode_succeed_point_free_string", &out);
     assert_eq!(
         outcome.exit_code,
@@ -1333,16 +1346,27 @@ main =
 "#;
 
 #[test]
+fn point_free_kernel_references_pass_ipe() {
+    let (built, _) = build_source("kernel_point_free", KERNEL_POINT_FREE);
+    assert!(
+        built.is_ok(),
+        "point-free kernel references must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for each point-free kernel reference: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
 fn point_free_kernel_references_build_and_run() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
     let (built, out) = build_source("kernel_point_free", KERNEL_POINT_FREE);
     assert!(
         built.is_ok(),
         "point-free kernel references must pass ipe: {:?}",
         built.err()
     );
-    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
-        return;
-    }
     let outcome = crate::support::build_and_run_emitted("kernel_point_free", &out);
     assert_eq!(
         outcome.exit_code,

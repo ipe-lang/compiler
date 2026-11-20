@@ -38,10 +38,9 @@ fn point_free_email_send_lowers_to_its_enum() {
     // path, not the empty-home ICE arm. An empty `ir` (a lowering rejection)
     // fails both assertions with the message.
     assert!(
-        ir.contains("FuncValue kernel Email.send"),
-        "a point-free `Email.send` must lower to a first-class kernel value; \
-         the emitted `FuncValue kernel Email.send` must appear in the lowered \
-         IR, got: {lowered:?}"
+        ir.contains("Call kernel Email.send") && !ir.contains("FuncValue kernel Email.send"),
+        "a point-free `Email.send` must lower to an eta closure over a saturated \
+         `Call kernel Email.send`, never a bare `FuncValue` kernel, got: {lowered:?}"
     );
     assert!(
         ir.contains("EmailProvider"),
