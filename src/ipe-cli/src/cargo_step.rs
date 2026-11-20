@@ -1584,8 +1584,8 @@ mod tests {
         BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, EmbeddedApp, Verbosity,
         WatchBuild,
     };
-    use crate::progress::testing::Capture;
-    use crate::progress::{Door, Mode};
+    use crate::progress::testing::{Capture, FROZEN, QUICK};
+    use crate::progress::{Door, Mode, Stage};
     use crate::target_dir::LinkableTargetDir;
     use crate::toolchain::CargoBin;
     use crate::watch::BuildAccel;
@@ -1963,14 +1963,56 @@ mod tests {
         assert_eq!(shown.lines().count(), 3, "the relay goes on: {shown:?}");
     }
 
-    /// A progress stage over `buf` in `mode`, building `the app`.
-    fn progress_live(buf: &Capture, mode: Mode) -> Mutex<super::Live<Capture>> {
-        Mutex::new(super::Live::new(
-            buf.clone(),
+    /// A progress stage over `buf` in `mode`, building `the app`, its ticker at `timing`.
+    fn timed_live(
+        buf: &Capture,
+        mode: Mode,
+        timing: crate::progress::Timing,
+    ) -> super::Live<Capture> {
+        super::Live::Progress(super::BuildStage {
+            stage: Stage::with_timing(buf.clone(), mode, "compiling the app…", timing),
             mode,
-            Verbosity::Progress,
-            "the app",
-        ))
+            what: "the app",
+            built: 0,
+            plain_lines: 0,
+        })
+    }
+
+    /// A progress stage over `buf` in `mode`, building `the app`, whose frames never move.
+    fn progress_live(buf: &Capture, mode: Mode) -> Mutex<super::Live<Capture>> {
+        Mutex::new(timed_live(buf, mode, FROZEN))
+    }
+
+    /// A build stage keeps turning while cargo reports nothing, and stops at its outcome.
+    #[test]
+    fn a_progress_build_stage_turns_while_cargo_is_silent() {
+        let buf = Capture::default();
+        let live = timed_live(&buf, Mode::Terminal, QUICK);
+        let frames = || {
+            crate::style::SPINNER_FRAMES
+                .iter()
+                .filter(|frame| buf.text().contains(*frame))
+                .count()
+        };
+        let start = std::time::Instant::now();
+        while frames() < 2 && start.elapsed() < std::time::Duration::from_secs(5) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(frames() >= 2, "the stage turns: {:?}", buf.text());
+        live.finish(true);
+        assert_eq!(buf.handles(), 1, "the ticker joined and let go");
+        let out = buf.text();
+        let Some((_, after)) = out.split_once(crate::style::glyph::OK) else {
+            assert!(out.contains(crate::style::glyph::OK), "{out:?}");
+            return;
+        };
+        assert!(
+            !crate::style::SPINNER_FRAMES
+                .iter()
+                .any(|frame| after.contains(frame)),
+            "{out:?}"
+        );
+        assert!(!after.contains('\r'), "{out:?}");
     }
 
     /// The crates a progress stage has counted.
