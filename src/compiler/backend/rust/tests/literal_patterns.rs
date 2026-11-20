@@ -70,7 +70,7 @@ fn tag_program(interner: &mut Interner, payload: Pat) -> DResult<Program> {
     let b = interner.intern("B")?;
     let f = interner.intern("f")?;
     let w = interner.intern("w")?;
-    let zero = interner.intern("zero")?;
+    let main = interner.intern("main")?;
 
     let def = EnumDef {
         name: tag,
@@ -128,10 +128,10 @@ fn tag_program(interner: &mut Interner, payload: Pat) -> DResult<Program> {
         body: Expr::Match(ipe_ir::Match::new(Expr::Var(w), arms, &[a, b])?),
     };
 
-    // A trivial entry so the program is well-formed; `zero` keeps it minimal.
+    // The module's `main`, the entry the epilogue calls as `ipe_main`.
     let main_fn = Func {
         id: FuncId::from_raw(1),
-        name: zero,
+        name: main,
         home: ModPath(vec![]),
         type_params: vec![],
         row_params: vec![],
