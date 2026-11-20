@@ -312,25 +312,36 @@ pub fn emit_func_value(
     ty: &IrType,
     generics: GenericScope,
 ) -> DResult<String> {
-    // A kernel whose emit arm carries a bridge or guard is never a bare function
-    // value: the lowerer eta-expands every point-free reference to it.
-    if let Callee::Kernel(k) = callee
-        && k.requires_saturated_emit()
-    {
-        return Err(Diagnostic::CompilerBug {
-            where_: "ipe_backend_rust::emit_func_value",
-            detail: format!(
-                "{k:?} reached as a bare function value; the lowerer must eta-expand \
-                 it so its saturated emit arm fires"
-            ),
-        });
-    }
-    let name = callee_name(ctx, callee)?;
+    let name = func_value_name(ctx, callee)?;
     let typed = render_type(ctx, ty, generics)?;
     let ctor = if wants_arc_ctor(ty) { "Arc" } else { "Box" };
     Ok(format!(
         "{{ let __ipe_fn: {typed} = {ctor}::new({name}); __ipe_fn }}"
     ))
+}
+
+/// The Rust name a function-value reference to `callee` boxes.
+///
+/// A kernel is never a function value: its saturated emit arm (a payload
+/// factory, a record bridge, an input guard, an inline body, a name with no
+/// runtime `fn`) is what makes the runtime agree with its Ipê arrow, so the
+/// lowerer eta-expands every point-free kernel reference into a saturated call.
+///
+/// # Errors
+///
+/// [`Diagnostic::CompilerBug`] for a kernel callee, which would otherwise box a
+/// runtime `fn` whose shape the Ipê arrow does not promise.
+pub fn func_value_name(ctx: &EmitCtx, callee: &Callee) -> DResult<String> {
+    match callee {
+        Callee::Kernel(k) => Err(Diagnostic::CompilerBug {
+            where_: "ipe_backend_rust::func_value_name",
+            detail: format!(
+                "{k:?} reached as a bare function value; the lowerer must eta-expand \
+                 every kernel reference so its saturated emit arm fires"
+            ),
+        }),
+        Callee::Func(_) | Callee::Ffi { .. } => callee_name(ctx, callee),
+    }
 }
 
 /// Emit the unboxed inner `move |p0: T0, …| -> R { <body> }` closure expression.
@@ -357,18 +368,29 @@ pub fn emit_lambda_unboxed(
         ));
     }
     let ret_s = render_type(ctx, ret, generics)?;
-    // This is a `move` closure: it captures `__ipe_lit` by move, so a style
-    // literal inside its body must NOT hoist into the enclosing view's table
-    // (it would contend with the binding's other uses). Fence hoisting off for
-    // the closure body; literals within emit directly, unchanged.
-    ctx.enter_closure();
-    let body_result = emit_expr_at(ctx, body, indent, child, generics);
-    ctx.exit_closure();
-    let body_s = body_result?;
+    let body_s = in_closure_body(ctx, || emit_expr_at(ctx, body, indent, child, generics))?;
     Ok(format!(
         "move |{}| -> {ret_s} {{ {body_s} }}",
         parts.join(", ")
     ))
+}
+
+/// Run `emit` as the body of a printed `move` closure.
+///
+/// Two emit states never reach a closure body. Style-literal hoisting is fenced
+/// off, because the closure captures `__ipe_lit` by move. The `update`-arm
+/// transition and Cmd-wiring rewrites are disarmed, because only the top `case`
+/// of an armed `update` is an overlay arm: a `case` inside a nested lambda is
+/// compiled as written. Both states are restored when `emit` returns. The string
+/// path ([`emit_lambda_unboxed`]) and the Doc path
+/// (`crate::emit_doc::build_closure`) share this one entry.
+pub fn in_closure_body<T>(ctx: &EmitCtx, emit: impl FnOnce() -> T) -> T {
+    ctx.enter_closure();
+    let saved_transition = ctx.begin_transition_update(None);
+    let out = emit();
+    ctx.end_transition_update(saved_transition);
+    ctx.exit_closure();
+    out
 }
 
 /// The compiler-bug refusal for an [`Expr::OnceLambda`] at an unadmitted position.

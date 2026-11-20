@@ -1029,3 +1029,354 @@ fn adapted_handler_shapes_build_and_run() {
         outcome.stdout
     );
 }
+
+/// `Decode.succeed` over a `Task` parameter: the factory reproduces its payload
+/// by `.clone()` on every run, which a task cannot do.
+const DECODE_SUCCEED_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.String
+import Ipe.Task as Task
+
+
+decodeTask : Task Error Int -> String -> Int
+decodeTask t raw =
+    case JsonDec.decodeString (JsonDec.succeed t) raw of
+        Ok _ ->
+            1
+
+        Err _ ->
+            0
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (decodeTask (Task.succeed 1) "1"))
+"#;
+
+/// `Decode.succeed` over a `String` parameter, decoded twice.
+const DECODE_SUCCEED_STRING: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.Task as Task
+
+
+decodeName : String -> String -> String
+decodeName s raw =
+    let
+        d =
+            JsonDec.succeed s
+    in
+    case ( JsonDec.decodeString d raw, JsonDec.decodeString d raw ) of
+        ( Ok a, Ok b ) ->
+            a ++ "," ++ b
+
+        _ ->
+            "err"
+
+
+main : Task Error ()
+main =
+    Io.println (decodeName "hi" "1")
+"#;
+
+/// A non-`Clone` `Decode.succeed` payload is refused at ipe time with IPE-L0135
+/// at the payload, before cargo can fail on its `.clone()`.
+#[test]
+fn decode_succeed_of_a_task_is_refused() {
+    let (built, _) = build_source("decode_succeed_task", DECODE_SUCCEED_TASK);
+    let want = source_capture_span(DECODE_SUCCEED_TASK, "t) raw");
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::NonCloneValueReuse),
+                    } if *span == want
+                )
+        ),
+        "a `Task` payload of `Decode.succeed` must fail closed with IPE-L0135 at the \
+         payload ({want:?}), got {built:?}"
+    );
+}
+
+/// A `Clone` `Decode.succeed` payload passes ipe.
+#[test]
+fn decode_succeed_of_a_string_passes_ipe() {
+    let (built, _) = build_source("decode_succeed_string", DECODE_SUCCEED_STRING);
+    assert!(
+        built.is_ok(),
+        "a `String` payload of `Decode.succeed` must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for a `Clone` `Decode.succeed` payload: gated on
+/// `IPE_E2E=1` (THE SEAL).
+#[test]
+fn decode_succeed_of_a_string_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source("decode_succeed_string_e2e", DECODE_SUCCEED_STRING);
+    assert!(built.is_ok(), "the build must succeed: {:?}", built.err());
+    let outcome = crate::support::build_and_run_emitted("decode_succeed_string", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "a `String` payload of `Decode.succeed` must build and exit 0; stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("hi,hi\n"),
+        "must decode the payload twice; got: {:?}",
+        outcome.stdout
+    );
+}
+
+/// A point-free `Decode.succeed` mapped over `Task` parameters: the eta
+/// parameter reaches the same `.clone()`-reproducing factory.
+const DECODE_SUCCEED_POINT_FREE_TASK: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.List as List
+import Ipe.String
+import Ipe.Task as Task
+
+
+decodeAll : Task Error Int -> String -> Int
+decodeAll t raw =
+    List.length (List.map (\d -> JsonDec.decodeString d raw) (List.map JsonDec.succeed [ t ]))
+
+
+main : Task Error ()
+main =
+    Io.println (String.fromInt (decodeAll (Task.succeed 1) "1"))
+"#;
+
+/// A point-free and a let-bound `Decode.succeed` over `String` payloads.
+const DECODE_SUCCEED_POINT_FREE_STRING: &str = r#"module Main exposing (main)
+
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.Json.Decode as JsonDec
+import Ipe.List as List
+import Ipe.String
+import Ipe.Task as Task
+
+
+decodeOne : String -> JsonDec.Decoder String -> String
+decodeOne raw d =
+    case JsonDec.decodeString d raw of
+        Ok s ->
+            s
+
+        Err _ ->
+            "err"
+
+
+decodeAll : String -> String
+decodeAll raw =
+    let
+        g =
+            JsonDec.succeed
+    in
+    String.join "," (List.map (decodeOne raw) (g "c" :: List.map JsonDec.succeed [ "a", "b" ]))
+
+
+main : Task Error ()
+main =
+    Io.println (decodeAll "1")
+"#;
+
+/// A point-free `Decode.succeed` whose payload is not `Clone` is refused at ipe
+/// time with IPE-L0135 at the reference, exactly as a saturated call is.
+#[test]
+fn point_free_decode_succeed_of_a_task_is_refused() {
+    let (built, _) = build_source(
+        "decode_succeed_point_free_task",
+        DECODE_SUCCEED_POINT_FREE_TASK,
+    );
+    let needle = "JsonDec.succeed [";
+    #[allow(clippy::expect_used)] // the needle is written into the source
+    let lo = DECODE_SUCCEED_POINT_FREE_TASK
+        .rfind(needle)
+        .expect("needle is in the source");
+    #[allow(clippy::expect_used)] // the source is far below 4 GiB
+    let lo = u32::try_from(lo).expect("offset fits u32");
+    let want = Span {
+        lo,
+        hi: lo.saturating_add(15),
+    };
+    assert!(
+        matches!(
+            &built,
+            Err(CliError::Pipeline { diag, .. })
+                if matches!(
+                    diag.as_ref(),
+                    Diagnostic::Lower {
+                        span,
+                        msg: LowerError::Unsupported(Feature::NonCloneValueReuse),
+                    } if *span == want
+                )
+        ),
+        "a point-free `Decode.succeed` over a `Task` must fail closed with IPE-L0135 at \
+         the reference ({want:?}), got {built:?}"
+    );
+}
+
+/// A point-free and a let-bound `Decode.succeed` over `String` payloads pass ipe.
+#[test]
+fn point_free_decode_succeed_of_a_string_passes_ipe() {
+    let (built, _) = build_source(
+        "decode_succeed_point_free_string",
+        DECODE_SUCCEED_POINT_FREE_STRING,
+    );
+    assert!(
+        built.is_ok(),
+        "a point-free `Decode.succeed` over a `String` must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// The same `String` payloads build and run correctly: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
+fn point_free_decode_succeed_of_a_string_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source(
+        "decode_succeed_point_free_string",
+        DECODE_SUCCEED_POINT_FREE_STRING,
+    );
+    assert!(
+        built.is_ok(),
+        "a point-free `Decode.succeed` over a `String` must pass ipe: {:?}",
+        built.err()
+    );
+    let outcome = crate::support::build_and_run_emitted("decode_succeed_point_free_string", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "a point-free `Decode.succeed` must build and exit 0; stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("c,a,b\n"),
+        "must decode every payload; got: {:?}",
+        outcome.stdout
+    );
+}
+
+/// Point-free references to kernels whose runtime `fn` differs from the Ipê
+/// arrow: a topic name with no runtime `fn`, a retry-policy builder over the
+/// emitted policy struct, network and process tasks over a record bridge, a
+/// map lookup, and a JSON encoder over the opaque `Value`. Each is eta-expanded
+/// into a saturated call, so the emitted program builds.
+const KERNEL_POINT_FREE: &str = r#"module Main exposing (main)
+
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Http as Http exposing (HttpResponse)
+import Ipe.Io as Io
+import Ipe.Json.Encode
+import Ipe.List as List
+import Ipe.Maybe as Maybe
+import Ipe.Process as Process
+import Ipe.PubSub as PubSub exposing (Topic)
+import Ipe.String as String
+import Ipe.Task as Task exposing (RetryPolicy)
+import Ipe.Url exposing (Url)
+
+
+topics : List (Topic String)
+topics =
+    List.map PubSub.topic [ "a", "b" ]
+
+
+policies : List (RetryPolicy Error)
+policies =
+    List.map Task.withJitter [ Task.defaultRetryPolicy ]
+
+
+fetches : List Url -> List (Task Error HttpResponse)
+fetches us =
+    List.map Http.get us
+
+
+runs : List (Task Error { exitCode : Int, stdout : String, stderr : String })
+runs =
+    let
+        run =
+            Process.runWith
+    in
+    List.map run []
+
+
+found : Maybe Int
+found =
+    let
+        get =
+            Dict.get
+    in
+    get "k" (Dict.fromList [ ( "k", 7 ) ])
+
+
+main : Task Error ()
+main =
+    Io.println
+        (String.join ","
+            [ String.fromInt (List.length topics)
+            , String.fromInt (List.length policies)
+            , String.fromInt (List.length (fetches []))
+            , String.fromInt (List.length runs)
+            , String.fromInt (Maybe.withDefault 0 found)
+            , JsonEnc.encode 0 (JsonEnc.list JsonEnc.string [ "x" ])
+            ]
+        )
+"#;
+
+#[test]
+fn point_free_kernel_references_pass_ipe() {
+    let (built, _) = build_source("kernel_point_free", KERNEL_POINT_FREE);
+    assert!(
+        built.is_ok(),
+        "point-free kernel references must pass ipe: {:?}",
+        built.err()
+    );
+}
+
+/// cargo-0 and run-correct for each point-free kernel reference: gated on `IPE_E2E=1` (THE SEAL).
+#[test]
+fn point_free_kernel_references_build_and_run() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    let (built, out) = build_source("kernel_point_free", KERNEL_POINT_FREE);
+    assert!(
+        built.is_ok(),
+        "point-free kernel references must pass ipe: {:?}",
+        built.err()
+    );
+    let outcome = crate::support::build_and_run_emitted("kernel_point_free", &out);
+    assert_eq!(
+        outcome.exit_code,
+        Some(0),
+        "point-free kernel references must build and exit 0; stdout: {:?}",
+        outcome.stdout
+    );
+    assert!(
+        outcome.stdout.contains("2,1,0,0,7,[\"x\"]\n"),
+        "each reference must reach its saturated arm; got: {:?}",
+        outcome.stdout
+    );
+}

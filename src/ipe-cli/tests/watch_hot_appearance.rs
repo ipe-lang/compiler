@@ -2204,3 +2204,124 @@ fn cmd_perform_arm_composes_and_serves() -> Result<(), BoxError> {
 
     stop_and_join(&handle, join)
 }
+
+/// A `Web.tea` over a `String` model field whose `update` is `update_body`; its
+/// `Fetch` arm performs `Task.succeed label` for a `label` bound from the model.
+fn web_fixture_cmd_perform_label(update_body: &str) -> String {
+    format!(
+        "module Main exposing (main)\n\n\
+         import Ipe.Tea.Web as Web\n\
+         import Ipe.Ui as Ui\n\
+         import Ipe.Tea.Web.Cmd\n\
+         import Ipe.Tea.Web.Sub\n\
+         import Ipe.Task as Task\n\
+         import Ipe.Error exposing (Error)\n\n\
+         type alias Model = {{ name : String }}\n\n\
+         type Msg = Fetch | GotName (Result Error String)\n\n\
+         init : WebReq -> ( Model, Cmd Msg )\n\
+         init _req =\n    \
+             ( {{ name = \"n\" }}, Cmd.none )\n\n\
+         update : Msg -> Model -> ( Model, Cmd Msg )\n\
+         update msg model =\n\
+         {update_body}\n\
+         view : Model -> Element Msg\n\
+         view model =\n    \
+             Ui.column []\n        \
+                 [ Ui.text \"marker\" ]\n\n\
+         subscriptions : Model -> Sub Msg\n\
+         subscriptions _model =\n    \
+             Sub.none\n\n\
+         main =\n    \
+             Web.tea\n        \
+                 {{ init = init, update = update, view = view, subscriptions = subscriptions\n        \
+                 , routes = [], notFound = Fetch\n        \
+                 }}\n"
+    )
+}
+
+/// The `Cmd.perform` arm sits inside a source lambda in `update`, reading a
+/// `let` binding of the enclosing body.
+const NESTED_LAMBDA_UPDATE: &str = "    let\n        \
+        label =\n            \
+            model.name\n\n        \
+        step =\n            \
+            \\m ->\n                \
+                case msg of\n                    \
+                    Fetch ->\n                        \
+                        ( m, Cmd.perform (Task.succeed label) GotName )\n\n                    \
+                    GotName _result ->\n                        \
+                        ( m, Cmd.none )\n    \
+    in\n    \
+    step model\n";
+
+/// The `Cmd.perform` arm reads `label`, which the body reads again after the
+/// `case`.
+const READ_AFTER_MATCH_UPDATE: &str = "    let\n        \
+        label =\n            \
+            model.name\n\n        \
+        next =\n            \
+            case msg of\n                \
+                Fetch ->\n                    \
+                    ( model, Cmd.perform (Task.succeed label) GotName )\n\n                \
+                GotName _result ->\n                    \
+                    ( model, Cmd.none )\n    \
+    in\n    \
+    if label == \"\" then\n        \
+        ( model, Cmd.none )\n\n    \
+    else\n        \
+        next\n";
+
+/// Cold-build `source` under the hot flag and wait until it serves its marker.
+fn assert_serves_hot(tag: &str, port: u16, source: &str, what: &str) -> Result<(), BoxError> {
+    let (ipe_dir, out_dir) = fresh_dirs(tag)?;
+    write_main(&ipe_dir, source)?;
+
+    let sink = EventSink::default();
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, port, &sink);
+
+    // One deadline over the conjunction, as in `cmd_perform_arm_composes_and_serves`.
+    assert!(
+        wait_for(Duration::from_mins(4), || {
+            sink.count_restarted() >= 1 && http_get_body(port).is_some_and(|b| b.contains("marker"))
+        }),
+        "the flag-on cold build must serve: {what}"
+    );
+
+    stop_and_join(&handle, join)
+}
+
+/// A wired `Cmd.perform` arm inside a source lambda builds under the hot flag:
+/// the arm is compiled as written there, so no thunk moves a captured binding
+/// out of the lambda's `Fn` environment (E0507).
+#[test]
+#[cfg(target_os = "linux")]
+fn cmd_perform_in_nested_lambda_builds_hot() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+    assert_serves_hot(
+        "cmdperformlambda",
+        19189,
+        &web_fixture_cmd_perform_label(NESTED_LAMBDA_UPDATE),
+        "a Cmd.perform arm inside a lambda in update compiles and boots",
+    )
+}
+
+/// A wired `Cmd.perform` arm whose effect reads a binding the body reads again
+/// after the `case` builds under the hot flag: the effect is evaluated before
+/// its thunk, which captures only that value (no E0382 at the later read).
+#[test]
+#[cfg(target_os = "linux")]
+fn cmd_perform_effect_read_after_match_builds_hot() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+    assert_serves_hot(
+        "cmdperformreadafter",
+        19190,
+        &web_fixture_cmd_perform_label(READ_AFTER_MATCH_UPDATE),
+        "a Cmd.perform effect reading a binding used after the case compiles and boots",
+    )
+}

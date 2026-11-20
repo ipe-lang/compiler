@@ -828,7 +828,11 @@ pub(crate) fn user_ipe_db_store_cond_fragment_in(
                             + Send
                             + Sync
                             + 'static,
-                    > = Box::new(sql_and);
+                    > = Box::new(
+                        move |__u_eta_0: ipe_runtime::db::SqlFragment, __u_eta_1: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                            sql_and(__u_eta_0, __u_eta_1)
+                        },
+                    );
                     __ipe_fn
                 },
                 crate::user_ipe_db_store_true_fragment(),
@@ -845,7 +849,11 @@ pub(crate) fn user_ipe_db_store_cond_fragment_in(
                             + Send
                             + Sync
                             + 'static,
-                    > = Box::new(sql_or);
+                    > = Box::new(
+                        move |__u_eta_2: ipe_runtime::db::SqlFragment, __u_eta_3: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                            sql_or(__u_eta_2, __u_eta_3)
+                        },
+                    );
                     __ipe_fn
                 },
                 crate::user_ipe_db_store_false_fragment(),
@@ -860,7 +868,11 @@ pub(crate) fn user_ipe_db_store_cond_fragment_in(
                         + Send
                         + Sync
                         + 'static,
-                > = Box::new(sql_not);
+                > = Box::new(
+                    move |__u_eta_4: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                        sql_not(__u_eta_4)
+                    },
+                );
                 __ipe_fn
             })
         }
@@ -1533,7 +1545,11 @@ pub(crate) fn user_ipe_db_store_pred_fragment_in(
                             + Send
                             + Sync
                             + 'static,
-                    > = Box::new(sql_not);
+                    > = Box::new(
+                        move |__u_eta_0: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                            sql_not(__u_eta_0)
+                        },
+                    );
                     __ipe_fn
                 },
             )
@@ -1550,7 +1566,11 @@ pub(crate) fn user_ipe_db_store_pred_fragment_in(
                             + Send
                             + Sync
                             + 'static,
-                    > = Box::new(sql_and);
+                    > = Box::new(
+                        move |__u_eta_1: ipe_runtime::db::SqlFragment, __u_eta_2: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                            sql_and(__u_eta_1, __u_eta_2)
+                        },
+                    );
                     __ipe_fn
                 },
                 crate::user_ipe_db_store_true_fragment(),
@@ -1569,7 +1589,11 @@ pub(crate) fn user_ipe_db_store_pred_fragment_in(
                             + Send
                             + Sync
                             + 'static,
-                    > = Box::new(sql_or);
+                    > = Box::new(
+                        move |__u_eta_3: ipe_runtime::db::SqlFragment, __u_eta_4: ipe_runtime::db::SqlFragment| -> ipe_runtime::db::SqlFragment {
+                            sql_or(__u_eta_3, __u_eta_4)
+                        },
+                    );
                     __ipe_fn
                 },
                 crate::user_ipe_db_store_false_fragment(),

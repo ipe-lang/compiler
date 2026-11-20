@@ -294,7 +294,9 @@ pub fn ipe_main() -> IpeTask<()> {
             count: 3i64,
             format: {
                 let __ipe_fn: ::std::sync::Arc<dyn Fn(i64) -> String + Send + Sync + 'static> =
-                    Arc::new(string_from_int);
+                    ::std::sync::Arc::new(move |__u_eta_0: i64| -> String {
+                        string_from_int(__u_eta_0)
+                    });
                 __ipe_fn
             },
         }),

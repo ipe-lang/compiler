@@ -1,14 +1,16 @@
-// Cmd-wiring emit composition is exercised end to end in
-// [`crate::emit_web`]'s `hot_appearance_tests` (a `Cmd.perform` arm composes the
-// `fire_cmd_wiring` dispatch; a `Cmd.none` arm and the flag-off case do not) and
-// the wiring VOCABULARY in [`crate::transition_classify`]'s `tests`, so no
-// standalone emit test lives here.
+// Cmd-wiring composition is also exercised in [`crate::emit_web`]'s
+// `hot_appearance_tests` and its vocabulary in [`crate::transition_classify`]'s
+// `tests`; the units here pin the thunk's capture and the closure-body disarm.
 
-use super::{AdaptedHandler, BoxedSub, DResult, Expr, IrType, ModPath, Pat};
+use super::{
+    AdaptedHandler, Arm, BoxedSub, Callee, DResult, Expr, GenericScope, IrType, KernelFn, Match,
+    ModPath, Pat,
+};
+use crate::{EmitCtx, RustBackend};
 use ipe_diagnostics::Diagnostic;
-use ipe_intern::Interner;
+use ipe_intern::{Interner, Symbol};
 use ipe_ir::once_closure::MovedCapture;
-use ipe_ir::{SharedAlts, SliceOwnership};
+use ipe_ir::{CallPin, OnFormKind, Program, SharedAlts, SliceOwnership};
 
 #[test]
 fn every_pattern_shape_has_one_boxed_field_class() -> DResult<()> {
@@ -143,5 +145,239 @@ fn an_adapted_slot_outside_handler_normal_form_is_a_compiler_bug() -> DResult<()
             "{slot:?} is not in handler normal form"
         );
     }
+    Ok(())
+}
+
+/// A program with no modules: enough context for emitting a closed expression.
+fn empty_program() -> Program {
+    Program {
+        modules: vec![],
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+    }
+}
+
+/// `Cmd.perform t f` over the locals `t` and `f`.
+fn cmd_perform(t: Symbol, f: Symbol) -> Expr {
+    Expr::Call {
+        callee: Callee::Kernel(KernelFn::CmdPerform),
+        args: vec![Expr::Var(t), Expr::Var(f)],
+        pin: CallPin::None,
+        on_form: OnFormKind::NotForm,
+    }
+}
+
+/// `case msg of 0 -> (m, Cmd.perform t f); _ -> (m, Cmd.perform t f)`.
+fn perform_case(msg: Symbol, m: Symbol, t: Symbol, f: Symbol) -> DResult<Expr> {
+    let arm = |pat| Arm {
+        pat,
+        body: Expr::Tuple(vec![Expr::Var(m), cmd_perform(t, f)]),
+        guard: None,
+    };
+    Ok(Expr::Match(Match::new_flat(
+        Expr::Var(msg),
+        vec![arm(Pat::Int(0)), arm(Pat::Wildcard)],
+    )?))
+}
+
+/// Emit `expr` on the string path and the Doc path with the `update` rewrite
+/// armed on `m`.
+fn emit_armed(ctx: &EmitCtx, m: Symbol, expr: &Expr) -> DResult<(String, String)> {
+    let saved = ctx.begin_transition_update(Some(m));
+    let generics = GenericScope::new(&[]);
+    let string = super::emit_expr_at(ctx, expr, 1, 0, generics);
+    let doc = crate::emit_doc::build_doc(ctx, expr, 1, 0, generics);
+    ctx.end_transition_update(saved);
+    let doc = crate::render::render(&doc?, crate::render::RenderConfig::default());
+    Ok((string?, doc))
+}
+
+/// The wired thunk captures only the fresh effect binding, built before it.
+#[test]
+fn cmd_wiring_effect_binds_before_its_thunk() -> DResult<()> {
+    let mut interner = Interner::new();
+    let [m, t, f] = [
+        interner.intern("m")?,
+        interner.intern("t")?,
+        interner.intern("f")?,
+    ];
+    let backend = RustBackend::new(&interner).with_hot_appearance(true);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let saved = ctx.begin_transition_update(Some(m));
+    let body = Expr::Tuple(vec![Expr::Var(m), cmd_perform(t, f)]);
+    let wired = super::emit_cmd_wiring_arm(&ctx, &body, 1, 0, GenericScope::new(&[]));
+    ctx.end_transition_update(saved);
+    let out = wired?.ok_or_else(|| Diagnostic::CompilerBug {
+        where_: "emit_expr::tests",
+        detail: "a literal `Cmd.perform` arm is wired under an armed `update`".to_owned(),
+    })?;
+    let bind = out.find("let __ipe_eff = ");
+    let thunk = out.find("Box::new(move || __ipe_eff) }");
+    assert!(
+        matches!((bind, thunk), (Some(bind_at), Some(head_at)) if bind_at < head_at),
+        "the effect is bound before its thunk, got:\n{out}"
+    );
+    assert_eq!(
+        out.matches("move ||").count(),
+        1,
+        "one thunk head, got:\n{out}"
+    );
+    assert!(
+        out.split_once("move ||")
+            .is_some_and(|(_, after)| after.starts_with(" __ipe_eff)")),
+        "the thunk body names only `__ipe_eff`, got:\n{out}"
+    );
+    Ok(())
+}
+
+/// A `case` inside a lambda in an armed `update` is compiled as written on both
+/// emit paths, while the same `case` at the top of the body is wired.
+#[test]
+fn nested_lambda_arm_is_not_wired() -> DResult<()> {
+    let mut interner = Interner::new();
+    let [m, t, f, msg] = [
+        interner.intern("m")?,
+        interner.intern("t")?,
+        interner.intern("f")?,
+        interner.intern("msg")?,
+    ];
+    let backend = RustBackend::new(&interner).with_hot_appearance(true);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let case = perform_case(msg, m, t, f)?;
+    let lambda = Expr::Lambda {
+        params: vec![(msg, IrType::Int)],
+        ret: IrType::Tuple(vec![IrType::Int, IrType::Cmd(Box::new(IrType::Int))]),
+        body: Box::new(case.clone()),
+    };
+    let (top_string, top_doc) = emit_armed(&ctx, m, &case)?;
+    assert!(
+        top_string.contains("fire_cmd_wiring") && top_doc.contains("fire_cmd_wiring"),
+        "the top `case` of an armed `update` is wired, got:\n{top_string}\n{top_doc}"
+    );
+    let (nested_string, nested_doc) = emit_armed(&ctx, m, &lambda)?;
+    assert!(
+        !nested_string.contains("fire_cmd_wiring") && !nested_doc.contains("fire_cmd_wiring"),
+        "a `case` inside a lambda is not an overlay arm, got:\n{nested_string}\n{nested_doc}"
+    );
+    assert_eq!(
+        ctx.transition_model_param(),
+        None,
+        "the arming is restored after the closure body"
+    );
+    Ok(())
+}
+
+/// With `hot_appearance` off nothing is armed, so the lambda emits the same text
+/// whether or not the caller tried to arm the rewrite.
+#[test]
+fn flag_off_nested_lambda_emit_is_unchanged() -> DResult<()> {
+    let mut interner = Interner::new();
+    let [m, t, f, msg] = [
+        interner.intern("m")?,
+        interner.intern("t")?,
+        interner.intern("f")?,
+        interner.intern("msg")?,
+    ];
+    let backend = RustBackend::new(&interner).with_hot_appearance(false);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let lambda = Expr::Lambda {
+        params: vec![(msg, IrType::Int)],
+        ret: IrType::Tuple(vec![IrType::Int, IrType::Cmd(Box::new(IrType::Int))]),
+        body: Box::new(perform_case(msg, m, t, f)?),
+    };
+    let generics = GenericScope::new(&[]);
+    let plain = super::emit_expr_at(&ctx, &lambda, 1, 0, generics)?;
+    let body = Expr::Tuple(vec![Expr::Var(m), cmd_perform(t, f)]);
+    assert!(
+        super::emit_cmd_wiring_arm(&ctx, &body, 1, 0, generics)?.is_none(),
+        "flag off: no arm is wired"
+    );
+    assert!(
+        !plain.contains("fire_cmd_wiring") && !plain.contains("__ipe_eff"),
+        "flag off: the lambda emits the plain `case`, got:\n{plain}"
+    );
+    Ok(())
+}
+
+/// A kernel reaches emit only as a saturated call: a `FuncValue` over any
+/// kernel is refused at every function-value emit site rather than boxed as a
+/// bare runtime `fn` whose shape the Ipê arrow does not promise.
+#[test]
+fn no_kernel_is_emitted_as_a_bare_function_value() -> DResult<()> {
+    let interner = Interner::new();
+    let backend = RustBackend::new(&interner);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let generics = GenericScope::new(&[]);
+    let ty = IrType::Fun(vec![IrType::Str], Box::new(IrType::Str));
+    let boxed = KernelFn::ALL
+        .iter()
+        .copied()
+        .filter(|k| {
+            let value = Expr::FuncValue {
+                callee: Callee::Kernel(*k),
+                ty: ty.clone(),
+            };
+            !matches!(
+                super::func_value_name(&ctx, &Callee::Kernel(*k)),
+                Err(Diagnostic::CompilerBug { .. })
+            ) || !matches!(
+                super::emit_expr_at(&ctx, &value, 1, 0, generics),
+                Err(Diagnostic::CompilerBug { .. })
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        boxed.is_empty(),
+        "kernels emitted as a bare function value: {boxed:?}"
+    );
+    Ok(())
+}
+
+/// `succeed`'s function payload is curried by name (`curry1(<fn>)`), a
+/// function-value emit site of its own: a kernel payload is refused there too
+/// rather than curried as a bare runtime `fn`.
+#[test]
+fn no_kernel_is_curried_as_a_bare_succeed_payload() -> DResult<()> {
+    let interner = Interner::new();
+    let backend = RustBackend::new(&interner);
+    let program = empty_program();
+    let ctx = backend.emit_ctx_for_tests(&program)?;
+    let generics = GenericScope::new(&[]);
+    let ty = IrType::Fun(vec![IrType::Str], Box::new(IrType::Int));
+    let curried = KernelFn::ALL
+        .iter()
+        .copied()
+        .flat_map(|k| {
+            [
+                KernelFn::JsonDecSucceed,
+                KernelFn::DbDecSucceed,
+                KernelFn::ConfigSucceed,
+            ]
+            .map(|succeed| (succeed, k))
+        })
+        .filter(|&(succeed, k)| {
+            let call = Expr::Call {
+                callee: Callee::Kernel(succeed),
+                args: vec![Expr::FuncValue {
+                    callee: Callee::Kernel(k),
+                    ty: ty.clone(),
+                }],
+                pin: CallPin::None,
+                on_form: OnFormKind::NotForm,
+            };
+            !matches!(
+                super::emit_expr_at(&ctx, &call, 1, 0, generics),
+                Err(Diagnostic::CompilerBug { .. })
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        curried.is_empty(),
+        "kernels curried as a bare succeed payload: {curried:?}"
+    );
     Ok(())
 }

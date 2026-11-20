@@ -2,8 +2,9 @@ use super::{
     ArgPlan, Callee, DResult, Diagnostic, Expr, GenericScope, Guard, IrType, KernelClass, KernelFn,
     LitKind, LowerError, NativeUiEmit, Span, Symbol, UiDelegate, UiEmitPlan,
     appearance_literal_record_fields, callee_name, clone_targets_in_expr, emit_expr_at,
-    emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars, int_literal,
-    kernel_name, once_closure_bug, render_type, shape_appearance_literal_args, ui_call_shape,
+    emit_lambda_unboxed, emit_shared_lambda, emit_sub_arm, float_literal, free_vars,
+    func_value_name, int_literal, kernel_name, once_closure_bug, render_type,
+    shape_appearance_literal_args, ui_call_shape,
 };
 use crate::EmitCtx;
 use core::fmt::Write as _;
@@ -949,6 +950,10 @@ pub fn emit_task_retry_call(
         KernelFn::TaskRetryWith => {
             // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if this arm adapts a slot `KernelFn::adapted_slots` does not list, so lowering would leave it un-normalized [ledger #boundary]
             const _: () = assert!(all_adapt(&[KernelFn::TaskRetryWith], AdaptedSlot::Thunk(1)));
+            // The predicate bridge captures only the fresh `__ipe_sr`; it is its
+            // own literal so no emitted text follows its `move` head.
+            const SHOULD_RETRY_BRIDGE: &str =
+                "move |__ipe_e: &IpeError| (__ipe_sr)(__ipe_e.clone())";
             // `retryWith policy task` — decompose policy, call runtime.
             // The `shouldRetry` field is `Arc<dyn Fn(IpeError) -> bool>` (directly
             // callable) but `task_retry_with` expects `impl Fn(&IpeError) -> bool`;
@@ -980,7 +985,7 @@ pub fn emit_task_retry_call(
                  __ipe_p.maxAttempts, \
                  __ipe_p.baseMs, \
                  __ipe_p.strategy, \
-                 move |__ipe_e: &IpeError| (__ipe_sr)(__ipe_e.clone()), \
+                 {SHOULD_RETRY_BRIDGE}, \
                  {task_s}\
                  ) }}"
             )))
@@ -4395,7 +4400,8 @@ pub fn emit_json_decoder_call(
     ) && let Some(arg) = args.first()
     {
         match arg {
-            // Case 1: named function (FuncValue) — curry{n}(fn_name)
+            // Case 1: named function (FuncValue) — curry{n}(fn_name); a kernel
+            // payload is refused, never curried as a bare runtime `fn`.
             Expr::FuncValue {
                 callee: fn_callee,
                 ty: IrType::Fun(params, _),
@@ -4407,7 +4413,7 @@ pub fn emit_json_decoder_call(
                         msg: LowerError::DecodeSucceedArityTooHigh { n },
                     });
                 }
-                let fn_name = callee_name(ctx, fn_callee)?;
+                let fn_name = func_value_name(ctx, fn_callee)?;
                 return Ok(Some(decode_succeed_curried(n, &fn_name)));
             }
             // Case 2: lambda — curry{n}(move |params| -> ret { body })
@@ -4453,10 +4459,10 @@ pub fn emit_json_decoder_call(
                     param_names.push(name);
                 }
                 let ret_s = render_type(ctx, ret, generics)?;
+                let params = param_decls.join(", ");
+                let args = param_names.join(", ");
                 let wrapper = format!(
-                    "{{ let __ipe_succeed = {arc}; move |{}| -> {ret_s} {{ (__ipe_succeed)({}) }} }}",
-                    param_decls.join(", "),
-                    param_names.join(", ")
+                    "{{ let __ipe_succeed = {arc}; move |{params}| -> {ret_s} {{ (__ipe_succeed)({args}) }} }}"
                 );
                 return Ok(Some(decode_succeed_curried(n, &wrapper)));
             }

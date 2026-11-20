@@ -225,7 +225,7 @@ const DEBUG_SITES: &[DebugSite] = &[
     },
     DebugSite {
         file: "rust/src/emit_expr/func.rs",
-        func: "emit_func_value",
+        func: "func_value_name",
         count: 1,
         why: DIAGNOSTIC,
     },

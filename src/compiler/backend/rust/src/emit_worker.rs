@@ -22,7 +22,7 @@ use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_ir::{Callee, Expr, KernelFn};
 
 use crate::EmitCtx;
-use crate::emit_expr::{callee_name, emit_expr_at};
+use crate::emit_expr::emit_expr_at;
 use crate::emit_types::GenericScope;
 
 /// Dispatch an `Ipe.Tea.Worker.tea` kernel call.
@@ -136,7 +136,7 @@ fn emit_worker_fn(
     generics: GenericScope,
 ) -> DResult<String> {
     if let Expr::FuncValue { callee, .. } = e {
-        return callee_name(ctx, callee);
+        return crate::emit_expr::func_value_name(ctx, callee);
     }
     emit_expr_at(ctx, e, indent, child, generics)
 }

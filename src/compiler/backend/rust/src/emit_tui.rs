@@ -45,7 +45,7 @@ use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_ir::{Callee, Expr, IrType, KernelFn};
 
 use crate::EmitCtx;
-use crate::emit_expr::{callee_name, emit_expr_at};
+use crate::emit_expr::emit_expr_at;
 use crate::emit_types::GenericScope;
 
 /// Dispatch an `Ipe.Terminal` full-screen kernel call.
@@ -211,7 +211,7 @@ fn emit_tui_fn(
 ) -> DResult<String> {
     if let Expr::FuncValue { callee, .. } = e {
         // Raw function-item reference: satisfies Send + Sync + 'static implicitly.
-        return callee_name(ctx, callee);
+        return crate::emit_expr::func_value_name(ctx, callee);
     }
     emit_expr_at(ctx, e, indent, child, generics)
 }

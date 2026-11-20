@@ -264,7 +264,7 @@ pub fn ipe_main() -> IpeTask<()> {
     ({
         let e = ipe_result_map_error::<_, _, i64>(IpeResult::Err("boom".to_string()), {
             let __ipe_fn: Box<dyn Fn(String) -> i64 + Send + Sync + 'static> =
-                Box::new(string_length);
+                Box::new(move |__u_eta_0: String| -> i64 { string_length(__u_eta_0) });
             __ipe_fn
         });
         io_println(format!(
