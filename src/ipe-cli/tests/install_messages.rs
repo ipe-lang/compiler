@@ -1313,7 +1313,7 @@ const RUNNERS: [&str; 27] = [
 /// defines; `cargo` is allowed only as `cargo version`. Options that make one
 /// of these run a program (GNU `sed`'s `e`, `tar --to-command`) are not
 /// parsed.
-const COMMANDS: [&str; 52] = [
+const COMMANDS: [&str; 53] = [
     "fi",
     "done",
     "for",
@@ -1322,6 +1322,7 @@ const COMMANDS: [&str; 52] = [
     "continue",
     "exit",
     "export",
+    "set",
     "unset",
     "umask",
     ":",

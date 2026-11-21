@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
@@ -112,10 +113,12 @@ exit 0
 /// A wget that is not GNU Wget, as `BusyBox` ships it: no `--version`.
 const OTHER_WGET: &str = "#!/bin/sh\nprintf 'wget %s\\n' \"$*\" >>\"$STUB_LOG\"\nexit 1\n";
 
-/// A `FreeBSD` fetch that logs its arguments and whether
-/// `SSL_NO_VERIFY_PEER` reached it, then serves like the curl stub.
+/// A `FreeBSD` fetch that logs its arguments and the TLS settings its
+/// environment holds, then serves like the curl stub.
 const FETCH_STUB: &str = r#"#!/bin/sh
-printf 'fetch %s SSL_NO_VERIFY_PEER=%s\n' "$*" "${SSL_NO_VERIFY_PEER-unset}" >>"$STUB_LOG"
+printf 'fetch %s SSL_NO_VERIFY_PEER=%s SSL_ALLOW_SSL3=%s SSL_NO_TLS1=%s SSL_NO_TLS1_1=%s\n' \
+  "$*" "${SSL_NO_VERIFY_PEER-unset}" "${SSL_ALLOW_SSL3-unset}" "${SSL_NO_TLS1-unset}" \
+  "${SSL_NO_TLS1_1-unset}" >>"$STUB_LOG"
 out=''; spider=0; url=''
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -158,6 +161,8 @@ struct Host<'a> {
     archive_size: Option<u64>,
     /// Text fed to a pseudo-terminal the run is attached to, if any.
     tty_input: Option<&'a str>,
+    /// Run a plain run under `sh -x`, which traces every command to stderr.
+    xtrace: bool,
 }
 
 impl Default for Host<'_> {
@@ -170,6 +175,7 @@ impl Default for Host<'_> {
             env: &[],
             archive_size: None,
             tty_input: None,
+            xtrace: false,
         }
     }
 }
@@ -297,6 +303,9 @@ fn run_host(r: &ScratchDir, host: &Host<'_>) -> io::Result<FetchRun> {
     let mut command = match host.tty_input {
         None => {
             let mut plain = Command::new("sh");
+            if host.xtrace {
+                plain.arg("-x");
+            }
             plain.arg(installer_path()).stdin(Stdio::null());
             plain
         }
@@ -317,6 +326,7 @@ fn run_host(r: &ScratchDir, host: &Host<'_>) -> io::Result<FetchRun> {
         }
     };
     command
+        .process_group(0)
         .env_clear()
         .env("PATH", path)
         .env("HOME", &home)
@@ -547,8 +557,9 @@ fn a4_other_wget_is_refused() -> io::Result<()> {
     Ok(())
 }
 
-/// A5: on `FreeBSD` with only fetch, the certificate overrides never reach
-/// it and every call carries a timeout.
+/// A5: on `FreeBSD` with only fetch, the certificate and protocol overrides
+/// never reach it, TLS 1.0 and 1.1 are switched off, and every call carries a
+/// timeout.
 #[test]
 fn a5_freebsd_fetch_runs_with_verification_held_on() -> io::Result<()> {
     let r = root("install-fetch-a5")?;
@@ -561,6 +572,7 @@ fn a5_freebsd_fetch_runs_with_verification_held_on() -> io::Result<()> {
                 ("STUB_OS", "FreeBSD"),
                 ("SSL_NO_VERIFY_PEER", "1"),
                 ("SSL_NO_VERIFY_HOSTNAME", "1"),
+                ("SSL_ALLOW_SSL3", "1"),
             ],
             ..Host::default()
         },
@@ -571,8 +583,10 @@ fn a5_freebsd_fetch_runs_with_verification_held_on() -> io::Result<()> {
     assert!(calls.len() >= 4, "every fetch must run fetch: {}", run.log);
     for call in &calls {
         assert!(
-            call.ends_with("SSL_NO_VERIFY_PEER=unset") && call.contains(" -T "),
-            "`{call}` must run with the override unset and a timeout"
+            call.ends_with(
+                " SSL_NO_VERIFY_PEER=unset SSL_ALLOW_SSL3=unset SSL_NO_TLS1=1 SSL_NO_TLS1_1=1"
+            ) && call.contains(" -T "),
+            "`{call}` must run with the overrides unset, TLS 1.2 or later and a timeout"
         );
     }
     Ok(())
@@ -782,6 +796,123 @@ fn a11_token_stays_out_of_every_argument() -> io::Result<()> {
             run.log
         );
     }
+    Ok(())
+}
+
+/// A11b: under GNU Wget, a redirect off the API host reads the anonymous
+/// config, so the token reaches only the host it was meant for.
+#[test]
+fn a11b_wget_drops_the_token_on_a_redirect_to_another_host() -> io::Result<()> {
+    let r = root("install-fetch-a11b")?;
+    let run = run_host(
+        &r,
+        &Host {
+            stubs: &[("wget", WGET)],
+            env: &[
+                ("GITHUB_TOKEN", "s3cr3t"),
+                ("STUB_REDIRECT_MATCH", "/releases/latest"),
+                ("STUB_REDIRECT_TO", "https://elsewhere.example/x"),
+            ],
+            ..Host::default()
+        },
+    )?;
+    assert_code(&run, 0, "a redirected API request");
+    let lines: Vec<&str> = run.log.lines().collect();
+    let configs = |host: &str| -> Vec<&str> {
+        lines
+            .windows(2)
+            .filter_map(|pair| match pair {
+                [call, config] if call.starts_with("wget ") && call.contains(host) => Some(*config),
+                _ => None,
+            })
+            .collect()
+    };
+    let api = configs("https://api.github.com/");
+    let elsewhere = configs("https://elsewhere.example/");
+    assert!(
+        !api.is_empty()
+            && api
+                .iter()
+                .all(|line| line.starts_with("config-mode auth.wgetrc ")),
+        "the API request itself carries the token: {}",
+        run.log
+    );
+    assert!(
+        !elsewhere.is_empty()
+            && elsewhere
+                .iter()
+                .all(|line| line.starts_with("config-mode wgetrc ")),
+        "the hop to another host must read the anonymous config: {}",
+        run.log
+    );
+    Ok(())
+}
+
+/// A11c: a run under `sh -x` traces no line holding the token.
+#[test]
+fn a11c_token_stays_out_of_the_shell_trace() -> io::Result<()> {
+    for (label, fetcher, body) in [
+        ("install-fetch-a11c-curl", "curl", CURL),
+        ("install-fetch-a11c-wget", "wget", WGET),
+    ] {
+        let r = root(label)?;
+        let run = run_host(
+            &r,
+            &Host {
+                stubs: &[(fetcher, body)],
+                env: &[("GITHUB_TOKEN", "s3cr3t")],
+                xtrace: true,
+                ..Host::default()
+            },
+        )?;
+        assert_code(&run, 0, label);
+        assert!(
+            run.stderr.contains("+ fetch_auth_setup"),
+            "{label}: the run must be traced: {}",
+            run.stderr
+        );
+        assert!(
+            !run.stderr.contains("s3cr3t"),
+            "{label}: the trace must not hold the token: {}",
+            run.stderr
+        );
+    }
+    Ok(())
+}
+
+/// A curl that, asked for the latest release, sends TERM to the installer's
+/// whole process group, as a terminal's Ctrl-C or a closing session does.
+const CURL_KILLED: &str = r#"#!/bin/sh
+case "$*" in *releases/latest*) kill -TERM 0; sleep 5 ;; esac
+exit 22
+"#;
+
+/// A11d: a run killed while the token file exists still removes its scratch,
+/// so no token is left on disk.
+#[test]
+fn a11d_a_killed_run_leaves_no_token_on_disk() -> io::Result<()> {
+    let r = root("install-fetch-a11d")?;
+    let base = leaf(&r, "tmpbase")?;
+    mkdir_mode(&base, 0o700)?;
+    let base_text = base
+        .to_str()
+        .ok_or_else(|| io::Error::other("the scratch path is not UTF-8"))?;
+    let run = run_host(
+        &r,
+        &Host {
+            stubs: &[("curl", CURL_KILLED)],
+            env: &[("GITHUB_TOKEN", "s3cr3t"), ("TMPDIR", base_text)],
+            ..Host::default()
+        },
+    )?;
+    let left: Vec<PathBuf> = std::fs::read_dir(&base)?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<io::Result<_>>()?;
+    assert!(
+        left.is_empty(),
+        "a killed run must remove its scratch: {left:?}"
+    );
+    assert_code(&run, 143, "a run killed by TERM");
     Ok(())
 }
 

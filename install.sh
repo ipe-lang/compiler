@@ -831,22 +831,40 @@ die_other_wget() {
   die_prerequisite 'Missing prerequisite: curl or GNU Wget [prerequisite fetcher].'
 }
 
-# fetch_auth_setup — when GITHUB_TOKEN or GH_TOKEN holds a token, write it to a
+# fetch_auth_setup — run fetch_auth_write with shell tracing suspended, so no
+# `set -x` line carries the token.
+fetch_auth_setup() {
+  case "$-" in
+    *x*)
+      set +x
+      fetch_auth_write
+      set -x
+      ;;
+    *) fetch_auth_write ;;
+  esac
+}
+
+# fetch_auth_write — when GITHUB_TOKEN or GH_TOKEN holds a token, write it to a
 # private file the fetcher reads it from, never its arguments, and set
 # FETCH_AUTH to 1. FreeBSD fetch sends no custom header, so it resolves the
 # release anonymously; so does a value with a byte no GitHub token holds.
-fetch_auth_setup() {
+fetch_auth_write() {
   FETCH_AUTH=0
   _fa_token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
   [ -n "$_fa_token" ] || return 0
-  [ "$FETCHER" != fetch ] || return 0
+  if [ "$FETCHER" = fetch ]; then
+    _fa_token=''
+    return 0
+  fi
   case "$_fa_token" in
     *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+      _fa_token=''
       info 'The GitHub token in the environment is not a token; resolving the release anonymously.'
       return 0
       ;;
   esac
   if [ "${#_fa_token}" -gt 1024 ]; then
+    _fa_token=''
     info 'The GitHub token in the environment is not a token; resolving the release anonymously.'
     return 0
   fi
@@ -859,6 +877,7 @@ fetch_auth_setup() {
         "$_fa_token" >"$tmp/auth.wgetrc" ) \
       || die 'Could not write %s.' "$tmp/auth.wgetrc"
   fi
+  _fa_token=''
   FETCH_AUTH=1
 }
 
@@ -884,12 +903,23 @@ fetch_to() {
       ;;
     wget) wget_walk "$_ft_file" "$_ft_url" "$_ft_auth" || return 1 ;;
     fetch)
-      ( unset SSL_NO_VERIFY_PEER SSL_NO_VERIFY_HOSTNAME SSL_CA_CERT_FILE SSL_CA_CERT_PATH
+      ( fetch_bsd_env
         fetch -q -T 30 -o "$_ft_file" "$_ft_url" 2>/dev/null ) || return 1
       ;;
     *) return 1 ;;
   esac
   fetch_size_ok "$_ft_file" "$_ft_max"
+}
+
+# fetch_bsd_env — set the environment FreeBSD fetch reads its TLS settings
+# from: peer and host name verification on, the system trust store, and no
+# protocol older than TLS 1.2. Call it in the subshell that runs fetch.
+fetch_bsd_env() {
+  unset SSL_NO_VERIFY_PEER SSL_NO_VERIFY_HOSTNAME SSL_CA_CERT_FILE SSL_CA_CERT_PATH \
+    SSL_ALLOW_SSL3
+  SSL_NO_TLS1=1
+  SSL_NO_TLS1_1=1
+  export SSL_NO_TLS1 SSL_NO_TLS1_1
 }
 
 # fetch_size_ok FILE MAX_BYTES — FILE exists and holds at most MAX_BYTES bytes;
@@ -917,7 +947,7 @@ fetch_ok() {
       ;;
     wget) wget_walk '' "$1" '' ;;
     fetch)
-      ( unset SSL_NO_VERIFY_PEER SSL_NO_VERIFY_HOSTNAME SSL_CA_CERT_FILE SSL_CA_CERT_PATH
+      ( fetch_bsd_env
         fetch -q -T 30 -s "$1" >/dev/null 2>&1 )
       ;;
     *) return 1 ;;
@@ -944,17 +974,30 @@ fetch_total() {
   [ "${#FETCH_TOTAL}" -le 12 ] || FETCH_TOTAL=0
 }
 
+# url_authority URL — set URL_AUTHORITY to the authority of the `https://`
+# URL: the text after the scheme up to the first `/`, `?` or `#`.
+url_authority() {
+  URL_AUTHORITY="${1#https://}"
+  URL_AUTHORITY="${URL_AUTHORITY%%[/?#]*}"
+}
+
 # wget_walk FILE URL [auth] — fetch URL with GNU Wget into FILE, or probe it
 # when FILE is empty, following at most FETCH_MAX_HOPS redirects by hand: each
-# hop's Location must pass fetch_url_ok, so a redirect never leaves HTTPS.
+# hop's Location must pass fetch_url_ok, so a redirect never leaves HTTPS. The
+# token goes only to URL's own authority: from the first hop elsewhere on,
+# every request reads the anonymous config.
 wget_walk() {
   _ww_file="$1"; _ww_url="$2"; _ww_hops=0
   _ww_config="$tmp/wgetrc"
   if [ "${3:-}" = auth ]; then
     _ww_config="$tmp/auth.wgetrc"
   fi
+  url_authority "$_ww_url"
+  _ww_origin="$URL_AUTHORITY"
   while :; do
     fetch_url_ok "$_ww_url" || return 1
+    url_authority "$_ww_url"
+    [ "$URL_AUTHORITY" = "$_ww_origin" ] || _ww_config="$tmp/wgetrc"
     _ww_status=0
     if [ -n "$_ww_file" ]; then
       wget --config="$_ww_config" --https-only --secure-protocol=TLSv1_2 --timeout=15 \
@@ -1221,6 +1264,12 @@ esac
 tmp="$(mktemp -d "$scratch_base/ipe-install.XXXXXX")" \
   || die 'Could not create a private temp directory under %s.' "$scratch_base"
 trap 'rm -rf "$tmp"' EXIT
+# A signal ends the run through `exit`, so the EXIT trap above still removes
+# the scratch and the token file in it: a shell need not run an EXIT trap when
+# a signal kills it.
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 private_dir_ok "$tmp" || die 'The temp directory %s is not private to you.' "$tmp"
 pkg="$tmp/pkg.$ext"
 
