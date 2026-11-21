@@ -1842,7 +1842,7 @@ pub fn install_panic_classifier() {
     // the values read once per process are fixed here.
     if let Err(refusals) = crate::env_registry::startup_check() {
         for refusal in &refusals {
-            eprint_task_error(&refusal.to_string());
+            eprint_refusal(&crate::system::ScrubbedLine::of_refusal(refusal));
         }
         crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
     }
@@ -1871,22 +1871,35 @@ const EPRINT_GUTTER: &str = "  ";
 /// codes that reach stderr are this function's own colour codes.
 pub(crate) fn format_task_error(msg: &str, use_color: bool) -> String {
     use crate::system::scrub_log_controls;
-    let (red, reset) = if use_color {
-        ("\x1b[31m", "\x1b[0m")
-    } else {
-        ("", "")
-    };
     let mut out = String::new();
     let mut lines = msg.lines();
     if let Some(first) = lines.next() {
-        let first = scrub_log_controls(first);
-        out.push_str(&format!("{EPRINT_GUTTER}{red}✗{reset} {first}\n"));
+        push_failure_line(&mut out, &scrub_log_controls(first), use_color);
         for rest in lines {
             let rest = scrub_log_controls(rest);
             out.push_str(&format!("{EPRINT_GUTTER}  {rest}\n"));
         }
     }
     out
+}
+
+/// Format a refusal's one line, already escaped once, as the first line of a
+/// task error: written as is, never scrubbed again.
+pub(crate) fn format_refusal(line: &crate::system::ScrubbedLine, use_color: bool) -> String {
+    let mut out = String::new();
+    push_failure_line(&mut out, &line.to_string(), use_color);
+    out
+}
+
+/// Append the guttered, glyph-led first line of a failure; `shown` is
+/// already escaped.
+fn push_failure_line(out: &mut String, shown: &str, use_color: bool) {
+    let (red, reset) = if use_color {
+        ("\x1b[31m", "\x1b[0m")
+    } else {
+        ("", "")
+    };
+    out.push_str(&format!("{EPRINT_GUTTER}{red}✗{reset} {shown}\n"));
 }
 
 /// Print a task-error message to stderr, styled like the CLI: a red `✗` glyph
@@ -1901,6 +1914,16 @@ pub fn eprint_task_error(msg: &str) {
     use std::io::{IsTerminal as _, Write as _};
     let use_color = std::io::stderr().is_terminal() && !super::color::no_color_requested();
     let formatted = format_task_error(msg, use_color);
+    let _ = std::io::stderr().write_all(formatted.as_bytes());
+}
+
+/// Print a refusal to stderr styled as [`eprint_task_error`] prints a
+/// message: its line is escaped exactly once, by
+/// [`crate::system::ScrubbedLine::of_refusal`], and written as is.
+pub(crate) fn eprint_refusal(line: &crate::system::ScrubbedLine) {
+    use std::io::{IsTerminal as _, Write as _};
+    let use_color = std::io::stderr().is_terminal() && !super::color::no_color_requested();
+    let formatted = format_refusal(line, use_color);
     let _ = std::io::stderr().write_all(formatted.as_bytes());
 }
 
@@ -3011,5 +3034,48 @@ mod eprint_tests {
     fn eprint_task_error_colour_mode_keeps_only_its_own_escapes() {
         let out = format_task_error("\x1b[31mfake\x1b[0m", true);
         assert_eq!(out, "  \x1b[31m✗\x1b[0m \\u{1b}[31mfake\\u{1b}[0m\n");
+    }
+
+    /// A startup env refusal prints its value escaped exactly once: `a\b`
+    /// shows as `a\\b`, never `a\\\\b`, and a newline in it stays a visible
+    /// escape on the one line.
+    #[test]
+    fn env_refusal_print_is_scrubbed_once() {
+        use crate::env_grammar::{Class, EnvRefusal, Grammar, Shown};
+        let refusal = EnvRefusal::Malformed {
+            name: "EXAMPLE_FLAG",
+            grammar: Grammar::Flag,
+            class: Class::Tunable,
+            shown: Shown::of(Class::Tunable, b"a\\b\n"),
+        };
+        let out = format_refusal(&crate::system::ScrubbedLine::of_refusal(&refusal), false);
+        assert!(out.starts_with("  ✗ EXAMPLE_FLAG must be "), "{out:?}");
+        assert!(out.contains("(got \"a\\\\b\\n\")"), "{out:?}");
+        assert!(!out.contains("a\\\\\\\\b"), "scrubbed twice: {out:?}");
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(
+            !out.trim_end_matches('\n')
+                .chars()
+                .any(crate::system::is_log_hazard),
+            "a raw control survived: {out:?}"
+        );
+        let colour = format_refusal(&crate::system::ScrubbedLine::of_refusal(&refusal), true);
+        assert!(colour.starts_with("  \x1b[31m✗\x1b[0m EXAMPLE_FLAG"), "{colour:?}");
+    }
+
+    /// A startup refusal that reaches the task-error print as an `IpeError`
+    /// carries raw text, so the print's own scrub is its only one.
+    #[cfg(feature = "web")]
+    #[test]
+    fn ipe_error_print_is_scrubbed_once() {
+        let refusal = crate::web::StartupRefusal::Bind(crate::system::EnvValueRefusal::new(
+            "EXAMPLE_BIND",
+            "an IP address",
+            b"a\\b",
+        ));
+        let error = crate::IpeError::from(refusal);
+        let out = format_task_error(&error.to_string(), false);
+        assert!(out.contains("(got \"a\\\\b\")"), "{out:?}");
+        assert!(!out.contains("a\\\\\\\\b"), "scrubbed twice: {out:?}");
     }
 }
