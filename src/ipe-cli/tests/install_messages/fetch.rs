@@ -49,6 +49,7 @@ case "$1" in -m) echo x86_64 ;; *) echo "${STUB_OS:-Linux}" ;; esac
 /// header, `-o` copies the file. A `<name>.size` file extends the copy to that
 /// many bytes.
 const CURL: &str = r#"#!/bin/sh
+if [ "$*" = '-q --version' ]; then echo "curl ${STUB_CURL_VERSION-8.5.0} (x86_64-pc-linux-gnu)"; exit 0; fi
 printf 'curl %s\n' "$*" >>"$STUB_LOG"
 out=''; head=0; range=0; url=''
 while [ $# -gt 0 ]; do
@@ -64,6 +65,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 name="${url%%\?*}"; name="${name##*/}"
+if [ -n "$out" ] && [ -f "${out%/*}/auth.header" ]; then printf 'token-file-at %s\n' "$name" >>"$STUB_LOG"; fi
 src="$SERVE/$name"
 [ -f "$src" ] || exit 22
 [ "$head" = 1 ] && exit 0
@@ -880,10 +882,12 @@ fn a11c_token_stays_out_of_the_shell_trace() -> io::Result<()> {
     Ok(())
 }
 
-/// A curl that, asked for the latest release, sends TERM to the installer's
-/// whole process group, as a terminal's Ctrl-C or a closing session does.
+/// A curl that, asked for the latest release, sends `STUB_SIGNAL` to the
+/// installer's whole process group, as a terminal's Ctrl-C or Ctrl-\ or a
+/// closing session does.
 const CURL_KILLED: &str = r#"#!/bin/sh
-case "$*" in *releases/latest*) kill -TERM 0; sleep 5 ;; esac
+if [ "$*" = '-q --version' ]; then echo 'curl 8.5.0 (x86_64-pc-linux-gnu)'; exit 0; fi
+case "$*" in *releases/latest*) kill -"$STUB_SIGNAL" 0; sleep 5 ;; esac
 exit 22
 "#;
 
@@ -891,28 +895,97 @@ exit 22
 /// so no token is left on disk.
 #[test]
 fn a11d_a_killed_run_leaves_no_token_on_disk() -> io::Result<()> {
-    let r = root("install-fetch-a11d")?;
-    let base = leaf(&r, "tmpbase")?;
-    mkdir_mode(&base, 0o700)?;
-    let base_text = base
-        .to_str()
-        .ok_or_else(|| io::Error::other("the scratch path is not UTF-8"))?;
+    for (signal, code) in [("TERM", 143), ("QUIT", 131)] {
+        let r = root(&format!("install-fetch-a11d-{signal}"))?;
+        let base = leaf(&r, "tmpbase")?;
+        mkdir_mode(&base, 0o700)?;
+        let base_text = base
+            .to_str()
+            .ok_or_else(|| io::Error::other("the scratch path is not UTF-8"))?;
+        let run = run_host(
+            &r,
+            &Host {
+                stubs: &[("curl", CURL_KILLED)],
+                env: &[
+                    ("GITHUB_TOKEN", "s3cr3t"),
+                    ("TMPDIR", base_text),
+                    ("STUB_SIGNAL", signal),
+                ],
+                ..Host::default()
+            },
+        )?;
+        let left: Vec<PathBuf> = std::fs::read_dir(&base)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<_>>()?;
+        assert!(
+            left.is_empty(),
+            "a run killed by {signal} must remove its scratch: {left:?}"
+        );
+        assert_code(&run, code, signal);
+    }
+    Ok(())
+}
+
+/// A11e: the token file exists only for the release lookup, so a run killed
+/// later, by a signal no trap catches, leaves no token on disk.
+#[test]
+fn a11e_token_file_lives_only_for_the_release_lookup() -> io::Result<()> {
+    let r = root("install-fetch-a11e")?;
     let run = run_host(
         &r,
         &Host {
-            stubs: &[("curl", CURL_KILLED)],
-            env: &[("GITHUB_TOKEN", "s3cr3t"), ("TMPDIR", base_text)],
+            stubs: &[("curl", CURL)],
+            env: &[("GITHUB_TOKEN", "s3cr3t")],
             ..Host::default()
         },
     )?;
-    let left: Vec<PathBuf> = std::fs::read_dir(&base)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<io::Result<_>>()?;
+    assert_code(&run, 0, "a curl host with a token");
+    let present: Vec<&str> = run.lines("token-file-at ").collect();
     assert!(
-        left.is_empty(),
-        "a killed run must remove its scratch: {left:?}"
+        !present.is_empty()
+            && present
+                .iter()
+                .all(|line| line.trim_end() == "token-file-at latest"),
+        "the token file must exist during the lookup and only then: {}",
+        run.log
     );
-    assert_code(&run, 143, "a run killed by TERM");
+    Ok(())
+}
+
+/// A11f: a curl older than 7.58, which sends a custom header on to a
+/// redirect's other host, or one whose version cannot be read, resolves the
+/// release without the token.
+#[test]
+fn a11f_old_curl_resolves_the_release_anonymously() -> io::Result<()> {
+    for (label, version, sends) in [
+        ("7_57", "7.57.0", false),
+        ("7_9", "7.9.99", false),
+        ("6_99", "6.99.0", false),
+        ("garbled", "x.y", false),
+        ("empty", "", false),
+        ("7_58", "7.58.0", true),
+        ("7_81", "7.81.0", true),
+        ("8_0", "8.0.1", true),
+    ] {
+        let r = root(&format!("install-fetch-a11f-{label}"))?;
+        let run = run_host(
+            &r,
+            &Host {
+                stubs: &[("curl", CURL)],
+                env: &[("GITHUB_TOKEN", "s3cr3t"), ("STUB_CURL_VERSION", version)],
+                ..Host::default()
+            },
+        )?;
+        assert_code(&run, 0, label);
+        let sent = run.lines("curl ").any(|call| call.contains(" -H @"));
+        assert_eq!(sent, sends, "curl {version}: token sent: {}", run.log);
+        assert_eq!(
+            run.log.contains("token-file-at"),
+            sends,
+            "curl {version}: a token file exists only when sent: {}",
+            run.log
+        );
+    }
     Ok(())
 }
 

@@ -868,6 +868,11 @@ fetch_auth_write() {
     info 'The GitHub token in the environment is not a token; resolving the release anonymously.'
     return 0
   fi
+  if [ "$FETCHER" = curl ] && ! curl_keeps_header_on_host; then
+    _fa_token=''
+    info 'This curl is older than 7.58 and would send the token on to another host; resolving the release anonymously.'
+    return 0
+  fi
   if [ "$FETCHER" = curl ]; then
     ( umask 077 && printf 'Authorization: Bearer %s\n' "$_fa_token" >"$tmp/auth.header" ) \
       || die 'Could not write %s.' "$tmp/auth.header"
@@ -879,6 +884,31 @@ fetch_auth_write() {
   fi
   _fa_token=''
   FETCH_AUTH=1
+}
+
+# curl_keeps_header_on_host — the curl on PATH is 7.58 or later, so a custom
+# header never follows a redirect to another host; an unreadable version
+# fails.
+curl_keeps_header_on_host() {
+  _ck_line="$(curl -q --version 2>/dev/null | head -n 1)" || return 1
+  case "$_ck_line" in
+    'curl '[0123456789]*) ;;
+    *) return 1 ;;
+  esac
+  _ck_ver="${_ck_line#curl }"
+  _ck_major="${_ck_ver%%.*}"
+  _ck_rest="${_ck_ver#*.}"
+  _ck_minor="${_ck_rest%%[!0123456789]*}"
+  case "$_ck_major" in ''|*[!0123456789]*) return 1 ;; esac
+  case "$_ck_minor" in ''|*[!0123456789]*) return 1 ;; esac
+  [ "${#_ck_major}" -le 4 ] && [ "${#_ck_minor}" -le 4 ] || return 1
+  [ "$_ck_major" -gt 7 ] || { [ "$_ck_major" -eq 7 ] && [ "$_ck_minor" -ge 58 ]; }
+}
+
+# fetch_auth_drop — remove the token file and send no token from here on.
+fetch_auth_drop() {
+  rm -f "$tmp/auth.header" "$tmp/auth.wgetrc"
+  FETCH_AUTH=0
 }
 
 # fetch_to FILE URL MAX_BYTES MAX_SECS [auth] — write URL's body to FILE. Fails
@@ -1270,6 +1300,8 @@ trap 'rm -rf "$tmp"' EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 131' QUIT
+trap 'exit 141' PIPE
 private_dir_ok "$tmp" || die 'The temp directory %s is not private to you.' "$tmp"
 pkg="$tmp/pkg.$ext"
 
@@ -1306,6 +1338,9 @@ else
   require_release_tag "$tag"
   stage_ok 'Found %s.' "$tag"
 fi
+# Only the lookup above sends the token; its file goes now, so a run killed
+# past this point (even by a signal no trap catches) leaves no token on disk.
+fetch_auth_drop
 
 # Display version: the release tag may carry an `ipe-` prefix (e.g. ipe-v0.1.2).
 # Strip it for the human-facing "vX.Y.Z" while keeping $tag for URLs.
