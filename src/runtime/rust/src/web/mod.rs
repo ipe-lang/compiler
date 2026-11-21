@@ -16539,7 +16539,7 @@ mod emitted_router_behavior_tests {
         else {
             panic!("a non-decimal grace is refused");
         };
-        let env = || crate::system::EnvValueRefusal::new("IPE_X", "a mode", RAW.as_bytes());
+        let env = || crate::system::EnvValueRefusal::new("APP_MODE", "a mode", RAW.as_bytes());
         let samples = [
             StartupRefusal::RouteTable(route::RoutePatternRefusal {
                 pattern: crate::system::RefusedText::new(RAW),
