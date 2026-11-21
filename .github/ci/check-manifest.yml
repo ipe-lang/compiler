@@ -767,6 +767,14 @@ checks:
     disposition: informational
     producer: install-smoke.yml
     owner: release
+  - context: "install-smoke (debian-wget)"
+    disposition: informational
+    producer: install-smoke.yml
+    owner: release
+  - context: "install-smoke (alpine)"
+    disposition: informational
+    producer: install-smoke.yml
+    owner: release
 
   # ── Docs deploy — informational ───────────────────────────────────────────
   - context: deploy

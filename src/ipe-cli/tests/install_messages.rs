@@ -19,13 +19,17 @@ use std::time::Duration;
 
 use ipe_sandbox::scratch::{LeafName, ScratchDir};
 
+#[path = "install_messages/fetch.rs"]
+mod fetch;
+
 const BEGIN: &str = "# >>> message helpers";
 const END: &str = "# <<< message helpers";
 const PARSERS: (&str, &str) = ("# >>> input parsers", "# <<< input parsers");
 
 /// The helpers whose first argument is a message format.
-const HELPERS: [&str; 8] = [
+const HELPERS: [&str; 9] = [
     "die",
+    "die_prerequisite",
     "info",
     "say",
     "prompt",
@@ -36,8 +40,9 @@ const HELPERS: [&str; 8] = [
 ];
 
 /// The block-internal helpers, which print text they do not escape.
-const INTERNAL: [&str; 5] = [
+const INTERNAL: [&str; 6] = [
     "render",
+    "die_settle",
     "msg_text",
     "msg_style",
     "stage_settle_ok",
@@ -1308,14 +1313,18 @@ const RUNNERS: [&str; 27] = [
 /// defines; `cargo` is allowed only as `cargo version`. Options that make one
 /// of these run a program (GNU `sed`'s `e`, `tar --to-command`) are not
 /// parsed.
-const COMMANDS: [&str; 44] = [
+const COMMANDS: [&str; 53] = [
     "fi",
     "done",
     "for",
     "return",
     "break",
+    "continue",
     "exit",
     "export",
+    "set",
+    "unset",
+    "umask",
     ":",
     "true",
     "read",
@@ -1344,6 +1353,9 @@ const COMMANDS: [&str; 44] = [
     "unzip",
     "sha256sum",
     "shasum",
+    "sha256",
+    "openssl",
+    "xcode-select",
     "cut",
     "od",
     "head",
@@ -1353,22 +1365,13 @@ const COMMANDS: [&str; 44] = [
     "sed",
     "grep",
     "curl",
+    "wget",
+    "fetch",
 ];
 
-/// The one shell the installer runs: rustup-init, read from the pipe on its
-/// stdin, with `-y` for its own prompt.
-const RUSTUP_SHELL: [&str; 4] = ["sh", "-s", "--", "-y"];
-
-/// The one command whose output `RUSTUP_SHELL` may run: rustup's own
-/// installer, fetched over HTTPS only.
-const RUSTUP_FETCH: [&str; 6] = [
-    "curl",
-    "--proto",
-    "'=https'",
-    "--tlsv1.2",
-    "-sSf",
-    "https://sh.rustup.rs",
-];
+/// The one shell the installer runs: rustup-init, which the fetch helpers
+/// wrote whole into the private scratch, with `-y` for its own prompt.
+const RUSTUP_SHELL: [&str; 3] = ["sh", "\"$tmp/rustup-init.sh\"", "-y"];
 
 /// The line that opens the group holding the whole installer, right after
 /// `set -eu`.
@@ -1386,12 +1389,19 @@ const GUARD_CLOSE: &str = "} >/dev/null";
 /// - `"$tmp/curl.rc"`: the download's exit code, inside the same dir.
 /// - `"$wm_tmp"`: `mktemp` under `IPE_HOME`.
 /// - `"$RC_FILE"`: the shell rc file, checked by `refuse_symlink_escape`.
-const FILE_TARGETS: [&str; 5] = [
+/// - `"$tmp/wgetrc"`, `"$tmp/auth.wgetrc"`, `"$tmp/auth.header"`: the
+///   fetchers' private config and token files, inside the scratch dir.
+/// - `"$tmp/wget.log"`: GNU Wget's response headers, read for redirects.
+const FILE_TARGETS: [&str; 9] = [
     "\"$TAG_FILE\"",
     "\"$dl_dest\"",
     "\"$tmp/curl.rc\"",
     "\"$wm_tmp\"",
     "\"$RC_FILE\"",
+    "\"$tmp/wgetrc\"",
+    "\"$tmp/auth.wgetrc\"",
+    "\"$tmp/auth.header\"",
+    "\"$tmp/wget.log\"",
 ];
 
 /// The one file the installer sources, on the user's say-so: rustup's own
@@ -1410,6 +1420,8 @@ struct Scan {
     /// The command names it runs that are neither `COMMANDS`, a helper, nor
     /// handled by name: each must be one of `defined`.
     called: Vec<String>,
+    /// Every literal command name it runs.
+    ran: Vec<String>,
 }
 
 /// Scan `script` for message shapes outside the helper contract.
@@ -1852,6 +1864,7 @@ impl<'a> Scanner<'a> {
             ));
             return 0;
         }
+        self.scan.ran.push(name.to_owned());
         if matches!(
             (rest.first(), rest.get(1)),
             (Some(Token::Sep(Sep::Open)), Some(Token::Sep(Sep::Close)))
@@ -1878,11 +1891,7 @@ impl<'a> Scanner<'a> {
             }
             "command" => self.refuse("`command` hides which command runs".to_owned()),
             "." if first_word(rest) == Some(SOURCED) => {}
-            "sh" if rustup_shell(rest)
-                && self
-                    .pipe_source
-                    .as_deref()
-                    .is_some_and(|source| source == RUSTUP_FETCH) => {}
+            "sh" if rustup_shell(rest) && self.pipe_source.is_none() => {}
             _ if RUNNERS.contains(&name) => {
                 self.refuse(format!("`{name}` runs a command the scan cannot see"));
             }
@@ -2002,8 +2011,8 @@ impl<'a> Scanner<'a> {
     }
 }
 
-/// Whether `sh` followed by `rest` is exactly `RUSTUP_SHELL`, reading the
-/// pipe on its stdin (no input redirection).
+/// Whether `sh` followed by `rest` is exactly `RUSTUP_SHELL`, with no input
+/// redirection.
 fn rustup_shell(rest: &[Token]) -> bool {
     let command: Vec<&Token> = rest
         .iter()
@@ -2190,6 +2199,10 @@ const REFUSED_SHAPES: &[&str] = &[
     "sh -c 'printf \"$1\" >&2' _ \"$x\"",
     "sh -s -- -y </dev/tty",
     "sh -s -- -y -q",
+    "sh \"$tmp/rustup-init.sh\" -y <\"$wm_tmp\"",
+    "printf x | sh \"$tmp/rustup-init.sh\" -y",
+    "sh \"$tmp/rustup-init.sh\" -y -q",
+    "sh \"$tmp/other.sh\" -y",
     "bash -c 'die \"$x\"'",
     "env printf x",
     "exec printf x",
@@ -2223,7 +2236,7 @@ const ACCEPTED_SHAPES: &[&str] = &[
     "curl -o /dev/null x",
     "printf x 2>/dev/null >/dev/null",
     "printf x >&-",
-    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs 2>/dev/null \\\n  | sh -s -- -y 2>/dev/null",
+    "true \\\n  && sh \"$tmp/rustup-init.sh\" -y 2>/dev/null",
     "trusted_tmp_base() { printf x; }",
     "trusted_tmp_base \"$b\" >/dev/null",
     "x=$(trusted_tmp_base \"$b\")",
