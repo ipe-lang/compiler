@@ -200,17 +200,12 @@ pub fn console_line(class: Option<&str>, detail: &str) -> String {
 /// A [`MountRefusal`]'s `Display` is already safe for a log line (every text
 /// it quotes is scrubbed exactly once, where the refusal is built or by its
 /// own `Display`), so routing it through [`console_line`] would scrub it twice
-/// and double every `\` it shows. This sink checks the rendered refusal
-/// instead: hazard-free text is written as is, and only text holding a log
-/// hazard (which no refusal renders) is scrubbed again, failing closed.
+/// and double every `\` it shows. It reaches the line as a
+/// [`crate::system::ScrubbedLine`] instead, which fails closed on a rendering
+/// that still holds a log hazard.
 pub fn console_refusal_line(class: &str, refusal: &MountRefusal) -> String {
-    use crate::system::{is_log_hazard, scrub_log_controls as scrub};
-    let shown = refusal.to_string();
-    let shown = if shown.chars().any(is_log_hazard) {
-        scrub(&shown).into_owned()
-    } else {
-        shown
-    };
+    use crate::system::{ScrubbedLine, scrub_log_controls as scrub};
+    let shown = ScrubbedLine::of_refusal(refusal);
     format!("[ipe-wasm:{}] {shown}", scrub(class))
 }
 
@@ -263,6 +258,8 @@ impl std::fmt::Display for MountRefusal {
         }
     }
 }
+
+impl crate::system::ScrubbedDisplay for MountRefusal {}
 
 impl From<MountRefusal> for crate::error::IpeError {
     fn from(refusal: MountRefusal) -> Self {
