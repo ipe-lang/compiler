@@ -35,7 +35,7 @@ pub use crate::encoding::{
 };
 #[cfg(feature = "web")]
 use crate::encoding::{EncodedBase, QueryText};
-use crate::system::{RefusedText, ScrubbedDisplay as _};
+use crate::system::RefusedText;
 
 /// A declared route: a parsed URL pattern + a builder that applies the
 /// captured `:param` strings (in pattern order) to the page constructor.
@@ -1105,7 +1105,7 @@ mod tests {
         ];
         let refusal = check_route_table(&rs).err();
         assert!(refusal.is_some_and(|r| {
-            let msg = r.to_string();
+            let msg = crate::system::refusal_text(&r);
             r.pattern.raw() == "/u/:id/:id"
                 && msg.contains("route pattern `/u/:id/:id` is malformed")
                 && msg.contains("parameter `id` appears twice")
@@ -1151,7 +1151,7 @@ mod tests {
         let refusal = check_route_table(&rs).err();
         assert!(refusal.is_some_and(|r| {
             r.pattern.raw() == "/file:id"
-                && r.to_string()
+                && crate::system::refusal_text(&r)
                     .contains("route pattern `/file:id` is malformed: a `:` or `*` at byte 4")
         }));
     }

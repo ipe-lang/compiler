@@ -6009,11 +6009,11 @@ mod env_ceiling_tests {
             scrub_log_controls(raw),
             "the operator line escapes the raw text exactly once"
         );
-        let ceiling = EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count");
+        let ceiling = EnvCeiling::new("EXAMPLE_CEILING", 7, ZeroCeiling::Refused, "count");
         let Err(refused) = ceiling.parse(Ok("a\\b\n".to_owned())) else {
             return;
         };
-        let raw = "IPE_TEST_CEILING must be a count (got \"a\\b\n\")";
+        let raw = "EXAMPLE_CEILING must be a count (got \"a\\b\n\")";
         assert_eq!(refused.to_string(), raw);
         assert_eq!(
             crate::ipe_error_message(IpeError::from(refused.clone())),
@@ -7533,8 +7533,8 @@ mod scrub_log_controls_tests {
     fn refusal_fixed_words_hold_no_hazard() {
         use crate::env_grammar::{Class, EnvRefusal, Grammar, Shown};
         let ceiling =
-            super::EnvCeiling::new("IPE_TEST_CEILING", 7, super::ZeroCeiling::Refused, "count");
-        let duration = super::EnvDuration::new("IPE_TEST_DURATION", 30, "duration");
+            super::EnvCeiling::new("EXAMPLE_CEILING", 7, super::ZeroCeiling::Refused, "count");
+        let duration = super::EnvDuration::new("EXAMPLE_DURATION", 30, "duration");
         let mut rendered = vec![
             super::refusal_text(&super::RefusedText::new("plain")),
             super::refusal_text(&super::EnvValueRefusal::new(

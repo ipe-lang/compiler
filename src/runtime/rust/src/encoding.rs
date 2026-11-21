@@ -1875,10 +1875,9 @@ pub struct RoutePatternRefusal {
 
 impl crate::system::ScrubbedDisplay for RoutePatternRefusal {
     fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
-        use crate::system::ScrubbedDisplay as _;
         use std::fmt::Write as _;
         out.write_str("route pattern `")?;
-        self.pattern.render(out)?;
+        crate::system::ScrubbedDisplay::render(&self.pattern, out)?;
         write!(out, "` is malformed: {}", self.refusal)
     }
 }
