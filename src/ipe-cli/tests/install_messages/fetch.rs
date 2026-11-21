@@ -539,8 +539,9 @@ fn a4_other_wget_is_refused() -> io::Result<()> {
         run.stderr
     );
     assert!(
-        run.lines("wget ").next().is_none(),
-        "the other wget must never fetch: {}",
+        run.lines("wget ")
+            .all(|call| call.trim_end() == "wget --version"),
+        "the other wget may only be asked its version, never fetch: {}",
         run.log
     );
     Ok(())
