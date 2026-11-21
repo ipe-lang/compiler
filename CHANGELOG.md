@@ -10,6 +10,40 @@ Entries below the header are maintained by
 section is generated from Conventional Commit messages and prepended when the
 standing release pull request is merged.
 
+## [0.7.5](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.4...ipe-v0.7.5) (2026-11-21)
+
+
+### Features
+
+* **cli:** pack web client desktop through a fixed webview shell ([#4160](https://github.com/ipe-lang/compiler/issues/4160)) ([0fd1d4c](https://github.com/ipe-lang/compiler/commit/0fd1d4cd2dac045b2426c8ff8a7837e260d88c02))
+
+
+### Bug Fixes
+
+* **ci:** Linux admission jail runs independent of the runner image ([#4163](https://github.com/ipe-lang/compiler/issues/4163)) ([2e4928b](https://github.com/ipe-lang/compiler/commit/2e4928b6ddef8d7c5a14d3714ec5354877fe6b66))
+* **cli:** one unprunable build-dir sibling no longer fails every claim ([#4177](https://github.com/ipe-lang/compiler/issues/4177)) ([65893c9](https://github.com/ipe-lang/compiler/commit/65893c9563f4329cd5bbb480c67e914133805a95))
+* **cli:** program and package names are parsed once at manifest decode ([#4203](https://github.com/ipe-lang/compiler/issues/4203)) ([e770297](https://github.com/ipe-lang/compiler/commit/e7702976ab7b5210eab1ef5cca410afe99748b68))
+* **cli:** the build directory is a function of the build posture ([#4169](https://github.com/ipe-lang/compiler/issues/4169)) ([871fda2](https://github.com/ipe-lang/compiler/commit/871fda278738776c8a056e6e8226744fa6651a47))
+* **deps,ci:** lettre 0.11.24 floor; nightly-green page fallback; apt mirror fallback ([#4179](https://github.com/ipe-lang/compiler/issues/4179)) ([b122f7e](https://github.com/ipe-lang/compiler/commit/b122f7e40f8231c06587a640e2433ee73c0c2d83))
+* **deps:** bump embedded wasmtime and scan release features ([#4171](https://github.com/ipe-lang/compiler/issues/4171)) ([e025480](https://github.com/ipe-lang/compiler/commit/e0254805e0d6821696250e46c43ccedf4c5c52b3))
+* **deps:** raise wasmtime and wasmtime-wasi to 48.0.10 (RUSTSEC-2026-0587) ([#4195](https://github.com/ipe-lang/compiler/issues/4195)) ([dc8cf63](https://github.com/ipe-lang/compiler/commit/dc8cf63b6668872f97e843055970fba2f44fdebe))
+* **doc:** read project modules only from a package, through one lazy scope ([#4186](https://github.com/ipe-lang/compiler/issues/4186)) ([d47868a](https://github.com/ipe-lang/compiler/commit/d47868a79fc2b36fcbcf32bc3030b7a7ea18eaf2))
+* **frames:** every target honours or refuses delivery.frameOrigins ([#4189](https://github.com/ipe-lang/compiler/issues/4189)) ([bf32f62](https://github.com/ipe-lang/compiler/commit/bf32f620224c6e14ab136c546018b51e6c9da626))
+* **index:** index sources are network URLs judged by one grammar ([#4188](https://github.com/ipe-lang/compiler/issues/4188)) ([5cfd303](https://github.com/ipe-lang/compiler/commit/5cfd303b59d3413935f6dda66f6ecec37a9e02eb))
+* **install:** one detector per prerequisite, every fetcher HTTPS-only and verified ([#4206](https://github.com/ipe-lang/compiler/issues/4206)) ([524ee92](https://github.com/ipe-lang/compiler/commit/524ee92736f6f62b6110c5b4c6069b75693a92da))
+* **ipe:** every user-file rewrite goes through the held directory writer ([#4156](https://github.com/ipe-lang/compiler/issues/4156)) ([6f53643](https://github.com/ipe-lang/compiler/commit/6f536439c8532a0d7ade5128ea2de40ab77547b2))
+* **lower:** kernel references and Cmd-wiring thunks always reach a building emit ([#4190](https://github.com/ipe-lang/compiler/issues/4190)) ([cc277d0](https://github.com/ipe-lang/compiler/commit/cc277d0046ee5068294387f0ed7d9f8e75c05710))
+* **runtime:** every async task starts through the task funnel; a tripped task ends its run typed ([#4194](https://github.com/ipe-lang/compiler/issues/4194)) ([704bc7b](https://github.com/ipe-lang/compiler/commit/704bc7bd8074eb640e29b1331a16f862a42a982f))
+* **runtime:** HttpMethod is one type every program can name ([#4200](https://github.com/ipe-lang/compiler/issues/4200)) ([24a05cd](https://github.com/ipe-lang/compiler/commit/24a05cdae13db36185eb2d1254a6297520c13d64))
+* **runtime:** keep focus through a browser's late focus drop ([#4199](https://github.com/ipe-lang/compiler/issues/4199)) ([64032ed](https://github.com/ipe-lang/compiler/commit/64032edf7758473ad7ddcc2e88e8f5b704fb3d2d))
+* **runtime:** the emitted entry builds ipe_main inside its catch ([#4172](https://github.com/ipe-lang/compiler/issues/4172)) ([da73ef4](https://github.com/ipe-lang/compiler/commit/da73ef4b4a29746b129ee4efd88bf26d9c7f5a60))
+* **runtime:** typed trusted frame origins with reachable count and header caps ([#4175](https://github.com/ipe-lang/compiler/issues/4175)) ([24c9994](https://github.com/ipe-lang/compiler/commit/24c99942a8f4edbc315be27bbbccaf7303cf00fc))
+* **sandbox,diagnostics:** FreeBSD jail acts through held handles; IPE-N0044 carries a typed refusal ([#4159](https://github.com/ipe-lang/compiler/issues/4159)) ([f7eb967](https://github.com/ipe-lang/compiler/commit/f7eb967f3f2e56a16372d10d15d6498329186420))
+* **sandbox:** FreeBSD launcher root acts are an admitted inventory ([#4170](https://github.com/ipe-lang/compiler/issues/4170)) ([886973f](https://github.com/ipe-lang/compiler/commit/886973f82a1bbfd10ccdee05f44b5ed6de04f3d6))
+* select the program entry by module home; eject copies the whole reachable runtime source ([#4193](https://github.com/ipe-lang/compiler/issues/4193)) ([0175fbb](https://github.com/ipe-lang/compiler/commit/0175fbbb4dc9e07457323fbf4c3af81a976cd431))
+* **test-runtime:** the gate binds the embedded runtime and the checkout walk is dev-only ([#4166](https://github.com/ipe-lang/compiler/issues/4166)) ([562ef8a](https://github.com/ipe-lang/compiler/commit/562ef8a24269cb9c46ed4ac54c9e04a216855b73))
+* **test:** a program run under xvfb-run is judged by its own recorded exit status ([#4181](https://github.com/ipe-lang/compiler/issues/4181)) ([01ba7aa](https://github.com/ipe-lang/compiler/commit/01ba7aa2d15de3ac90ee5dc37dd75275229be9ab))
+
 ## [0.7.4](https://github.com/ipe-lang/compiler/compare/ipe-v0.7.3...ipe-v0.7.4) (2026-11-13)
 
 

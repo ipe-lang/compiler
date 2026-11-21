@@ -47,7 +47,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.7.4" # x-release-please-version
+version = "0.7.5" # x-release-please-version
 license = "Apache-2.0"
 
 # `unsafe` is a build error in every member. The sanctioned sites carry a
