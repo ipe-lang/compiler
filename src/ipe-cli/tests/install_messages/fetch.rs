@@ -139,7 +139,7 @@ enum Sums {
     Good,
     /// No `SHA256SUMS` at all.
     Absent,
-    /// A `SHA256SUMS` holding this text, `{digest}` replaced by the
+    /// A `SHA256SUMS` holding this text, `@DIGEST@` replaced by the
     /// archive's true digest.
     Text(&'static str),
 }
@@ -260,7 +260,7 @@ fn serve(r: &ScratchDir, serve: &Path, host: &Host<'_>) -> io::Result<()> {
     let text = match &host.sums {
         Sums::Good => format!("{digest}  {artifact}\n"),
         Sums::Absent => return Ok(()),
-        Sums::Text(text) => text.replace("{digest}", &digest),
+        Sums::Text(text) => text.replace("@DIGEST@", &digest),
     };
     std::fs::write(serve.join("SHA256SUMS"), text)
 }
@@ -345,7 +345,7 @@ fn run_host(r: &ScratchDir, host: &Host<'_>) -> io::Result<FetchRun> {
         stderr.push_str(&String::from_utf8_lossy(&std::fs::read(stdout_path)?));
     }
     Ok(FetchRun {
-        code: status.and_then(ExitStatus::code),
+        code: status.as_ref().and_then(ExitStatus::code),
         stderr,
         log: std::fs::read_to_string(log)?,
         install_dir,
@@ -677,7 +677,7 @@ fn a8_checksum_entry_matches_the_exact_name() -> io::Result<()> {
         &r,
         &Host {
             sums: Sums::Text(
-                "{digest}  xipe-linux-x64.tar.gz\n{digest}  ipe-linux-x64.tar.gz.sig\n",
+                "@DIGEST@  xipe-linux-x64.tar.gz\n@DIGEST@  ipe-linux-x64.tar.gz.sig\n",
             ),
             ..Host::default()
         },
@@ -694,7 +694,7 @@ fn a9_mismatched_or_malformed_checksum_is_refused() -> io::Result<()> {
         "0000000000000000000000000000000000000000000000000000000000000000  ipe-linux-x64.tar.gz\n";
     let short =
         "000000000000000000000000000000000000000000000000000000000000000  ipe-linux-x64.tar.gz\n";
-    let twice = "{digest}  ipe-linux-x64.tar.gz\n{digest} *ipe-linux-x64.tar.gz\n";
+    let twice = "@DIGEST@  ipe-linux-x64.tar.gz\n@DIGEST@ *ipe-linux-x64.tar.gz\n";
     for (label, text, marker) in [
         ("install-fetch-a9-wrong", wrong, "Checksum mismatch"),
         (
