@@ -829,18 +829,27 @@ pub enum FrameRegisterRefusal {
 }
 
 #[cfg(feature = "encoding")]
-impl std::fmt::Display for FrameRegisterRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::system::ScrubbedDisplay for FrameRegisterRefusal {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
             Self::Origin { index, refusal } => {
                 write!(
-                    f,
+                    out,
                     "trusted frame origin {}: {refusal}",
                     index.saturating_add(1)
                 )
             }
-            Self::List(refusal) => write!(f, "trusted frame origins: {refusal}"),
+            Self::List(refusal) => write!(out, "trusted frame origins: {refusal}"),
         }
+    }
+}
+
+/// The text value of the refusal (see [`crate::system::ScrubbedDisplay`]).
+#[cfg(feature = "encoding")]
+impl std::fmt::Display for FrameRegisterRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&crate::system::refusal_text(self))
     }
 }
 
@@ -905,7 +914,7 @@ pub fn try_register(origins: &[&str], granted: &[&str]) -> Result<(), FrameRegis
 #[cfg(all(feature = "encoding", not(target_arch = "wasm32")))]
 pub fn register(origins: &[&str], granted: &[&str]) {
     if let Err(refusal) = try_register(origins, granted) {
-        crate::core::eprint_task_error(&refusal.to_string());
+        crate::core::eprint_refusal(&crate::system::ScrubbedLine::of_refusal(&refusal));
         crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
     }
 }

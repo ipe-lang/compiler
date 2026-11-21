@@ -202,9 +202,16 @@ pub fn console_line(class: Option<&str>, detail: &str) -> String {
 /// fails closed on a rendering that still holds a log hazard; only the class
 /// is scrubbed here.
 pub fn console_refusal_line(class: &str, refusal: &MountRefusal) -> String {
-    use crate::system::{ScrubbedLine, scrub_log_controls as scrub};
-    let shown = ScrubbedLine::of_refusal(refusal);
-    format!("[ipe-wasm:{}] {shown}", scrub(class))
+    console_scrubbed_line(class, &crate::system::ScrubbedLine::of_refusal(refusal))
+}
+
+/// The browser-console line `[ipe-wasm:<class>] <shown>` for a line already
+/// escaped once: only the class is scrubbed here.
+pub(crate) fn console_scrubbed_line(class: &str, shown: &crate::system::ScrubbedLine) -> String {
+    format!(
+        "[ipe-wasm:{}] {shown}",
+        crate::system::scrub_log_controls(class)
+    )
 }
 
 /// Why the browser client refused to mount an app.
@@ -1293,6 +1300,22 @@ mod tests {
             "[ipe-wasm:StartupRefused] EXAMPLE_VALUE must be an IP address (got \"a\\\\b\")"
         );
         assert!(!line.contains("a\\\\\\\\b"), "scrubbed twice: {line:?}");
+    }
+
+    /// A startup env refusal the browser entry prints directly reaches the
+    /// console escaped exactly once: `a\b` shows as `a\\b`, never `a\\\\b`.
+    #[test]
+    fn console_scrubbed_line_prints_an_env_refusal_once() {
+        let refusal =
+            crate::system::EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", b"a\\b\n");
+        let line = console_scrubbed_line(
+            "StartupRefused",
+            &crate::system::ScrubbedLine::of_refusal(&refusal),
+        );
+        assert_eq!(
+            line,
+            "[ipe-wasm:StartupRefused] EXAMPLE_VALUE must be an IP address (got \"a\\\\b\\n\")"
+        );
     }
 
     /// A mount refusal reaches the browser console scrubbed exactly once: a

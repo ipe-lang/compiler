@@ -52,6 +52,7 @@ use crate::html::frame_patch::{
 use crate::html::{
     ClientMarks, FormData, Html, RenderCtx, STAMPED_ID_ATTR, assign_ipe_ids, render_html_in,
 };
+use crate::system::{ScrubbedDisplay, ScrubbedLine};
 use crate::tea::{IpeCmd, IpeSub};
 use crate::web::route::MountRefusal;
 
@@ -74,11 +75,11 @@ fn console_fatal(class: &str, detail: &str) {
     web_sys::console::error_1(&JsValue::from_str(&line));
 }
 
-/// [`console_fatal`] for a mount refusal, whose `Display` is already scrubbed:
-/// the line is built by [`crate::web::route::console_refusal_line`], which
-/// scrubs only the class.
-fn console_fatal_refusal(class: &str, refusal: &MountRefusal) {
-    let line = crate::web::route::console_refusal_line(class, refusal);
+/// [`console_fatal`] for a refusal: its line is rendered by
+/// [`ScrubbedLine::of_refusal`], each text it quotes escaped exactly once,
+/// and [`crate::web::route::console_scrubbed_line`] scrubs only the class.
+fn console_fatal_refusal<R: ScrubbedDisplay + ?Sized>(class: &str, refusal: &R) {
+    let line = crate::web::route::console_scrubbed_line(class, &ScrubbedLine::of_refusal(refusal));
     web_sys::console::error_1(&JsValue::from_str(&line));
 }
 
@@ -138,7 +139,7 @@ fn judge_startup(frames: FrameAdmission) {
         Ok(()) => true,
         Err(refusals) => {
             for refusal in &refusals {
-                console_fatal("StartupRefused", &refusal.to_string());
+                console_fatal_refusal("StartupRefused", refusal);
             }
             false
         }
@@ -168,7 +169,7 @@ pub fn install_panic_hook_trusting_frames(origins: &[&str], granted: &[&str]) {
     let frames = match crate::frames::try_register(origins, granted) {
         Ok(()) => FrameAdmission::Registered,
         Err(refusal) => {
-            console_fatal("StartupRefused", &refusal.to_string());
+            console_fatal_refusal("StartupRefused", &refusal);
             FrameAdmission::Refused
         }
     };

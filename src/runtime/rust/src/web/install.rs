@@ -36,11 +36,19 @@ pub enum InstallRefusal {
     Path(BundlePathRefusal),
 }
 
+impl crate::system::ScrubbedDisplay for InstallRefusal {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        match self {
+            Self::Path(refusal) => write!(out, "the install offer has no asset path: {refusal}"),
+        }
+    }
+}
+
+/// The text value of the refusal (see [`crate::system::ScrubbedDisplay`]).
 impl std::fmt::Display for InstallRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Path(refusal) => write!(f, "the install offer has no asset path: {refusal}"),
-        }
+        f.write_str(&crate::system::refusal_text(self))
     }
 }
 
@@ -158,7 +166,7 @@ pub fn register(facts: &'static InstallFacts) {
             }
         }
         Err(refusal) => {
-            crate::core::eprint_task_error(&refusal.to_string());
+            crate::core::eprint_refusal(&crate::system::ScrubbedLine::of_refusal(&refusal));
             crate::system::exit_process(crate::system::ProcessStatus::FAILURE);
         }
     }
