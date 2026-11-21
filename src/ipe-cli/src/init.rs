@@ -788,7 +788,7 @@ fn wizard_shape() -> Result<InitShape, CliError> {
              \n\
              Shape [1]: ",
     );
-    let _ = std::io::stdout().flush();
+    let _ = std::io::Write::flush(&mut crate::progress::Door::Stdout);
     let line = read_line_trimmed();
     let shape = match line.as_deref().unwrap_or("") {
         "" | "1" | "web" => InitShape::Web,
@@ -829,7 +829,7 @@ fn wizard_runtime() -> Result<Runtime, CliError> {
     }
     menu.push_str("\nRuntime [1]: ");
     crate::screen::prompt(&menu);
-    let _ = std::io::stdout().flush();
+    let _ = std::io::Write::flush(&mut crate::progress::Door::Stdout);
     let line = read_line_trimmed();
     runtime_choice(line.as_deref().unwrap_or(""))
 }

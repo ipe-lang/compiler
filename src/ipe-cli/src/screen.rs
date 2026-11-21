@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::CliError;
 use crate::doc_search::DocMiss;
+use crate::progress;
 use crate::style::{self, GUTTER, Palette, REPORT_BUGS_PHRASE, TerminalSafe};
 
 /// The semantic role of a piece of human output, which fixes its colour.
@@ -106,16 +107,11 @@ impl Stream {
     /// Write `text` whole and flush. Best effort: a closed stream (a reader
     /// that went away) drops the bytes rather than aborting the process.
     fn write(self, text: &str) {
-        let _ = match self {
-            Self::Stdout => {
-                let mut out = std::io::stdout().lock();
-                out.write_all(text.as_bytes()).and_then(|()| out.flush())
-            }
-            Self::Stderr => {
-                let mut err = std::io::stderr().lock();
-                err.write_all(text.as_bytes()).and_then(|()| err.flush())
-            }
+        let mut door = match self {
+            Self::Stdout => progress::Door::Stdout,
+            Self::Stderr => progress::Door::Stderr,
         };
+        let _ = door.write_all(text.as_bytes()).and_then(|()| door.flush());
     }
 }
 
@@ -425,7 +421,7 @@ impl Interactive {
     pub fn ask_yes_no(&self, question: &str, default: bool) -> bool {
         let hint = if default { "[Y/n]" } else { "[y/N]" };
         prompt(&format!("{question} {hint} "));
-        let _ = std::io::stdout().flush();
+        let _ = progress::Door::Stdout.flush();
         crate::read_yes_no_default(default)
     }
 }
