@@ -146,6 +146,7 @@ fn module_with(name: Symbol, surface: Option<Surface>) -> Module {
         uses_locale: on(Surface::Locale),
         uses_time: on(Surface::Time),
         uses_env_public: on(Surface::EnvPublic),
+        uses_db_operator: false,
         uses_http: on(Surface::Http),
         uses_config: on(Surface::Config),
         uses_compression: on(Surface::Compression),

@@ -161,6 +161,7 @@ fn emit_count_main_rs(tco: bool) -> DResult<String> {
             uses_locale: false,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_debug: false,
             uses_ffi: false,
             uses_async_runtime: false,

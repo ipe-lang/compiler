@@ -52,6 +52,9 @@ mod ty_templates;
 mod ui_msg_slots;
 mod user_pins;
 
+#[cfg(test)]
+mod operator_db_url;
+
 use capture_rewrite::force_shared_capture_clones;
 use clone_class::CaptureWalk;
 use clone_class::{
@@ -9472,6 +9475,15 @@ enum Intercepted {
     Fallthrough(Option<Callee>),
 }
 
+/// Whether kernel `k` opens the operator database, the store `DATABASE_URL`
+/// and the `Db.url` setting name.
+///
+/// True exactly for the kernels whose runtime symbol resolves the operator
+/// store; `operator_url_readers_agree` pins that agreement.
+pub(crate) const fn reads_operator_db_url(k: KernelFn) -> bool {
+    matches!(k, KernelFn::DbConnect)
+}
+
 /// Per-family kernel-usage flags, collected in ONE traversal over every
 /// function body (rather than walking every body once per family — nine
 /// independent full-AST `expr_uses_<family>_kernel` passes).
@@ -9625,6 +9637,9 @@ struct KernelUsage {
     /// The `Ipe.Env` `Env.public` kernel — gates emitting the per-project
     /// `env_public.rs` (built from `package.ipe`'s `[wasm] publicEnv` allowlist).
     env_public: bool,
+    /// Any kernel that opens the operator database ([`reads_operator_db_url`])
+    /// — gates the `db-operator` runtime feature.
+    db_operator: bool,
     /// Any development-only `Debug.*` escape hatch (`Debug.log`). Recorded
     /// unconditionally here; a PRODUCTION build (`ipe release`) rejects it at
     /// emit demand (IPE-L0140). A development build ignores the flag.
@@ -9698,6 +9713,7 @@ impl KernelUsage {
             && self.locale
             && self.time
             && self.env_public
+            && self.db_operator
             && self.debug
             && self.ffi
             && self.async_runtime
@@ -9761,6 +9777,7 @@ impl KernelUsage {
         );
         self.time |= k.is_time();
         self.env_public |= matches!(k, KernelFn::EnvPublic);
+        self.db_operator |= reads_operator_db_url(k);
         self.debug |= k.is_dev_only();
         // A kernel whose emitted symbol lives in a feature-module its emit-class
         // does not pull in (e.g. `Cmd.publish`'s `cmd_publish` in `web::pubsub`,
@@ -17580,6 +17597,9 @@ impl<'a> Lowerer<'a> {
         // env_public; pub use env_public::*;` to the emitted
         // `ipe_runtime/mod.rs`.
         let uses_env_public = kernel_usage.env_public;
+        // detect `Db.connect` usage — the backend selects the `db-operator`
+        // runtime feature, whose server start judges `DATABASE_URL`.
+        let uses_db_operator = kernel_usage.db_operator;
 
         // detect outbound Ipe.WebSocket client usage — the backend adds the
         // `websocket_client` Cargo feature + `ws_client` runtime module.
@@ -17645,6 +17665,7 @@ impl<'a> Lowerer<'a> {
             uses_locale,
             uses_time,
             uses_env_public,
+            uses_db_operator,
             uses_debug,
             uses_ffi,
             uses_async_runtime,

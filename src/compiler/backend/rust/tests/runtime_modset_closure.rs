@@ -146,6 +146,7 @@ fn module_for_mask(name: ipe_intern::Symbol, mask: u32) -> Module {
         uses_locale: f(29),
         uses_time: false,
         uses_env_public: f(10),
+        uses_db_operator: false,
         uses_http: f(11),
         uses_config: f(12),
         uses_compression: f(13),

@@ -50,6 +50,7 @@ fn webview_program(interner: &mut Interner) -> Program {
             uses_locale: false,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_http: false,
             uses_config: false,
             uses_compression: false,
