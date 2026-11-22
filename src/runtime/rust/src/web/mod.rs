@@ -4999,9 +4999,11 @@ where
     crate::tea::WebApp(crate::tea::WebAppKind::Mountable { serve, router })
 }
 
-/// Why a live web app refused to start as declared. The `Display` text is the
-/// operator detail: it goes to the runtime log (a mount) or to the local task
-/// error (a standalone app), never into a response body.
+/// Why a live web app refused to start as declared.
+///
+/// Its render is the operator detail: escaped once for the runtime log (a
+/// mount) or raw in the `IpeError` a standalone app returns, never in a
+/// response body.
 #[cfg(feature = "web")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StartupRefusal {
@@ -5025,18 +5027,24 @@ pub(crate) enum StartupRefusal {
 }
 
 #[cfg(feature = "web")]
-impl std::fmt::Display for StartupRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::system::ScrubbedDisplay for StartupRefusal {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
-            Self::RouteTable(refusal) => write!(f, "{refusal}"),
-            Self::SessionStore(e) => write!(f, "session store misconfigured: {e}"),
-            Self::MountBase { base, refusal } => {
-                write!(f, "web base path `{base}` is not a mount base: {refusal}")
+            Self::RouteTable(refusal) => refusal.render(out),
+            Self::SessionStore(e) => {
+                out.write_str("session store misconfigured: ")?;
+                e.render(out)
             }
-            Self::Ceiling(refusal) => write!(f, "{refusal}"),
-            Self::FrameAncestors(refusal) => write!(f, "{refusal}"),
-            Self::Bind(refusal) => write!(f, "{refusal}"),
-            Self::Auth(refusal) => write!(f, "{refusal}"),
+            Self::MountBase { base, refusal } => {
+                out.write_str("web base path ")?;
+                base.render(out)?;
+                write!(out, " is not a mount base: {refusal}")
+            }
+            Self::Ceiling(refusal) => refusal.render(out),
+            Self::FrameAncestors(refusal) => write!(out, "{refusal}"),
+            Self::Bind(refusal) => refusal.render(out),
+            Self::Auth(refusal) => refusal.render(out),
         }
     }
 }
@@ -5046,15 +5054,12 @@ impl std::fmt::Display for StartupRefusal {
 #[cfg(feature = "web")]
 impl From<StartupRefusal> for crate::error::IpeError {
     fn from(cause: StartupRefusal) -> Self {
-        Self::invalid_input(cause.to_string())
+        Self::invalid_input(crate::system::refusal_text(&cause))
     }
 }
 
-#[cfg(feature = "web")]
-impl crate::system::ScrubbedDisplay for StartupRefusal {}
-
-/// The operator log message of a fail-closed mount: the refusal's text,
-/// already scrubbed where it was built, reaches the log scrubbed once.
+/// The operator log message of a fail-closed mount: the refusal rendered with
+/// each text it quotes escaped exactly once.
 #[cfg(feature = "web")]
 fn fail_closed_log_message(cause: &StartupRefusal) -> crate::system::ScrubbedLine {
     crate::system::ScrubbedLine::of_refusal(cause).after("mounted web app disabled: ")
@@ -9264,7 +9269,7 @@ mod base_path_tests {
             assert!(
                 matches!(
                     MountContext::standalone(Some(bad)),
-                    Err(super::StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
+                    Err(super::StartupRefusal::MountBase { ref base, .. }) if base.raw() == bad
                 ),
                 "{bad:?} must refuse the start"
             );
@@ -11414,7 +11419,7 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(
                     parse_mount_base(bad),
-                    Err(StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base.raw() == bad
                 ),
                 "base {bad} must be refused"
             );
@@ -11423,8 +11428,8 @@ mod sse_reconnect_reconcile_tests {
         assert!(parse_mount_base("/_ipe/console").is_ok_and(|b| b.prefix() == "/_ipe/console"));
     }
 
-    /// A refused base path is scrubbed once, where the refusal is built: a
-    /// `\` in it renders as `\\`, never re-escaped to `\\\\` by the `Display`.
+    /// A refused base path is escaped once on the operator line: a `\` in it
+    /// renders as `\\`, never re-escaped to `\\\\`.
     #[test]
     fn startup_refusal_scrubs_the_base_once() {
         let refusals = [
@@ -11432,11 +11437,13 @@ mod sse_reconnect_reconcile_tests {
             parse_mount_base("/a\\b").err(),
         ];
         let expected = [
-            "web base path `/%zz\\\\` is not a mount base",
-            "web base path `/a\\\\b` is not a mount base",
+            "web base path \"/%zz\\\\\" is not a mount base",
+            "web base path \"/a\\\\b\" is not a mount base",
         ];
         for (refusal, expected) in refusals.into_iter().zip(expected) {
-            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            let rendered = refusal
+                .map(|r| crate::system::ScrubbedLine::of_refusal(&r).to_string())
+                .unwrap_or_default();
             assert!(
                 rendered.starts_with(expected) && !rendered.contains("\\\\\\\\"),
                 "{rendered:?} must start with {expected:?}"
@@ -11459,7 +11466,9 @@ mod sse_reconnect_reconcile_tests {
                 ),
                 "{refusal:?}"
             );
-            let rendered = refusal.map(|r| r.to_string()).unwrap_or_default();
+            let rendered = refusal
+                .map(|r| crate::system::ScrubbedLine::of_refusal(&r).to_string())
+                .unwrap_or_default();
             assert!(
                 !rendered.contains('\u{202e}')
                     && !rendered.contains('\n')
@@ -11478,7 +11487,7 @@ mod sse_reconnect_reconcile_tests {
             assert!(
                 matches!(
                     parse_mount_base(bad),
-                    Err(StartupRefusal::MountBase { ref base, .. }) if base.as_str() == bad
+                    Err(StartupRefusal::MountBase { ref base, .. }) if base.raw() == bad
                 ),
                 "base {bad} must be refused"
             );
@@ -11604,8 +11613,7 @@ mod static_noise_mime_tests {
 // `update` unwinds into that spawn boundary, ending only the tripping session's
 // driver while the process — and every other session's driver — survives. This
 // module pins that isolation at the spawn boundary the driver uses.
-#[cfg(test)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
 mod recursion_session_isolation_tests {
     // A session-`update` that trips the recursion guard, spawned exactly as
     // `drive_session` spawns its fold task, dies as a panicking `JoinError`
@@ -14199,7 +14207,7 @@ mod emitted_router_behavior_tests {
     fn a_non_mount_base_path_refuses_the_start() {
         let refused = MountContext::standalone(Some("/app/x%41")).err();
         assert!(
-            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base.as_str() == "/app/x%41"),
+            matches!(&refused, Some(StartupRefusal::MountBase { base, .. }) if base.raw() == "/app/x%41"),
             "a non-mount base must refuse the start, got {refused:?}"
         );
         assert!(MountContext::standalone(Some("/app/xA")).is_ok());
@@ -14380,7 +14388,7 @@ mod emitted_router_behavior_tests {
             let Err(cause) = refused else {
                 panic!("IPE_HTTP_BIND={raw:?} must refuse the app");
             };
-            let shown = cause.to_string();
+            let shown = crate::system::refusal_text(&cause);
             let error = crate::error::IpeError::from(cause);
             assert_eq!(
                 crate::ipe_error_kind(error.clone()),
@@ -16399,7 +16407,7 @@ mod emitted_router_behavior_tests {
         assert!(
             matches!(
                 &result,
-                IpeResult::Err(message) if message.contains("route pattern `/%zz` is malformed")
+                IpeResult::Err(message) if message.contains("route pattern \"/%zz\" is malformed")
             ),
             "a malformed route table must refuse to start, naming the pattern: {result:?}"
         );
@@ -16464,14 +16472,14 @@ mod emitted_router_behavior_tests {
     }
 
     /// A store refusal's operator text is scrubbed of controls before it
-    /// reaches the startup error or the log.
+    /// reaches the log.
     #[test]
     fn store_refusal_display_is_scrubbed() {
         let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
             backend: "postgres",
             cause: crate::system::RefusedText::new("bad\n[ipe.live] forged\u{1b}[31m\u{202e}"),
         });
-        let shown = cause.to_string();
+        let shown = crate::system::ScrubbedLine::of_refusal(&cause).to_string();
         assert!(
             !shown.chars().any(crate::system::is_log_hazard),
             "a raw control survived: {shown:?}"
@@ -16479,9 +16487,8 @@ mod emitted_router_behavior_tests {
         assert_eq!(shown.lines().count(), 1, "{shown:?}");
     }
 
-    /// A store refusal's cause is scrubbed once, where the refusal is built: a
-    /// `\` in it renders as `\\`, never re-escaped to `\\\\` on its way to the
-    /// startup error.
+    /// A store refusal's cause is escaped once on the operator line: a `\` in
+    /// it renders as `\\`, never `\\\\`; the startup error holds it raw.
     #[test]
     fn store_refusal_scrubs_the_cause_once() {
         let cause = StartupRefusal::SessionStore(store::StoreConfigError::Refused {
@@ -16489,9 +16496,15 @@ mod emitted_router_behavior_tests {
             cause: crate::system::RefusedText::new("host a\\b"),
         });
         assert_eq!(
-            cause.to_string(),
+            crate::error::ipe_error_message(cause.clone().into()),
             "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
-             (host a\\\\b); fix the connection URL or the server, or set \
+             (\"host a\\b\"); fix the connection URL or the server, or set \
+             IPE_WEB_STORE=file|memory"
+        );
+        assert_eq!(
+            crate::system::ScrubbedLine::of_refusal(&cause).to_string(),
+            "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
+             (\"host a\\\\b\"); fix the connection URL or the server, or set \
              IPE_WEB_STORE=file|memory"
         );
     }
@@ -16514,7 +16527,7 @@ mod emitted_router_behavior_tests {
         assert_eq!(
             line.trim_start(),
             "[ipe.live] mounted web app disabled: session store misconfigured: \
-             IPE_WEB_STORE=postgres refused at connect (host a\\\\b\\n[ipe.live] forged); \
+             IPE_WEB_STORE=postgres refused at connect (\"host a\\\\b\\n[ipe.live] forged\"); \
              fix the connection URL or the server, or set IPE_WEB_STORE=file|memory"
         );
         assert!(!line.contains("a\\\\\\\\b"), "{line:?}");
@@ -16939,7 +16952,7 @@ mod emitted_router_behavior_tests {
             ),
         ];
         for cause in causes {
-            let detail = cause.to_string();
+            let detail = crate::system::refusal_text(&cause);
             let (status, body) = block_on(mounted_get(fail_closed_router(&cause)));
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{detail}");
             assert_eq!(body, FAIL_CLOSED_BODY, "{detail}");

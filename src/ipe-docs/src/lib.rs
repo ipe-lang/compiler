@@ -119,6 +119,62 @@ pub struct CommandInfo {
     pub help: String,
 }
 
+// ── Errors ────────────────────────────────────────────────────────────────────
+
+/// Why the documentation index could not be built.
+#[derive(Debug)]
+pub enum IndexError {
+    /// An embedded stdlib module did not parse.
+    Parse {
+        /// The dotted name of the module, e.g. `Ipe.List`.
+        module: &'static str,
+        /// The parser's diagnostic.
+        diagnostic: Box<ipe_diagnostics::Diagnostic>,
+    },
+    /// A source directory could not be opened.
+    ReadDir {
+        /// What the directory holds: `explain` or `content`.
+        role: &'static str,
+        /// The directory the builder was given.
+        path: PathBuf,
+        /// The filesystem error.
+        source: std::io::Error,
+    },
+    /// An operator's source text is a key another entry already holds.
+    OperatorCollision {
+        /// The operator's source text, e.g. `//`.
+        operator: &'static str,
+        /// The kind of the entry that holds the key.
+        held_kind: EntryKind,
+        /// The source key of the entry that holds the key.
+        held_key: String,
+    },
+}
+
+impl std::fmt::Display for IndexError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Parse { module, diagnostic } => {
+                write!(f, "parse error in {module}: {diagnostic:?}")
+            }
+            Self::ReadDir { role, path, source } => {
+                write!(f, "cannot read {role} dir {}: {source}", path.display())
+            }
+            Self::OperatorCollision {
+                operator,
+                held_kind,
+                held_key,
+            } => write!(
+                f,
+                "operator `{operator}` collides with the {} entry `{held_key}`",
+                held_kind.route_subdir()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IndexError {}
+
 // ── Index ─────────────────────────────────────────────────────────────────────
 
 /// The in-memory documentation index.
@@ -142,13 +198,14 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns an error string if `explain_dir` or `content_dir` cannot be
-    /// opened as a directory, or if any stdlib module fails to parse.
+    /// [`IndexError::ReadDir`] if `explain_dir` or `content_dir` cannot be
+    /// opened as a directory; [`IndexError::Parse`] if any stdlib module fails
+    /// to parse.
     pub fn build(
         explain_dir: &Path,
         content_dir: &Path,
         commands: &[CommandInfo],
-    ) -> Result<Self, String> {
+    ) -> Result<Self, IndexError> {
         let mut builder = IndexBuilder::new();
         builder.add_stdlib()?;
         builder.add_compiled_stdlib()?;
@@ -173,8 +230,9 @@ impl Index {
     ///
     /// # Errors
     ///
-    /// Returns an error string if any embedded stdlib module fails to parse.
-    pub fn build_embedded() -> Result<Self, String> {
+    /// [`IndexError::Parse`] if any embedded stdlib module fails to parse;
+    /// [`IndexError::OperatorCollision`] if an operator's text is already a key.
+    pub fn build_embedded() -> Result<Self, IndexError> {
         let mut builder = IndexBuilder::new();
         builder.add_stdlib()?;
         builder.add_compiled_stdlib()?;
@@ -249,11 +307,15 @@ impl IndexBuilder {
     /// # Errors
     ///
     /// Returns an error if any stdlib module fails to parse.
-    pub fn add_stdlib(&mut self) -> Result<(), String> {
+    pub fn add_stdlib(&mut self) -> Result<(), IndexError> {
         let mut interner = Interner::new();
         for std_mod in STDLIB_MODULES {
-            let module = parse_module(std_mod.source, &mut interner)
-                .map_err(|d| format!("parse error in {}: {d:?}", std_mod.name))?;
+            let module = parse_module(std_mod.source, &mut interner).map_err(|diagnostic| {
+                IndexError::Parse {
+                    module: std_mod.name,
+                    diagnostic: Box::new(diagnostic),
+                }
+            })?;
 
             let short = stdlib_short_name(std_mod.name);
 
@@ -313,11 +375,15 @@ impl IndexBuilder {
     /// # Errors
     ///
     /// Returns an error if any compiled-source stdlib module fails to parse.
-    pub fn add_compiled_stdlib(&mut self) -> Result<(), String> {
+    pub fn add_compiled_stdlib(&mut self) -> Result<(), IndexError> {
         let mut interner = Interner::new();
         for std_mod in COMPILED_STD_MODULES {
-            let module = parse_module(std_mod.source, &mut interner)
-                .map_err(|d| format!("parse error in {}: {d:?}", std_mod.dotted))?;
+            let module = parse_module(std_mod.source, &mut interner).map_err(|diagnostic| {
+                IndexError::Parse {
+                    module: std_mod.dotted,
+                    diagnostic: Box::new(diagnostic),
+                }
+            })?;
 
             let short = stdlib_short_name(std_mod.dotted);
 
@@ -372,9 +438,12 @@ impl IndexBuilder {
     /// # Errors
     ///
     /// Returns an error if `explain_dir` cannot be opened as a directory.
-    pub fn add_diagnostics(&mut self, explain_dir: &Path) -> Result<(), String> {
-        let rd = std::fs::read_dir(explain_dir)
-            .map_err(|e| format!("cannot read explain dir {}: {e}", explain_dir.display()))?;
+    pub fn add_diagnostics(&mut self, explain_dir: &Path) -> Result<(), IndexError> {
+        let rd = std::fs::read_dir(explain_dir).map_err(|source| IndexError::ReadDir {
+            role: "explain",
+            path: explain_dir.to_path_buf(),
+            source,
+        })?;
         for dir_entry in rd.flatten() {
             let path: PathBuf = dir_entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -430,9 +499,12 @@ impl IndexBuilder {
     /// # Errors
     ///
     /// Returns an error if `content_dir` cannot be opened as a directory.
-    pub fn add_constructs(&mut self, content_dir: &Path) -> Result<(), String> {
-        let rd = std::fs::read_dir(content_dir)
-            .map_err(|e| format!("cannot read content dir {}: {e}", content_dir.display()))?;
+    pub fn add_constructs(&mut self, content_dir: &Path) -> Result<(), IndexError> {
+        let rd = std::fs::read_dir(content_dir).map_err(|source| IndexError::ReadDir {
+            role: "content",
+            path: content_dir.to_path_buf(),
+            source,
+        })?;
         for dir_entry in rd.flatten() {
             let path: PathBuf = dir_entry.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -510,15 +582,15 @@ impl IndexBuilder {
     /// # Errors
     ///
     /// Names the operator whose source text another entry already holds.
-    pub fn add_operators(&mut self) -> Result<(), String> {
+    pub fn add_operators(&mut self) -> Result<(), IndexError> {
         for op in BinOp::ALL {
             let key = op.text();
             if let Some(held) = self.entries.get(key) {
-                return Err(format!(
-                    "operator `{key}` collides with the {} entry `{}`",
-                    held.kind.route_subdir(),
-                    held.source_key
-                ));
+                return Err(IndexError::OperatorCollision {
+                    operator: key,
+                    held_kind: held.kind.clone(),
+                    held_key: held.source_key.clone(),
+                });
             }
             let fixity = op.fixity();
             let assoc = match fixity.assoc() {
@@ -734,7 +806,7 @@ pub fn stdlib_module_matches(query: &str, dotted: &str) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CommandInfo, Entry, EntryKind, Index, IndexBuilder, operator_meaning};
+    use super::{CommandInfo, Entry, EntryKind, Index, IndexBuilder, IndexError, operator_meaning};
     use ipe_syntax::BinOp;
 
     /// Resolve a workspace-root-relative path.
@@ -1076,7 +1148,11 @@ mod tests {
         );
         let refused = builder.add_operators();
         assert!(
-            refused.as_ref().is_err_and(|e| e.contains("`//`")),
+            matches!(
+                &refused,
+                Err(IndexError::OperatorCollision { operator: "//", held_key, .. })
+                    if held_key == "//"
+            ),
             "{refused:?}"
         );
         let idx = builder.finish();

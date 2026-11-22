@@ -52,6 +52,9 @@ cd counter
 ipe dev run             # serves at http://localhost:8000 (server-rendered HTML + live SSE)
 ```
 
+`ipe dev run` builds once; to rebuild and rerun automatically as you edit, run
+`ipe dev watch` instead.
+
 On a TTY `ipe init` asks the shape (`web` / `tui` / `cli` / `worker` / `server` / `script`) and, for the web shape, 
 asks which runtime — `served` (a co-located SSR + SSE server) or `client` (a wasm client).
 

@@ -1233,27 +1233,39 @@ mod read_ceiling_tests {
     #[cfg(unix)]
     #[test]
     fn ceiling_non_unicode_shows_every_byte_escaped() {
+        use crate::system::{ScrubbedLine, refusal_text};
         use std::os::unix::ffi::OsStringExt as _;
         let raw = std::ffi::OsString::from_vec(vec![b'1', 0xff, 0x1b, b'[', b'2', b'J', 0xfe]);
-        let res = parse_read_ceiling(Err(std::env::VarError::NotUnicode(raw)));
+        let refusal = FILE_READ_CEILING
+            .parse(Err(std::env::VarError::NotUnicode(raw)))
+            .unwrap_err();
         assert_eq!(
-            res,
-            Err(
-                r#"IPE_FILE_READ_MAX must be a decimal byte count (got "1\xFF\u{1b}[2J\xFE")"#
-                    .to_string()
-            )
+            ScrubbedLine::of_refusal(&refusal).to_string(),
+            r#"IPE_FILE_READ_MAX must be a decimal byte count (got "1\xFF\u{1b}[2J\xFE")"#,
+            "the operator line escapes every byte once"
+        );
+        assert_eq!(
+            refusal_text(&refusal),
+            "IPE_FILE_READ_MAX must be a decimal byte count (got \"1\u{fffd}\u{1b}[2J\u{fffd}\")",
+            "the text value holds the value raw, a byte that is not UTF-8 as U+FFFD"
         );
     }
 
     #[test]
     fn ceiling_refusal_escapes_controls_and_quotes() {
-        let res = parse_read_ceiling(Ok("1\n\"\u{202e}\\".into()));
+        use crate::system::{ScrubbedLine, refusal_text};
+        let refusal = FILE_READ_CEILING
+            .parse(Ok("1\n\"\u{202e}\\".into()))
+            .unwrap_err();
         assert_eq!(
-            res,
-            Err(
-                r#"IPE_FILE_READ_MAX must be a decimal byte count (got "1\n\"\u{202e}\\")"#
-                    .to_string()
-            )
+            ScrubbedLine::of_refusal(&refusal).to_string(),
+            r#"IPE_FILE_READ_MAX must be a decimal byte count (got "1\n\"\u{202e}\\")"#,
+            "the operator line escapes controls and quotes once"
+        );
+        assert_eq!(
+            refusal_text(&refusal),
+            "IPE_FILE_READ_MAX must be a decimal byte count (got \"1\n\"\u{202e}\\\")",
+            "the text value holds the value raw"
         );
     }
 

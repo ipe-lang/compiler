@@ -127,8 +127,10 @@ use crate::cli_args::OutputFormat;
 use crate::doc_bundle::{
     BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
 };
+use crate::doc_index::{DocIndex, Resolved as MemberHit, Row};
 use crate::doc_pick::Pick;
-use crate::doc_search::{DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
+use crate::doc_search::{Closeness, DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
+use crate::doc_signature::WrittenSignatures;
 use crate::progress::{Indicator, Mode};
 use crate::project_root::{ProjectRoot, RootArg};
 use crate::text;
@@ -562,9 +564,15 @@ fn parse_doc_flags(
                 ))));
             }
             "--plain" | "--json" if !matches!(sub, Sub::List | Sub::Query(_) | Sub::Lookup(_)) => {
+                // A bare `ipe doc` runs the default action the user never
+                // typed; the refusal names the command as typed.
+                let typed = if matches!(sub, Sub::Generate) {
+                    arg.clone()
+                } else {
+                    sub_name(sub).to_owned()
+                };
                 return Err(CliError::Usage(text::msg::doc_lookup_only_flag(
-                    &sub_name(sub),
-                    &arg,
+                    &typed, &arg,
                 )));
             }
             "--out" => {
@@ -852,13 +860,24 @@ pub(crate) fn build_doc_bundle_over(
                 }
             }
         }
-        by_canonical
+        let mut sources: Vec<BundleSource> = by_canonical
             .into_iter()
             .map(|(canonical, (body, mut aliases))| {
                 aliases.sort_unstable();
                 BundleSource::with_body(canonical, canonical, body).with_aliases(aliases)
             })
-            .collect()
+            .collect();
+        // Every exposed member, documented or not, is an entry: a member the
+        // content index does not already file under its qualified key joins
+        // under that key, so a miss ranks it too.
+        let (members, _kernel) = build_doc_index()?;
+        for row in members.rows() {
+            let qualified = row.qualified();
+            if idx.resolve(&qualified).is_none() {
+                sources.push(BundleSource::with_body(qualified.clone(), qualified, ""));
+            }
+        }
+        sources
     };
 
     // Diagnostics: from the embedded explain pages. The title is the page's
@@ -1035,9 +1054,57 @@ fn run_doc_lookup_with_fuzzy(
     format: OutputFormat,
 ) -> Result<(), CliError> {
     let key = query.text();
-    // An exact index key opens before a project member is tried; the bundle
-    // is built only past both.
+    // An exact index key of a kind other than a stdlib member (a code, a
+    // construct, a command, an operator) opens first; then a member of a
+    // project module the key names; then a stdlib member, documented or not,
+    // from the one `DocIndex`. The bundle is built only past all three.
     let index = build_index()?;
+    if let Some(entry) = index.resolve(key)
+        && !matches!(entry.kind, ipe_docs::EntryKind::Symbol)
+    {
+        render_hit(Hit::Indexed(entry), format);
+        return Ok(());
+    }
+    // A project module shadows a stdlib module of the same short name, so a
+    // project module that exposes the member answers before a stdlib suffix
+    // key names another module's member.
+    if let Some((module, member)) = project_member(key, scope)? {
+        render_member(module, member, None, format);
+        return Ok(());
+    }
+    let (members, mut kernel) = build_doc_index()?;
+    match members.resolve(key) {
+        Some(MemberHit::One(row)) => {
+            let (module, written) = row_module_doc(row, &mut kernel)?;
+            render_member(&module, &row.name, written.as_ref(), format);
+            return Ok(());
+        }
+        Some(MemberHit::Ambiguous(rows)) => {
+            // A key two members share opens neither: the miss lists exactly
+            // the owners, each as the qualified term that opens it.
+            let bundle = build_doc_bundle_over(&index, &DocsOverlay::Embedded)?;
+            let entries: Vec<&DocEntry> = rows
+                .iter()
+                .filter_map(|row| {
+                    bundle
+                        .resolve_qualified(&format!("symbol:{}", row.qualified()))
+                        .ok()
+                })
+                .collect();
+            let closeness = if entries.is_empty() {
+                Closeness::Nothing
+            } else {
+                Closeness::Match
+            };
+            let ranked = Ranked {
+                entries,
+                closeness,
+                truncated: false,
+            };
+            return Err(miss_error(key, &ranked, format));
+        }
+        None => {}
+    }
     if let Some(entry) = index.resolve(key) {
         render_hit(Hit::Indexed(entry), format);
         return Ok(());
@@ -1046,7 +1113,7 @@ fn run_doc_lookup_with_fuzzy(
     // A member of a module the index does not carry (a project module).
     match resolve_member(key, scope)? {
         MemberResolution::Found(module, member) => {
-            render_member(&module, &member, format);
+            render_member(&module, &member, None, format);
             return Ok(());
         }
         MemberResolution::Ambiguous(candidates) => {
@@ -1145,6 +1212,28 @@ fn in_reserved_namespace(module_name: &str) -> bool {
     ipe_kernels::is_reserved_module_path(&module_name.split('.').collect::<Vec<_>>())
 }
 
+/// The project module `key`'s module part names, and the member, when that
+/// module exposes it. A name no discovered project module carries misses
+/// without a type-check.
+///
+/// # Errors
+/// [`CliError`] when the current directory's package cannot be read or typed.
+fn project_member<'s, 'k>(
+    key: &'k str,
+    scope: &'s ProjectScope,
+) -> Result<Option<(&'s ModuleDoc, &'k str)>, CliError> {
+    let Some((module_name, member)) = key.rsplit_once('.') else {
+        return Ok(None);
+    };
+    Ok(scope
+        .module(module_name)?
+        .filter(|module| {
+            module.values.iter().any(|v| v.name == member)
+                || module.unions.iter().any(|u| u.name == member)
+        })
+        .map(|module| (module, member)))
+}
+
 /// One `Module.member` resolution's outcome.
 #[derive(Debug)]
 pub(crate) enum MemberResolution {
@@ -1171,6 +1260,77 @@ fn ambiguous_module_error(query: &str, candidates: &[String], format: OutputForm
             crate::driver::emit_machine_error(format, "doc", &err)
         }
     }
+}
+
+/// The member [`DocIndex`] over every documented stdlib module, and the kernel
+/// module docs it was read from, so a hit in a kernel module is rendered
+/// without a second build.
+///
+/// # Errors
+/// [`CliError`] when the kernel type table cannot be built or a registered
+/// source does not parse.
+fn build_doc_index() -> Result<(DocIndex, BTreeMap<String, ModuleDoc>), CliError> {
+    let kernel = build_kernel_module_docs()?;
+    let index = DocIndex::build(|dotted| {
+        kernel.get(dotted).map_or_else(Vec::new, |doc| {
+            doc.values
+                .iter()
+                .map(|v| v.name.clone())
+                .chain(doc.unions.iter().map(|u| u.name.clone()))
+                .collect()
+        })
+    })
+    .map_err(|e| match e {
+        crate::doc_index::DocIndexError::Parse { module, diagnostic } => {
+            CliError::from(DiffError::Typecheck {
+                module: module.split('.').map(str::to_owned).collect(),
+                diag: diagnostic,
+            })
+        }
+    })?;
+    Ok((index, kernel))
+}
+
+/// The documented module `row` belongs to, and the written signatures of its
+/// source, when it has one.
+///
+/// Only the hit's own module is type-checked; a kernel module is taken from
+/// the `kernel` docs already built.
+///
+/// # Errors
+/// [`CliError`] when the module cannot be documented or its source does not parse.
+fn row_module_doc(
+    row: &Row,
+    kernel: &mut BTreeMap<String, ModuleDoc>,
+) -> Result<(ModuleDoc, Option<WrittenSignatures>), CliError> {
+    let dotted = row.module.dotted;
+    let segments: Vec<String> = dotted.split('.').map(str::to_owned).collect();
+    let (doc, source) = match row.module.role {
+        ipe_stdlib::Role::Kernel { veneer } => (
+            kernel
+                .remove(dotted)
+                .unwrap_or_else(|| empty_stdlib_module_doc(dotted)),
+            veneer,
+        ),
+        ipe_stdlib::Role::Compiled { source, .. }
+        | ipe_stdlib::Role::CompiledVeneer { source, .. } => (
+            build_compiled_std_module_doc(&segments, source)?,
+            Some(source),
+        ),
+        ipe_stdlib::Role::DocOnly { source } => (
+            build_source_only_module_doc(&segments, source),
+            Some(source),
+        ),
+        ipe_stdlib::Role::Retired => (empty_stdlib_module_doc(dotted), None),
+    };
+    let written = source
+        .map(WrittenSignatures::parse)
+        .transpose()
+        .map_err(|diag| DiffError::Typecheck {
+            module: segments,
+            diag: Box::new(diag),
+        })?;
+    Ok((doc, written))
 }
 
 /// Resolve `Module.member` to the module's doc and the member's name.
@@ -1229,27 +1389,44 @@ fn find_module_doc(module_name: &str, scope: &ProjectScope) -> Result<ModuleLook
     })
 }
 
-/// Render one member of `module` per `format`: its signature (or type
-/// declaration) and its doc comment.
-fn render_member(module: &ModuleDoc, member: &str, format: OutputFormat) {
+/// Render one member of `module` per `format`: the signature line first, then
+/// its doc comment.
+///
+/// A value's signature is its checked type, or the annotation of `written`
+/// when that agrees with it ([`crate::doc_signature`]). Every format carries
+/// the same signature: human and plain lead with `Module.member : Type`, and
+/// `--json` is the one [`member_json`] shape.
+fn render_member(
+    module: &ModuleDoc,
+    member: &str,
+    written: Option<&WrittenSignatures>,
+    format: OutputFormat,
+) {
     use crate::screen::{Screen, Stream, Tone, emit_machine};
     let key = format!("{}.{member}", module.name);
     let value = module.values.iter().find(|v| v.name == member);
     let union = module.unions.iter().find(|u| u.name == member);
-    let (declaration, comment) = match (value, union) {
-        (Some(v), _) => (
-            format!("{} : {}", v.name, v.signature.text()),
-            v.comment.as_str(),
-        ),
-        (None, Some(u)) => (
-            format!("type {}{}", u.name, union_params(u.params)),
-            u.comment.as_str(),
-        ),
-        (None, None) => (key.clone(), ""),
+    let (signature, heading, comment) = match (value, union) {
+        (Some(v), _) => {
+            let signature = match (written, v.signature.resolved()) {
+                (Some(written), Some(checked)) => {
+                    written.shown_for(&v.name, checked).text().to_owned()
+                }
+                _ => v.signature.text(),
+            };
+            let heading = format!("{key} : {signature}");
+            (signature, heading, v.comment.as_str())
+        }
+        (None, Some(u)) => {
+            let signature = format!("type {}{}", u.name, union_params(u.params));
+            let heading = format!("type {key}{}", union_params(u.params));
+            (signature, heading, u.comment.as_str())
+        }
+        (None, None) => (String::new(), key.clone(), ""),
     };
     match format {
         OutputFormat::Plain => {
-            let mut out = declaration;
+            let mut out = heading;
             out.push('\n');
             if !comment.is_empty() {
                 out.push_str(comment);
@@ -1258,25 +1435,32 @@ fn render_member(module: &ModuleDoc, member: &str, format: OutputFormat) {
             emit_machine(Stream::Stdout, &out);
         }
         OutputFormat::Json => {
-            let out = format!(
-                "{{\"kind\":\"symbol\",\"key\":{},\"text\":{}}}\n",
-                json_string(&key),
-                json_string(&format!("{declaration}\n{comment}")),
-            );
+            let mut out = member_json(&key, &module.name, member, &signature, comment);
+            out.push('\n');
             emit_machine(Stream::Stdout, &out);
         }
         OutputFormat::Human => {
             let mut screen = Screen::new(Stream::Stdout);
-            screen
-                .line(Tone::Text, &format!("{key}  [symbol]"))
-                .blank()
-                .line(Tone::Success, &declaration);
+            screen.line(Tone::Success, &heading);
             if !comment.is_empty() {
                 screen.blank().line(Tone::Text, comment);
             }
             screen.emit();
         }
     }
+}
+
+/// The one `--json` shape of a member entry, whichever route found it:
+/// `{kind, key, module, name, signature, contract, examples, see_also}`.
+fn member_json(key: &str, module: &str, name: &str, signature: &str, contract: &str) -> String {
+    format!(
+        "{{\"kind\":\"symbol\",\"key\":{},\"module\":{},\"name\":{},\"signature\":{},\"contract\":{},\"examples\":[],\"see_also\":[]}}",
+        json_string(key),
+        json_string(module),
+        json_string(name),
+        json_string(signature),
+        json_string(contract),
+    )
 }
 
 /// `ipe doc --type "<type expr>"` — search the stdlib API by type signature.
@@ -1348,12 +1532,11 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
             emit_machine(Stream::Stdout, &out);
         }
         OutputFormat::Json => {
-            let out = format!(
-                "{{\"kind\":{},\"key\":{},\"title\":{},\"body\":{}}}\n",
-                json_string(entry.kind.prefix()),
-                json_string(&entry.key),
-                json_string(&entry.title),
-                json_string(entry.body.as_str()),
+            let out = entry_json(
+                entry.kind.prefix(),
+                &entry.key,
+                &entry.title,
+                entry.body.as_str(),
             );
             emit_machine(Stream::Stdout, &out);
         }
@@ -1393,7 +1576,22 @@ fn render_doc_entry_plain(entry: &ipe_docs::Entry) -> String {
     out
 }
 
-/// JSON rendering of a documentation entry.
+/// The one `--json` shape of a non-member entry, whichever route found it:
+/// `{kind, key, title, body}`, newline-terminated. A member entry is
+/// [`member_json`].
+fn entry_json(kind: &str, key: &str, title: &str, body: &str) -> String {
+    format!(
+        "{{\"kind\":{},\"key\":{},\"title\":{},\"body\":{}}}\n",
+        json_string(kind),
+        json_string(key),
+        json_string(title),
+        json_string(body),
+    )
+}
+
+/// JSON rendering of a content-index entry, in the [`entry_json`] shape. The
+/// title is the explain page's heading for a code and the command summary for
+/// a command, as the bundle titles them; any other entry is titled by its key.
 fn render_doc_entry_json(entry: &ipe_docs::Entry) -> String {
     let kind = match entry.kind {
         ipe_docs::EntryKind::Symbol => "symbol",
@@ -1403,12 +1601,18 @@ fn render_doc_entry_json(entry: &ipe_docs::Entry) -> String {
         ipe_docs::EntryKind::Command => "command",
         ipe_docs::EntryKind::EnvVar => "env-var",
     };
-    format!(
-        "{{\"kind\":{},\"key\":{},\"text\":{}}}\n",
-        json_string(kind),
-        json_string(&entry.source_key),
-        json_string(&entry.text),
-    )
+    let title = match entry.kind {
+        ipe_docs::EntryKind::Diagnostic => explain_title(&entry.text),
+        ipe_docs::EntryKind::Command => {
+            crate::help::command_summary(&entry.source_key).map(str::to_owned)
+        }
+        ipe_docs::EntryKind::Symbol
+        | ipe_docs::EntryKind::Module
+        | ipe_docs::EntryKind::Construct
+        | ipe_docs::EntryKind::EnvVar => None,
+    }
+    .unwrap_or_else(|| entry.source_key.clone());
+    entry_json(kind, &entry.source_key, &title, &entry.text)
 }
 
 /// Human (rich) rendering of a documentation entry with ANSI colour.
@@ -1545,7 +1749,7 @@ fn open_picked(miss: DocMiss, scope: &ProjectScope) -> Result<(), CliError> {
     crate::screen::report_error(&CliError::DocNotFound { miss });
     let picked = crate::doc_pick::pick(
         &mut std::io::stdin().lock(),
-        &mut std::io::stderr(),
+        &mut crate::progress::Door::Stderr,
         terms.len(),
     );
     let chosen = match picked {
@@ -1844,28 +2048,14 @@ fn build_project_docs(path: &Path) -> Result<DocsJson, CliError> {
     })
 }
 
-/// Enumerate every stdlib module name (both compiled-source and kernel-qualifier),
-/// sorted alphabetically.
+/// Every documented stdlib module name, one per [`ipe_stdlib::STDLIB`] row
+/// that is not retired, sorted alphabetically.
 fn stdlib_module_names() -> Vec<String> {
-    let mut names: BTreeSet<String> = BTreeSet::new();
-
-    // Compiled-source modules (Ipe.Css, Ipe.Test, …).
-    for m in ipe_stdlib::COMPILED_STD_MODULES {
-        names.insert(m.dotted.to_owned());
-    }
-
-    // Documentation-only reserved qualifiers (Ipe.Ffi.Kernel, Ipe.Ffi.Rust).
-    for m in ipe_stdlib::DOC_ONLY_MODULES {
-        names.insert(m.dotted.to_owned());
-    }
-
-    // Kernel-qualifier modules (Ipe.List, Ipe.String, …).
-    for (segments, _qualifier) in ipe_canon::STDLIB_MODULE_QUALIFIERS {
-        names.insert(segments.join("."));
-    }
-
-    names.retain(|n| !is_retired_stdlib_module(n));
-
+    let names: BTreeSet<String> = ipe_stdlib::STDLIB
+        .iter()
+        .filter(|m| m.is_documented())
+        .map(|m| m.dotted.to_owned())
+        .collect();
     names.into_iter().collect()
 }
 
@@ -2032,6 +2222,16 @@ fn query_single_stdlib_module(module_name: &str) -> Result<StdlibModuleLookup, C
         }
     }
 
+    // A documentation-only module is read from its source alone.
+    for m in ipe_stdlib::DOC_ONLY_MODULES {
+        if m.dotted == dotted {
+            let segments: Vec<String> = m.dotted.split('.').map(str::to_owned).collect();
+            return Ok(StdlibModuleLookup::Found(build_source_only_module_doc(
+                &segments, m.source,
+            )));
+        }
+    }
+
     // 2. Kernel-qualifier: the type table is one shared db; take this entry.
     if let Some(doc) = build_kernel_module_docs()?.remove(&dotted) {
         return Ok(StdlibModuleLookup::Found(doc));
@@ -2179,12 +2379,15 @@ fn build_source_only_module_doc(segments: &[String], source: &str) -> ModuleDoc 
     }
 }
 
-/// Whether a stdlib module path is retired from the doc site.
+/// Whether a stdlib module path is retired from the doc site: its
+/// [`ipe_stdlib::STDLIB`] row is [`ipe_stdlib::Role::Retired`].
 ///
-/// `Ipe.Tea.Terminal` is superseded by `Ipe.Color`; the compiler still resolves
-/// its imports, but no doc page or module listing exposes the retired namespace.
+/// The compiler still resolves a retired module's imports, but no doc page or
+/// module listing exposes it.
 fn is_retired_stdlib_module(dotted: &str) -> bool {
-    dotted.starts_with("Ipe.Tea.Terminal")
+    ipe_stdlib::STDLIB
+        .iter()
+        .any(|m| m.dotted == dotted && matches!(m.role, ipe_stdlib::Role::Retired))
 }
 
 /// The builtin row a kernel type scheme names `Error` by, found at compile time.
@@ -2899,7 +3102,7 @@ fn query_module(
             Ok(())
         }
         ModuleQuery::Member(owner, member) => {
-            render_member(&owner, &member, format);
+            render_member(&owner, &member, None, format);
             Ok(())
         }
         ModuleQuery::Ambiguous(candidates) => {
@@ -3233,7 +3436,7 @@ fn collect_heads<'a>(ty: &'a TyDoc, homes: &mut BTreeMap<&'a str, BTreeSet<&'a s
 /// [`SigPiece::Link`] always carry identical display text, only one wrapped in
 /// link markup, so the flat string and the linked rendering can never drift
 /// apart the way two independently-written renderers could.
-fn plain_signature(ty: &TyDoc) -> String {
+pub(crate) fn plain_signature(ty: &TyDoc) -> String {
     let mut pieces = Vec::new();
     let heads = HeadStyle::of(ty);
     push_ty(ty, None, &heads, Prec::Top, &mut pieces);
@@ -6528,6 +6731,101 @@ mod tests {
         String::from_utf8(out).expect("a UTF-8 response")
     }
 
+    /// Every name a documented stdlib module exposes, read from the checked
+    /// module docs (`extract_stdlib_module` for a compiled module, the kernel
+    /// scheme table for a kernel one), is a row the `DocIndex` opens under its
+    /// qualified key: no exposed member is a miss. A compiled module's page
+    /// also lists its private unions; the `exposing` clause, not the page,
+    /// says which names are exposed.
+    #[test]
+    #[allow(clippy::panic)] // a module that cannot be documented IS the failure
+    fn every_exposed_name_has_a_row() {
+        use crate::doc_index::{Exposure, exposed_names};
+        let (members, kernel) = build_doc_index().expect("the member index builds");
+        let mut checked = 0_usize;
+        let mut private = 0_usize;
+        let mut missing: Vec<String> = Vec::new();
+        for module in ipe_stdlib::STDLIB {
+            let names: Vec<String> = match module.role {
+                ipe_stdlib::Role::Compiled { source, .. }
+                | ipe_stdlib::Role::CompiledVeneer { source, .. } => {
+                    let segments: Vec<String> =
+                        module.dotted.split('.').map(str::to_owned).collect();
+                    let doc = build_compiled_std_module_doc(&segments, source)
+                        .unwrap_or_else(|e| panic!("{} documents: {e:?}", module.dotted));
+                    let exposed = exposed_names(module.dotted, source, Exposure::Every)
+                        .unwrap_or_else(|e| panic!("{} parses: {e:?}", module.dotted));
+                    doc.values
+                        .into_iter()
+                        .map(|v| v.name)
+                        .chain(doc.unions.into_iter().map(|u| u.name))
+                        .filter(|name| {
+                            let kept = exposed.contains(name);
+                            if !kept {
+                                private += 1;
+                            }
+                            kept
+                        })
+                        .collect()
+                }
+                ipe_stdlib::Role::Kernel { .. } => {
+                    kernel.get(module.dotted).map_or_else(Vec::new, |doc| {
+                        doc.values
+                            .iter()
+                            .map(|v| v.name.clone())
+                            .chain(doc.unions.iter().map(|u| u.name.clone()))
+                            .collect()
+                    })
+                }
+                ipe_stdlib::Role::DocOnly { .. } | ipe_stdlib::Role::Retired => Vec::new(),
+            };
+            for name in names {
+                let qualified = format!("{}.{name}", module.dotted);
+                if !matches!(
+                    members.resolve(&qualified),
+                    Some(MemberHit::One(row)) if row.qualified() == qualified
+                ) {
+                    missing.push(qualified);
+                }
+                checked += 1;
+            }
+        }
+        assert!(missing.is_empty(), "exposed but with no row: {missing:?}");
+        assert!(checked > 100, "the walk is non-vacuous: {checked} names");
+        assert!(
+            private > 0,
+            "no page lists a private union any more: drop the exposing filter ({private})"
+        );
+    }
+
+    /// The content index's member arm is reached only after [`DocIndex`]
+    /// misses, so every member key it holds must be one [`DocIndex`] answers:
+    /// a key only the content index knows would render without its signature.
+    /// Operators are the content index's own symbol keys.
+    #[test]
+    fn every_content_index_member_key_is_a_doc_index_key() {
+        let (members, _kernel) = build_doc_index().expect("the member index builds");
+        let index = build_index().expect("the content index builds");
+        let mut compared = 0_usize;
+        let mut unanswered: Vec<&str> = index
+            .keys()
+            .filter(|key| {
+                index
+                    .resolve(key)
+                    .is_some_and(|entry| entry.kind == ipe_docs::EntryKind::Symbol)
+                    && key.chars().next().is_some_and(char::is_alphabetic)
+            })
+            .inspect(|_| compared += 1)
+            .filter(|key| members.resolve(key).is_none())
+            .collect();
+        unanswered.sort_unstable();
+        assert!(compared > 100, "the walk is non-vacuous: {compared} keys");
+        assert!(
+            unanswered.is_empty(),
+            "member keys only the content index answers: {unanswered:?}"
+        );
+    }
+
     #[test]
     fn build_kernel_module_docs_is_non_vacuous_over_the_live_registry() {
         let docs = build_kernel_module_docs().expect(
@@ -7272,6 +7570,7 @@ mod tests {
     fn every_listed_term_opens_its_entry_when_passed_back() {
         let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         let index = build_index().expect("the doc index builds");
+        let (members, _kernel) = build_doc_index().expect("the member index builds");
         let modules = stdlib_module_names();
         let mut checked = 0_usize;
         let mut listed = std::collections::BTreeSet::new();
@@ -7301,13 +7600,18 @@ mod tests {
                 } => {
                     assert_eq!(got.text(), term, "a listed term carries no edge whitespace");
                     assert_eq!(entry.kind, DocKind::Symbol, "{term:?}");
-                    let resolved = index.resolve(got.text());
-                    assert!(
-                        resolved.is_some_and(|e| matches!(e.kind, ipe_docs::EntryKind::Symbol)),
-                        "{term:?} must open the symbol through the index"
-                    );
+                    // A bare member term opens through the `DocIndex` ahead of
+                    // the content index, as `run_doc_lookup_with_fuzzy` routes it.
+                    let opened = match members.resolve(got.text()) {
+                        Some(MemberHit::One(row)) => Some(row.qualified()),
+                        Some(MemberHit::Ambiguous(_)) => None,
+                        None => index
+                            .resolve(got.text())
+                            .filter(|e| matches!(e.kind, ipe_docs::EntryKind::Symbol))
+                            .map(|e| e.source_key.clone()),
+                    };
                     assert_eq!(
-                        resolved.map(|e| e.source_key.as_str()),
+                        opened.as_deref(),
                         Some(entry.key.as_str()),
                         "{term:?} must open the very entry it was listed for"
                     );
@@ -7375,11 +7679,23 @@ mod tests {
             spellings > entries,
             "aliases fold into fewer entries: {spellings} spellings, {entries} entries"
         );
+        // A symbol entry is keyed by its canonical key in the content index, or
+        // is a member row the `DocIndex` files under that very qualified key.
+        let (members, _kernel) = build_doc_index().expect("the member index builds");
+        let unkeyed: Vec<&str> = bundle
+            .entries_for_kind(DocKind::Symbol)
+            .filter(|e| {
+                index.resolve(&e.key).is_none_or(|i| i.source_key != e.key)
+                    && !matches!(
+                        members.resolve(&e.key),
+                        Some(MemberHit::One(row)) if row.qualified() == e.key
+                    )
+            })
+            .map(|e| e.key.as_str())
+            .collect();
         assert!(
-            bundle
-                .entries_for_kind(DocKind::Symbol)
-                .all(|e| index.resolve(&e.key).is_some_and(|i| i.source_key == e.key)),
-            "every symbol entry is keyed by its own canonical key"
+            unkeyed.is_empty(),
+            "every symbol entry is keyed by its own canonical key: {unkeyed:?}"
         );
     }
 
@@ -8117,8 +8433,18 @@ mod tests {
             Some("IPE-L0107")
         );
         assert_eq!(
-            value.get("text").and_then(serde_json::Value::as_str),
+            value.get("body").and_then(serde_json::Value::as_str),
             Some(text)
+        );
+        let mut fields: Vec<&str> = value
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["body", "key", "kind", "title"],
+            "the one non-member shape"
         );
     }
 
@@ -10802,9 +11128,21 @@ total =
     fn lookup_misses_list_guide_agents() {
         let bundle = build_doc_bundle(&repo_overlay()).expect("the doc bundle builds");
         for raw in ["agent", "guide:agent", "AGENTS.md", "authoring"] {
-            let query = DocQuery::parse(raw).expect("a valid query");
-            let ranked =
-                crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query);
+            // Ranked as the lookup routes it: a `kind:key` miss ranks its key
+            // over that kind's entries, a bare miss over every entry.
+            let ranked = if let Err(crate::doc_bundle::BundleError::UnknownKey { kind, key }) =
+                bundle.resolve_qualified(raw)
+            {
+                let key = DocQuery::parse(&key).expect("a valid key");
+                crate::doc_search::rank(
+                    bundle.entries_for_kind(kind),
+                    bundle.aliases_for_kind(kind),
+                    &key,
+                )
+            } else {
+                let query = DocQuery::parse(raw).expect("a valid query");
+                crate::doc_search::rank(bundle.all_entries(), bundle.all_aliases(), &query)
+            };
             let err = miss_error(raw, &ranked, OutputFormat::Human);
             assert!(
                 matches!(err, CliError::DocNotFound { .. }),

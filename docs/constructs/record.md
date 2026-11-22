@@ -8,8 +8,6 @@ see_also: ["type-alias", "record-update", "type"]
 
 # `record` — named field collections
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 A record groups several values under named fields. Every field has a fixed name
 and type. Records are immutable — updating a field produces a new record; the
 original is unchanged.

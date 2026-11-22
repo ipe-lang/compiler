@@ -5,7 +5,7 @@
 //! the miss list ([`crate::doc_pick`]) and the unique-exact open both read this
 //! one ranking, so they can never disagree.
 //!
-//! The typo tier and the nearest fallback rank through the shared
+//! The typo tier ranks through the shared
 //! [`ipe_diagnostics::suggest`] ranker, over every spelling the exact lookup
 //! accepts: each entry's key and each alias, an alias scoring for its
 //! canonical entry and never listed itself.
@@ -130,13 +130,17 @@ pub enum Tier {
     Subsequence,
 }
 
-/// Whether a ranking found matches or fell back to the nearest entries.
+/// Whether a ranking found matches or found nothing.
+///
+/// A spelling within the shared ranker's [`Threshold::Relative`] typo bound is
+/// already a [`Tier::Typo`] match, so a ranking that matched nothing has no
+/// near spelling to offer: it lists no entry rather than unrelated ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closeness {
     /// At least one entry matched a [`Tier`].
     Match,
-    /// No entry matched; the hits are the entries nearest by edit distance.
-    Nearest,
+    /// No entry matched any [`Tier`]; the ranking lists nothing.
+    Nothing,
 }
 
 impl Closeness {
@@ -145,7 +149,7 @@ impl Closeness {
     pub const fn word(self) -> &'static str {
         match self {
             Self::Match => "match",
-            Self::Nearest => "nearest",
+            Self::Nothing => "nothing",
         }
     }
 }
@@ -155,7 +159,7 @@ impl Closeness {
 pub struct Ranked<'a> {
     /// The kept entries, in rank order.
     pub entries: Vec<&'a DocEntry>,
-    /// Whether the entries matched or are the nearest fallback.
+    /// Whether the entries matched, or nothing did and the list is empty.
     pub closeness: Closeness,
     /// Whether a ceiling cut the scan or the list, so more entries may fit.
     pub truncated: bool,
@@ -219,10 +223,8 @@ fn field_len(text: &str) -> usize {
 /// edit distance (zero for every other tier); kind and key are unique
 /// together, so the order is total and every run returns the same list. The
 /// key length counts at most [`FIELD_CHARS`] characters.
-/// When nothing matches, the hits are the entries nearest by edit distance,
-/// within [`Distance::CEILING`], ordered by `(distance, key length, kind,
-/// key)`; every spelling no longer than the compared width is within it, so a
-/// miss does not dead-end while such an entry exists.
+/// When nothing matches, the ranking is [`Closeness::Nothing`] and lists no
+/// entry: a spelling within the typo bound would have matched [`Tier::Typo`].
 #[must_use]
 pub fn rank<'a, I, A>(entries: I, aliases: A, query: &DocQuery) -> Ranked<'a>
 where
@@ -280,30 +282,10 @@ where
         .collect();
 
     if matched.is_empty() {
-        let nearest = suggest::rank(
-            &query.query,
-            universe(),
-            Policy {
-                cap: Cap::MAX,
-                threshold: Threshold::Nearest {
-                    max: Distance::CEILING,
-                },
-            },
-        );
-        let mut hits: Vec<(Distance, Peer<'a>)> = nearest
-            .hits
-            .iter()
-            .map(|h| (h.distance(), *h.target()))
-            .collect();
-        hits.sort_unstable();
         return Ranked {
-            entries: hits
-                .into_iter()
-                .filter_map(|(_, at)| scanned.get(&at).copied())
-                .take(RESULT_LIMIT)
-                .collect(),
-            closeness: Closeness::Nearest,
-            truncated: cut || nearest.truncated,
+            entries: Vec::new(),
+            closeness: Closeness::Nothing,
+            truncated: cut,
         };
     }
 
@@ -487,7 +469,7 @@ pub struct DocMiss {
     pub query: TerminalLine,
     /// The listed entries, best first.
     pub hits: Vec<DocHit>,
-    /// Whether the hits matched or are the nearest fallback.
+    /// Whether the hits matched, or nothing did and the list is empty.
     pub closeness: Closeness,
     /// Whether a ceiling cut the list.
     pub truncated: bool,
@@ -851,17 +833,16 @@ mod tests {
         let long = "日".repeat(suggest::DISTANCE_CHARS.saturating_mul(3));
         let wide = vec![entry(DocKind::Topic, &long, &long)];
         let ranked = plain(&wide, &query("本"));
-        assert_eq!(ranked.closeness, Closeness::Nearest);
-        assert_eq!(ranked.entries.len(), 1);
+        assert_eq!(ranked.closeness, Closeness::Nothing);
+        assert!(ranked.entries.is_empty());
     }
 
     #[test]
-    fn nothing_matching_falls_back_to_the_nearest_entries() {
+    fn nothing_matched_lists_nothing() {
         let selects = select_entries();
         let ranked = plain(&selects, &query("zzzzzzzzzzz"));
-        assert_eq!(ranked.closeness, Closeness::Nearest);
-        assert!(!ranked.entries.is_empty(), "never a dead end");
-        assert!(ranked.entries.len() <= RESULT_LIMIT);
+        assert_eq!(ranked.closeness, Closeness::Nothing);
+        assert!(ranked.entries.is_empty(), "no unrelated entry is listed");
         let empty: Vec<DocEntry> = Vec::new();
         let ranked = plain(&empty, &query("zzz"));
         assert!(ranked.entries.is_empty());
@@ -931,8 +912,8 @@ mod tests {
             .map(|n| entry(DocKind::Topic, &format!("t{n:02}"), "T"))
             .collect();
         let ranked = plain(&far, &query("zzzzzzzzzzzzz"));
-        assert_eq!(ranked.closeness, Closeness::Nearest);
-        assert_eq!(ranked.entries.len(), RESULT_LIMIT);
+        assert_eq!(ranked.closeness, Closeness::Nothing);
+        assert!(ranked.entries.is_empty());
     }
 
     #[test]

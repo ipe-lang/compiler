@@ -9,8 +9,6 @@ see_also: ["main", "state", "errors"]
 
 # `effects` — the Task discipline
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 In Ipê, a side effect — printing output, reading input, making an HTTP request,
 writing a file — is not executed immediately when your code reaches it. Instead,
 it is represented as a **value** of type `Task Error result`. You build a

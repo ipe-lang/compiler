@@ -454,12 +454,11 @@ fn run_fmt_stdin_from(reader: impl Read, check: bool) -> Result<(), CliError> {
             ));
         }
     } else {
-        std::io::Write::write_all(&mut std::io::stdout(), formatted.as_bytes()).map_err(|e| {
-            CliError::Io {
+        std::io::Write::write_all(&mut crate::progress::Door::Stdout, formatted.as_bytes())
+            .map_err(|e| CliError::Io {
                 path: PathBuf::from("<stdout>"),
                 source: e,
-            }
-        })?;
+            })?;
     }
 
     Ok(())
@@ -489,7 +488,7 @@ fn diff_eprint(label: &str, original: &str, formatted: &str) {
     // SAFETY: diff_eprint is only called in the `--check` path, which
     // typically targets stderr.  We write to stdout here to stay consistent
     // with how other formatters surface diffs (rustfmt prints to stdout).
-    let _ = std::io::Write::write_all(&mut std::io::stdout(), out.as_bytes());
+    let _ = std::io::Write::write_all(&mut crate::progress::Door::Stdout, out.as_bytes());
 }
 
 /// Map a [`FmtError`] onto the driver's [`CliError`] channel.

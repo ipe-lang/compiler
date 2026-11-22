@@ -49,7 +49,7 @@ view model =
     Ui.column
         [ Ui.spacing 16, Ui.padding 32, Ui.centerX ]
         [ Ui.el
-            [ Font.size 20, Font.bold ]
+            [ Font.size 20, Font.bold, Ui.centerX ]
             (Ui.text "Ipê counter")
         , Ui.row
             [ Ui.spacing 12 ]
@@ -62,7 +62,12 @@ view model =
                 ]
                 { onPress = Just Decrement, label = Ui.el [ Ui.centerX ] (Ui.text "-") }
             , Ui.el
-                [ Font.size 32, Font.bold ]
+                [ Font.size 32
+                , Font.bold
+                , Ui.width (Ui.minimum 96 Ui.shrink)
+                , Ui.centerY
+                , Font.center
+                ]
                 (Ui.text (String.fromInt model.count))
             , Ui.button
                 [ Ui.padding 12

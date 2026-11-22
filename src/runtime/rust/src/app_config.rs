@@ -212,25 +212,39 @@ impl ConfigError {
         }
     }
 
-    /// The operator-facing message naming the missing variable and its role. No
-    /// secret value is ever interpolated — only the variable NAME, which is not
-    /// itself sensitive.
+    /// The message naming the missing variable and its role, as a text value
+    /// (the variable name raw). No secret value is ever interpolated — only the
+    /// variable NAME, which is not itself sensitive.
     #[must_use]
     pub fn message(&self) -> String {
-        format!(
-            "required configuration secret is missing: set the `{}` environment variable \
-             (a required secret sourced via `App.fromEnvRequired` must not be empty; the \
-             server will not start until it is supplied)",
-            self.env_var
-        )
+        crate::system::refusal_text(self)
+    }
+
+    /// The stderr line [`Self::abort_startup`] writes: the variable name,
+    /// which the program computes at run time, escaped once inside its quotes.
+    #[must_use]
+    fn operator_line(&self) -> crate::system::ScrubbedLine {
+        crate::system::ScrubbedLine::of_refusal(self).after("configuration error: ")
     }
 
     /// Report this fail-closed config error to stderr and exit non-zero — the
     /// server never binds. `-> !`: this never returns, so a caller expecting a
     /// [`Secret`] uses it in value position without producing an empty secret.
     pub fn abort_startup(&self) -> ! {
-        crate::system::write_stderr_line(&format!("configuration error: {}", self.message()));
+        crate::system::write_stderr_line(&self.operator_line().to_string());
         crate::system::exit_process(crate::system::ProcessStatus::FAILURE)
+    }
+}
+
+impl crate::system::ScrubbedDisplay for ConfigError {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        out.write_str("required configuration secret is missing: set the ")?;
+        out.quote(&self.env_var);
+        out.write_str(
+            " environment variable (a required secret sourced via `App.fromEnvRequired` \
+             must not be empty; the server will not start until it is supplied)",
+        )
     }
 }
 
@@ -848,14 +862,14 @@ pub(crate) enum AuthStartupRefusal {
 }
 
 #[cfg(feature = "web")]
-impl std::fmt::Display for AuthStartupRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl crate::system::ScrubbedDisplay for AuthStartupRefusal {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
-            Self::Revocation(refusal) => write!(f, "{refusal}"),
-            Self::RevocationUnbound => write!(
-                f,
+            Self::Revocation(refusal) => refusal.render(out),
+            Self::RevocationUnbound => out.write_str(
                 "Web.withRevocation / IPE_AUTH_REVOCATION=store needs Ipe.Auth (no token \
-                 verifier is compiled into this app)"
+                 verifier is compiled into this app)",
             ),
         }
     }
@@ -1161,7 +1175,11 @@ mod tests {
         use std::os::unix::ffi::OsStringExt as _;
         let raw = std::ffi::OsString::from_vec(b"127.0.0.\xFF".to_vec());
         let outcome = host_bind_from(Err(std::env::VarError::NotUnicode(raw)), None);
-        assert!(outcome.is_err_and(|r| r.to_string().contains("\\xFF")));
+        assert!(outcome.is_err_and(|r| {
+            crate::system::ScrubbedLine::of_refusal(&r)
+                .to_string()
+                .contains("\\xFF")
+        }));
     }
 
     // ── CSRF: stricter-only, env may disable, setting may only enforce ────
@@ -1615,7 +1633,7 @@ mod tests {
             );
         }
         assert_eq!(
-            AuthStartupRefusal::RevocationUnbound.to_string(),
+            crate::system::refusal_text(&AuthStartupRefusal::RevocationUnbound),
             "Web.withRevocation / IPE_AUTH_REVOCATION=store needs Ipe.Auth (no token verifier \
              is compiled into this app)"
         );
@@ -1679,6 +1697,29 @@ mod tests {
             metrics,
             Setting::ConsoleToken(ConsoleTokenKind::Metrics, _)
         ));
+    }
+
+    #[test]
+    fn a_config_error_variable_name_cannot_forge_its_stderr_line() {
+        // The name is a run-time `String`: its line breaks, controls and quote
+        // stay inside one escaped quoted span on the single stderr line.
+        let err = ConfigError::missing_required_secret("X\"\n[ipe.live] forged\u{1b}[2J");
+        let line = err.operator_line().to_string();
+        assert!(
+            !line.contains('\n') && !line.contains('\u{1b}'),
+            "got: {line}"
+        );
+        assert_eq!(
+            line,
+            "configuration error: required configuration secret is missing: set the \
+             \"X\\\"\\n[ipe.live] forged\\u{1b}[2J\" environment variable (a required \
+             secret sourced via `App.fromEnvRequired` must not be empty; the server will \
+             not start until it is supplied)"
+        );
+        assert!(
+            err.message().contains("X\"\n[ipe.live] forged\u{1b}[2J"),
+            "the text value holds the name raw"
+        );
     }
 
     #[test]

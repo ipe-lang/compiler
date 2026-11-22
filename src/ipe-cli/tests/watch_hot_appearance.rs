@@ -490,6 +490,24 @@ impl EventSink {
             .count()
     }
 
+    /// The first event that ends a build: its compile refused, its cargo
+    /// build failed, or the supervisor took the new binary.
+    fn first_build_end(&self) -> Option<WatchEvent> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    WatchEvent::CompileFailed { .. }
+                        | WatchEvent::CargoFailed { .. }
+                        | WatchEvent::Restarted { .. }
+                )
+            })
+            .cloned()
+    }
+
     fn as_callback(&self) -> Arc<dyn Fn(WatchEvent) + Send + Sync> {
         let this = self.clone();
         Arc::new(move |e| this.push(e))
@@ -2324,4 +2342,43 @@ fn cmd_perform_effect_read_after_match_builds_hot() -> Result<(), BoxError> {
         &web_fixture_cmd_perform_label(READ_AFTER_MATCH_UPDATE),
         "a Cmd.perform effect reading a binding used after the case compiles and boots",
     )
+}
+
+/// `ipe dev watch` over a fresh `ipe init --shape tui` project, appearance
+/// hot-swap on: the emit `ipe` accepts must `cargo build`. A terminal app
+/// swaps appearance only, so its emit names no reader only a served web
+/// runtime compiles.
+#[test]
+#[allow(clippy::expect_used)] // a missing `ipe` binary or refused scaffold is a harness setup failure
+fn a_fresh_tui_project_builds_under_the_hot_watch() -> Result<(), BoxError> {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+    let (ipe_dir, out_dir) = fresh_dirs("tui_init")?;
+    let init = std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf())
+        .args(["init", "--shape", "tui"])
+        .arg(&ipe_dir)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run ipe init");
+    assert!(
+        init.status.success(),
+        "ipe init --shape tui succeeds; stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let sink = EventSink::default();
+    let (join, handle) = start_watch(&ipe_dir, &out_dir, 19197, &sink);
+    let ended = wait_for(Duration::from_mins(6), || sink.first_build_end().is_some());
+    let first = sink.first_build_end();
+    stop_and_join(&handle, join)?;
+    assert!(ended, "the first tui build never ended");
+    assert!(
+        matches!(first, Some(WatchEvent::Restarted { .. })),
+        "the hot tui build must compile and cargo-build, got {first:?}"
+    );
+    let _ = std::fs::remove_dir_all(ipe_dir.parent().unwrap_or(&ipe_dir));
+    Ok(())
 }

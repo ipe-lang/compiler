@@ -59,7 +59,7 @@ src/runtime/rust/src/web/mod.rs 22
 src/runtime/rust/src/web/observability.rs 3
 src/runtime/rust/src/web/push_exporter.rs 9
 src/runtime/rust/src/web/sse.rs 1
-src/runtime/rust/src/web/store.rs 2
+src/runtime/rust/src/web/store.rs 1
 src/runtime/rust/src/ws_client.rs 2
 tools/e2e-support/src/bin.rs 2
 tools/e2e-support/src/lib.rs 1

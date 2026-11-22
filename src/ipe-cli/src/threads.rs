@@ -40,7 +40,7 @@ pub enum ThreadRole {
     WatchCargoWaiter,
     /// Enforces a WASI run's wall-clock ceiling.
     WasiWallClock,
-    /// Paints a progress spinner on stderr while a slow step runs.
+    /// Paints a stage or pending spinner on stdout or stderr while a slow step runs.
     ProgressTicker,
 }
 

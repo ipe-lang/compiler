@@ -8,8 +8,6 @@ see_also: ["type", "record"]
 
 # `type alias` — named type abbreviations
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 A `type alias` declaration gives an alternative name to an existing type. The
 compiler treats the alias and the original as interchangeable — they are the
 same type, just spelled differently.

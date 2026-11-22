@@ -67,6 +67,7 @@ use std::fmt::Write as _;
 use crate::emit_template::write_json_string;
 use ipe_intern::Symbol;
 use ipe_ir::{Callee, Expr, FuncId, KernelFn, Match};
+use ipe_runtime_rust::length::PxBounds;
 
 /// The render/decode nesting ceiling, mirrored from the runtime
 /// (`ipe_runtime::ui::template::MAX_UI_TEMPLATE_DEPTH`). Kept as a local constant
@@ -146,7 +147,8 @@ impl CompileUiColor {
 }
 
 /// A `Length` reduced to inert data — integer-valued shapes only. Mirrors the
-/// runtime `UiLength`; the `Min` / `Max` recursive shapes carry an inner length.
+/// runtime `UiLength` wire; [`static_length`] only builds the normal form
+/// `Min(lo, Max(hi, base))`, an absent bound omitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompileUiLength {
     Px(i64),
@@ -1805,28 +1807,54 @@ fn push_handler_hole(event: &'static str, msg: &Expr, holes: &mut Holes) -> Opti
 /// Reduce a `Length`-producing kernel call over literal arguments to inert data,
 /// or `None`. Only integer-valued `Length`s templatize; a `Model`-derived length
 /// refuses.
+///
+/// A `minimum` / `maximum` chain folds in nesting order through the runtime's
+/// own [`PxBounds`] — the fold the kernels run — and is written in the normal
+/// form `Min(lo, Max(hi, base))`. The walk is iterative, so the chain depth never
+/// drives the compiler's stack.
 fn static_length(expr: &Expr) -> Option<CompileUiLength> {
-    let Expr::Call { callee, args, .. } = expr else {
-        return None;
-    };
-    let Callee::Kernel(k) = callee else {
-        return None;
-    };
-    match (k, args.as_slice()) {
-        (KernelFn::UiPx, [Expr::Int(n)]) => Some(CompileUiLength::Px(*n)),
-        (KernelFn::UiFill, []) => Some(CompileUiLength::Fill(1)),
-        (KernelFn::UiFillPortion, [Expr::Int(n)]) => Some(CompileUiLength::Fill(*n)),
-        (KernelFn::UiContent | KernelFn::UiShrink, []) => Some(CompileUiLength::Content),
-        (KernelFn::UiVh, [Expr::Int(n)]) => Some(CompileUiLength::Vh(*n)),
-        (KernelFn::UiVw, [Expr::Int(n)]) => Some(CompileUiLength::Vw(*n)),
-        (KernelFn::UiMinimum, [Expr::Int(n), inner]) => {
-            Some(CompileUiLength::Min(*n, Box::new(static_length(inner)?)))
+    let mut spine: Vec<(bool, i64)> = Vec::new();
+    let mut cur = expr;
+    let base = loop {
+        let Expr::Call { callee, args, .. } = cur else {
+            return None;
+        };
+        let Callee::Kernel(k) = callee else {
+            return None;
+        };
+        match (k, args.as_slice()) {
+            (KernelFn::UiMinimum, [Expr::Int(n), inner]) => {
+                spine.push((true, *n));
+                cur = inner;
+            }
+            (KernelFn::UiMaximum, [Expr::Int(n), inner]) => {
+                spine.push((false, *n));
+                cur = inner;
+            }
+            (KernelFn::UiPx, [Expr::Int(n)]) => break CompileUiLength::Px(*n),
+            (KernelFn::UiFill, []) => break CompileUiLength::Fill(1),
+            (KernelFn::UiFillPortion, [Expr::Int(n)]) => break CompileUiLength::Fill(*n),
+            (KernelFn::UiContent | KernelFn::UiShrink, []) => break CompileUiLength::Content,
+            (KernelFn::UiVh, [Expr::Int(n)]) => break CompileUiLength::Vh(*n),
+            (KernelFn::UiVw, [Expr::Int(n)]) => break CompileUiLength::Vw(*n),
+            _ => return None,
         }
-        (KernelFn::UiMaximum, [Expr::Int(n), inner]) => {
-            Some(CompileUiLength::Max(*n, Box::new(static_length(inner)?)))
+    };
+    let bounds = spine.iter().rev().fold(PxBounds::NONE, |b, (at_least, n)| {
+        if *at_least {
+            b.at_least(*n)
+        } else {
+            b.at_most(*n)
         }
-        _ => None,
-    }
+    });
+    let capped = match bounds.upper() {
+        Some(hi) => CompileUiLength::Max(hi, Box::new(base)),
+        None => base,
+    };
+    Some(match bounds.lower() {
+        Some(lo) => CompileUiLength::Min(lo, Box::new(capped)),
+        None => capped,
+    })
 }
 
 /// Reduce a `Color`-producing kernel call over literal arguments to inert data,
@@ -2099,6 +2127,76 @@ mod tests {
                 children: vec![],
             }
         );
+    }
+
+    /// Refusal of a baked bound chain that disagrees with the runtime fold: a
+    /// non-normal `maximum 200 (minimum 40 (maximum 300 fill))` bakes as the
+    /// folded normal form `Min(40, Max(200, Fill 1))`.
+    #[test]
+    fn static_length_emits_normal_form() {
+        let chain = kcall(
+            KernelFn::UiMaximum,
+            vec![
+                Expr::Int(200),
+                kcall(
+                    KernelFn::UiMinimum,
+                    vec![
+                        Expr::Int(40),
+                        kcall(
+                            KernelFn::UiMaximum,
+                            vec![Expr::Int(300), kcall(KernelFn::UiFill, vec![])],
+                        ),
+                    ],
+                ),
+            ],
+        );
+        let node = kcall(
+            KernelFn::UiNode,
+            vec![
+                desc_none(),
+                attr_list(vec![kcall(KernelFn::UiHeight, vec![chain])]),
+                child_list(vec![]),
+            ],
+        );
+        let got = ui_template_of_expr(&node, None).expect("templatable");
+        let CompileUiTemplate::Node { attrs, .. } = got else {
+            assert!(matches!(got, CompileUiTemplate::Node { .. }), "{got:?}");
+            return;
+        };
+        let json: Vec<String> = attrs.iter().map(CompileUiAttr::attr_json).collect();
+        assert_eq!(
+            json,
+            vec![r#"{"Height":{"Min":[40,{"Max":[200,{"Fill":1}]}]}}"#]
+        );
+
+        // The outer cap wins over an inner floor, and a negative bound clamps.
+        let crossed = kcall(
+            KernelFn::UiNode,
+            vec![
+                desc_none(),
+                attr_list(vec![kcall(
+                    KernelFn::UiWidth,
+                    vec![kcall(
+                        KernelFn::UiMaximum,
+                        vec![
+                            Expr::Int(-5),
+                            kcall(
+                                KernelFn::UiMinimum,
+                                vec![Expr::Int(30), kcall(KernelFn::UiShrink, vec![])],
+                            ),
+                        ],
+                    )],
+                )]),
+                child_list(vec![]),
+            ],
+        );
+        let got = ui_template_of_expr(&crossed, None).expect("templatable");
+        let CompileUiTemplate::Node { attrs, .. } = got else {
+            assert!(matches!(got, CompileUiTemplate::Node { .. }), "{got:?}");
+            return;
+        };
+        let json: Vec<String> = attrs.iter().map(CompileUiAttr::attr_json).collect();
+        assert_eq!(json, vec![r#"{"Width":{"Min":[0,{"Max":[0,"Content"]}]}}"#]);
     }
 
     // ── acceptance: structural wrapper resolution ─────────────────────────────
@@ -3014,6 +3112,13 @@ mod tests {
             desc: CompileUiDesc::DescHeading(2),
             attrs: vec![
                 CompileUiAttr::Width(CompileUiLength::Max(320, Box::new(CompileUiLength::Vh(80)))),
+                CompileUiAttr::Height(CompileUiLength::Min(
+                    40,
+                    Box::new(CompileUiLength::Max(
+                        200,
+                        Box::new(CompileUiLength::Fill(1)),
+                    )),
+                )),
                 CompileUiAttr::Padding(1, 2, 3, 4),
                 CompileUiAttr::Style("k".to_string(), "v".to_string()),
                 CompileUiAttr::AlignX("CenterX"),
@@ -3040,7 +3145,9 @@ mod tests {
         };
         let expected = concat!(
             r#"{"TaggedNode":{"tag":"section","desc":{"DescHeading":2},"attrs":["#,
-            r#"{"Width":{"Max":[320,{"Vh":80}]}},{"Padding":[1,2,3,4]},{"Style":["k","v"]},"#,
+            r#"{"Width":{"Max":[320,{"Vh":80}]}},"#,
+            r#"{"Height":{"Min":[40,{"Max":[200,{"Fill":1}]}]}},"#,
+            r#"{"Padding":[1,2,3,4]},{"Style":["k","v"]},"#,
             r#"{"AlignX":"CenterX"},"Pointer",{"FontAlign":"center"},"#,
             r#"{"FontColor":{"r":10,"g":20,"b":30,"a":1.0}},"#,
             r#"{"BgColor":{"r":1,"g":2,"b":3,"a":0.25}},{"FontLetterSpacing":1.5}],"#,

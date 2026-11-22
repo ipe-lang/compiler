@@ -20,7 +20,7 @@
 //! The extractor never authors prose: it only relays comment text and the
 //! `name : Type` signature line exactly as they appear in the source.
 
-use ipe_stdlib::{COMPILED_STD_MODULES, DOC_ONLY_MODULES, MODULES as STDLIB_MODULES, StdTier};
+use ipe_stdlib::{Role, STDLIB, StdTier};
 
 /// A single documented export of a stdlib module.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,32 +57,24 @@ pub struct ModuleDoc {
     pub tier: StdTier,
 }
 
-/// Extract documentation for every embedded stdlib module (both the
-/// kernel-veneer `MODULES` and the compiled-source `COMPILED_STD_MODULES`),
-/// sorted by short module name.
+/// Extract documentation for every registered stdlib module that carries a
+/// source, one per [`STDLIB`] row, sorted by short module name.
 #[must_use]
 pub fn all_module_docs() -> Vec<ModuleDoc> {
-    let mut out: Vec<ModuleDoc> = Vec::new();
-
-    for m in STDLIB_MODULES {
-        out.push(extract_module_doc(m.name, m.source));
-    }
-    for m in COMPILED_STD_MODULES {
-        let mut doc = extract_module_doc(m.dotted, m.source);
-        // The tier is this row's own typed field, never re-derived from
-        // `dotted`'s spelling.
-        doc.tier = m.tier;
-        out.push(doc);
-    }
-    for m in DOC_ONLY_MODULES {
-        out.push(extract_module_doc(m.dotted, m.source));
-    }
-
+    let mut out: Vec<ModuleDoc> = STDLIB
+        .iter()
+        .filter(|row| row.is_documented())
+        .filter_map(|row| {
+            let mut doc = extract_module_doc(row.dotted, row.source()?);
+            // The tier is this row's own typed field, never re-derived from
+            // `dotted`'s spelling.
+            if let Role::Compiled { tier, .. } | Role::CompiledVeneer { tier, .. } = row.role {
+                doc.tier = tier;
+            }
+            Some(doc)
+        })
+        .collect();
     out.sort_by(|a, b| a.short.cmp(&b.short));
-    // A module may appear in both `MODULES` (kernel veneer) and
-    // `COMPILED_STD_MODULES` (compiled source) — e.g. `Ipe.Char`, which shares
-    // one embedded source. Emit each short name once.
-    out.dedup_by(|a, b| a.short == b.short);
     out
 }
 

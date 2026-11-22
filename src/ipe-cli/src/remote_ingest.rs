@@ -752,6 +752,8 @@ pub fn run_inherited(
             Some(bytes)
         }
     };
+    // The child writes to the terminal unarbitrated, so no stage paints until it exits.
+    let _terminal = crate::progress::hand_over();
     let mut child =
         ipe_runtime_rust::system::spawn_hardened(command).map_err(InheritedError::Spawn)?;
     let Some(bytes) = bytes else {

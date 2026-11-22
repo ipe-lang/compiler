@@ -20,6 +20,7 @@
 use std::num::NonZeroU32;
 
 use super::super::html::{Attribute as HtmlAttribute, Html};
+use crate::length::PxBounds;
 
 /// `Ipe.Ui.Color` = `Rgba Int Int Int Float` (R/G/B 0-255 ints, alpha 0..1).
 #[derive(Clone, Debug, PartialEq)]
@@ -62,57 +63,143 @@ impl Portion {
     }
 }
 
-/// `Ipe.Ui.Length`. `Min`/`Max` are self-recursive → `Box` (E0072 otherwise).
-#[derive(Clone, Debug, PartialEq)]
-pub enum Length {
+/// The size an `Ipe.Ui.Length` asks for before its `minimum` / `maximum` bounds.
+///
+/// A bound is never a base: bounds fold into the [`Length`]'s [`PxBounds`], so
+/// no consumer walks a wrapper chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BaseLength {
+    /// `Ui.px n`.
     Px(i64),
+    /// `Ui.content` / `Ui.shrink`: the content's natural size.
     Content,
+    /// `Ui.fill` / `Ui.fillPortion n`: a share of the parent's leftover space.
     Fill(Portion),
-    Min(i64, Box<Length>),
-    Max(i64, Box<Length>),
+    /// `Ui.vh n`: percent of the viewport height.
     Vh(i64),
+    /// `Ui.vw n`: percent of the viewport width.
     Vw(i64),
 }
 
+impl BaseLength {
+    /// The unit spelling of a `Px` / `Vh` / `Vw` base, `None` for a base with
+    /// no single-unit CSS value.
+    ///
+    /// The shared units are spelled by the one runtime renderer
+    /// ([`crate::length::CssUnit`]), byte-equal to `Ipe.Css.lengthToString`
+    /// (held by the `css_length_color_ssot` equivalence guards).
+    #[must_use]
+    pub(crate) fn unit_css(self) -> Option<String> {
+        use crate::length::CssUnit;
+        match self {
+            Self::Px(n) => Some(CssUnit::Px.css(n)),
+            Self::Vh(n) => Some(CssUnit::Vh.css(n)),
+            Self::Vw(n) => Some(CssUnit::Vw.css(n)),
+            Self::Content | Self::Fill(_) => None,
+        }
+    }
+}
+
+/// A size quantity floored at 0: a negative size has no CSS value (a browser
+/// drops the declaration) and no cell count, so every backend reads it as 0.
+const fn non_negative(n: i64) -> i64 {
+    if n < 0 { 0 } else { n }
+}
+
+/// `Ipe.Ui.Length`: a non-negative base size clamped by a non-negative px
+/// interval.
+///
+/// The flat normal form of every `minimum` / `maximum` chain, folded in nesting
+/// order by [`PxBounds`] when the chain is built, so the carrier is `Copy` at any
+/// program nesting depth and every backend applies the same clamp
+/// `max(lo, min(hi, base))`. A bounded value has no single CSS value; the web
+/// renderer writes the base and each bound as separate declarations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Length {
+    base: BaseLength,
+    bounds: PxBounds,
+}
+
 impl Length {
+    const fn unbounded(base: BaseLength) -> Self {
+        Self {
+            base,
+            bounds: PxBounds::NONE,
+        }
+    }
+
+    /// `Ui.px n`; a negative `n` is 0, the smallest size any backend lays out.
+    #[must_use]
+    pub const fn px(n: i64) -> Self {
+        Self::unbounded(BaseLength::Px(non_negative(n)))
+    }
+
+    /// `Ui.content` / `Ui.shrink`.
+    #[must_use]
+    pub const fn content() -> Self {
+        Self::unbounded(BaseLength::Content)
+    }
+
+    /// A fill of `portion` shares.
+    #[must_use]
+    pub const fn fill(portion: Portion) -> Self {
+        Self::unbounded(BaseLength::Fill(portion))
+    }
+
+    /// `Ui.vh n`; a negative `n` is 0.
+    #[must_use]
+    pub const fn vh(n: i64) -> Self {
+        Self::unbounded(BaseLength::Vh(non_negative(n)))
+    }
+
+    /// `Ui.vw n`; a negative `n` is 0.
+    #[must_use]
+    pub const fn vw(n: i64) -> Self {
+        Self::unbounded(BaseLength::Vw(non_negative(n)))
+    }
+
     /// `Ui.fillPortion n`: a fill of `n` shares, or `Content` (`Ui.shrink`) when
     /// `n <= 0`, so a non-positive portion is content-sized on every backend.
     #[must_use]
     pub fn fill_portion(n: i64) -> Self {
-        Portion::from_int(n).map_or(Self::Content, Self::Fill)
+        Portion::from_int(n).map_or_else(Self::content, Self::fill)
     }
 
-    /// Render this length to its CSS value string. The single renderer for the
-    /// `Ipe.Ui.Length` domain, shared by the inline-style and stylesheet paths.
-    ///
-    /// `Fill(n)` renders `100%`; the flex sizing (`flex-grow:n`, `flex-basis:0`)
-    /// that divides free space depends on the parent's flex axis, so the
-    /// parent-aware `render::size_css` emits it, not this context-free renderer.
-    ///
-    /// `Min(n, l)` is a lower bound (CSS `max(npx, l)`, never below `n`) and
-    /// `Max(n, l)` an upper bound (CSS `min(npx, l)`, never above `n`), the same
-    /// bounds the TUI layout applies.
-    ///
-    /// The shared `Px`/`Vh`/`Vw` units are spelled by the one runtime renderer
-    /// ([`crate::length::CssUnit`]); `Ipe.Ui`'s `Length` is a surface carrier
-    /// that funnels those shared shapes into `ipe_runtime::length` rather than
-    /// re-deriving the spelling. Byte-for-byte equivalence with the pure-Ipê
-    /// `Ipe.Css.lengthToString` is enforced by the `css_length_color_ssot`
-    /// equivalence test.
+    /// `Ui.minimum n self`: never smaller than `n` px.
     #[must_use]
-    pub(crate) fn css(&self) -> String {
-        use crate::length::CssUnit;
-        match self {
-            Self::Px(n) => CssUnit::Px.css(*n),
-            Self::Content => "auto".to_owned(),
-            Self::Fill(_) => "100%".to_owned(),
-            Self::Min(n, inner) => format!("max({},{})", CssUnit::Px.css(*n), inner.css()),
-            Self::Max(n, inner) => format!("min({},{})", CssUnit::Px.css(*n), inner.css()),
-            Self::Vh(n) => CssUnit::Vh.css(*n),
-            Self::Vw(n) => CssUnit::Vw.css(*n),
+    pub fn at_least(self, n: i64) -> Self {
+        Self {
+            base: self.base,
+            bounds: self.bounds.at_least(n),
         }
     }
+
+    /// `Ui.maximum n self`: never larger than `n` px.
+    #[must_use]
+    pub fn at_most(self, n: i64) -> Self {
+        Self {
+            base: self.base,
+            bounds: self.bounds.at_most(n),
+        }
+    }
+
+    /// The size asked for before the bounds.
+    #[must_use]
+    pub const fn base(self) -> BaseLength {
+        self.base
+    }
+
+    /// The folded `minimum` / `maximum` bounds.
+    #[must_use]
+    pub const fn bounds(self) -> PxBounds {
+        self.bounds
+    }
 }
+
+// The carrier stays flat: a `Length` is a fixed-size `Copy` value however
+// deeply a program nests its bounds.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `Length` grows past a flat carrier [ledger #boundary]
+const _: () = assert!(std::mem::size_of::<Length>() <= 48);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum HAlign {
@@ -775,42 +862,83 @@ mod tests {
         assert_eq!(style, format!("background-color:{direct}"));
     }
 
-    // SSOT: a length formats identically through the inline-style path (sized
-    // with no flex parent) and the direct `Length::css` renderer, including the
-    // recursive `Min`/`Max` arms.
-    #[test]
-    fn length_renders_identically_across_paths() {
-        let len = Length::Max(320, Box::new(Length::Vh(80)));
-        let direct = len.css();
-
-        enum Msg {}
-        let style =
-            super::super::render::block_style_string(&[Attribute::<Msg>::AttrWidth(len.clone())]);
-
-        assert_eq!(direct, "min(320px,80vh)");
-        assert_eq!(style, format!("width:{direct}"));
-
-        let floor = Length::Min(100, Box::new(Length::Fill(Portion::ONE)));
-        assert_eq!(floor.css(), "max(100px,100%)", "minimum is a lower bound");
-    }
-
-    // Cross-language SSOT equivalence: `Length::css` output must be byte-for-byte
-    // identical to `Ipe.Css.lengthToString` for every shared value shape.
+    // Cross-language SSOT equivalence: `BaseLength::unit_css` output must be
+    // byte-for-byte identical to `Ipe.Css.lengthToString` for every shared value
+    // shape.
     //
     // Shared shapes: `Px n`, `Vh n`, `Vw n`.
-    // Out of scope (no `Ipe.Css` spelling): `Fill`/`Content`/`Min`/`Max` are
-    // layout-intent lengths in `Ipe.Ui` with no counterpart in `Ipe.Css`.
+    // Out of scope (no `Ipe.Css` spelling): `Fill`/`Content` and the
+    // `minimum`/`maximum` bounds are layout intent in `Ipe.Ui` with no
+    // counterpart in `Ipe.Css`.
     // The `.ipe` side of this assertion is exercised by the
     // `golden_css_length_color_ssot` fixture in the `g_stdui` integration suite.
     #[test]
     fn length_css_matches_ipe_css_length_to_string_for_shared_shapes() {
-        assert_eq!(Length::Px(0).css(), "0px");
-        assert_eq!(Length::Px(16).css(), "16px");
-        assert_eq!(Length::Px(100).css(), "100px");
-        assert_eq!(Length::Vh(50).css(), "50vh");
-        assert_eq!(Length::Vh(100).css(), "100vh");
-        assert_eq!(Length::Vw(50).css(), "50vw");
-        assert_eq!(Length::Vw(100).css(), "100vw");
+        let unit = |b: BaseLength| b.unit_css();
+        assert_eq!(unit(BaseLength::Px(0)).as_deref(), Some("0px"));
+        assert_eq!(unit(BaseLength::Px(16)).as_deref(), Some("16px"));
+        assert_eq!(unit(BaseLength::Px(100)).as_deref(), Some("100px"));
+        assert_eq!(unit(BaseLength::Vh(50)).as_deref(), Some("50vh"));
+        assert_eq!(unit(BaseLength::Vh(100)).as_deref(), Some("100vh"));
+        assert_eq!(unit(BaseLength::Vw(50)).as_deref(), Some("50vw"));
+        assert_eq!(unit(BaseLength::Vw(100)).as_deref(), Some("100vw"));
+        assert_eq!(unit(BaseLength::Content), None);
+        assert_eq!(unit(BaseLength::Fill(Portion::ONE)), None);
+    }
+
+    // A bounded length renders through the one width renderer: the base and each
+    // bound as separate declarations, never a CSS math function.
+    #[test]
+    fn length_renders_identically_across_paths() {
+        let len = Length::vh(80).at_most(320);
+        enum Msg {}
+        let style = super::super::render::block_style_string(&[Attribute::<Msg>::AttrWidth(len)]);
+        assert_eq!(style, "width:80vh;max-width:320px");
+        let floor = Length::fill(Portion::ONE).at_least(100);
+        let style = super::super::render::block_style_string(&[Attribute::<Msg>::AttrWidth(floor)]);
+        assert_eq!(
+            style, "width:100%;min-width:100px",
+            "minimum is a lower bound"
+        );
+    }
+
+    /// Refusal of a program-depth carrier: a million alternated bounds stay one
+    /// flat `Copy` value that renders, lays out and drops on a small stack.
+    #[test]
+    fn deep_bound_chain_is_flat() {
+        use super::super::helpers::{ui_maximum_, ui_minimum_, ui_shrink_};
+        let worker = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut len = ui_shrink_();
+                for i in 0..1_000_000_i64 {
+                    len = if i % 2 == 0 {
+                        ui_minimum_(i % 500, len)
+                    } else {
+                        ui_maximum_(1000 - i % 400, len)
+                    };
+                }
+                enum Msg {}
+                let css =
+                    super::super::render::block_style_string(&[Attribute::<Msg>::AttrWidth(len)]);
+                #[cfg(feature = "tui")]
+                {
+                    let view: Element<()> = Element::Node(
+                        Description::NoDescription,
+                        vec![Attribute::AttrWidth(len)],
+                        vec![Element::Text("x".into())],
+                    );
+                    let _ = crate::tui::layout::element_to_cells(&view, 40, 10);
+                }
+                css
+            });
+        #[allow(clippy::expect_used)] // a failed spawn is a test-harness fault, not the subject
+        let worker = worker.expect("spawn the small-stack worker");
+        let css = worker.join();
+        assert!(
+            matches!(css.as_deref(), Ok(s) if s.starts_with("width:fit-content")),
+            "{css:?}"
+        );
     }
 
     // Cross-language SSOT equivalence: `Color::css` output must be byte-for-byte

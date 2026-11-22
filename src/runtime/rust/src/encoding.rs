@@ -1867,19 +1867,18 @@ impl std::fmt::Display for RouteSegmentRefusal {
 /// not parse.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RoutePatternRefusal {
-    /// The pattern text as registered, scrubbed where the refusal is built.
+    /// The pattern text as registered, held raw.
     pub pattern: crate::system::RefusedText,
     /// Why its first malformed segment was refused.
     pub refusal: RouteSegmentRefusal,
 }
 
-impl std::fmt::Display for RoutePatternRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "route pattern `{}` is malformed: {}",
-            self.pattern, self.refusal
-        )
+impl crate::system::ScrubbedDisplay for RoutePatternRefusal {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        out.write_str("route pattern ")?;
+        crate::system::ScrubbedDisplay::render(&self.pattern, out)?;
+        write!(out, " is malformed: {}", self.refusal)
     }
 }
 

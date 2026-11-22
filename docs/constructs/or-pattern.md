@@ -8,8 +8,6 @@ see_also: ["case", "type"]
 
 # `or-pattern` — `|` in case branches
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 An or-pattern lets two or more patterns share a single branch body inside a
 `case` expression. Write the alternatives separated by `|` on the left side
 of `->`.

@@ -2350,8 +2350,8 @@ enum StoreBackend {
 /// A requested backend this build cannot serve — a fail-closed startup error.
 ///
 /// The only text it quotes from outside the runtime, a connect refusal's
-/// cause, is held as [`crate::system::RefusedText`], so its `Display` is safe
-/// for a log line as is.
+/// cause, is held raw as [`crate::system::RefusedText`] and written through
+/// the refusal's render, escaped once for a log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreConfigError {
     /// `IPE_WEB_STORE` names a backend this build was compiled without.
@@ -2370,24 +2370,29 @@ pub enum StoreConfigError {
     },
 }
 
-impl std::fmt::Display for StoreConfigError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+/// The variable a [`StoreConfigError`] names in its fix.
+const STORE_VAR: &str = "IPE_WEB_STORE";
+
+impl crate::system::ScrubbedDisplay for StoreConfigError {
+    fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
             Self::FeatureAbsent { backend, feature } => write!(
-                f,
-                "IPE_WEB_STORE={backend} requested but this build has no `{feature}` feature; \
-                 build with `{feature}` or set IPE_WEB_STORE=file|memory"
+                out,
+                "{STORE_VAR}={backend} requested but this build has no `{feature}` feature; \
+                 build with `{feature}` or set {STORE_VAR}=file|memory"
             ),
-            Self::Refused { backend, cause } => write!(
-                f,
-                "IPE_WEB_STORE={backend} refused at connect ({cause}); fix the connection URL \
-                 or the server, or set IPE_WEB_STORE=file|memory"
-            ),
+            Self::Refused { backend, cause } => {
+                write!(out, "{STORE_VAR}={backend} refused at connect (")?;
+                cause.render(out)?;
+                write!(
+                    out,
+                    "); fix the connection URL or the server, or set {STORE_VAR}=file|memory"
+                )
+            }
         }
     }
 }
-
-impl std::error::Error for StoreConfigError {}
 
 impl StoreBackend {
     /// Parse `IPE_WEB_STORE`. `sqlite`/`postgres` require the `db` feature;
@@ -2936,7 +2941,7 @@ mod tests {
                     ),
                     "{refused:?}"
                 );
-                let msg = refused.to_string();
+                let msg = crate::system::refusal_text(&refused);
                 assert!(msg.contains("refused"), "unexpected refusal: {msg}");
                 assert!(!msg.contains("s3cr3t-pw"), "password leaked: {msg}");
                 assert!(!msg.contains("admin"), "user leaked: {msg}");
@@ -2975,7 +2980,9 @@ mod tests {
                 ),
                 "{url:?} must refuse startup: {refused:?}"
             );
-            let msg = refused.map(|r| r.to_string()).unwrap_or_default();
+            let msg = refused
+                .map(|r| crate::system::refusal_text(&r))
+                .unwrap_or_default();
             assert!(msg.contains(mode), "{url:?}: {msg}");
             assert!(msg.contains("sslmode=verify-full"), "{url:?}: {msg}");
             assert!(!msg.contains("s3cr3t-pw"), "password leaked: {msg}");
@@ -4273,7 +4280,9 @@ mod tests {
                 feature: "db"
             })
         );
-        let msg = err.map(|e| e.to_string()).unwrap_or_default();
+        let msg = err
+            .map(|e| crate::system::refusal_text(&e))
+            .unwrap_or_default();
         assert!(
             msg.contains("sqlite") && msg.contains("`db`"),
             "the error must name the missing feature: {msg:?}"

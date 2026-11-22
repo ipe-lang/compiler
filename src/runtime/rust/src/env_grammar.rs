@@ -5,6 +5,8 @@
 //! names the variable and the form, so a typo never selects a default. The
 //! registry ([`crate::env_registry`]) binds each variable name to one grammar.
 
+use crate::system::{Render, ScrubbedDisplay, refusal_text};
+
 /// How a variable's value may be shown and documented.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Class {
@@ -250,8 +252,8 @@ impl ListenPort {
 /// alone, so its text cannot reach a message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Shown {
-    /// The value, truncated and escaped so it can neither flood nor forge a line.
-    Escaped(String),
+    /// The value, truncated and held raw; a refusal's render quotes it.
+    Value(crate::system::ShownEnvValue),
     /// A secret's value, shown only by its length.
     Redacted {
         /// The value's length in bytes.
@@ -266,17 +268,21 @@ impl Shown {
         match class {
             Class::Secret => Self::Redacted { bytes: raw.len() },
             Class::Tunable | Class::SecurityTunable | Class::Internal => {
-                Self::Escaped(crate::system::shown_env_value(raw))
+                Self::Value(crate::system::shown_env_value(raw))
             }
         }
     }
-}
 
-impl std::fmt::Display for Shown {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// Writes the value quoted in `out`'s mode, or a secret's length alone in
+    /// every mode.
+    fn render(&self, out: &mut Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
-            Self::Escaped(text) => write!(f, "\"{text}\""),
-            Self::Redacted { bytes } => write!(f, "<redacted, {bytes} bytes>"),
+            Self::Value(value) => {
+                value.render(out);
+                Ok(())
+            }
+            Self::Redacted { bytes } => write!(out, "<redacted, {bytes} bytes>"),
         }
     }
 }
@@ -350,9 +356,10 @@ impl EnvRefusal {
 }
 
 /// The advice closing a refusal of a variable of `class`.
-fn class_note(f: &mut std::fmt::Formatter<'_>, class: Class) -> std::fmt::Result {
+fn class_note(out: &mut Render, class: Class) -> std::fmt::Result {
+    use std::fmt::Write as _;
     match class {
-        Class::Internal => f.write_str(
+        Class::Internal => out.write_str(
             "; it is set by the dev supervisor (`ipe dev watch` or the dev console), \
              so restart the supervisor",
         ),
@@ -360,8 +367,9 @@ fn class_note(f: &mut std::fmt::Formatter<'_>, class: Class) -> std::fmt::Result
     }
 }
 
-impl std::fmt::Display for EnvRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl ScrubbedDisplay for EnvRefusal {
+    fn render(&self, out: &mut Render) -> std::fmt::Result {
+        use std::fmt::Write as _;
         match self {
             Self::Malformed {
                 name,
@@ -369,8 +377,10 @@ impl std::fmt::Display for EnvRefusal {
                 class,
                 shown,
             } => {
-                write!(f, "{name} must be {} (got {shown})", grammar.expected())?;
-                class_note(f, *class)
+                write!(out, "{name} must be {} (got ", grammar.expected())?;
+                shown.render(out)?;
+                out.write_char(')')?;
+                class_note(out, *class)
             }
             Self::NotUnicode {
                 name,
@@ -378,12 +388,10 @@ impl std::fmt::Display for EnvRefusal {
                 class,
                 shown,
             } => {
-                write!(
-                    f,
-                    "{name} must be {} (got {shown}, which is not valid Unicode)",
-                    grammar.expected()
-                )?;
-                class_note(f, *class)
+                write!(out, "{name} must be {} (got ", grammar.expected())?;
+                shown.render(out)?;
+                out.write_str(", which is not valid Unicode)")?;
+                class_note(out, *class)
             }
             Self::Empty {
                 name,
@@ -391,19 +399,26 @@ impl std::fmt::Display for EnvRefusal {
                 class,
             } => {
                 write!(
-                    f,
+                    out,
                     "{name} must be {} (got an empty value)",
                     grammar.expected()
                 )?;
-                class_note(f, *class)
+                class_note(out, *class)
             }
-            Self::Ceiling(refusal) => refusal.fmt(f),
-            Self::HostNames { name, refusal } => write!(f, "{name} {refusal}"),
+            Self::Ceiling(refusal) => refusal.render(out),
+            Self::HostNames { name, refusal } => write!(out, "{name} {refusal}"),
             Self::Retired { name, use_instead } => match use_instead {
-                Some(other) => write!(f, "{name} is no longer read; set {other} instead"),
-                None => write!(f, "{name} is no longer read; unset it"),
+                Some(other) => write!(out, "{name} is no longer read; set {other} instead"),
+                None => write!(out, "{name} is no longer read; unset it"),
             },
         }
+    }
+}
+
+/// The text value: the refused value raw (see [`ScrubbedDisplay`]).
+impl std::fmt::Display for EnvRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&refusal_text(self))
     }
 }
 
@@ -411,7 +426,7 @@ impl std::error::Error for EnvRefusal {}
 
 impl From<EnvRefusal> for crate::error::IpeError {
     fn from(refusal: EnvRefusal) -> Self {
-        Self::invalid_input(refusal.to_string())
+        Self::invalid_input(refusal_text(&refusal))
     }
 }
 
@@ -618,7 +633,7 @@ mod tests {
             assert!(refusal.is_err(), "a forged line is not a port");
             return;
         };
-        let text = refusal.to_string();
+        let text = crate::system::ScrubbedLine::of_refusal(&refusal).to_string();
         assert!(!text.contains('\n') && text.contains("\\n"), "{text}");
     }
 
@@ -635,7 +650,8 @@ mod tests {
             "{refusal:?}"
         );
         let Err(refusal) = refusal else { return };
-        assert!(refusal.to_string().contains("\\xFF"), "{refusal}");
+        let line = crate::system::ScrubbedLine::of_refusal(&refusal).to_string();
+        assert!(line.contains("\\xFF"), "{line}");
     }
 
     #[test]
