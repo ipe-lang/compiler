@@ -33,6 +33,7 @@ use crate::EmitCtx;
 use crate::emit_expr::emit_expr_at;
 use crate::emit_types::{GenericScope, render_type};
 use crate::route_grammar::{self, SegmentShape};
+use crate::runtime_items::RuntimeItem;
 
 /// Wrap an emitted `view : Model -> Element Msg` so its result type is the
 /// `Html` the runtime sink mounts: the emitted `Element`-returning view is
@@ -189,9 +190,8 @@ pub fn emit_web_call(
             };
             let view_s = emit_expr_at(ctx, view_e, indent, child, generics)?;
             let model_s = emit_expr_at(ctx, model_e, indent, child, generics)?;
-            Ok(Some(format!(
-                "ipe_runtime::web::web_render_static({view_s}, {model_s})"
-            )))
+            let render = ctx.use_item(RuntimeItem::WebRenderStatic);
+            Ok(Some(format!("{render}({view_s}, {model_s})")))
         }
 
         // Any non-Web kernel variant: let the standard path handle it.
@@ -619,7 +619,7 @@ fn emit_routed_web_leaf(
     )?;
     let register = format!(
         "{}{}",
-        crate::served_install::register_stmt(&ctx.served_install),
+        crate::served_install::register_stmt(ctx),
         served_register_stmts(ctx)
     );
     let handler = &update.handler;
@@ -629,12 +629,11 @@ fn emit_routed_web_leaf(
          {page_of}, {render_s}, {WEB_STORE_ARGS}"
     );
     let handle = if mountable {
-        format!("ipe_runtime::web::web_embed_routed({args})")
+        let embed = ctx.use_item(RuntimeItem::WebEmbedRouted);
+        format!("{embed}({args})")
     } else {
-        format!(
-            "ipe_runtime::tea::WebApp(ipe_runtime::tea::WebAppKind::Standalone(\
-             ipe_runtime::web::web_app_routed({args})))"
-        )
+        let app = ctx.use_item(RuntimeItem::WebAppRouted);
+        format!("ipe_runtime::tea::WebApp(ipe_runtime::tea::WebAppKind::Standalone({app}({args})))")
     };
     let prelude = &update.prelude;
     Ok(Some(format!(
@@ -670,21 +669,20 @@ fn emit_single_page_web_leaf(
 ) -> String {
     let args = format!("{init_s}, {update_s}, {view_s}, {subs_s}, {WEB_STORE_ARGS}");
     let handle = if mountable {
-        format!("ipe_runtime::web::web_embed({args})")
+        let embed = ctx.use_item(RuntimeItem::WebEmbed);
+        format!("{embed}({args})")
     } else {
-        format!(
-            "ipe_runtime::tea::WebApp(ipe_runtime::tea::WebAppKind::Standalone(\
-             ipe_runtime::web::web_app({args})))"
-        )
+        let app = ctx.use_item(RuntimeItem::WebApp);
+        format!("ipe_runtime::tea::WebApp(ipe_runtime::tea::WebAppKind::Standalone({app}({args})))")
     };
     // The additive-`Msg`-variant hot-swap descriptor: an inert emitted const the
     // `ipe dev watch` classifier scans to diff the `Msg` variant surface. Empty (no
-    // emit change) unless the `hot_appearance` dev gate is on, so a release emit is
+    // emit change) unless the hot appearance posture is on, so a release emit is
     // byte-identical.
     let msg_set_item = msg_set_descriptor_item(ctx, update_e);
     let register = format!(
         "{}{}",
-        crate::served_install::register_stmt(&ctx.served_install),
+        crate::served_install::register_stmt(ctx),
         served_register_stmts(ctx)
     );
     format!("{{ {register}{tag_const} {msg_set_item}{handle} }}")
@@ -1394,7 +1392,7 @@ fn schema_tag_const(ctx: &EmitCtx, view_e: &Expr) -> DResult<String> {
 }
 
 /// Bake the program's `Msg`-set descriptor as an inert emitted item, but ONLY
-/// under the `hot_appearance` dev gate. Returns the empty string with the flag off
+/// under the hot appearance posture. Returns the empty string with it off
 /// (the default, and every production build), so a release emit is byte-identical
 /// whether or not this is called — the descriptor is a dev-loop artefact the
 /// `ipe dev watch` classifier scans out of the emitted text to diff the `Msg` variant
@@ -1412,7 +1410,7 @@ fn schema_tag_const(ctx: &EmitCtx, view_e: &Expr) -> DResult<String> {
 /// descriptor to diff and the edit takes the ordinary appearance/transition/Logic
 /// path, never a spurious `Msg`-set hot-swap.
 fn msg_set_descriptor_item(ctx: &EmitCtx, update_e: &Expr) -> String {
-    if !ctx.hot_appearance {
+    if !ctx.hot.appearance() {
         return String::new();
     }
     let Some(json) = ctx.msg_set_descriptor_json(update_e) else {

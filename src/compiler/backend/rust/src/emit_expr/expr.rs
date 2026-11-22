@@ -12,6 +12,7 @@ use super::{
     swapped_container_clone_rewrite,
 };
 use crate::EmitCtx;
+use crate::runtime_items::RuntimeItem;
 use ipe_intern::rust_char_lit;
 use ipe_ir::once_closure::{ClosureSite, admitted_once_parts};
 
@@ -1051,7 +1052,7 @@ pub fn emit_match(
 }
 
 /// Reduce a TEA `update` arm body to an `apply_transition_hot` call when the
-/// transition rewrite is armed (a TEA `update` body under `hot_appearance`) AND
+/// transition rewrite is armed (a TEA `update` body under hot logic) AND
 /// the body is a data-describable single-field change with `Cmd.none`. `None`
 /// otherwise — the caller emits the arm body normally, byte-identically.
 ///
@@ -1091,14 +1092,15 @@ pub fn emit_transition_arm(ctx: &EmitCtx, body: &Expr) -> DResult<Option<String>
     // so the literal is the exact JSON bytes the runtime decodes.
     let json = ct.to_json();
     let json_lit = rust_str_lit(&json);
+    let reader = ctx.use_item(RuntimeItem::ApplyTransitionHot);
     Ok(Some(format!(
-        "(ipe_runtime::web::apply_transition_hot({json_lit}, {model_ident}), cmd_none())"
+        "({reader}({json_lit}, {model_ident}), cmd_none())"
     )))
 }
 
 /// Reduce a TEA `subscriptions` entry to a `sub_every_hot` call when the
 /// sub-description rewrite is armed (a TEA `subscriptions` body under
-/// `hot_appearance`) AND the entry is a data-describable tick source
+/// hot logic) AND the entry is a data-describable tick source
 /// (`Time.every <lit> <msg>` / `Sub.every <lit> <msg>`). `None` otherwise — the
 /// caller emits the entry normally, byte-identically.
 ///
@@ -1131,11 +1133,12 @@ pub fn emit_sub_arm(ctx: &EmitCtx, kernel: KernelFn, args: &[Expr]) -> Option<St
     // the runtime decodes.
     let json = cs.to_json();
     let json_lit = rust_str_lit(&json);
-    Some(format!("ipe_runtime::web::sub_every_hot({json_lit})"))
+    let reader = ctx.use_item(RuntimeItem::SubEveryHot);
+    Some(format!("{reader}({json_lit})"))
 }
 
 /// Reduce a TEA `init` body to an `apply_init_hot` call when the init rewrite is
-/// armed (a `hot_appearance` build) AND the body is a data-describable record
+/// armed (a hot-logic build) AND the body is a data-describable record
 /// literal with `Cmd.none`. `None` otherwise — the caller emits the body
 /// normally, byte-identically.
 ///
@@ -1185,8 +1188,9 @@ pub fn emit_init_datum(
     let compiled_record = emit_expr_at(ctx, record_expr, indent, depth, generics)?;
     let json = cd.to_json();
     let json_lit = rust_str_lit(&json);
+    let reader = ctx.use_item(RuntimeItem::ApplyInitHot);
     Ok(Some(format!(
-        "(ipe_runtime::web::apply_init_hot({json_lit}, {compiled_record}), cmd_none())"
+        "({reader}({json_lit}, {compiled_record}), cmd_none())"
     )))
 }
 
@@ -1216,7 +1220,7 @@ pub fn emit_init_datum(
 /// fires no effect (fail-closed), never an out-of-range access.
 ///
 /// Only fires under an armed `update` body (`transition_model_param` set, i.e.
-/// `hot_appearance` on): with the flag off this returns `None` and the arm is
+/// hot logic on): with it off this returns `None` and the arm is
 /// emitted normally, byte-identical. Conservative: only the closed wiring
 /// vocabulary (`Cmd.none`, a single literal `Cmd.perform`) classifies; the
 /// `Cmd.none` no-effect case is left to the transition path (which fires no effect
@@ -1234,7 +1238,7 @@ pub fn emit_cmd_wiring_arm(
     generics: GenericScope,
 ) -> DResult<Option<String>> {
     // Only compose under an armed `update` body — the same gate the transition
-    // rewrite uses. With `hot_appearance` off this is `None` and the arm emits
+    // rewrite uses. With hot logic off this is `None` and the arm emits
     // normally (byte-identical).
     if ctx.transition_model_param().is_none() {
         return Ok(None);
@@ -1268,7 +1272,8 @@ pub fn emit_cmd_wiring_arm(
     let table = format!("{{ let __ipe_eff = {effect_s}; Box::new(move || __ipe_eff) }}");
     let json = arm.wiring.to_json();
     let json_lit = rust_str_lit(&json);
+    let dispatch = ctx.use_item(RuntimeItem::FireCmdWiring);
     Ok(Some(format!(
-        "({model_s}, ipe_runtime::web::fire_cmd_wiring({json_lit}, vec![{table}]))"
+        "({model_s}, {dispatch}({json_lit}, vec![{table}]))"
     )))
 }

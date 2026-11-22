@@ -15,13 +15,14 @@ mod seal_e2e;
 
 use ipe_backend::Backend;
 use ipe_backend_rust::RustBackend;
+use ipe_backend_rust::runtime_items::RuntimeItem;
 use ipe_diagnostics::{DResult, Diagnostic};
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{
-    Arm, CallPin, Callee, Expr, Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind,
-    Pat, Program,
+    Arm, CallPin, Callee, EnumDef, Expr, Func, FuncId, IrType, KernelFn, Match, ModPath, Module,
+    OnFormKind, Pat, Program, TypeDef, Variant,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The hazardous record-field value: an ASCII letter, a RIGHT-TO-LEFT OVERRIDE,
 /// then another ASCII letter.
@@ -35,9 +36,23 @@ const BIDI_CHAR: char = '\u{202E}';
 /// (the Live web-app runtime, which owns `apply_init_hot`/`apply_transition_hot`)
 /// are on — the flags a real `Web.tea` program sets.
 fn tea_program(name: Symbol, funcs: Vec<Func>, entry: Option<FuncId>) -> Program {
+    shaped_program(name, funcs, entry, Shape::Web)
+}
+
+/// The repaintable view a hot-posture program carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shape {
+    /// A served `Web.tea` app: `uses_web`.
+    Web,
+    /// A terminal `Tui.tea` app: `uses_tui` and `uses_ui`, no `uses_web`.
+    Tui,
+}
+
+/// [`tea_program`] for either repaintable shape.
+fn shaped_program(name: Symbol, funcs: Vec<Func>, entry: Option<FuncId>, shape: Shape) -> Program {
     Program {
         imports_unsafe_submodule: false,
-        imported_web_capabilities: std::collections::BTreeSet::new(),
+        imported_web_capabilities: BTreeSet::new(),
         modules: vec![Module {
             name: ModPath(vec![name]),
             types: vec![],
@@ -64,9 +79,9 @@ fn tea_program(name: Symbol, funcs: Vec<Func>, entry: Option<FuncId>) -> Program
             uses_crypto: false,
             uses_jwt: false,
             uses_url: false,
-            uses_ui: false,
-            uses_web: true,
-            uses_tui: false,
+            uses_ui: shape == Shape::Tui,
+            uses_web: shape == Shape::Web,
+            uses_tui: shape == Shape::Tui,
             uses_console: false,
             uses_webview: false,
             uses_css: false,
@@ -320,5 +335,153 @@ fn end_to_end_hot_init_renders_bidi_string() -> DResult<()> {
         "the hot-reduced init must decode and print the exact source string, \
          bidi override included"
     );
+    Ok(())
+}
+
+/// `prog` with every module re-flagged as the `shape` view.
+fn reshaped(mut prog: Program, shape: Shape) -> Program {
+    for module in &mut prog.modules {
+        module.uses_ui = shape == Shape::Tui;
+        module.uses_web = shape == Shape::Web;
+        module.uses_tui = shape == Shape::Tui;
+    }
+    prog
+}
+
+/// An `update`-shaped function `t -> f -> Model -> (Model, Cmd _)` whose one
+/// arm fires a literal `Cmd.perform t f`: the Cmd-wiring shape.
+fn wiring_hot_program(interner: &mut Interner) -> DResult<Program> {
+    let main_mod = interner.intern("Main")?;
+    let name_sym = interner.intern("name")?;
+    let [model, task, to_msg] = [
+        interner.intern("model")?,
+        interner.intern("t")?,
+        interner.intern("f")?,
+    ];
+    let rec = name_record(name_sym);
+    let perform = Expr::Call {
+        callee: Callee::Kernel(KernelFn::CmdPerform),
+        args: vec![Expr::Var(task), Expr::Var(to_msg)],
+        pin: CallPin::None,
+        on_form: OnFormKind::NotForm,
+    };
+    let arm_body = Expr::Tuple(vec![Expr::Var(model), perform]);
+    let case = Match::new_flat(Expr::Bool(true), vec![Arm::new(Pat::Wildcard, arm_body)])?;
+    let update_fn = Func {
+        id: FuncId::from_raw(0),
+        name: interner.intern("wire")?,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![
+            ipe_ir::Param::owned(task, IrType::Int),
+            ipe_ir::Param::owned(to_msg, IrType::Int),
+            ipe_ir::Param::owned(model, rec.clone()),
+        ],
+        ret: IrType::Tuple(vec![rec, IrType::Cmd(Box::new(IrType::Int))]),
+        body: Expr::Match(case),
+    };
+    Ok(tea_program(main_mod, vec![update_fn], None))
+}
+
+/// A `subscriptions`-shaped function `Model -> Sub Msg` whose body is a
+/// literal `Time.every 1000 Tick`, with its one-variant `Msg` enum: the
+/// tick-source shape.
+fn subs_hot_program(interner: &mut Interner) -> DResult<Program> {
+    let main_mod = interner.intern("Main")?;
+    let name_sym = interner.intern("name")?;
+    let model = interner.intern("model")?;
+    let msg = interner.intern("Msg")?;
+    let tick = interner.intern("Tick")?;
+    let subs_fn = Func {
+        id: FuncId::from_raw(0),
+        name: interner.intern("subs")?,
+        home: ModPath(vec![]),
+        type_params: vec![],
+        row_params: vec![],
+        params: vec![ipe_ir::Param::owned(model, name_record(name_sym))],
+        ret: IrType::Sub(Box::new(IrType::Int)),
+        body: Expr::Call {
+            callee: Callee::Kernel(KernelFn::TimeEvery),
+            args: vec![
+                Expr::Int(1000),
+                Expr::Ctor {
+                    home: ModPath(vec![main_mod]),
+                    ty: msg,
+                    variant: tick,
+                    args: vec![],
+                },
+            ],
+            pin: CallPin::None,
+            on_form: OnFormKind::NotForm,
+        },
+    };
+    let mut prog = tea_program(main_mod, vec![subs_fn], None);
+    for module in &mut prog.modules {
+        module.types.push(TypeDef::Enum(EnumDef {
+            name: msg,
+            home: ModPath(vec![main_mod]),
+            type_params: vec![],
+            variants: vec![Variant {
+                name: tick,
+                fields: vec![],
+            }],
+        }));
+    }
+    Ok(prog)
+}
+
+/// Each logic hot-swap shape with the one runtime item its rewrite names.
+fn logic_cases(interner: &mut Interner) -> DResult<Vec<(Program, RuntimeItem)>> {
+    Ok(vec![
+        (init_hot_program(interner)?, RuntimeItem::ApplyInitHot),
+        (
+            update_hot_program(interner)?,
+            RuntimeItem::ApplyTransitionHot,
+        ),
+        (wiring_hot_program(interner)?, RuntimeItem::FireCmdWiring),
+        (subs_hot_program(interner)?, RuntimeItem::SubEveryHot),
+    ])
+}
+
+/// The hot logic readers are compiled only into a served web runtime, so a
+/// terminal app under `ipe dev watch` keeps every TEA body compiled: no logic
+/// item is recorded, and the emitted source names none of the four readers.
+/// The same bodies on a served web app still reduce to their readers, which
+/// pins that the logic rewrite survives where it belongs.
+#[test]
+fn a_tui_hot_build_names_no_web_logic_reader() -> DResult<()> {
+    let mut interner = Interner::new();
+    let logic_paths = [
+        RuntimeItem::ApplyInitHot,
+        RuntimeItem::ApplyTransitionHot,
+        RuntimeItem::FireCmdWiring,
+        RuntimeItem::SubEveryHot,
+    ]
+    .map(RuntimeItem::path);
+    let cases = logic_cases(&mut interner)?;
+    let backend = RustBackend::new(&interner).with_hot_appearance(true);
+    for (prog, item) in cases {
+        assert_eq!(
+            backend.emitted_runtime_items(&prog)?,
+            BTreeSet::from([item]),
+            "a served web app reduces the body to `{}`",
+            item.path()
+        );
+        let tui = reshaped(prog, Shape::Tui);
+        assert_eq!(
+            backend.emitted_runtime_items(&tui)?,
+            BTreeSet::new(),
+            "a tui app records no logic reader for the `{}` shape",
+            item.path()
+        );
+        let out = emit_hot(&interner, &tui)?;
+        for path in logic_paths {
+            assert!(
+                !out.contains(path),
+                "a tui hot build must not name `{path}`, got:\n{out}"
+            );
+        }
+    }
     Ok(())
 }

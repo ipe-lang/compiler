@@ -29,6 +29,8 @@ use ipe_backend_rust::{
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{EnumDef, ModPath, Module, Program, TypeDef};
 
+mod runtime_items_agree;
+
 /// The browser-only feature, never selected on a native target.
 const WASM_ONLY: &str = "wasm-client";
 
@@ -203,14 +205,8 @@ impl Case {
         }
     }
 
-    /// The feature set the backend selects for this case.
-    #[allow(clippy::expect_used)] // a body-free program the backend refuses is a broken fixture
-    fn features(self, interner: &Interner) -> BTreeSet<String> {
-        let program = Program {
-            imports_unsafe_submodule: false,
-            imported_web_capabilities: BTreeSet::new(),
-            modules: vec![self.module],
-        };
+    /// The backend configured for this case.
+    const fn backend<'i>(&self, interner: &'i Interner) -> RustBackend<'i> {
         RustBackend::new(interner)
             .with_runtime_dep(Some(RuntimeDep {
                 content: RuntimeContentId::from_digest_bytes([0; 16]),
@@ -219,11 +215,36 @@ impl Case {
             .with_db_driver(self.driver)
             .with_debugger(self.debugger)
             .with_hot_appearance(self.hot_appearance)
-            .runtime_feature_names(&program)
+    }
+
+    /// The one-module program this case emits.
+    fn program(self) -> Program {
+        Program {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            modules: vec![self.module],
+        }
+    }
+
+    /// The feature set the backend selects for this case.
+    #[allow(clippy::expect_used)] // a body-free program the backend refuses is a broken fixture
+    fn features(self, interner: &Interner) -> BTreeSet<String> {
+        let backend = self.backend(interner);
+        backend
+            .runtime_feature_names(&self.program())
             .expect("runtime_feature_names must succeed for a body-free native program")
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+}
+
+/// The watch-mode terminal case: a `Tui.tea` shape under `ipe dev watch`.
+fn hot_tui_case(main: Symbol) -> Case {
+    Case {
+        intent: BuildIntent::Development,
+        hot_appearance: true,
+        ..Case::release(module_with(main, Some(Surface::Tui)))
     }
 }
 
@@ -255,11 +276,7 @@ fn basis_sets() -> BTreeSet<BTreeSet<String>> {
         debugger: true,
         ..Case::release(module_with(main, None))
     });
-    cases.push(Case {
-        intent: BuildIntent::Development,
-        hot_appearance: true,
-        ..Case::release(module_with(main, Some(Surface::Tui)))
-    });
+    cases.push(hot_tui_case(main));
     cases.into_iter().map(|c| c.features(&interner)).collect()
 }
 
@@ -521,4 +538,28 @@ fn a_manifest_command_outside_the_context_does_not_count() {
         missing_legs(&basis, &manifest_leg_sets(&manifest, MANIFEST_CONTEXT)),
         vec![leg]
     );
+}
+
+/// The watch-mode terminal build resolves to no served web runtime, and its
+/// emit names no feature-gated web item: the hot posture of a tui app swaps
+/// appearance only, so nothing it emits needs `web`.
+#[test]
+#[allow(clippy::expect_used)] // the interner refusing a fixed name is a broken fixture
+fn the_watch_mode_terminal_build_needs_no_web_runtime() {
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    let selected = hot_tui_case(main).features(&interner);
+    let names: Vec<&str> = selected.iter().map(String::as_str).collect();
+    let resolved = crate::resolve_features(&names, &crate::load_fixtures().table);
+    for web in ["web", "web-core"] {
+        assert!(
+            !resolved.contains(web),
+            "the hot tui build resolves `{web}`: {resolved:?}"
+        );
+    }
+    let items = hot_tui_case(main)
+        .backend(&interner)
+        .emitted_runtime_items(&hot_tui_case(main).program())
+        .expect("a body-free hot tui program emits");
+    assert!(items.is_empty(), "the hot tui emit records {items:?}");
 }

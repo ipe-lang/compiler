@@ -299,11 +299,11 @@ fn watch_line(text: &crate::style::TerminalSafe, role: WatchRole) -> String {
     let (colour, glyph, reset) = match role {
         WatchRole::Info => (p.dim, "", p.reset),
         WatchRole::Success => (p.green, "", p.reset),
-        // A failed rebuild leaves the last-good binary running, so it is a soft
-        // warning, not a hard stop — a calm light yellow, never alarming red.
+        // A failed rebuild never touches the running app (its line names the
+        // fallback through `FallbackNote`), so it is a soft warning, not a hard
+        // stop — a calm light yellow, never alarming red.
         WatchRole::Failure => (
-            // Failure glyph from the SSOT; the tint is the soft warning amber,
-            // not red — a failed rebuild leaves the last-good binary running.
+            // Failure glyph from the SSOT; the tint is the soft warning amber.
             p.bright_yellow,
             crate::style::outcome_glyph(crate::style::Outcome::Failure),
             p.reset,
@@ -1387,9 +1387,15 @@ fn run_inner(
                         // above, every line guttered two spaces (so the whole
                         // report sits inset, not just the header), a blank line
                         // below to set it off from the next watch line. Light
-                        // yellow, not red — the last-good binary stays up.
+                        // yellow, not red — a failed compile leaves whatever
+                        // the supervisor holds untouched, and the frame says
+                        // which fallback that is.
                         let mut screen = crate::screen::Screen::new(crate::screen::Stream::Stderr);
-                        let frame = compile_failed_frame(&msg, screen.palette());
+                        let frame = compile_failed_frame(
+                            &msg,
+                            failure_fallback(&mut supervisor),
+                            screen.palette(),
+                        );
                         screen.guttered(&frame).emit();
                         emit(opts, WatchEvent::CompileFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
@@ -1728,8 +1734,8 @@ fn run_inner(
                         let msg = red.to_string();
                         emit_watch_line(
                             &crate::style::TerminalSafe::sanitize(&format!(
-                                "[ipe dev watch] cargo build failed (last-good binary stays \
-                                     up):\n{msg}"
+                                "[ipe dev watch] cargo build failed ({}):\n{msg}",
+                                failure_fallback(&mut supervisor).text()
                             )),
                             WatchRole::Failure,
                         );
@@ -2828,24 +2834,66 @@ fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> std::io::Result<C
         .map_err(std::io::Error::from)
 }
 
+/// What a failed rebuild falls back to: the supervisor's state, which the
+/// failure leaves untouched.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FallbackNote {
+    /// The last good build is running and keeps running.
+    LastGoodRunning,
+    /// A last good build exists on disk but nothing is running.
+    LastGoodStopped,
+    /// No build has ever succeeded, so there is no app to fall back to.
+    NoAppYet,
+}
+
+impl FallbackNote {
+    /// The parenthetical the failure line carries.
+    const fn text(self) -> &'static str {
+        match self {
+            Self::LastGoodRunning => "last-good binary stays up",
+            Self::LastGoodStopped => "last-good binary kept, not running",
+            Self::NoAppYet => "no app is running yet",
+        }
+    }
+}
+
+/// The fallback a failed rebuild leaves in place under `state`.
+///
+/// A `Running` state holds the child it last started, which may since have
+/// exited (a crashed app): the child is probed, so the note claims a running
+/// app only while one is. A probe that fails claims nothing is running.
+fn failure_fallback(state: &mut ipe_watch::SupervisorState) -> FallbackNote {
+    match state {
+        ipe_watch::SupervisorState::Running { child, .. } => match child.try_wait() {
+            Ok(None) => FallbackNote::LastGoodRunning,
+            Ok(Some(_)) | Err(_) => FallbackNote::LastGoodStopped,
+        },
+        ipe_watch::SupervisorState::NotRunning { last_good: Some(_) } => {
+            FallbackNote::LastGoodStopped
+        }
+        ipe_watch::SupervisorState::NotRunning { last_good: None } => FallbackNote::NoAppYet,
+    }
+}
+
 /// Frame a compiler diagnostic for the watch stderr build-failed report: the
-/// guttered, soft-yellow block `ipe dev watch` prints when a compile fails while the
-/// last-good binary stays up.
+/// guttered, soft-yellow block `ipe dev watch` prints when a compile fails,
+/// naming the `fallback` the failure leaves in place.
 ///
 /// The diagnostic carries `.ipe` source-span snippets — untrusted text that
 /// could smuggle raw control/ANSI bytes able to move the cursor, recolour, or
 /// hide output on our stderr. It is sanitised through [`crate::style::TerminalSafe`]
 /// FIRST; the palette escapes are our own, added only after the untrusted text is
 /// neutralised, so the frame's sole control bytes are the ones we put there.
-fn compile_failed_frame(msg: &str, p: &crate::style::Palette) -> String {
+fn compile_failed_frame(msg: &str, fallback: FallbackNote, p: &crate::style::Palette) -> String {
     let safe_msg = crate::style::TerminalSafe::sanitize(msg.trim_end());
     // The failure glyph comes from the style SSOT; the tint is deliberately the
-    // soft warning amber, not the red a hard failure wears — the last-good binary
-    // stays up.
+    // soft warning amber, not the red a hard failure wears — a failed compile
+    // touches nothing the supervisor holds.
     let body = format!(
-        "{}{} [ipe dev watch] build failed (last-good binary stays up):{}\n{}",
+        "{}{} [ipe dev watch] build failed ({}):{}\n{}",
         p.bright_yellow,
         crate::style::outcome_glyph(crate::style::Outcome::Failure),
+        fallback.text(),
         p.reset,
         safe_msg.as_str()
     );
@@ -3342,13 +3390,13 @@ fn find_executable_path(cargo_json_stdout: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppearanceRoute, BuildAccel, Command, Duration, OrchestratorEvent, RESOLVE_RETRY_DELAY,
-        RebuildTimings, WatchRole, appearance_route, apply_build_accel_env, child_command,
-        child_env, choose_build_accel, compile_failed_frame, dir_has_dep_rlib, emitted_binds_http,
-        emitted_is_tui, emitted_is_web, env_flag_on, first_error_line, mint_hot_token, mpsc,
-        prove_green_crate, push_control_appearance, resolve_project_sources,
-        schedule_resolve_retry, send_control_frame, spawn_command, strip_ansi, watch_emit_settings,
-        watch_line, watch_runtime_dep, watch_status_body,
+        AppearanceRoute, BuildAccel, Command, Duration, FallbackNote, OrchestratorEvent,
+        RESOLVE_RETRY_DELAY, RebuildTimings, WatchRole, appearance_route, apply_build_accel_env,
+        child_command, child_env, choose_build_accel, compile_failed_frame, dir_has_dep_rlib,
+        emitted_binds_http, emitted_is_tui, emitted_is_web, env_flag_on, failure_fallback,
+        first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
+        resolve_project_sources, schedule_resolve_retry, send_control_frame, spawn_command,
+        strip_ansi, watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
     };
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -4127,7 +4175,7 @@ mod tests {
         let p = crate::style::Palette::select(false);
         let hostile =
             "type error near:\n\u{1b}[31m  x = \u{1b}]0;pwned\u{7}evil\u{1b}[0m\r\n\u{7}bell";
-        let frame = compile_failed_frame(hostile, p);
+        let frame = compile_failed_frame(hostile, FallbackNote::NoAppYet, p);
         assert!(
             !frame.contains('\u{1b}'),
             "no raw ESC may reach stderr: {frame:?}"
@@ -4171,6 +4219,73 @@ mod tests {
                 .lines()
                 .any(|l| l == format!("{}=4321", ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV)),
             "child env must carry the requested port: {printed}"
+        );
+    }
+
+    /// A failed rebuild names the fallback the supervisor actually holds: with
+    /// no build yet there is no last-good binary to claim, and a running app is
+    /// the one that stays up.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rebuild_names_the_fallback_the_supervisor_holds() {
+        let mut fresh = ipe_watch::SupervisorState::fresh();
+        assert_eq!(failure_fallback(&mut fresh), FallbackNote::NoAppYet);
+        assert!(
+            !FallbackNote::NoAppYet.text().contains("last-good"),
+            "a watch with no build yet claims no last-good binary"
+        );
+        let mut stopped = ipe_watch::SupervisorState::NotRunning {
+            last_good: Some(ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/true"),
+                content_hash: [0; 32],
+            }),
+        };
+        assert_eq!(
+            failure_fallback(&mut stopped),
+            FallbackNote::LastGoodStopped
+        );
+        let mut sleeper = Command::new("/bin/sleep");
+        sleeper.arg("30");
+        let child = ipe_runtime_rust::system::spawn_hardened(sleeper)
+            .expect("hardened /bin/sleep must spawn");
+        let mut running = ipe_watch::SupervisorState::Running {
+            child,
+            artifact: ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/sleep"),
+                content_hash: [0; 32],
+            },
+        };
+        assert_eq!(
+            failure_fallback(&mut running),
+            FallbackNote::LastGoodRunning
+        );
+        if let ipe_watch::SupervisorState::Running { mut child, .. } = running {
+            child.kill().expect("stop /bin/sleep");
+            child.wait().expect("reap /bin/sleep");
+        }
+    }
+
+    /// The supervisor still holds a `Running` state after its app exits on its
+    /// own (a crash between two builds): the failure note must not claim the
+    /// last-good binary stays up.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rebuild_after_the_app_exited_claims_no_running_app() {
+        let mut child =
+            spawn_command(Path::new("/bin/true"), &[]).expect("hardened /bin/true must spawn");
+        let status = child.wait().expect("reap /bin/true");
+        assert!(status.success(), "hardened /bin/true must exit 0");
+        let mut exited = ipe_watch::SupervisorState::Running {
+            child,
+            artifact: ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/true"),
+                content_hash: [0; 32],
+            },
+        };
+        assert_eq!(failure_fallback(&mut exited), FallbackNote::LastGoodStopped);
+        assert!(
+            !FallbackNote::LastGoodStopped.text().contains("stays up"),
+            "the exited-app note claims no running app"
         );
     }
 

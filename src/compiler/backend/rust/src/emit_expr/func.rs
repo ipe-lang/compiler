@@ -834,7 +834,7 @@ pub const fn func_returns_cmd_tuple(func: &ipe_ir::Func) -> bool {
 ///
 /// Reduces `init _ = ({ f = lit, … }, Cmd.none)` to an `apply_init_hot` call so an
 /// `init` edit is session-scoped (a FRESH session decodes the edited datum; a LIVE
-/// session keeps its Model). Armed only under `hot_appearance`, only for a
+/// session keeps its Model). Armed only under [`crate::DevHotSwap::logic`], only for a
 /// function whose return type is `(_, Cmd _)` (the TEA producer shape), and only
 /// when the body classifies as a record literal of closed leaves with `Cmd.none`.
 /// An `update` body is a `msg` match (never a bare record tuple), so it never
@@ -847,7 +847,7 @@ pub fn emit_init_hot_for_func(
     ipe_main_wrap: bool,
     generics: GenericScope,
 ) -> DResult<Option<String>> {
-    if ctx.hot_appearance && !ipe_main_wrap && func_returns_cmd_tuple(func) {
+    if ctx.hot.logic() && !ipe_main_wrap && func_returns_cmd_tuple(func) {
         emit_init_datum(ctx, body_expr, 1, 0, generics)
     } else {
         Ok(None)
@@ -1055,7 +1055,7 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     // non-`TailLoop` body (the common case) routes to the ordinary value emitter,
     // which is exhaustive and fail-closed for any stray TCO node.
     // Arm the per-function style-literal accumulator for this body. Under
-    // `hot_appearance` an allowlisted style literal emitted below hoists into
+    // hot appearance an allowlisted style literal emitted below hoists into
     // this function's table; with the flag off it stays inert and nothing hoists,
     // so the emitted body is byte-identical to the direct-literal form. The
     // previous accumulator is restored after the body is rendered so nested
@@ -1066,17 +1066,17 @@ fn emit_func_item(ctx: &EmitCtx, func: &Func, vis_prefix: &str) -> DResult<Strin
     // function whose return type is `(Model, Cmd _)` and whose last parameter is
     // that Model record is a TEA update; its `Model` parameter arms
     // `emit_match` to reduce a data-describable arm to an `apply_transition_hot`
-    // call. Inert unless `hot_appearance` (the shared dev gate) is on — with the
-    // flag off no arm is ever rewritten and the body is byte-identical. Restored
+    // call. Inert unless the hot posture swaps logic — otherwise no arm is
+    // ever rewritten and the body is byte-identical. Restored
     // after the body so nested function emission never inherits the arming.
-    let tea_update_param = if ctx.hot_appearance {
+    let tea_update_param = if ctx.hot.logic() {
         tea_update_model_param(func)
     } else {
         None
     };
     let saved_transition = ctx.begin_transition_update(tea_update_param);
     // Arm the sub-description rewrite for a TEA `subscriptions` body; inert off.
-    let saved_subs_hot = ctx.begin_subs_hot(ctx.hot_appearance && is_tea_subs_function(func));
+    let saved_subs_hot = ctx.begin_subs_hot(ctx.hot.logic() && is_tea_subs_function(func));
     let body = if is_caf {
         let call_line = emit_caf_get_or_init(ctx, body_expr, generics)?;
         format!(

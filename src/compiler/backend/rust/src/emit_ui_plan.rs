@@ -1635,7 +1635,7 @@ pub const fn is_tui_appearance_kernel(k: KernelFn) -> bool {
 ///   `Ui.text` content literal stays direct (dev == prod at the tui boundary).
 /// * **Neither** — `&[]`: no dev-loop repaint surface, so nothing hoists.
 ///
-/// The hoist itself is still additionally gated on `EmitCtx::hot_appearance`
+/// The hoist itself is still additionally gated on `DevHotSwap::appearance`
 /// (armed only under `ipe dev watch`) and on `hoist_style_literal`'s top-level /
 /// direct-literal fences; this function only narrows *which kernels* are
 /// hoist-eligible per shape.
