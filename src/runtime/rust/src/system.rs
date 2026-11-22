@@ -680,15 +680,20 @@ impl From<EnvValueRefusal> for IpeError {
 ///
 /// Built only by [`shown_env_value`], which keeps at most
 /// [`ENV_VALUE_SHOWN_CHARS`] source characters (or bytes that are not UTF-8),
-/// so a refusal's size never follows the value. It is written only through a
-/// [`Render`]: escaped once for an operator line, raw for a text value.
+/// so a refusal's size never follows the value, and records whether it cut
+/// the value there, so a cut value never prints as a shorter one. It is
+/// written only through a [`Render`]: escaped once for an operator line, raw
+/// for a text value.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShownEnvValue(Box<[u8]>);
+pub struct ShownEnvValue {
+    kept: Box<[u8]>,
+    cut: bool,
+}
 
 impl ShownEnvValue {
     /// Writes the value in `out`'s mode ([`Render::quote_bytes`]).
     pub(crate) fn render(&self, out: &mut Render) {
-        out.quote_bytes(&self.0);
+        out.quote_bytes(&self.kept, self.cut);
     }
 }
 
@@ -711,7 +716,11 @@ pub(crate) fn shown_env_value(raw: &[u8]) -> ShownEnvValue {
             end = end.saturating_add(len);
         }
     }
-    ShownEnvValue(raw.get(..end).unwrap_or(raw).into())
+    let kept = raw.get(..end).unwrap_or(raw);
+    ShownEnvValue {
+        kept: kept.into(),
+        cut: kept.len() < raw.len(),
+    }
 }
 
 /// The invoking user's home directory: the one runtime home reader.
@@ -1021,8 +1030,8 @@ impl Render {
     /// Writes foreign bytes between `"` delimiters: each UTF-8 run as
     /// [`Self::quote`] does, and each byte that is not UTF-8 as `\xNN` when
     /// scrubbed (an escape the scrub never writes otherwise) or as U+FFFD
-    /// when raw.
-    pub(crate) fn quote_bytes(&mut self, raw: &[u8]) {
+    /// when raw; a `cut` text is marked as [`Self::quote_cut`] marks it.
+    pub(crate) fn quote_bytes(&mut self, raw: &[u8], cut: bool) {
         use std::fmt::Write as _;
         self.text.push('"');
         for chunk in raw.utf8_chunks() {
@@ -1035,6 +1044,9 @@ impl Render {
                     }
                 }
             }
+        }
+        if cut {
+            self.push_cut_marker();
         }
         self.text.push('"');
     }
@@ -5903,7 +5915,7 @@ mod signal_mask_tests {
 mod env_ceiling_tests {
     use super::{
         CeilingDefect, ENV_VALUE_SHOWN_CHARS, EnvCeiling, EnvDuration, EnvValueRefusal, IpeError,
-        PROCESS_OUTPUT_CEILING, PROCESS_WALL_CEILING, ScrubbedLine, ZeroCeiling,
+        PROCESS_OUTPUT_CEILING, PROCESS_WALL_CEILING, SCRUB_TRUNCATED, ScrubbedLine, ZeroCeiling,
         assert_env_ceiling_contract, assert_env_duration_contract, locked_remove_var,
         locked_set_var, process_bounds, process_output_ceiling, refusal_text, scrub_log_controls,
     };
@@ -6028,6 +6040,44 @@ mod env_ceiling_tests {
             refusal_text(&invalid),
             "EXAMPLE_VALUE must be an IP address (got \"\u{fffd}1\")",
             "the text value shows a byte that is not UTF-8 as U+FFFD"
+        );
+    }
+
+    /// A value cut at [`ENV_VALUE_SHOWN_CHARS`] is marked cut inside its
+    /// quotes, so it never prints like the shorter value it was cut to. Red
+    /// when the echo drops the tail unmarked.
+    #[test]
+    fn a_cut_env_value_never_prints_as_its_prefix() {
+        let prefix = "x".repeat(ENV_VALUE_SHOWN_CHARS);
+        let exact = EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", prefix.as_bytes());
+        let longer = EnvValueRefusal::new(
+            "EXAMPLE_VALUE",
+            "an IP address",
+            format!("{prefix}y").as_bytes(),
+        );
+        let line = |r: &EnvValueRefusal| ScrubbedLine::of_refusal(r).to_string();
+        assert_eq!(
+            line(&exact),
+            format!("EXAMPLE_VALUE must be an IP address (got \"{prefix}\")")
+        );
+        assert_eq!(
+            line(&longer),
+            format!("EXAMPLE_VALUE must be an IP address (got \"{prefix}{SCRUB_TRUNCATED}\")")
+        );
+        assert_eq!(
+            refusal_text(&longer),
+            format!("EXAMPLE_VALUE must be an IP address (got \"{prefix}\u{2026}\")"),
+            "the text value marks the cut too"
+        );
+        let bytes = [prefix.as_bytes(), b"\xFF"].concat();
+        assert_eq!(
+            line(&EnvValueRefusal::new(
+                "EXAMPLE_VALUE",
+                "an IP address",
+                &bytes
+            )),
+            line(&longer),
+            "a cut before a byte that is not UTF-8 is marked the same way"
         );
     }
 
