@@ -9,8 +9,6 @@ see_also: ["effects", "shapes", "errors"]
 
 # `state` — managing application state with TEA
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 Ipê programs have no mutable variables. Instead, state is held in an immutable
 **Model** value. When something happens — a button click, a timer, a network
 response — the runtime calls your `update` function with the current model and

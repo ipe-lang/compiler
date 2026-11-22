@@ -8,8 +8,6 @@ see_also: ["module"]
 
 # `import` — bringing modules into scope
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 An `import` declaration makes the names from another module available in the
 current file. By default you access them qualified; `exposing` and `as` let you
 control how.

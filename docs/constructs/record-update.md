@@ -8,8 +8,6 @@ see_also: ["record", "type-alias"]
 
 # `record update` — `{ r | field = value }`
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 Record update syntax produces a new record that is identical to an existing one
 except for the fields you name. It never mutates the original.
 

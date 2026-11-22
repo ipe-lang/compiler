@@ -8,8 +8,6 @@ see_also: ["let", "pipe", "case"]
 
 # `lambda` — anonymous functions
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 A lambda is an unnamed function written inline. Use it when a function is only
 needed once — for a `List.map` callback, a `Task.andThen` continuation, or any
 spot where naming the function separately would be more ceremony than clarity.

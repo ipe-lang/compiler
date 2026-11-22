@@ -9,8 +9,6 @@ see_also: ["effects", "shapes", "errors"]
 
 # `main` — the program entry point
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 Every Ipê program has exactly one top-level binding named `main`. The runtime
 takes `main`, runs its effect, and exits. `main` must have type `Task Error ()`.
 

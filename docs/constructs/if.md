@@ -8,8 +8,6 @@ see_also: ["case", "let"]
 
 # `if` — conditional expression
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 An `if` expression picks one of two branches based on a `Bool`. Both branches
 must have the same type, because `if` is an expression — it always produces
 a value.
