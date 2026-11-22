@@ -35,8 +35,8 @@ mod emit_console;
 mod emit_doc;
 mod emit_settings;
 pub use emit_settings::{
-    CrateName, EmitHost, EmitSettings, FrameListRefused, SINGLE_FILE_CRATE_NAME, TEST_CRATE_NAME,
-    TEST_RUN_KEY_ENV, frame_origins_for, frame_origins_of,
+    CrateName, DevHotSwap, EmitHost, EmitSettings, FrameListRefused, SINGLE_FILE_CRATE_NAME,
+    TEST_CRATE_NAME, TEST_RUN_KEY_ENV, frame_origins_for, frame_origins_of,
 };
 mod emit_expr;
 mod emit_model_gate;
@@ -65,11 +65,12 @@ mod render;
 mod route_grammar;
 mod runtime_features;
 pub use runtime_features::{TokioProjection, tokio_projection_table};
+pub mod runtime_items;
 mod rust_file;
 pub mod static_build;
 // The `update`-arm → transition-datum classifier: the compile-time half of the
 // dev-loop's logic hot-swap (the counterpart of `emit_template`'s static
-// partition). Public API — consumed by the `hot_appearance` update emitter and
+// partition). Public API — consumed by the hot-logic update emitter and
 // the `ipe dev watch` transition classifier; its dev == prod conformance to the
 // runtime `apply_transition` is pinned in-module.
 pub mod transition_classify;
@@ -712,7 +713,9 @@ impl<'a> RustBackend<'a> {
     /// [`project::emit_spine`].
     pub fn emit_spine(&self, program: &Program) -> DResult<String> {
         let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
-        project::emit_spine(&ctx, program)
+        let spine = project::emit_spine(&ctx, program)?;
+        ctx.check_runtime_items()?;
+        Ok(spine)
     }
 
     /// Build the [`EmitCtx`] for `program` exactly as [`Backend::emit`] does,
@@ -743,6 +746,23 @@ impl<'a> RustBackend<'a> {
         Ok(runtime_features::runtime_features(&ctx).as_feature_names())
     }
 
+    /// The feature-gated runtime items emitting `program` names, recorded by
+    /// [`runtime_items`] as the emitters wrote them. The emit entry points
+    /// refuse any of them the selected features do not compile; this reports
+    /// the set itself, so a posture test can pin which items a shape reaches.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`Diagnostic`] from [`EmitCtx::build`] or the emit.
+    pub fn emitted_runtime_items(
+        &self,
+        program: &Program,
+    ) -> DResult<BTreeSet<runtime_items::RuntimeItem>> {
+        let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
+        project::emit_program(&ctx, program)?;
+        Ok(ctx.runtime_items.take())
+    }
+
     /// Render one `IpeModule(home)` file's Rust text for `program` (see
     /// [`project::emit_module_file`]). ADDITIVE entry point: NOT
     /// on the public emission path. Builds the [`EmitCtx`] the same way
@@ -754,11 +774,13 @@ impl<'a> RustBackend<'a> {
     /// [`project::emit_module_file`].
     pub fn emit_module_file(&self, program: &Program, home: &ModPath) -> DResult<String> {
         let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
-        project::emit_module_file(
+        let text = project::emit_module_file(
             &ctx,
             program,
             &rust_file::RustFileId::IpeModule(home.clone()),
-        )
+        )?;
+        ctx.check_runtime_items()?;
+        Ok(text)
     }
 
     /// Assemble the full split [`EmittedProject`] from already-rendered per-file
@@ -819,7 +841,9 @@ impl Backend for RustBackend<'_> {
 
     fn emit(&self, program: &Program) -> DResult<EmittedProject> {
         let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
-        project::emit_program(&ctx, program)
+        let project = project::emit_program(&ctx, program)?;
+        ctx.check_runtime_items()?;
+        Ok(project)
     }
 }
 
@@ -943,15 +967,15 @@ struct ScopeState {
     lit_accum: RefCell<LiteralAccum>,
     /// The `Model` parameter symbol of the `update` function currently being
     /// emitted, set only while emitting a TEA `update` lambda body under
-    /// [`EmitCtx::hot_appearance`]. `Some` there arms
+    /// [`DevHotSwap::logic`]. `Some` there arms
     /// [`crate::emit_expr::emit_match`] to reduce a data-describable arm to an
     /// `apply_transition_hot` call (the logic counterpart of the appearance
     /// literal-table hoist); `None` everywhere else, so no other `case` is ever
     /// transition-rewritten.
     transition_model_param: RefCell<Option<ipe_intern::Symbol>>,
     /// Whether a TEA `subscriptions` body is currently being emitted under
-    /// [`EmitCtx::hot_appearance`]. `true` only while emitting a
-    /// `Model -> Sub Msg` function body under the flag; arms
+    /// [`DevHotSwap::logic`]. `true` only while emitting a
+    /// `Model -> Sub Msg` function body under it; arms
     /// [`crate::emit_expr`]'s `Sub.every` / `Time.every` kernel emit to reduce a
     /// data-describable tick entry to a `sub_every_hot("<baked datum>")` call.
     /// `false` everywhere else, so no other `Sub.every`/`Time.every` is ever
@@ -963,14 +987,14 @@ impl ScopeState {
     /// Arm the per-function literal accumulator for a fresh function body and
     /// return the previous accumulator state so the caller can restore it after
     /// the body is emitted. Only meaningful under
-    /// [`EmitCtx::hot_appearance`]; when the flag is off it is a cheap no-op
+    /// [`DevHotSwap::appearance`]; when it is off this is a cheap no-op
     /// reset that stays inert (nothing ever hoists), keeping the emit
     /// byte-identical to the direct-literal form.
-    fn begin_function_literals(&self, hot_appearance: bool) -> LiteralAccum {
+    fn begin_function_literals(&self, appearance: bool) -> LiteralAccum {
         std::mem::replace(
             &mut *self.lit_accum.borrow_mut(),
             LiteralAccum {
-                active: hot_appearance,
+                active: appearance,
                 closure_depth: 0,
                 probe_depth: 0,
                 defaults: Vec::new(),
@@ -1527,11 +1551,15 @@ pub(crate) struct EmitCtx<'a> {
     /// The emitted crate's `[package] name`, written into the emitted
     /// `Cargo.toml`.
     pub(crate) crate_name: CrateName,
-    /// `true` when `IPE_WATCH_HOT_APPEARANCE` is set — the dev-only flag that
-    /// routes style-value literals through a per-view [`ipe_runtime::literal_table::LiteralTable`]
-    /// so a `view` appearance edit can hot-swap without recompiling. Default off:
-    /// with the flag unset the emit is byte-identical to the direct-literal form.
-    pub(crate) hot_appearance: bool,
+    /// What the `ipe dev watch` hot posture swaps for this program (see
+    /// [`DevHotSwap`]). Appearance sites read [`DevHotSwap::appearance`], the
+    /// TEA datum rewrites read [`DevHotSwap::logic`]. Off outside the dev
+    /// loop, where the emit is byte-identical to the direct form.
+    pub(crate) hot: DevHotSwap,
+    /// Every feature-gated runtime item the emit has named, through
+    /// [`Self::use_item`]; checked against the selected features by
+    /// [`Self::check_runtime_items`] before the project reaches cargo.
+    runtime_items: RefCell<BTreeSet<runtime_items::RuntimeItem>>,
     /// `Ipe.Ui` structural wrapper functions — pure, single-kernel layout builders
     /// (`el` / `row` / `column` / `wrappedRow` / `grid` / `paragraph` /
     /// `textColumn` / `form` / `input`) whose bodies are a single `UiNode` or
@@ -2445,7 +2473,11 @@ impl<'a> EmitCtx<'a> {
             // the direct-literal form — so a release artifact never references the
             // dev-loop table. `tui_shape_hoists`, `pure_webview_shape_does_not_hoist`,
             // and `web_content_kernel_does_not_hoist_on_tui_shape` pin the shapes.
-            hot_appearance: hot_appearance && (uses_web || uses_tui),
+            // Logic hot-swap reads the session-scoped `ipe_runtime::web` readers,
+            // which only a native served web build compiles and feeds, so a tui
+            // shape swaps appearance alone ([`DevHotSwap::from_flag`]).
+            hot: DevHotSwap::from_flag(hot_appearance, uses_web, uses_tui, target),
+            runtime_items: RefCell::new(BTreeSet::new()),
             ui_structural_wrappers,
             route_tables,
             page_link_table: None,
@@ -2498,11 +2530,11 @@ impl<'a> EmitCtx<'a> {
 
     /// Arm the per-function literal accumulator for a fresh function body and
     /// return the previous accumulator state so the caller can restore it after
-    /// the body is emitted. Only meaningful under [`Self::hot_appearance`]; when
-    /// the flag is off it is a cheap no-op reset that stays inert (nothing ever
+    /// the body is emitted. Only meaningful under [`DevHotSwap::appearance`];
+    /// when it is off this is a cheap no-op reset that stays inert (nothing ever
     /// hoists), keeping the emit byte-identical to the direct-literal form.
     fn begin_function_literals(&self) -> LiteralAccum {
-        self.scope.begin_function_literals(self.hot_appearance)
+        self.scope.begin_function_literals(self.hot.appearance())
     }
 
     /// Finish the current function body: take its accumulated style-literal
@@ -2510,6 +2542,27 @@ impl<'a> EmitCtx<'a> {
     /// vector means nothing was hoisted, so the caller emits no table prologue.
     fn end_function_literals(&self, previous: LiteralAccum) -> Vec<String> {
         self.scope.end_function_literals(previous)
+    }
+
+    /// Record that the emit names the feature-gated runtime `item`, and return
+    /// the path to write. The only way an emitter spells a gated item, so
+    /// [`Self::check_runtime_items`] sees every one.
+    pub(crate) fn use_item(&self, item: runtime_items::RuntimeItem) -> &'static str {
+        self.runtime_items.borrow_mut().insert(item);
+        item.path()
+    }
+
+    /// Refuse an emit that named a runtime item the build's selected features
+    /// (their transitive closure through the runtime crate) do not compile,
+    /// before the project ever reaches cargo.
+    ///
+    /// # Errors
+    ///
+    /// A [`Diagnostic::CompilerBug`] naming the item and its feature gate.
+    fn check_runtime_items(&self) -> DResult<()> {
+        let selected = runtime_features::runtime_features(self).vendored_features();
+        runtime_items::check_items(&self.runtime_items.borrow(), &selected)
+            .map_err(Diagnostic::from)
     }
 
     /// Enter a `move`-closure body: hoisting is fenced off inside a closure

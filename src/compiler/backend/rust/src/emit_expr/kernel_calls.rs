@@ -160,7 +160,7 @@ pub fn call_has_kernel_special_case(
                     // special case (appearance-literal hoisting). Every other Pure
                     // kernel is not UI-family and returns `None` here. (The two
                     // hot-swap template probes are omitted for the same reason as in
-                    // the Ui/Web arm: the Doc emitter never arms `hot_appearance`.)
+                    // the Ui/Web arm: the Doc emitter never arms the hot posture.)
                     || emit_ui_call(ctx, callee, args, on_form, indent, child, generics)?.is_some()
                     || emit_css_value_call(ctx, callee, args, indent, child, generics)?.is_some()
                     // `PubSub.topic` is the identity function — `Topic a` erases to
@@ -1882,7 +1882,7 @@ pub fn emit_tea_call(
         // ── Arity-2: tick subscriptions — standard path ──────────────────────────
         // `Sub.every : Int -> msg -> Sub msg` and
         // `Time.every : Int -> msg -> Sub msg`
-        // Under an armed TEA `subscriptions` body (`hot_appearance` on), a
+        // Under an armed TEA `subscriptions` body (hot logic on), a
         // data-describable tick entry (a literal interval + a serde-encodable
         // literal message) reduces to `sub_every_hot("<baked datum>")`, read by the
         // ONE compiled sub-runner over the baked datum (dev == prod). Both spellings
@@ -3035,7 +3035,7 @@ pub fn emit_ui_plan(
             // to the direct emit (dev == prod); the total `unwrap_or` fallback is
             // the original literal, so a stale or malformed patch can neither
             // panic nor change the built value.
-            // Gate on the shape-aware `hot_appearance` flag (armed for a web or
+            // Gate on the shape-aware hot appearance posture (armed for a web or
             // tui view under `ipe dev watch`), NOT `uses_web`: the table now lives in
             // `ipe_runtime::literal_table`, present for a terminal dev-loop build
             // (`control-wire`) as well as a web one (`web-core`), so a `Tui.tea`
@@ -3047,7 +3047,7 @@ pub fn emit_ui_plan(
             // view never routes a web-content construct through the table. With
             // the flag off no position is marked, and every argument emits inline
             // exactly as before (dev == prod by absence).
-            let positions: &[(usize, LitKind)] = if ctx.hot_appearance {
+            let positions: &[(usize, LitKind)] = if ctx.hot.appearance() {
                 shape_appearance_literal_args(k, ctx.uses_web, ctx.uses_tui)
             } else {
                 &[]

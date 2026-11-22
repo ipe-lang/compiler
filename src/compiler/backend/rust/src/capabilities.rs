@@ -244,7 +244,7 @@ pub const CAPABILITIES: &[RuntimeCapability] = &[
     // The loopback dev-loop control channel for a repaintable TERMINAL shape. A
     // `Tui.tea` app has no HTTP control port, so its appearance hot-swap rides the
     // `control-wire` loopback socket instead. Selected ONLY for an `ipe dev watch`
-    // build of a tui view: `hot_appearance` AND `uses_tui`. A plain `ipe dev build` /
+    // build of a tui view: hot appearance AND `uses_tui`. A plain `ipe dev build` /
     // `ipe release` arms no dev-loop flag, so a production terminal artifact
     // selects it not — the control server is absent from production by
     // construction (dev == prod by absence).
@@ -255,11 +255,11 @@ pub const CAPABILITIES: &[RuntimeCapability] = &[
     // socket accept-loop. The `debugger` flag is likewise NOT a disjunct here:
     // the `debugger` Cargo feature already implies `control-wire` in the crate
     // graph (`debugger = ["control-wire", …]`), so a `--debugger` build pulls the
-    // control codec transitively without this row — this row is the pure-
-    // `hot_appearance` tui selector, never double-counting (the feature set is a
+    // control codec transitively without this row — this row is the pure
+    // hot-appearance tui selector, never double-counting (the feature set is a
     // set). The web shape reaches the control module through its `server` feature.
     RuntimeCapability {
-        gate: |ctx| ctx.hot_appearance && ctx.uses_tui,
+        gate: |ctx| ctx.hot.appearance() && ctx.uses_tui,
         select: |_| RuntimeFeature::ControlWire,
         covers: &[RuntimeFeature::ControlWire],
         wasip1_legal: false,

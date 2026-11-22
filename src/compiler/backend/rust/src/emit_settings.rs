@@ -66,6 +66,70 @@ pub enum EmitHost {
     WebView(WebViewWindow),
 }
 
+/// What the `ipe dev watch` hot posture swaps without a rebuild, decided once
+/// per emit from the requested flag, the program's shape and the target.
+///
+/// The two capabilities have different runtime footprints: appearance reads
+/// `ipe_runtime::literal_table` (built under `web-core` or `control-wire`),
+/// while logic reads the session-scoped readers in `ipe_runtime::web`, which
+/// only a native served web build compiles and only its HTTP hot handlers
+/// feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DevHotSwap {
+    /// No hot rewrite: the emit is the release form.
+    Off,
+    /// Style literals route through the literal table.
+    Appearance,
+    /// Appearance, plus the `init`/`update`/`subscriptions` datum readers.
+    AppearanceAndLogic,
+}
+
+impl DevHotSwap {
+    /// The posture for a build that requested hot swap (`requested`), with
+    /// the program's served-web and terminal shapes, on `target`.
+    ///
+    /// Only a repaintable view hot-swaps: a served web app (over its HTTP
+    /// control port) or a `Tui.tea` app (over the loopback control socket).
+    /// Logic swaps only where its readers are compiled and fed: a native
+    /// served web build.
+    #[must_use]
+    pub const fn from_flag(
+        requested: bool,
+        uses_web: bool,
+        uses_tui: bool,
+        target: ipe_ir::Target,
+    ) -> Self {
+        if !requested || !(uses_web || uses_tui) {
+            return Self::Off;
+        }
+        match target {
+            ipe_ir::Target::Native if uses_web => Self::AppearanceAndLogic,
+            ipe_ir::Target::Native | ipe_ir::Target::WasmClient | ipe_ir::Target::WasmWasi => {
+                Self::Appearance
+            }
+        }
+    }
+
+    /// Whether style literals route through the literal table.
+    #[must_use]
+    pub const fn appearance(self) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Appearance | Self::AppearanceAndLogic => true,
+        }
+    }
+
+    /// Whether the TEA `init`/`update`/`subscriptions` bodies reduce to their
+    /// hot datum readers.
+    #[must_use]
+    pub const fn logic(self) -> bool {
+        match self {
+            Self::Off | Self::Appearance => false,
+            Self::AppearanceAndLogic => true,
+        }
+    }
+}
+
 /// Every input a build chooses for one emit.
 ///
 /// There is no `Default`: each production site states every field. Tests
@@ -95,7 +159,8 @@ pub struct EmitSettings {
     pub debugger: bool,
     /// The emitted crate's package name.
     pub crate_name: CrateName,
-    /// `true` when style literals route through the appearance hot-swap table.
+    /// `true` when the build requests the `ipe dev watch` hot posture;
+    /// [`DevHotSwap::from_flag`] decides what it swaps for the program.
     pub hot_appearance: bool,
     /// How the emitted program is hosted.
     pub host: EmitHost,
@@ -1177,5 +1242,35 @@ mod tests {
                 Err(FrameListRefused::NoWebLeaf { .. })
             ));
         }
+    }
+
+    /// A terminal app's hot posture swaps appearance only: its runtime has no
+    /// overlay channel and no `ipe_runtime::web` readers. Only a native served
+    /// web app swaps logic, and a request that is off, or a shape with no
+    /// repaintable view, swaps nothing.
+    #[test]
+    fn only_a_native_served_web_build_swaps_logic() {
+        use ipe_ir::Target::{Native, WasmClient, WasmWasi};
+        let posture = DevHotSwap::from_flag;
+        assert_eq!(posture(true, false, true, Native), DevHotSwap::Appearance);
+        assert_eq!(
+            posture(true, true, false, Native),
+            DevHotSwap::AppearanceAndLogic
+        );
+        assert_eq!(
+            posture(true, true, true, Native),
+            DevHotSwap::AppearanceAndLogic
+        );
+        assert_eq!(
+            posture(true, true, false, WasmClient),
+            DevHotSwap::Appearance
+        );
+        assert_eq!(posture(true, false, true, WasmWasi), DevHotSwap::Appearance);
+        assert_eq!(posture(true, false, false, Native), DevHotSwap::Off);
+        assert_eq!(posture(false, true, true, Native), DevHotSwap::Off);
+        assert!(DevHotSwap::Appearance.appearance() && !DevHotSwap::Appearance.logic());
+        assert!(DevHotSwap::AppearanceAndLogic.appearance());
+        assert!(DevHotSwap::AppearanceAndLogic.logic());
+        assert!(!DevHotSwap::Off.appearance() && !DevHotSwap::Off.logic());
     }
 }
