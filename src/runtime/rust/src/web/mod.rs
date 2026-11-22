@@ -16576,6 +16576,8 @@ mod emitted_router_behavior_tests {
             StartupRefusal::FrameAncestors(crate::telemetry::FrameAncestorsRefusal::Blank),
             StartupRefusal::Bind(env()),
             StartupRefusal::Auth(crate::app_config::AuthStartupRefusal::Revocation(env())),
+            #[cfg(feature = "db-operator")]
+            StartupRefusal::Database(crate::db::OperatorUrlRefusal::EnvEmpty),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for cause in &samples {
@@ -16587,6 +16589,8 @@ mod emitted_router_behavior_tests {
                 StartupRefusal::FrameAncestors(_) => ("frame", false),
                 StartupRefusal::Bind(_) => ("bind", true),
                 StartupRefusal::Auth(_) => ("auth", true),
+                #[cfg(feature = "db-operator")]
+                StartupRefusal::Database(_) => ("database", false),
             };
             seen.insert(kind);
             let line = crate::system::scrubbed_runtime_log_line(
@@ -16607,7 +16611,8 @@ mod emitted_router_behavior_tests {
                 assert!(line.contains("a\\\\b\\n"), "{kind}: {line:?}");
             }
         }
-        assert_eq!(seen.len(), 7, "one sample per variant: {seen:?}");
+        let variants = 7 + usize::from(cfg!(feature = "db-operator"));
+        assert_eq!(seen.len(), variants, "one sample per variant: {seen:?}");
     }
 
     /// A mounted routed app whose table holds a malformed pattern answers every

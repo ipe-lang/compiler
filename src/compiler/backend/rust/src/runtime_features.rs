@@ -1325,6 +1325,11 @@ mod tests {
     fn db_operator_feature_selected_by_db_connect_only() {
         let mut interner = Interner::new();
         let main = interner.intern("Main").expect("intern Main");
+        let mut connect = db_module(&mut interner, main);
+        connect.uses_db_operator = true;
+        let open_only = db_module(&mut interner, main);
+        let flag_only = ctx_module(main, |m| m.uses_db_operator = true);
+
         let features = |modules: Vec<Module>| {
             let prog = Program {
                 imports_unsafe_submodule: false,
@@ -1335,11 +1340,6 @@ mod tests {
             let ctx = backend.emit_ctx_for_tests(&prog).expect("build EmitCtx");
             super::runtime_features(&ctx).as_feature_names()
         };
-
-        let mut connect = db_module(&mut interner, main);
-        connect.uses_db_operator = true;
-        let open_only = db_module(&mut interner, main);
-        let flag_only = ctx_module(main, |m| m.uses_db_operator = true);
 
         let f = features(vec![connect]);
         assert!(f.contains(&"db-operator"), "`Db.connect` selects it: {f:?}");

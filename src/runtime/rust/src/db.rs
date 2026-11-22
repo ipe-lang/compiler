@@ -2959,7 +2959,7 @@ impl OperatorUrlSource {
     /// The name a refusal gives the source.
     const fn shown(self) -> &'static str {
         match self {
-            Self::Env => "DATABASE_URL",
+            Self::Env => OPERATOR_DB_ENV,
             Self::Setting => "the `Db.url` setting",
         }
     }
@@ -3159,7 +3159,7 @@ enum DefaultStore {
 #[derive(Clone)]
 enum OperatorStore {
     /// A URL the operator or the app configured.
-    Configured(ConfiguredUrl),
+    Configured(Box<ConfiguredUrl>),
     /// The runtime-authored default.
     Default(DefaultStore),
 }
@@ -3297,8 +3297,8 @@ fn choose_store(
     let env = env?;
     let setting = setting.as_ref().map_err(|refused| *refused)?;
     Ok(match (env, setting) {
-        (Some(url), _) => OperatorStore::Configured(url),
-        (None, Some(url)) => OperatorStore::Configured(url.clone()),
+        (Some(url), _) => OperatorStore::Configured(Box::new(url)),
+        (None, Some(url)) => OperatorStore::Configured(Box::new(url.clone())),
         (None, None) => OperatorStore::Default(default()),
     })
 }
@@ -3391,10 +3391,16 @@ fn emit_default_warning(lines: &[String; 2]) {
     }
 }
 
+/// The raw `DATABASE_URL`: the one read of [`OPERATOR_DB_ENV`], spelled as a
+/// literal so the environment-read scan sees a host variable.
+fn read_operator_db_env() -> Result<String, std::env::VarError> {
+    crate::system::read_env_var("DATABASE_URL")
+}
+
 /// The process's operator store, resolved and warned about once.
 fn operator_store() -> &'static StoreChoice {
     OPERATOR.store(
-        crate::system::read_env_var(OPERATOR_DB_ENV),
+        read_operator_db_env(),
         crate::app_config::installed_db_url_setting(),
         KERNEL_ENGINE,
         working_directory,
@@ -3410,7 +3416,7 @@ fn operator_store() -> &'static StoreChoice {
 #[cfg(feature = "db-operator")]
 pub(crate) fn check_operator_url_at_start() -> Result<(), OperatorUrlRefusal> {
     OPERATOR.check_at_start(
-        crate::system::read_env_var(OPERATOR_DB_ENV),
+        read_operator_db_env(),
         crate::app_config::installed_db_url_setting(),
         KERNEL_ENGINE,
     )
@@ -8681,6 +8687,16 @@ mod tests {
                 kind: DbUrlRefusalKind::SurroundingWhitespace,
             })
         );
+    }
+
+    /// The operator URL has one environment read, under [`OPERATOR_DB_ENV`]'s
+    /// spelling, so the name a refusal shows is the name the runtime reads.
+    #[test]
+    fn operator_db_env_is_read_once_under_its_const() {
+        let source = include_str!("db.rs");
+        let read = format!("read_env_var(\"{OPERATOR_DB_ENV}\")");
+        assert_eq!(source.matches(read.as_str()).count(), 1, "{read}");
+        assert_eq!(OperatorUrlSource::Env.shown(), OPERATOR_DB_ENV);
     }
 
     /// T5: an empty or malformed `Db.url` setting is refused, naming the setting.
