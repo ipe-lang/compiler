@@ -880,6 +880,31 @@ fn a_hazardous_extra_word_is_never_echoed() -> io::Result<()> {
     Ok(())
 }
 
+/// The quote fix is offered only when it is read back unchanged: a shell
+/// would expand or split `$`, `` ` ``, `"`, `!` or `%` inside the quotes, a
+/// leading `-` reads as a flag, and a query that trims to a mode word opens
+/// that mode, so each keeps the single-key refusal.
+#[test]
+fn a_quote_fix_not_read_back_unchanged_is_not_offered() -> io::Result<()> {
+    let dir = fresh_dir("quote_fix_read_back")?;
+    for args in [
+        ["doc", "read", "$(id)"],
+        ["doc", "read", "`id`"],
+        ["doc", "read", "a\"b"],
+        ["doc", "read", "x!"],
+        ["doc", "read", "%PATH%"],
+        ["doc", "-", "x"],
+        ["doc", " list", ""],
+    ] {
+        let (ok, stdout, stderr) = run_in(&dir, &args);
+        assert!(!ok, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?}:\n{stdout}");
+        assert!(!stderr.contains("ipe doc \""), "{args:?}:\n{stderr}");
+        assert!(stderr.contains("single <key>"), "{args:?}:\n{stderr}");
+    }
+    Ok(())
+}
+
 /// A malformed query is refused with a typed usage error before any lookup:
 /// no stack trace, and the hazardous text is never echoed raw.
 #[test]

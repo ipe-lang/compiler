@@ -639,8 +639,10 @@ const fn sub_term(sub: &Sub) -> Option<&DocQuery> {
 /// [`route_term`] itself, to a lookup: a joined query that routes another way
 /// (an operator or `kind:key` beside a word, whose `/` or `:` makes the whole
 /// a path) keeps the single-key refusal, so the echoed command never names a
-/// route the user did not ask for. The joined query is parsed before it is
-/// echoed, so a hazardous word is refused, never printed.
+/// route the user did not ask for. The fix is offered only when a shell and
+/// the whole argument parser read it back unchanged ([`quote_fix_reparses`]).
+/// The joined query is parsed before it is echoed, so a hazardous word is
+/// refused, never printed.
 fn extra_word_refusal<'r>(
     term: &DocQuery,
     word: &str,
@@ -670,11 +672,44 @@ fn extra_word_refusal<'r>(
     };
     CliError::Usage(
         quoted
-            .filter(|_| !names_a_path)
+            .filter(|query| !names_a_path && quote_fix_reparses(query.text()))
             .map_or_else(text::msg::doc_single_key, |query| {
                 text::msg::doc_quote_query(&query.text())
             }),
     )
+}
+
+/// The characters a shell does not take literally inside `"…"`: POSIX and
+/// PowerShell expansion and escapes, history expansion, `cmd` variables, and
+/// the typographic quotes PowerShell reads as `"`.
+const DOUBLE_QUOTE_ACTIVE: [char; 9] = [
+    '"', '$', '`', '\\', '!', '%', '\u{201c}', '\u{201d}', '\u{201e}',
+];
+
+/// Whether the fix `ipe doc "<query>"` is read back as the lookup of `query`:
+/// a shell hands `query` over as one argument unchanged, and [`parse_doc_with`]
+/// itself, flag gate and mode words included, routes that argument to the
+/// lookup of the same text.
+fn quote_fix_reparses(query: &str) -> bool {
+    if query.contains(DOUBLE_QUOTE_ACTIVE) {
+        return false;
+    }
+    match parse_doc_with(&[query.to_owned()], &mut |_| {}) {
+        Ok(DocMode::Lookup {
+            key: LookupTerm::Bare(term) | LookupTerm::Qualified { term, .. },
+            ..
+        }) => term.text() == query,
+        Ok(
+            DocMode::Generate { .. }
+            | DocMode::Serve { .. }
+            | DocMode::Check { .. }
+            | DocMode::List { .. }
+            | DocMode::Query { .. }
+            | DocMode::CheckExamples
+            | DocMode::TypeSearch { .. },
+        )
+        | Err(_) => false,
+    }
 }
 
 /// The subcommand's name for an error message.
