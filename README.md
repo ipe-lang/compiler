@@ -27,9 +27,21 @@ to learn more about it.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh -o ipe-install.sh && sh ipe-install.sh
 ```
 
+Or, with GNU Wget:
+
+```sh
+wget -qO ipe-install.sh https://raw.githubusercontent.com/ipe-lang/compiler/main/install.sh && sh ipe-install.sh
+```
+
+Prerequisites:
+
+- curl or GNU Wget, and a SHA-256 tool (`sha256sum`, `shasum`, `sha256` or `openssl`) — to install;
+- Rust 1.85 or later and a C toolchain — to build. The installer names any you lack, with the command that installs it.
+
+Per-OS commands and troubleshooting: [Installing on Linux, macOS and FreeBSD](docs/guide/install.md).
 For Windows (experimental), follow [these instructions](docs/guide/windows.md).
 
 ## Quickstart

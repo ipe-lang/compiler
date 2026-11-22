@@ -1,7 +1,9 @@
 # Proves install.sh actually downloads, extracts, and installs a working `ipe` on
 # every platform it claims to support — Linux, macOS, Windows (Git Bash), and
-# FreeBSD — using the documented `curl … | sh` delivery, then exercises the
-# `ipe upgrade` self-updater. A published release must exist for the installer to
+# FreeBSD — the way the README runs it, then exercises the `ipe upgrade`
+# self-updater. Container jobs prove the prerequisite paths: a host with no
+# downloader is refused, a GNU Wget-only host installs, and Alpine's BusyBox
+# wget is refused until curl is installed. A published release must exist for the installer to
 # fetch, so this runs post-merge, on a weekly schedule, and on any PR that touches
 # the installer. Advisory (not a required gate); it guards the install path from
 # silent rot across OSes.
@@ -43,7 +45,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install ipe via the documented `curl … | sh`, then verify `ipe upgrade`
+      - name: Install ipe the documented way, then verify `ipe upgrade`
         shell: bash
         env:
           IPE_INSTALL_DIR: ${{ runner.temp }}/ipe-smoke
@@ -52,9 +54,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          # Replicate the documented one-liner `curl -fsSL … | sh`: deliver the
-          # installer on stdin (no `$0` file), exactly as a real user runs it.
-          cat install.sh | sh
+          # The README saves the installer whole, then runs it.
+          sh install.sh
           # Git Bash on Windows installs ipe.exe; resolve either name.
           bin="$IPE_INSTALL_DIR/ipe"
           [ -x "$bin" ] || bin="$bin.exe"
@@ -70,7 +71,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install ipe via the documented `curl … | sh` inside a FreeBSD VM
+      - name: Install ipe with the base system's fetch inside a FreeBSD VM
         uses: vmactions/freebsd-vm@811efaaac0668df8bfb8308c3ec997b5ab50037b # v1.6.0
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -81,10 +82,47 @@ jobs:
           # Copy the host token into the VM so install.sh's release lookup is
           # authenticated (avoids anonymous API rate-limit 403).
           envs: 'GITHUB_TOKEN'
-          prepare: pkg install -y curl
           run: |
             set -eu
             export IPE_INSTALL_DIR="$HOME/ipe-smoke"
-            cat install.sh | sh
+            sh install.sh
             "$IPE_INSTALL_DIR/ipe" version
             "$IPE_INSTALL_DIR/ipe" upgrade --dry-run | grep -F "/main/install.sh"
+
+  # Prerequisite paths, each in a clean distribution container: the installer
+  # refuses a host it cannot download on with exit 3, and installs once the
+  # named prerequisite is present.
+  prerequisites:
+    name: install-smoke (${{ matrix.host }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [debian-wget, alpine]
+        include:
+          - host: debian-wget
+            image: debian:stable-slim
+            add: apt-get update -qq && apt-get install -y -qq wget ca-certificates
+          - host: alpine
+            image: alpine:3
+            add: apk add -q curl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Refused without its prerequisite, installed with it
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          IMAGE: ${{ matrix.image }}
+          ADD: ${{ matrix.add }}
+        run: |
+          set -eu
+          docker run --rm -e GITHUB_TOKEN -e ADD -v "$PWD:/src:ro" "$IMAGE" sh -c '
+            set -u
+            export IPE_INSTALL_DIR=/opt/ipe-smoke
+            code=0
+            sh /src/install.sh || code=$?
+            [ "$code" = 3 ] || { echo "expected exit 3 before the prerequisite, got $code"; exit 1; }
+            [ ! -e "$IPE_INSTALL_DIR/ipe" ] || { echo "a refused run installed ipe"; exit 1; }
+            sh -c "$ADD"
+            sh /src/install.sh
+            [ -x "$IPE_INSTALL_DIR/ipe" ]
+          '
