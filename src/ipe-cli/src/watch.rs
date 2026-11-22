@@ -3816,6 +3816,13 @@ mod tests {
             assert_eq!(surface.terminal(), terminal, "{surface:?} terminal");
             assert_eq!(surface.appearance_route(), route, "{surface:?} route");
         }
+    }
+
+    /// The entry's shape and its first-party HTTP listener decide the surface:
+    /// a non-web, non-terminal shape that binds HTTP is probed as a listener.
+    #[test]
+    fn every_shape_takes_one_surface() {
+        use super::surface::Listener;
         let shapes = [
             (Shape::Web, false, ChildSurface::WebApp),
             (Shape::Web, true, ChildSurface::WebApp),
