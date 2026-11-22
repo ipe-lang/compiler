@@ -23,9 +23,10 @@
 use super::super::css_safety::{CssValueOrigin, SafeCssPropertyName, SafeCssValue};
 use super::super::html::{Attribute as HtmlAttribute, Html, admit_element};
 use super::element::{
-    Attribute, Description, Element, HAlign, HeadingLevel, Length, Location, Portion, SectionHead,
-    VAlign, section_head,
+    Attribute, BaseLength, Description, Element, HAlign, HeadingLevel, Length, Location,
+    SectionHead, VAlign, section_head,
 };
+use crate::length::PxBounds;
 
 // ── CSS boundary smart constructors ───────────────────────────────────────────
 // `SafeCssPropertyName` / `SafeCssValue` moved to the shared `css_safety` module
@@ -971,94 +972,64 @@ impl Dim {
     }
 }
 
-/// A `fill` length parsed once: its portion and the `minimum` / `maximum` px
-/// bounds wrapped around it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct FillSpec {
-    /// Flex portion, positive by type.
-    portion: Portion,
-    /// Largest `minimum` bound around the fill, in px.
-    lower: Option<i64>,
-    /// Smallest `maximum` bound around the fill, in px.
-    upper: Option<i64>,
-}
-
-/// Parse a `Length` into its `FillSpec`, or `None` when it is not a `fill`.
-///
-/// `Min` / `Max` wrappers are unwrapped iteratively (bounded stack on any
-/// nesting depth), matching the TUI's `fill_spec`.
-fn fill_spec(len: &Length) -> Option<FillSpec> {
-    let mut lower: Option<i64> = None;
-    let mut upper: Option<i64> = None;
-    let mut cur = len;
-    loop {
-        match cur {
-            Length::Fill(portion) => {
-                return Some(FillSpec {
-                    portion: *portion,
-                    lower,
-                    upper,
-                });
-            }
-            Length::Min(n, inner) => {
-                lower = Some(lower.map_or(*n, |l| l.max(*n)));
-                cur = inner;
-            }
-            Length::Max(n, inner) => {
-                upper = Some(upper.map_or(*n, |u| u.min(*n)));
-                cur = inner;
-            }
-            Length::Px(_) | Length::Content | Length::Vh(_) | Length::Vw(_) => return None,
-        }
-    }
-}
-
 /// True when the node's `height` is a `fill` (possibly bounded).
 fn has_height_fill<M>(attrs: &[Attribute<M>]) -> bool {
-    attrs
-        .iter()
-        .any(|a| matches!(a, Attribute::AttrHeight(len) if fill_spec(len).is_some()))
+    attrs.iter().any(
+        |a| matches!(a, Attribute::AttrHeight(len) if matches!(len.base(), BaseLength::Fill(_))),
+    )
 }
 
 /// Emit the CSS of one size attribute laid out by a parent with main axis `main`.
 ///
-/// - main-axis `fill`: the dimension, the portion growth, `flex-basis:0`, and
-///   a `min-*` floor (the `minimum` bound, else 0) plus any `maximum` cap;
-/// - cross-axis `fill` in a row: `align-self:stretch` plus its bounds, never
-///   `height:100%` (inert in an auto-height row) nor a flex property;
-/// - any other case: the dimension's `Length::css` value only.
+/// The only `Ipe.Ui` length renderer. The base renders as its own declaration:
+/// - `px` / `vh` / `vw`: the dimension in its unit;
+/// - `content`: `fit-content`, the same size a width-less node takes;
+/// - main-axis `fill`: `100%`, the portion growth, `flex-basis:0`, and a
+///   `min-*` floor (the `minimum` bound, else 0);
+/// - cross-axis `fill` in a row: `align-self:stretch`, never `height:100%`
+///   (inert in an auto-height row) nor a flex property;
+/// - any other `fill`: `100%`.
+///
+/// Each bound then renders as a separate `min-*` / `max-*` declaration, never a
+/// CSS math function: `min-*` beats `max-*` and the folded bounds keep
+/// `lo <= hi`, so the used size is exactly `max(lo, min(hi, base))`.
 fn dim_css(dim: Dim, len: &Length, main: MainAxis) -> String {
     use crate::length::CssUnit;
     use std::fmt::Write as _;
     let name = dim.css_name();
-    let Some(fill) = fill_spec(len) else {
-        return format!("{name}:{}", len.css());
-    };
-    let mut out = match (dim, main) {
-        (Dim::Width, MainAxis::Width) | (Dim::Height, MainAxis::Height) => {
-            let floor = fill
-                .lower
-                .map_or_else(|| "0".to_owned(), |l| CssUnit::Px.css(l));
-            format!(
-                "{name}:{};flex-grow:{};flex-basis:0;min-{name}:{floor}",
-                len.css(),
-                fill.portion.get()
-            )
+    let bounds = len.bounds();
+    let base = len.base();
+    let main_axis_fill = matches!(
+        (dim, main, base),
+        (Dim::Width, MainAxis::Width, BaseLength::Fill(_))
+            | (Dim::Height, MainAxis::Height, BaseLength::Fill(_))
+    );
+    let mut out = match base {
+        BaseLength::Px(_) | BaseLength::Vh(_) | BaseLength::Vw(_) => {
+            format!("{name}:{}", base.unit_css().unwrap_or_default())
         }
-        (Dim::Height, MainAxis::Width) => {
-            let mut stretch = "align-self:stretch".to_owned();
-            if let Some(l) = fill.lower {
-                let _ = write!(stretch, ";min-{name}:{}", CssUnit::Px.css(l));
+        BaseLength::Content => format!("{name}:fit-content"),
+        BaseLength::Fill(portion) if main_axis_fill => {
+            format!("{name}:100%;flex-grow:{};flex-basis:0", portion.get())
+        }
+        BaseLength::Fill(_) => match (dim, main) {
+            (Dim::Height, MainAxis::Width) => "align-self:stretch".to_owned(),
+            (Dim::Width, _) | (Dim::Height, MainAxis::Height | MainAxis::None) => {
+                format!("{name}:100%")
             }
-            stretch
-        }
-        // `Length::css` already folds the bounds into `max()` / `min()`.
-        (Dim::Width, MainAxis::Height | MainAxis::None) | (Dim::Height, MainAxis::None) => {
-            return format!("{name}:{}", len.css());
-        }
+        },
     };
-    if let Some(u) = fill.upper {
-        let _ = write!(out, ";max-{name}:{}", CssUnit::Px.css(u));
+    match bounds.lower() {
+        Some(lo) => {
+            let _ = write!(out, ";min-{name}:{}", CssUnit::Px.css(lo));
+        }
+        None if main_axis_fill => {
+            let _ = write!(out, ";min-{name}:0");
+        }
+        None => {}
+    }
+    if let Some(hi) = bounds.upper() {
+        let _ = write!(out, ";max-{name}:{}", CssUnit::Px.css(hi));
     }
     out
 }
@@ -1312,16 +1283,18 @@ fn alignment_css<M>(attrs: &[Attribute<M>], parent_axis: FlexAxis) -> String {
 /// parent (width = main axis): in a column the width is the cross axis, so
 /// shrinking never compresses it and `flex-shrink:0` would wrongly pin
 /// deeply-nested content that elm-ui lets reflow. `fill` has its own grow/basis
-/// model; `min`/`max`/`content` keep the default shrink so an intrinsic bound
+/// model; a bounded or `content` width keeps the default shrink so an intrinsic bound
 /// can still give.
 fn overconstrain_css<M>(attrs: &[Attribute<M>], parent_axis: FlexAxis) -> &'static str {
     match main_dim(parent_axis) {
         MainAxis::Width => {}
         MainAxis::Height | MainAxis::None => return "",
     }
-    let fixed_width = attrs
-        .iter()
-        .any(|a| matches!(a, Attribute::AttrWidth(Length::Px(_) | Length::Vw(_))));
+    let fixed_width = attrs.iter().any(|a| {
+        matches!(a, Attribute::AttrWidth(len)
+            if matches!(len.base(), BaseLength::Px(_) | BaseLength::Vw(_))
+                && len.bounds() == PxBounds::NONE)
+    });
     if fixed_width { "flex-shrink:0" } else { "" }
 }
 
@@ -1749,7 +1722,7 @@ fn render_node_as<M: Clone>(
     // so a normal explain render carries no annotation overhead.
     if explain_active && explain_verbose_enabled() {
         let w = attrs.iter().find_map(|a| match a {
-            Attribute::AttrWidth(l) => Some(l.css()),
+            Attribute::AttrWidth(l) => Some(dim_css(Dim::Width, l, MainAxis::None)),
             _ => None,
         });
         let w = w.unwrap_or_else(|| "shrink".to_owned());
@@ -1928,6 +1901,7 @@ mod tests {
     use super::*;
     use crate::color::Color;
     use crate::html::render_html;
+    use crate::ui::element::Portion;
 
     #[derive(Clone, Debug, PartialEq)]
     enum TestMsg {
@@ -2100,7 +2074,7 @@ mod tests {
         );
 
         let fixed: Element<TestMsg> = ui_el_(
-            vec![ui_width_(Length::Px(200))],
+            vec![ui_width_(Length::px(200))],
             Element::Text("x".to_owned()),
         );
         let s = render_html(&render_element(fixed));
@@ -2380,7 +2354,7 @@ mod tests {
         let row: Element<TestMsg> = ui_row_(
             vec![],
             vec![ui_el_(
-                vec![ui_width_(Length::Px(150))],
+                vec![ui_width_(Length::px(150))],
                 Element::Text("a".to_owned()),
             )],
         );
@@ -2393,7 +2367,7 @@ mod tests {
         let col: Element<TestMsg> = ui_column_(
             vec![],
             vec![ui_el_(
-                vec![ui_width_(Length::Px(150))],
+                vec![ui_width_(Length::px(150))],
                 Element::Text("a".to_owned()),
             )],
         );
@@ -2451,7 +2425,7 @@ mod tests {
         let row: Element<TestMsg> = ui_row_(
             vec![Attribute::AttrExplain],
             vec![ui_el_(
-                vec![ui_width_(Length::Px(150))],
+                vec![ui_width_(Length::px(150))],
                 Element::Text("wide".to_owned()),
             )],
         );
@@ -2523,7 +2497,7 @@ mod tests {
     #[test]
     fn layout_root_attrs_override_root_fill() {
         let html = ui_layout::<TestMsg>(
-            vec![Attribute::AttrHeight(Length::Px(300))],
+            vec![Attribute::AttrHeight(Length::px(300))],
             Element::Text("a".to_owned()),
         );
         let root = child_of(&html, 0).and_then(style_of).unwrap_or_default();
@@ -2545,7 +2519,7 @@ mod tests {
     fn layout_renders_author_root_as_column_child() {
         use crate::ui::helpers::ui_el_;
         let elem: Element<TestMsg> = ui_el_(
-            vec![Attribute::AttrHeight(Length::Fill(Portion::ONE))],
+            vec![Attribute::AttrHeight(Length::fill(Portion::ONE))],
             Element::Text("a".to_owned()),
         );
         let html = ui_layout(vec![], elem);
@@ -2590,7 +2564,7 @@ mod tests {
     fn fill_height_in_column_is_main_axis() {
         use crate::ui::helpers::{ui_column_, ui_el_};
         let child = ui_el_(
-            vec![Attribute::AttrHeight(Length::Fill(Portion::ONE))],
+            vec![Attribute::AttrHeight(Length::fill(Portion::ONE))],
             Element::Text("a".to_owned()),
         );
         let s = first_child_style(ui_column_(vec![], vec![child]));
@@ -2607,8 +2581,8 @@ mod tests {
         use crate::ui::helpers::{ui_el_, ui_row_};
         let child = ui_el_(
             vec![
-                Attribute::AttrHeight(Length::Fill(Portion::ONE)),
-                Attribute::AttrWidth(Length::Px(40)),
+                Attribute::AttrHeight(Length::fill(Portion::ONE)),
+                Attribute::AttrWidth(Length::px(40)),
             ],
             Element::Text("a".to_owned()),
         );
@@ -2629,7 +2603,7 @@ mod tests {
     fn fill_width_in_column_emits_no_flex() {
         use crate::ui::helpers::{ui_column_, ui_el_};
         let child = ui_el_(
-            vec![Attribute::AttrWidth(Length::Fill(Portion::ONE))],
+            vec![Attribute::AttrWidth(Length::fill(Portion::ONE))],
             Element::Text("a".to_owned()),
         );
         let s = first_child_style(ui_column_(vec![], vec![child]));
@@ -2648,8 +2622,8 @@ mod tests {
         use crate::ui::helpers::ui_el_;
         let child = ui_el_(
             vec![
-                Attribute::AttrWidth(Length::Fill(Portion::ONE)),
-                Attribute::AttrHeight(Length::Fill(Portion::ONE)),
+                Attribute::AttrWidth(Length::fill(Portion::ONE)),
+                Attribute::AttrHeight(Length::fill(Portion::ONE)),
             ],
             Element::Text("a".to_owned()),
         );
@@ -2672,7 +2646,7 @@ mod tests {
             &[Attribute::<TestMsg>::AttrWidth(ui_shrink_())],
             FlexAxis::Row,
         );
-        assert_eq!(shrink, "width:auto");
+        assert_eq!(shrink, "width:fit-content");
         for n in [0, -3, i64::MIN] {
             assert_eq!(ui_fill_portion_(n), ui_shrink_(), "fillPortion {n}");
             for axis in [FlexAxis::Row, FlexAxis::Column, FlexAxis::Block] {
@@ -2717,7 +2691,7 @@ mod tests {
         );
         assert_eq!(
             ui_fill_portion_(i64::from(Portion::MAX.get()) + 1),
-            Length::Fill(Portion::MAX)
+            Length::fill(Portion::MAX)
         );
     }
 
@@ -2726,44 +2700,28 @@ mod tests {
     #[test]
     fn fill_inside_min_max_keeps_portion() {
         let min = size_css(
-            &[Attribute::<TestMsg>::AttrWidth(Length::Min(
-                100,
-                Box::new(Length::Fill(Portion::ONE)),
-            ))],
+            &[Attribute::<TestMsg>::AttrWidth(
+                Length::fill(Portion::ONE).at_least(100),
+            )],
             FlexAxis::Row,
         );
-        assert!(
-            min.contains("flex-grow:1;flex-basis:0"),
-            "min fill grows: {min}"
-        );
-        assert!(
-            min.starts_with("width:max(100px,100%);"),
-            "minimum is a lower bound: {min}"
-        );
-        assert!(min.ends_with("min-width:100px"), "minimum floors: {min}");
+        assert_eq!(min, "width:100%;flex-grow:1;flex-basis:0;min-width:100px");
 
         let max = size_css(
-            &[Attribute::<TestMsg>::AttrWidth(Length::Max(
-                200,
-                Box::new(Length::Fill(Portion::ONE)),
-            ))],
+            &[Attribute::<TestMsg>::AttrWidth(
+                Length::fill(Portion::ONE).at_most(200),
+            )],
             FlexAxis::Row,
         );
-        assert!(
-            max.contains("flex-grow:1;flex-basis:0;min-width:0"),
-            "max fill grows: {max}"
+        assert_eq!(
+            max,
+            "width:100%;flex-grow:1;flex-basis:0;min-width:0;max-width:200px"
         );
-        assert!(
-            max.starts_with("width:min(200px,100%);"),
-            "maximum is an upper bound: {max}"
-        );
-        assert!(max.ends_with(";max-width:200px"), "maximum caps: {max}");
 
         let cross = size_css(
-            &[Attribute::<TestMsg>::AttrHeight(Length::Max(
-                8,
-                Box::new(Length::Min(4, Box::new(Length::Fill(Portion::ONE)))),
-            ))],
+            &[Attribute::<TestMsg>::AttrHeight(
+                Length::fill(Portion::ONE).at_least(4).at_most(8),
+            )],
             FlexAxis::Row,
         );
         assert_eq!(
@@ -2772,29 +2730,231 @@ mod tests {
         );
     }
 
-    /// Nested bounds of one kind combine to the tightest: the largest floor and
-    /// the smallest cap.
+    /// Nested bounds fold in nesting order: two floors keep the larger, two
+    /// caps the smaller, and the portion survives.
     #[test]
-    fn fill_spec_combines_nested_bounds() {
-        let len = Length::Min(
-            10,
-            Box::new(Length::Min(
-                30,
-                Box::new(Length::Max(
-                    90,
-                    Box::new(Length::Max(50, Box::new(Length::fill_portion(2)))),
-                )),
-            )),
+    fn nested_bounds_fold_to_one_interval() {
+        let len = Length::fill_portion(2)
+            .at_most(50)
+            .at_most(90)
+            .at_least(30)
+            .at_least(10);
+        assert_eq!(
+            len.base(),
+            BaseLength::Fill(Portion::from_int(2).unwrap_or(Portion::ONE))
         );
         assert_eq!(
-            fill_spec(&len),
-            Some(FillSpec {
-                portion: Portion::from_int(2).expect("2 is a positive portion"),
-                lower: Some(30),
-                upper: Some(50),
-            })
+            (len.bounds().lower(), len.bounds().upper()),
+            (Some(30), Some(50))
         );
-        assert_eq!(fill_spec(&Length::Min(10, Box::new(Length::Px(5)))), None);
+        let row = size_css(&[Attribute::<TestMsg>::AttrWidth(len)], FlexAxis::Row);
+        assert_eq!(
+            row,
+            "width:100%;flex-grow:2;flex-basis:0;min-width:30px;max-width:50px"
+        );
+    }
+
+    /// The bases and bound chains `every_length_shape_renders_valid_bounded_css`
+    /// sweeps.
+    fn length_shapes() -> Vec<Length> {
+        let bases = [
+            Length::px(-5),
+            Length::px(0),
+            Length::px(96),
+            Length::vh(-5),
+            Length::vh(50),
+            Length::vw(-5),
+            Length::vw(50),
+            Length::content(),
+            Length::fill(Portion::ONE),
+            Length::fill(Portion::MAX),
+            Length::fill_portion(0),
+        ];
+        let ns = [-5, 0, 40, 96, 200, i64::MAX];
+        let mut chains: Vec<Vec<(bool, i64)>> = vec![Vec::new()];
+        let mut frontier: Vec<Vec<(bool, i64)>> = vec![Vec::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for chain in &frontier {
+                for n in ns {
+                    for at_least in [true, false] {
+                        let mut longer = chain.clone();
+                        longer.push((at_least, n));
+                        next.push(longer);
+                    }
+                }
+            }
+            chains.extend(next.iter().cloned());
+            frontier = next;
+        }
+        let mut out = Vec::new();
+        for base in bases {
+            for chain in &chains {
+                out.push(chain.iter().fold(base, |l, (at_least, n)| {
+                    if *at_least {
+                        l.at_least(*n)
+                    } else {
+                        l.at_most(*n)
+                    }
+                }));
+            }
+        }
+        out
+    }
+
+    /// Refusal of a context-free length splice: every base under every bound
+    /// chain of depth <= 3, on both axes, in every parent, renders only
+    /// declarations the CSS gate admits — no math function, no `auto`, no
+    /// negative size — and writes each folded bound as its own `min-*` /
+    /// `max-*` declaration.
+    #[test]
+    fn every_length_shape_renders_valid_bounded_css() {
+        const PROPS: [&str; 9] = [
+            "width",
+            "height",
+            "min-width",
+            "max-width",
+            "min-height",
+            "max-height",
+            "flex-grow",
+            "flex-basis",
+            "align-self",
+        ];
+        for len in length_shapes() {
+            for dim in [Dim::Width, Dim::Height] {
+                for parent in [FlexAxis::Row, FlexAxis::Column, FlexAxis::Block] {
+                    let main = main_dim(parent);
+                    let css = dim_css(dim, &len, main);
+                    let ctx = format!("{len:?} {} under {parent:?}: {css}", dim.css_name());
+                    for banned in ["min(", "max(", "clamp(", "calc(", "auto"] {
+                        assert!(!css.contains(banned), "{banned} in {ctx}");
+                    }
+                    let bytes = css.as_bytes();
+                    assert!(
+                        !bytes.windows(2).any(|w| w.first() == Some(&b'-')
+                            && w.get(1).is_some_and(u8::is_ascii_digit)),
+                        "negative size in {ctx}"
+                    );
+                    for decl in css.split(';') {
+                        let parsed = decl.split_once(':');
+                        assert!(
+                            parsed.is_some_and(
+                                |(p, v)| PROPS.contains(&p) && SafeCssValue::parse(v).is_some()
+                            ),
+                            "declaration {decl:?} in {ctx}"
+                        );
+                    }
+                    let name = dim.css_name();
+                    let main_fill = matches!(len.base(), BaseLength::Fill(_))
+                        && matches!(
+                            (dim, main),
+                            (Dim::Width, MainAxis::Width) | (Dim::Height, MainAxis::Height)
+                        );
+                    let floor = match (len.bounds().lower(), main_fill) {
+                        (Some(lo), _) => Some(format!("min-{name}:{lo}px")),
+                        (None, true) => Some(format!("min-{name}:0")),
+                        (None, false) => None,
+                    };
+                    let floors: Vec<&str> = css
+                        .split(';')
+                        .filter(|d| d.starts_with(&format!("min-{name}:")))
+                        .collect();
+                    assert_eq!(
+                        floors,
+                        floor.as_deref().into_iter().collect::<Vec<_>>(),
+                        "{ctx}"
+                    );
+                    let cap = len.bounds().upper().map(|hi| format!("max-{name}:{hi}px"));
+                    let caps: Vec<&str> = css
+                        .split(';')
+                        .filter(|d| d.starts_with(&format!("max-{name}:")))
+                        .collect();
+                    assert_eq!(
+                        caps,
+                        cap.as_deref().into_iter().collect::<Vec<_>>(),
+                        "{ctx}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Refusal: `Ui.minimum 96 Ui.shrink` floors the content size with a
+    /// separate `min-*` declaration, never `max(96px,auto)` (which a browser
+    /// drops whole).
+    #[test]
+    fn minimum_over_shrink_is_fit_content_floor() {
+        use crate::ui::helpers::{ui_minimum_, ui_shrink_};
+        let len = ui_minimum_(96, ui_shrink_());
+        for parent in [FlexAxis::Row, FlexAxis::Column, FlexAxis::Block] {
+            let w = size_css(&[Attribute::<TestMsg>::AttrWidth(len)], parent);
+            assert_eq!(w, "width:fit-content;min-width:96px", "{parent:?}");
+            let h = size_css(&[Attribute::<TestMsg>::AttrHeight(len)], parent);
+            assert_eq!(h, "height:fit-content;min-height:96px", "{parent:?}");
+        }
+    }
+
+    /// Refusal of the order-insensitive fold: `maximum 10 (minimum 30 fill)` is
+    /// exactly 10 — the outer cap wins, and no 30px floor is written.
+    #[test]
+    fn maximum_outside_minimum_wins() {
+        use crate::ui::helpers::{ui_fill_, ui_maximum_, ui_minimum_};
+        let len = ui_maximum_(10, ui_minimum_(30, ui_fill_()));
+        let css = size_css(&[Attribute::<TestMsg>::AttrWidth(len)], FlexAxis::Row);
+        assert!(css.contains("min-width:10px"), "{css}");
+        assert!(css.contains("max-width:10px"), "{css}");
+        assert!(!css.contains("30px"), "{css}");
+    }
+
+    /// Refusal: a negative bound clamps to 0 rather than rendering a negative
+    /// size the browser would drop.
+    #[test]
+    fn negative_bound_clamps_to_zero() {
+        use crate::ui::helpers::{ui_maximum_, ui_minimum_, ui_px_};
+        let capped = size_css(
+            &[Attribute::<TestMsg>::AttrWidth(ui_maximum_(-5, ui_px_(20)))],
+            FlexAxis::Block,
+        );
+        assert_eq!(capped, "width:20px;max-width:0px");
+        let floored = size_css(
+            &[Attribute::<TestMsg>::AttrWidth(ui_minimum_(-5, ui_px_(20)))],
+            FlexAxis::Block,
+        );
+        assert_eq!(floored, "width:20px;min-width:0px");
+        assert!(!capped.contains("-5px") && !floored.contains("-5px"));
+    }
+
+    /// Refusal: a negative `px` / `vh` / `vw` base renders 0, as the TUI lays it
+    /// out, rather than a negative size the browser drops (leaving the node
+    /// unsized on the web only).
+    #[test]
+    fn negative_base_clamps_to_zero() {
+        use crate::ui::helpers::{ui_px_, ui_vh_, ui_vw_};
+        let cases = [
+            (ui_px_(-5), "width:0px"),
+            (ui_vh_(-5), "width:0vh"),
+            (ui_vw_(i64::MIN), "width:0vw"),
+        ];
+        for (len, want) in cases {
+            let css = size_css(&[Attribute::<TestMsg>::AttrWidth(len)], FlexAxis::Block);
+            assert_eq!(css, want);
+        }
+    }
+
+    /// Refusal: an explicit `Ui.width Ui.shrink` sizes exactly as a width-less
+    /// node does (`fit-content`), never `width:auto`, which stretches in a block
+    /// or column parent.
+    #[test]
+    fn explicit_shrink_equals_default_width() {
+        use crate::ui::helpers::{ui_el_, ui_shrink_, ui_width_};
+        let explicit: Element<TestMsg> =
+            ui_el_(vec![ui_width_(ui_shrink_())], Element::Text("x".to_owned()));
+        let default: Element<TestMsg> = ui_el_(vec![], Element::Text("x".to_owned()));
+        for el in [explicit, default] {
+            let s = render_html(&render_element(el));
+            assert!(s.contains("width:fit-content"), "{s}");
+            assert!(!s.contains("width:auto"), "{s}");
+        }
     }
 
     /// Refusal: `alignY` beside a `fill` height in a row yields to the stretch —
@@ -2805,7 +2965,7 @@ mod tests {
         let child = ui_el_(
             vec![
                 Attribute::AttrAlignY(VAlign::CenterY),
-                Attribute::AttrHeight(Length::Fill(Portion::ONE)),
+                Attribute::AttrHeight(Length::fill(Portion::ONE)),
             ],
             Element::Text("a".to_owned()),
         );
@@ -2822,7 +2982,7 @@ mod tests {
         let child = ui_el_(
             vec![
                 Attribute::AttrAlignX(HAlign::CenterX),
-                Attribute::AttrHeight(Length::Fill(Portion::ONE)),
+                Attribute::AttrHeight(Length::fill(Portion::ONE)),
             ],
             Element::Text("a".to_owned()),
         );
@@ -2838,7 +2998,7 @@ mod tests {
     /// A fixed width is pinned (`flex-shrink:0`) only on a row's main axis.
     #[test]
     fn overconstrain_only_on_row_main_axis() {
-        let attrs = [Attribute::<TestMsg>::AttrWidth(Length::Px(40))];
+        let attrs = [Attribute::<TestMsg>::AttrWidth(Length::px(40))];
         assert_eq!(overconstrain_css(&attrs, FlexAxis::Row), "flex-shrink:0");
         assert_eq!(overconstrain_css(&attrs, FlexAxis::Column), "");
         assert_eq!(overconstrain_css(&attrs, FlexAxis::Block), "");
@@ -2859,8 +3019,8 @@ mod tests {
     #[test]
     fn build_style_string_emits_no_size() {
         let s = build_style_string(&[
-            Attribute::<TestMsg>::AttrWidth(Length::Fill(Portion::ONE)),
-            Attribute::AttrHeight(Length::Px(9)),
+            Attribute::<TestMsg>::AttrWidth(Length::fill(Portion::ONE)),
+            Attribute::AttrHeight(Length::px(9)),
         ]);
         assert_eq!(s, "");
     }
@@ -2873,7 +3033,7 @@ mod tests {
         let child = ui_el_(
             vec![
                 Attribute::AttrStyle("width".to_owned(), "7px".to_owned()),
-                Attribute::AttrWidth(Length::Px(40)),
+                Attribute::AttrWidth(Length::px(40)),
             ],
             Element::Text("a".to_owned()),
         );

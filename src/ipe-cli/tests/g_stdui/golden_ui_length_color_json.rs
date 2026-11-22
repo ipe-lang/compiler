@@ -8,7 +8,7 @@
 //! typed. This golden proves the pipeline end-to-end:
 //!
 //! * `Ui.px 120` (a `Length`) fed to `Ui.width`   → `width:120px`
-//! * `Ui.minimum 40 Ui.fill` (a `Length`)         → `height:max(40px,100%)`
+//! * `Ui.minimum 40 Ui.fill` (a `Length`)         → `height:100%` + `min-height:40px`
 //! * `Ui.rgb 0 128 255` (a `Color`) fed to
 //!   `Background.color`                            → `background-color:rgba(0,128,255,1)`
 //! * `JsonEnc.object`/`string`/`int`/`encode`      → `{"name":"ada","age":36}`
@@ -67,9 +67,18 @@ fn ui_length_color_and_json_value_render_end_to_end() {
         stdout.contains("width:120px"),
         "Ui.px 120 (Length) must render `width:120px`; got:\n{stdout}"
     );
+    // The bounded element's own declarations: a main-axis fill also adds its
+    // flex terms, so the two need not be adjacent.
+    let sized_style = stdout
+        .split("<div style=\"")
+        .filter_map(|rest| rest.split_once("\">sized<"))
+        .map(|(style, _)| style)
+        .next()
+        .unwrap_or_default();
+    let declarations: Vec<&str> = sized_style.split(';').collect();
     assert!(
-        stdout.contains("height:max(40px,100%)"),
-        "Ui.minimum 40 Ui.fill (Length) must render `height:max(40px,100%)`; got:\n{stdout}"
+        declarations.contains(&"height:100%") && declarations.contains(&"min-height:40px"),
+        "Ui.minimum 40 Ui.fill (Length) must render `height:100%` and `min-height:40px`; got:\n{stdout}"
     );
     // `Color` value (Ui.rgb) rendered into CSS.
     assert!(

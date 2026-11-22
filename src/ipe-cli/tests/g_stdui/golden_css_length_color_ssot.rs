@@ -1,5 +1,5 @@
 //! Cross-language SSOT equivalence gate for `Ipe.Css.lengthToString` /
-//! `Ipe.Css.colorToString` versus the native `ui::element::Length::css` /
+//! `Ipe.Css.colorToString` versus the native `ui::element::BaseLength::unit_css` /
 //! `Color::css` renderers.
 //!
 //! PRINCIPLES §SSOT: two representations that cannot import each other —
@@ -70,7 +70,7 @@ fn css_length_color_ssot_emits_byte_identical() {
 
 /// Full E2E SEAL (`IPE_E2E=1`): build and run the emitted project; assert
 /// stdout matches the expected CSS strings byte-for-byte. The expected
-/// values are the SAME strings asserted by the native `Length::css` /
+/// values are the SAME strings asserted by the native `BaseLength::unit_css` /
 /// `Color::css` unit tests in `element.rs`, proving cross-language equivalence
 /// end-to-end.
 #[test]
@@ -96,7 +96,7 @@ fn css_length_color_ssot_e2e_output_matches_native_table() {
 
     let stdout = &outcome.stdout;
 
-    // Length shapes — values must match `Length::css` assertions in element.rs.
+    // Length shapes — values must match `BaseLength::unit_css` assertions in element.rs.
     for (shape, expected) in [
         ("Px 0", "0px"),
         ("Px 16", "16px"),

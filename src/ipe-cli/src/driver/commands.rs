@@ -382,7 +382,7 @@ impl HeldBuild {
     /// # Errors
     /// The refusals of [`apply_fixes_cmd`] and [`HeldBuild::read`].
     pub fn fixed(self) -> Result<Self, CliError> {
-        apply_fixes_cmd(&self.root, None, true, &mut std::io::stdout())?;
+        apply_fixes_cmd(&self.root, None, true, &mut crate::progress::Door::Stdout)?;
         Self::read(self.root)
     }
 
@@ -3377,7 +3377,7 @@ pub fn show_session_trace(trace: &TraceFile) -> Result<(), CliError> {
     use std::io::Write as _;
     let path = trace.path();
     let rendered = load_session_trace(trace)?;
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = crate::progress::Door::Stdout;
     stdout
         .write_all(rendered.as_bytes())
         .and_then(|()| stdout.flush())
@@ -4068,7 +4068,12 @@ pub const fn run_explain(_rest: &[String]) -> Result<(), CliError> {
 pub fn run_fix(rest: &[String]) -> Result<(), CliError> {
     let args = cli_args::parse_fix(rest)?;
     let (root, file) = analysis_root(&working_dir()?, Some(Path::new(&args.entry)))?;
-    apply_fixes_cmd(&root, file.as_ref(), args.auto, &mut std::io::stdout())?;
+    apply_fixes_cmd(
+        &root,
+        file.as_ref(),
+        args.auto,
+        &mut crate::progress::Door::Stdout,
+    )?;
     Ok(())
 }
 
@@ -4474,7 +4479,7 @@ fn acknowledge_unsafe_imports(
         unsafe_ack::unsafe_modules_in_sources(own_sources(held).into_iter().map(|(_, src)| src));
     let manifest_accept = &manifest.capabilities_accept;
     let mut stdin = std::io::stdin().lock();
-    let mut stderr = std::io::stderr().lock();
+    let mut stderr = crate::progress::Door::Stderr;
     unsafe_ack::gate(
         &resolved.inferred,
         manifest_accept,

@@ -141,8 +141,8 @@ fn implicit_fill_if_hoisted<M>(layout_attrs: &[Attribute<M>]) -> Vec<Attribute<M
         vec![]
     } else {
         vec![
-            Attribute::AttrWidth(Length::Fill(Portion::ONE)),
-            Attribute::AttrHeight(Length::Fill(Portion::ONE)),
+            Attribute::AttrWidth(Length::fill(Portion::ONE)),
+            Attribute::AttrHeight(Length::fill(Portion::ONE)),
         ]
     }
 }

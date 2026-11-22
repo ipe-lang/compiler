@@ -14,16 +14,17 @@
 //! Scope: column / row / el / text / button + colour + spacing + padding + bold;
 //! text/password/checkbox/radio/slider inputs; Tab focus; scroll-into-view.
 //! Follow-on: mouse hit-testing, multiline cursor up/down, word-jumps, precise
-//! slider value, Length(Fill/Min/Max). No panic vectors.
+//! slider value. No panic vectors.
 
 use super::super::html::Html;
 use super::super::ui::{
-    Attribute, Description, Element, HAlign, Length, Location, Portion, SectionHead, VAlign,
-    WhiteSpace, section_head,
+    Attribute, BaseLength, Description, Element, HAlign, Length, Location, Portion, SectionHead,
+    VAlign, WhiteSpace, section_head,
 };
 use super::cell::{sanitize_rune, sanitize_text_keeping_newlines};
 use super::focus::{Focusable, InputRegistry};
 use crate::color::Color;
+use crate::length::PxBounds;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const CANVAS_W: usize = 1280;
@@ -179,11 +180,13 @@ struct Walked {
     pad_right: i64,
     pad_bottom: i64,
     pad_left: i64,
-    /// The raw `Ui.width` `Length`, if any. `None` (or `Content`) → content-sized.
+    /// The raw `Ui.width` `Length`, if any. `None` (or a `content` base) →
+    /// content-sized, clamped by any bounds.
     /// Resolved to cells lazily (avail_w + canvas are only known at render time).
     width: Option<Length>,
-    /// The raw `Ui.height` `Length`, if any. `None`/`Content` → content-sized;
-    /// `Px`/`Vh`/`Min`/`Max` give a fixed row count (apply_self_height).
+    /// The raw `Ui.height` `Length`, if any. A `px` / `vh` base gives a fixed
+    /// row count; any other bounded base clamps the natural height
+    /// (`apply_self_height`).
     height: Option<Length>,
     style: Style,
     /// `__grid` marker present (`Ui.grid`). Children flow row-major into auto-flow
@@ -250,7 +253,7 @@ fn root_width<M>(view: &Element<M>) -> Option<Length> {
 /// The `Ui.width` `Length` on a node, if present.
 fn width_length<M>(attrs: &[Attribute<M>]) -> Option<Length> {
     attrs.iter().find_map(|a| match a {
-        Attribute::AttrWidth(l) => Some(l.clone()),
+        Attribute::AttrWidth(l) => Some(*l),
         _ => None,
     })
 }
@@ -258,32 +261,40 @@ fn width_length<M>(attrs: &[Attribute<M>]) -> Option<Length> {
 /// The `Ui.height` `Length` on a node, if present.
 fn height_length<M>(attrs: &[Attribute<M>]) -> Option<Length> {
     attrs.iter().find_map(|a| match a {
-        Attribute::AttrHeight(l) => Some(l.clone()),
+        Attribute::AttrHeight(l) => Some(*l),
         _ => None,
     })
 }
 
-/// Resolve a NON-fill height `Length` to explicit ROWS. `None` → content-sized.
+/// True when a declared size is content-sized: absent, or a `content` base
+/// (bounded or not).
+fn content_sized(l: Option<&Length>) -> bool {
+    l.is_none_or(|l| matches!(l.base(), BaseLength::Content))
+}
+
+/// Resolve a height `Length` with a fixed base (`px` / `vh`) to explicit ROWS,
+/// clamped by its bounds. `None` → content-sized.
 /// The y-axis analogue of `resolve_fixed_w` (cells_y for px, canvas.rows for vh).
 fn resolve_fixed_h(l: &Length, canvas: Canvas) -> Option<usize> {
-    match l {
-        Length::Px(n) => Some(canvas.cells_y(*n).max(1)),
+    let rows = match l.base() {
+        BaseLength::Px(n) => canvas.cells_y(n).max(1),
         // Vh percentage is program-controlled (Ui.vh : Int -> Length): clamp the
         // resolved rows to MAX_CELLS so a huge percent can't drive an unbounded
         // pad-loop / Vec alloc (cells_x/y are already clamped; Vw/Vh bypass them).
-        Length::Vh(p) => {
-            Some((canvas.rows.saturating_mul((*p).max(0) as usize) / 100).min(MAX_CELLS))
-        }
-        Length::Content | Length::Fill(_) | Length::Vw(_) => None,
-        Length::Min(n, inner) => {
-            let mn = canvas.cells_y(*n);
-            Some(resolve_fixed_h(inner, canvas).map_or(mn, |c| c.max(mn)))
-        }
-        Length::Max(n, inner) => {
-            let mx = canvas.cells_y(*n);
-            Some(resolve_fixed_h(inner, canvas).map_or(mx, |c| c.min(mx)))
-        }
-    }
+        BaseLength::Vh(p) => (canvas.rows.saturating_mul(p.max(0) as usize) / 100).min(MAX_CELLS),
+        BaseLength::Content | BaseLength::Fill(_) | BaseLength::Vw(_) => return None,
+    };
+    Some(l.bounds().clamp_with(rows, |px| canvas.cells_y(px)))
+}
+
+/// The explicit row count of a node of measured `natural` rows: its fixed height,
+/// else the natural height clamped by the bounds of a bounded content-like
+/// height, else `None` (content-sized, unclamped).
+fn self_rows(l: &Length, natural: usize, canvas: Canvas) -> Option<usize> {
+    resolve_fixed_h(l, canvas).or_else(|| {
+        (l.bounds() != PxBounds::NONE)
+            .then(|| l.bounds().clamp_with(natural, |px| canvas.cells_y(px)))
+    })
 }
 
 /// `(portion, min_cells, max_cells)` for a fill child (see `fill_spec`).
@@ -301,59 +312,51 @@ const fn portion_shares(p: Portion) -> usize {
 }
 
 /// Distribution spec for a fill child: `Some((portion, min_cells, max_cells))`
-/// when the length is `Fill` (possibly wrapped in `Min`/`Max`). Such a child is
-/// sized by the parent ROW's fill-distribution pass, not by its own content.
+/// when the base is `Fill` (bounded or not). Such a child is sized by the parent
+/// ROW's fill-distribution pass, not by its own content.
 fn fill_spec(l: &Length, canvas: Canvas) -> Option<FillSpec> {
-    match l {
+    match l.base() {
         // The portion is positive and at most `Portion::MAX` by type.
-        Length::Fill(p) => Some((*p, None, None)),
-        Length::Min(n, inner) => fill_spec(inner, canvas)
-            .map(|(p, mn, mx)| (p, Some(mn.unwrap_or(0).max(canvas.cells_x(*n))), mx)),
-        Length::Max(n, inner) => fill_spec(inner, canvas).map(|(p, mn, mx)| {
-            let cap = canvas.cells_x(*n);
-            (p, mn, Some(mx.map_or(cap, |x| x.min(cap))))
-        }),
-        _ => None,
+        BaseLength::Fill(p) => Some((
+            p,
+            l.bounds().lower().map(|n| canvas.cells_x(n)),
+            l.bounds().upper().map(|n| canvas.cells_x(n)),
+        )),
+        BaseLength::Px(_) | BaseLength::Content | BaseLength::Vh(_) | BaseLength::Vw(_) => None,
     }
 }
 
-/// Resolve a NON-fill width `Length` to explicit cells given the available width.
-/// `None` → content-sized (the caller measures children). `Min`/`Max` bounds
-/// are correctly converted px→cells.
 /// The fixed pixel height of `attrs` (`Ui.height (Ui.px n)`) in CELLS, when set.
 /// Only `Px` yields a fixed row count (the multiline-textarea case); Fill/Content
-/// auto-size and return `None`.
+/// auto-size and return `None`. The bounds clamp the px base.
 fn height_cells<M>(attrs: &[Attribute<M>], canvas: Canvas) -> Option<usize> {
-    for a in attrs {
-        if let Attribute::AttrHeight(Length::Px(n)) = a {
-            return Some(canvas.cells_y(*n).max(1));
+    attrs.iter().find_map(|a| match a {
+        Attribute::AttrHeight(l) if matches!(l.base(), BaseLength::Px(_)) => {
+            resolve_fixed_h(l, canvas)
         }
-    }
-    None
+        _ => None,
+    })
 }
 
+/// Resolve a width `Length` with a non-content base to explicit cells given the
+/// available width, clamped by its bounds. `None` → content-sized (the caller
+/// measures children, then clamps through [`clamp_cells_x`]).
 fn resolve_fixed_w(l: &Length, available: usize, canvas: Canvas) -> Option<usize> {
-    match l {
-        Length::Px(n) => Some(canvas.cells_x(*n)),
-        Length::Content => None,
-        Length::Fill(_) => Some(available), // a direct ask claims all; the ROW pass overrides
+    let cells = match l.base() {
+        BaseLength::Px(n) => canvas.cells_x(n),
+        BaseLength::Content => return None,
+        BaseLength::Fill(_) => available, // a direct ask claims all; the ROW pass overrides
         // Vw/Vh percentages are program-controlled: clamp to MAX_CELLS (see Vh in
         // resolve_fixed_h — these bypass the already-clamped cells_x/y path).
-        Length::Vw(p) => {
-            Some((canvas.cols.saturating_mul((*p).max(0) as usize) / 100).min(MAX_CELLS))
-        }
-        Length::Vh(p) => {
-            Some((canvas.rows.saturating_mul((*p).max(0) as usize) / 100).min(MAX_CELLS))
-        }
-        Length::Min(n, inner) => {
-            let mn = canvas.cells_x(*n);
-            Some(resolve_fixed_w(inner, available, canvas).map_or(mn, |c| c.max(mn)))
-        }
-        Length::Max(n, inner) => {
-            let mx = canvas.cells_x(*n);
-            Some(resolve_fixed_w(inner, available, canvas).map_or(available.min(mx), |c| c.min(mx)))
-        }
-    }
+        BaseLength::Vw(p) => (canvas.cols.saturating_mul(p.max(0) as usize) / 100).min(MAX_CELLS),
+        BaseLength::Vh(p) => (canvas.rows.saturating_mul(p.max(0) as usize) / 100).min(MAX_CELLS),
+    };
+    Some(clamp_cells_x(l, cells, canvas))
+}
+
+/// Clamp a width of `cells` by the bounds of `l`, px converted to cells.
+fn clamp_cells_x(l: &Length, cells: usize, canvas: Canvas) -> usize {
+    l.bounds().clamp_with(cells, |px| canvas.cells_x(px))
 }
 
 #[derive(Clone)]
@@ -1212,8 +1215,10 @@ fn render_input<M: Clone>(
                 .unwrap_or(100.0);
             let val: f64 = value.trim().parse().unwrap_or(min);
             let width = width_length(attrs)
-                .and_then(|l| resolve_fixed_w(&l, avail_w, ctx.canvas))
-                .unwrap_or(12)
+                .map_or(12, |l| {
+                    resolve_fixed_w(&l, avail_w, ctx.canvas)
+                        .unwrap_or_else(|| clamp_cells_x(&l, 12, ctx.canvas))
+                })
                 .max(3);
             let frac = if max > min {
                 ((val - min) / (max - min)).clamp(0.0, 1.0)
@@ -1361,7 +1366,9 @@ fn render_input<M: Clone>(
         // text-like field stretches to the parent's allocation so an unsized input
         // still shows a full-width groove.
         let cells = match width_length(attrs) {
-            Some(l) if fill_spec(&l, ctx.canvas).is_some() => Some(avail_w),
+            // A bounded `content` field clamps its natural outer width.
+            Some(l) if matches!(l.base(), BaseLength::Content) => (l.bounds() != PxBounds::NONE)
+                .then(|| clamp_cells_x(&l, block.width() + frame_ring, ctx.canvas)),
             Some(l) => resolve_fixed_w(&l, avail_w, ctx.canvas),
             None if is_text_like => Some(avail_w),
             None => None,
@@ -1733,11 +1740,20 @@ fn render_node<M: Clone>(
                 }
                 // In a fixed-height COLUMN, height-fill children split the leftover
                 // vertical space (audit #2/#4). Needs the column's resolved height.
+                let natural_h = children
+                    .iter()
+                    .map(|r| r.block.height())
+                    .sum::<usize>()
+                    .saturating_add(
+                        ctx.canvas
+                            .cells_y(w.spacing_px)
+                            .saturating_mul(children.len().saturating_sub(1)),
+                    );
                 if w.dir == Dir::Column
                     && let Some(th) = w
                         .height
                         .as_ref()
-                        .and_then(|l| resolve_fixed_h(l, ctx.canvas))
+                        .and_then(|l| self_rows(l, natural_h, ctx.canvas))
                 {
                     distribute_col_fill(
                         &mut children,
@@ -1753,8 +1769,10 @@ fn render_node<M: Clone>(
                 // = vertical (alignY). Applied before stacking.
                 match w.dir {
                     Dir::Column => {
-                        let target_w = if matches!(w.width, None | Some(Length::Content)) {
-                            children.iter().map(|r| r.block.width()).max().unwrap_or(0)
+                        let target_w = if content_sized(w.width.as_ref()) {
+                            let natural =
+                                children.iter().map(|r| r.block.width()).max().unwrap_or(0);
+                            content_self_width(&w, natural, ctx.canvas)
                         } else {
                             content_avail
                         };
@@ -1800,7 +1818,7 @@ fn render_node<M: Clone>(
             // (center/right). Only visible when the box is wider than the text — a
             // content-sized box has no slack, so it's a no-op there. (audit #7)
             if let Some(fa) = w.font_align {
-                let sized = !matches!(w.width, None | Some(Length::Content));
+                let sized = !content_sized(w.width.as_ref());
                 let target = if sized {
                     content_avail
                 } else {
@@ -2240,60 +2258,68 @@ fn border_glyphs(
     }
 }
 
+/// The horizontal cells a node's padding and border ring take.
+fn horizontal_ring(w: &Walked, canvas: Canvas) -> usize {
+    canvas.cells_x(w.pad_left)
+        + canvas.cells_x(w.pad_right)
+        + if w.border.is_some() { 2 } else { 0 }
+}
+
 /// Content width available to a node's children = the node's allocation minus its
 /// horizontal padding (and the 1-cell-each-side border ring, when present).
 fn node_content_avail(avail_w: usize, w: &Walked, canvas: Canvas) -> usize {
-    let pad = canvas.cells_x(w.pad_left)
-        + canvas.cells_x(w.pad_right)
-        + if w.border.is_some() { 2 } else { 0 };
-    let base = match &w.width {
-        None => avail_w,
-        Some(l) => {
-            if let Some((_, mn, mx)) = fill_spec(l, canvas) {
-                // fill → the parent-allocated width, clamped to its own min/max
-                // (a ROW parent re-distributes the final width over this).
-                let mut t = avail_w;
-                if let Some(m) = mn {
-                    t = t.max(m);
-                }
-                if let Some(m) = mx {
-                    t = t.min(m);
-                }
-                t
-            } else {
-                // Px / Vw / Min / Max → resolved cells; Content → avail.
-                resolve_fixed_w(l, avail_w, canvas).unwrap_or(avail_w)
-            }
-        }
-    };
-    base.saturating_sub(pad)
+    let base = w.width.as_ref().map_or(avail_w, |l| {
+        // Px / Vw / Vh / Fill → resolved cells within the bounds (a ROW parent
+        // re-distributes a fill's final width over this); Content → the
+        // allocation under its cap.
+        resolve_fixed_w(l, avail_w, canvas).unwrap_or_else(|| {
+            l.bounds()
+                .upper()
+                .map_or(avail_w, |hi| avail_w.min(canvas.cells_x(hi)))
+        })
+    });
+    base.saturating_sub(horizontal_ring(w, canvas))
 }
 
-/// Constrain a node's inner block to its `Ui.width` directive. `Auto` keeps the
-/// natural content width (byte-identical to the pre-Fill behaviour); `Fill`
-/// expands to the content allocation; `Px` sets the exact cell width.
-fn apply_self_width(block: &mut Block, w: &Walked, content_avail: usize, _canvas: Canvas) {
-    // `content_avail` is already the node's resolved inner width (node_content_avail
-    // applied Px/Vw/Min/Max/Fill). So a sized node takes content_avail; an Auto /
-    // Content node keeps its natural content width. A fill child in a row has its
-    // final width re-set by the parent's distribution pass (which overrides this).
-    let sized = !matches!(w.width, None | Some(Length::Content));
-    if sized {
-        block.set_width(content_avail, w.style.bg);
+/// The inner width of a content-sized node whose children measure `natural`
+/// cells: the natural OUTER width clamped by the declared bounds, less the ring.
+fn content_self_width(w: &Walked, natural: usize, canvas: Canvas) -> usize {
+    match &w.width {
+        Some(l) if l.bounds() != PxBounds::NONE => {
+            let ring = horizontal_ring(w, canvas);
+            clamp_cells_x(l, natural.saturating_add(ring), canvas).saturating_sub(ring)
+        }
+        _ => natural,
     }
 }
 
-/// Hold a box to its declared `Ui.height` (Px/Vh/Min/Max): pad short blocks with
-/// bg-filled blank rows, clip tall ones. A `None`/`Content`/`Fill` height is
-/// content-sized (no change). Was missing entirely → fixed-height boxes collapsed
-/// to their content height (audit #1/#15).
+/// Constrain a node's inner block to its `Ui.width` directive.
+///
+/// A sized node (px / vw / vh / fill) takes `content_avail`, its resolved inner
+/// width; a content-sized node keeps its natural width, clamped by any bounds. A
+/// fill child in a row has its final width re-set by the parent's distribution
+/// pass (which overrides this).
+fn apply_self_width(block: &mut Block, w: &Walked, content_avail: usize, canvas: Canvas) {
+    if !content_sized(w.width.as_ref()) {
+        block.set_width(content_avail, w.style.bg);
+    } else if w.width.is_some_and(|l| l.bounds() != PxBounds::NONE) {
+        let target = content_self_width(w, block.width(), canvas);
+        block.set_width(target, w.style.bg);
+    }
+}
+
+/// Hold a box to its declared `Ui.height`: pad short blocks with bg-filled blank
+/// rows, clip tall ones.
+///
+/// A px / vh height is fixed; any other bounded height is its natural height
+/// clamped by the bounds; an unbounded `content` / `fill` height is unchanged.
 fn apply_self_height(block: &mut Block, w: &Walked, canvas: Canvas) {
-    let rows = match &w.height {
-        Some(l) => match resolve_fixed_h(l, canvas) {
-            Some(r) => r,
-            None => return,
-        },
-        None => return,
+    let Some(rows) = w
+        .height
+        .as_ref()
+        .and_then(|l| self_rows(l, block.lines.len(), canvas))
+    else {
+        return;
     };
     // Terminal-proportional clamp: `resolve_fixed_h` → `cells_y` caps at MAX_CELLS
     // but `rows × width` can still reach ~10 GB. Cap the pad-row count the same way
@@ -2802,8 +2828,11 @@ fn render_with_focus_encoded<M: Clone>(
         // NARROWER root (px / vw / a capped max / capped fill) fills only its own
         // resolved width; the trailing columns stay terminal-default.
         let fill_to_edge = match root_width(view) {
-            None | Some(Length::Content) => true,
-            Some(Length::Fill(_)) => true,
+            None => true,
+            Some(l) if matches!(l.base(), BaseLength::Content) => l
+                .bounds()
+                .upper()
+                .is_none_or(|hi| canvas.cells_x(hi) >= cols),
             Some(l) => resolve_fixed_w(&l, cols, canvas).is_none_or(|cells| cells >= cols),
         };
         rendered.block.backfill_root_bg(cols, bg, fill_to_edge);
@@ -3017,7 +3046,7 @@ mod tests {
     fn fill_width_expands_to_avail() {
         let t: Element<()> = node(
             vec![
-                Attribute::AttrWidth(Length::Fill(Portion::ONE)),
+                Attribute::AttrWidth(Length::fill(Portion::ONE)),
                 Attribute::AttrBgColor(rgb(5, 6, 7)),
             ],
             vec![Element::Text("x".into())],
@@ -3036,7 +3065,7 @@ mod tests {
         // canvas px_per_cell_x = 1280/80 = 16 → 160px ≈ 10 cells.
         let t: Element<()> = node(
             vec![
-                Attribute::AttrWidth(Length::Px(160)),
+                Attribute::AttrWidth(Length::px(160)),
                 Attribute::AttrBgColor(rgb(1, 2, 3)),
             ],
             vec![Element::Text("hi".into())],
@@ -3050,10 +3079,10 @@ mod tests {
 
     #[test]
     fn vw_width_resolves_to_viewport_fraction() {
-        // Vw(50) on 80 cols → ~40 cells of bg.
+        // vw 50 on 80 cols → ~40 cells of bg.
         let t: Element<()> = node(
             vec![
-                Attribute::AttrWidth(Length::Vw(50)),
+                Attribute::AttrWidth(Length::vw(50)),
                 Attribute::AttrBgColor(rgb(9, 9, 9)),
             ],
             vec![Element::Text("x".into())],
@@ -3069,10 +3098,10 @@ mod tests {
 
     #[test]
     fn min_width_floors_content() {
-        // Min(160, Content): content "hi" (2 cells) floored to 160px ≈ 10 cells.
+        // `minimum 160 content`: content "hi" (2 cells) floored to 160px ≈ 10 cells.
         let t: Element<()> = node(
             vec![
-                Attribute::AttrWidth(Length::Min(160, Box::new(Length::Content))),
+                Attribute::AttrWidth(Length::content().at_least(160)),
                 Attribute::AttrBgColor(rgb(4, 4, 4)),
             ],
             vec![Element::Text("hi".into())],
@@ -3087,10 +3116,10 @@ mod tests {
 
     #[test]
     fn max_width_caps_fill() {
-        // Max(160, Fill): fill would claim 80 cols, capped to 160px ≈ 10 cells.
+        // `maximum 160 fill`: fill would claim 80 cols, capped to 160px ≈ 10 cells.
         let t: Element<()> = node(
             vec![
-                Attribute::AttrWidth(Length::Max(160, Box::new(Length::Fill(Portion::ONE)))),
+                Attribute::AttrWidth(Length::fill(Portion::ONE).at_most(160)),
                 Attribute::AttrBgColor(rgb(2, 2, 2)),
             ],
             vec![Element::Text("x".into())],
@@ -3101,6 +3130,87 @@ mod tests {
         assert!(
             (3..=15).contains(&spaces),
             "Max caps fill at ~10 cols: {first:?} ({spaces})"
+        );
+    }
+
+    /// The `(width, height)` in cells `el` lays out to in a `cols`-wide frame.
+    fn measure(el: &Element<()>, cols: usize) -> (usize, usize) {
+        let mut reg = InputRegistry::new();
+        let mut ctx = Ctx {
+            canvas: Canvas::new(cols, 24),
+            focus_idx: usize::MAX,
+            focusables: Vec::new(),
+            inputs: &mut reg,
+        };
+        let r = render_node(el, Style::default(), &mut ctx, cols);
+        (r.block.width(), r.block.height())
+    }
+
+    /// Refusal of a bound that replaces the content size: a bounded `content`
+    /// width / height is the measured natural size clamped by the bounds — a
+    /// floor lifts short content, never shrinks long content, and a cap clips
+    /// only content wider than it.
+    #[test]
+    fn tui_bound_over_content_clamps_natural() {
+        let canvas = Canvas::new(80, 24);
+        let floor_cells = canvas.cells_x(160);
+        let long = "x".repeat(30);
+        let el = |len: Length, text: &str| -> Element<()> {
+            node(
+                vec![Attribute::AttrWidth(len)],
+                vec![Element::Text(text.into())],
+            )
+        };
+        assert_eq!(
+            measure(&el(Length::content().at_least(160), "hi"), 80).0,
+            floor_cells
+        );
+        assert_eq!(
+            measure(&el(Length::content().at_least(160), &long), 80).0,
+            30
+        );
+        assert_eq!(measure(&el(Length::content().at_most(160), "hi"), 80).0, 2);
+        assert_eq!(
+            measure(&el(Length::content().at_most(160), &long), 80).0,
+            floor_cells
+        );
+
+        let floor_rows = canvas.cells_y(160);
+        assert!(floor_rows > 1, "the height floor must exceed one text row");
+        let tall: Element<()> = node(
+            vec![Attribute::AttrHeight(Length::content().at_least(160))],
+            vec![Element::Text("hi".into())],
+        );
+        assert_eq!(measure(&tall, 80).1, floor_rows);
+        let capped: Element<()> = node(
+            vec![Attribute::AttrHeight(Length::content().at_most(160))],
+            vec![Element::Text("hi".into())],
+        );
+        assert_eq!(measure(&capped, 80).1, 1);
+    }
+
+    /// Refusal of the order-insensitive fold in the terminal: `maximum 10
+    /// (minimum 30 fill)` in a row is exactly 10px wide.
+    #[test]
+    fn tui_maximum_outside_minimum_wins() {
+        use crate::ui::helpers::{ui_fill_, ui_maximum_, ui_minimum_};
+        let canvas = Canvas::new(80, 24);
+        let child: Element<()> = node(
+            vec![Attribute::AttrWidth(ui_maximum_(
+                10,
+                ui_minimum_(30, ui_fill_()),
+            ))],
+            vec![Element::Text("x".into())],
+        );
+        let row: Element<()> = node(
+            vec![Attribute::AttrStyle("__row".into(), String::new())],
+            vec![child],
+        );
+        assert_eq!(measure(&row, 80).0, canvas.cells_x(10));
+        assert_ne!(
+            canvas.cells_x(10),
+            canvas.cells_x(30),
+            "the probe must separate 10 from 30"
         );
     }
 
@@ -3182,7 +3292,7 @@ mod tests {
         let child = |c: Color| -> Element<()> {
             node(
                 vec![
-                    Attribute::AttrWidth(Length::Fill(Portion::ONE)),
+                    Attribute::AttrWidth(Length::fill(Portion::ONE)),
                     Attribute::AttrBgColor(c),
                 ],
                 vec![Element::Text("x".into())],
@@ -3386,7 +3496,7 @@ mod tests {
             "input".into(),
             Description::NoDescription,
             vec![
-                Attribute::AttrWidth(Length::Px(160)),
+                Attribute::AttrWidth(Length::px(160)),
                 Attribute::AttrAttribute("type".into(), "text".into()),
             ],
             vec![],
@@ -3409,7 +3519,7 @@ mod tests {
             "input".into(),
             Description::NoDescription,
             vec![
-                Attribute::AttrWidth(Length::Px(160)),
+                Attribute::AttrWidth(Length::px(160)),
                 Attribute::AttrBgColor(rgb(30, 36, 60)),
                 Attribute::AttrAttribute("type".into(), "text".into()),
             ],
@@ -3435,7 +3545,7 @@ mod tests {
             "input".into(),
             Description::NoDescription,
             vec![
-                Attribute::AttrWidth(Length::Px(160)),
+                Attribute::AttrWidth(Length::px(160)),
                 Attribute::AttrAttribute("type".into(), "text".into()),
             ],
             vec![],

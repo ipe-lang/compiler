@@ -197,9 +197,11 @@ impl InitShape {
     /// The single source of truth for the text, so a new shape cannot silently
     /// inherit another shape's instructions. `web` is the one shape with a
     /// runtime choice (spec § 0.1): `runtime` picks between its served and
-    /// client wording; every other arm ignores it.
-    const fn open_hint(self, runtime: Runtime) -> &'static str {
-        match self {
+    /// client wording; every other arm ignores it. Every delivery but `web
+    /// client` is watched, so [`Self::WATCH_HINT`] is appended there — a `web
+    /// client` scaffold already names its own rebuild command in its base hint.
+    fn open_hint(self, runtime: Runtime) -> String {
+        let base = match self {
             Self::Web => match runtime {
                 Runtime::Served => "Then open http://localhost:8000 and click the counter buttons.",
                 Runtime::Client => {
@@ -215,8 +217,20 @@ impl InitShape {
             Self::Worker => "It logs three ticks and exits on its own — no interaction needed.",
             Self::Server => "Then open http://localhost:8000 (or curl it) to see the response.",
             Self::Script => "It prints its greeting and exits — no interaction needed.",
+        };
+        if matches!((self, runtime), (Self::Web, Runtime::Client)) {
+            base.to_owned()
+        } else {
+            format!("{base}{}", Self::WATCH_HINT)
         }
     }
+
+    /// Appended to every [`Self::open_hint`] but `web client`'s: `ipe dev run`
+    /// builds once, so editing and trying again means rerunning it by hand,
+    /// while `ipe dev watch` rebuilds and reruns on its own as the source
+    /// changes — the loop an edit-and-check session actually wants.
+    const WATCH_HINT: &str =
+        " Run `ipe dev watch` instead of `ipe dev run` to rebuild and rerun as you edit.";
 
     /// The `README.md`'s one-sentence description of what `src/Main.ipe` is.
     ///
@@ -788,7 +802,7 @@ fn wizard_shape() -> Result<InitShape, CliError> {
              \n\
              Shape [1]: ",
     );
-    let _ = std::io::stdout().flush();
+    let _ = std::io::Write::flush(&mut crate::progress::Door::Stdout);
     let line = read_line_trimmed();
     let shape = match line.as_deref().unwrap_or("") {
         "" | "1" | "web" => InitShape::Web,
@@ -829,7 +843,7 @@ fn wizard_runtime() -> Result<Runtime, CliError> {
     }
     menu.push_str("\nRuntime [1]: ");
     crate::screen::prompt(&menu);
-    let _ = std::io::stdout().flush();
+    let _ = std::io::Write::flush(&mut crate::progress::Door::Stdout);
     let line = read_line_trimmed();
     runtime_choice(line.as_deref().unwrap_or(""))
 }
@@ -932,7 +946,7 @@ fn managed_files(project_name: &str, shape: InitShape, runtime: Runtime) -> Vec<
                 .replace("{name}", project_name)
                 .replace("{description}", shape.readme_description(runtime))
                 .replace("{run_command}", &shape.next_step_command(runtime))
-                .replace("{run_hint}", shape.open_hint(runtime)),
+                .replace("{run_hint}", &shape.open_hint(runtime)),
         ),
         ManagedFile::source(ManagedDir::Root, ".gitignore", GITIGNORE.to_owned()),
         ManagedFile::guide(),

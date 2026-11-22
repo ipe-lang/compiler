@@ -2219,7 +2219,7 @@ fn install_wrapper(
             ),
         );
         crate::screen::prompt("Continue? [y/N] ");
-        let _ = std::io::stdout().flush();
+        let _ = crate::progress::Door::Stdout.flush();
         if !crate::read_yes_no() {
             return Err(CliError::Usage(text::msg::install_aborted()));
         }
@@ -2935,7 +2935,7 @@ pub fn run_add(rest: &[String]) -> Result<(), CliError> {
             &ipe_ffi::driver::trust_summary(spec.name(), "", None, 0),
         );
         crate::screen::prompt("[y/N] ");
-        let _ = std::io::stdout().flush();
+        let _ = crate::progress::Door::Stdout.flush();
         if !crate::read_yes_no() {
             return Err(CliError::Usage(text::msg::rust_add_aborted()));
         }
@@ -3040,7 +3040,7 @@ pub fn run_install(rest: &[String]) -> Result<(), CliError> {
             ),
         );
         crate::screen::prompt("Continue? [y/N] ");
-        let _ = std::io::stdout().flush();
+        let _ = crate::progress::Door::Stdout.flush();
         if !crate::read_yes_no() {
             return Err(CliError::Usage(text::msg::install_aborted()));
         }
