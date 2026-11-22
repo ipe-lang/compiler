@@ -274,7 +274,7 @@ fn spawn_server(test_name: &str, mut cmd: Command, port: u16) -> Result<Server, 
     let lines = Arc::new(Mutex::new(Vec::new()));
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let sink = Arc::clone(&lines);
-    let drain = std::thread::spawn(move || {
+    let spawned = std::thread::Builder::new().spawn(move || {
         for line in BufReader::new(stderr).lines() {
             let Ok(line) = line else { break };
             if line.contains("listening on") {
@@ -285,6 +285,14 @@ fn spawn_server(test_name: &str, mut cmd: Command, port: u16) -> Result<Server, 
             }
         }
     });
+    let drain = match spawned {
+        Ok(drain) => drain,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("{test_name}: cannot spawn the stderr drain: {e}").into());
+        }
+    };
     let server = Server {
         child,
         lines,
