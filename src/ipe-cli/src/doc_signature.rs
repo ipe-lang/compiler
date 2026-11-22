@@ -17,41 +17,34 @@ use std::collections::BTreeMap;
 
 use ipe_diagnostics::TyDoc;
 use ipe_intern::{Interner, Symbol};
-use ipe_syntax::ast::TypeAnnotation;
+use ipe_syntax::TypeAnnotation;
 
 /// The most alias uses one comparison expands before it reports a drift.
-pub(crate) const MAX_ALIAS_EXPANSIONS: u32 = 256;
+pub const MAX_ALIAS_EXPANSIONS: u32 = 256;
 
 /// The signature text a member's entry shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShownSignature {
+pub struct ShownSignature {
     text: String,
-    written: bool,
 }
 
 impl ShownSignature {
     /// The checked type's own rendering, with no annotation to admit.
-    pub(crate) fn checked(checked: &TyDoc) -> Self {
+    pub fn checked(checked: &TyDoc) -> Self {
         Self {
             text: crate::doc::plain_signature(checked),
-            written: false,
         }
     }
 
     /// The flat signature text.
-    pub(crate) fn text(&self) -> &str {
+    pub fn text(&self) -> &str {
         &self.text
-    }
-
-    /// Whether the text is the admitted annotation rather than the checked type.
-    pub(crate) const fn is_written(&self) -> bool {
-        self.written
     }
 }
 
 /// A written annotation that does not agree with the checked type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SignatureDrift;
+pub struct SignatureDrift;
 
 /// One `type alias` a module declares, for expanding a written annotation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +55,7 @@ struct Alias {
 
 /// The `type alias` declarations an annotation may name, by alias name.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct AliasTable {
+pub struct AliasTable {
     by_name: BTreeMap<Box<str>, Alias>,
 }
 
@@ -81,7 +74,7 @@ impl AliasTable {
 ///
 /// # Errors
 /// [`SignatureDrift`] when the annotation does not agree with `checked`.
-pub(crate) fn shown(
+pub fn shown(
     checked: &TyDoc,
     written: Option<&TyDoc>,
     aliases: &AliasTable,
@@ -98,7 +91,6 @@ pub(crate) fn shown(
     if check.agree(written, checked) {
         Ok(ShownSignature {
             text: crate::doc::plain_signature(written),
-            written: true,
         })
     } else {
         Err(SignatureDrift)
@@ -252,7 +244,7 @@ fn written_type(annotation: &TypeAnnotation, interner: &Interner) -> Option<TyDo
 /// A module's written annotations and the aliases they may name, read once
 /// from its parsed source.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct WrittenSignatures {
+pub struct WrittenSignatures {
     annotations: BTreeMap<String, TyDoc>,
     aliases: AliasTable,
 }
@@ -262,7 +254,7 @@ impl WrittenSignatures {
     ///
     /// # Errors
     /// The parse diagnostic when `source` does not parse.
-    pub(crate) fn parse(source: &str) -> Result<Self, ipe_diagnostics::Diagnostic> {
+    pub fn parse(source: &str) -> Result<Self, ipe_diagnostics::Diagnostic> {
         let mut interner = Interner::new();
         let parsed = ipe_parse::parse_module(source, &mut interner)?;
         let mut out = Self::default();
@@ -297,7 +289,7 @@ impl WrittenSignatures {
 
     /// The signature `name` shows over its `checked` type: the admitted
     /// annotation, or the checked type when there is none or it drifts.
-    pub(crate) fn shown_for(&self, name: &str, checked: &TyDoc) -> ShownSignature {
+    pub fn shown_for(&self, name: &str, checked: &TyDoc) -> ShownSignature {
         shown(checked, self.annotations.get(name), &self.aliases)
             .unwrap_or_else(|SignatureDrift| ShownSignature::checked(checked))
     }
@@ -329,7 +321,6 @@ mod tests {
         let written = WrittenSignatures::parse("module M exposing (r)\n\nr : Result e a\nr = r\n")
             .expect("the fixture parses");
         let shown = written.shown_for("r", &checked);
-        assert!(shown.is_written());
         assert_eq!(shown.text(), "Result e a");
     }
 
@@ -341,7 +332,6 @@ mod tests {
         )
         .expect("the fixture parses");
         let shown = written.shown_for("p", &checked);
-        assert!(shown.is_written());
         assert_eq!(shown.text(), "Parse Int");
     }
 
@@ -369,11 +359,11 @@ mod tests {
             WrittenSignatures::parse("module M exposing (f)\n\nf : String -> Int\nf = f\n")
                 .expect("the fixture parses");
         let fallback = written.shown_for("f", &checked);
-        assert!(
-            !fallback.is_written(),
+        assert_eq!(
+            fallback.text(),
+            "Int -> String",
             "a drift never prints the written text"
         );
-        assert_eq!(fallback.text(), "Int -> String");
     }
 
     #[test]
@@ -390,7 +380,6 @@ mod tests {
     fn no_annotation_shows_the_checked_type() {
         let checked = fun(var("a"), var("a"));
         let shown = shown(&checked, None, &AliasTable::default()).expect("no drift");
-        assert!(!shown.is_written());
         assert_eq!(shown.text(), "a -> a");
     }
 }

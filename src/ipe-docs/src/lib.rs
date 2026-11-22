@@ -806,7 +806,7 @@ pub fn stdlib_module_matches(query: &str, dotted: &str) -> bool {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{CommandInfo, Entry, EntryKind, Index, IndexBuilder, operator_meaning};
+    use super::{CommandInfo, Entry, EntryKind, Index, IndexBuilder, IndexError, operator_meaning};
     use ipe_syntax::BinOp;
 
     /// Resolve a workspace-root-relative path.

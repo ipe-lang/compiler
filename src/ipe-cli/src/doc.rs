@@ -127,7 +127,7 @@ use crate::cli_args::OutputFormat;
 use crate::doc_bundle::{
     BundleError, BundleSource, DocBundle, DocEntry, DocKind, DocsOverlay, is_qualified,
 };
-use crate::doc_index::{DocIndex, Resolved, Row};
+use crate::doc_index::{DocIndex, Resolved as MemberHit, Row};
 use crate::doc_pick::Pick;
 use crate::doc_search::{Closeness, DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
 use crate::doc_signature::WrittenSignatures;
@@ -1067,12 +1067,12 @@ fn run_doc_lookup_with_fuzzy(
     }
     let (members, mut kernel) = build_doc_index()?;
     match members.resolve(key) {
-        Some(Resolved::One(row)) => {
+        Some(MemberHit::One(row)) => {
             let (module, written) = row_module_doc(row, &mut kernel)?;
             render_member(&module, &row.name, written.as_ref(), format);
             return Ok(());
         }
-        Some(Resolved::Ambiguous(rows)) => {
+        Some(MemberHit::Ambiguous(rows)) => {
             // A key two members share opens neither: the miss lists exactly
             // the owners, each as the qualified term that opens it.
             let bundle = build_doc_bundle_over(&index, &DocsOverlay::Embedded)?;
@@ -1251,7 +1251,14 @@ fn build_doc_index() -> Result<(DocIndex, BTreeMap<String, ModuleDoc>), CliError
                 .collect()
         })
     })
-    .map_err(|e| CliError::Usage(text::msg::doc_stdlib_index_failed(&e)))?;
+    .map_err(|e| match e {
+        crate::doc_index::DocIndexError::Parse { module, diagnostic } => {
+            CliError::from(DiffError::Typecheck {
+                module: module.split('.').map(str::to_owned).collect(),
+                diag: diagnostic,
+            })
+        }
+    })?;
     Ok((index, kernel))
 }
 
@@ -1290,7 +1297,10 @@ fn row_module_doc(
     let written = source
         .map(WrittenSignatures::parse)
         .transpose()
-        .map_err(|d| CliError::Usage(text::msg::doc_stdlib_index_failed(&format!("{d:?}"))))?;
+        .map_err(|diag| DiffError::Typecheck {
+            module: segments,
+            diag: Box::new(diag),
+        })?;
     Ok((doc, written))
 }
 
@@ -6711,7 +6721,7 @@ mod tests {
                 assert!(
                     matches!(
                         members.resolve(&qualified),
-                        Some(Resolved::One(row)) if row.qualified() == qualified
+                        Some(MemberHit::One(row)) if row.qualified() == qualified
                     ),
                     "`{qualified}` is exposed but has no row"
                 );

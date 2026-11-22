@@ -151,11 +151,15 @@ macro_rules! projection {
             let mut slots: &mut [$ty] = &mut out;
             let mut rest = rows;
             while let Some((row, tail)) = rest.split_first() {
-                if let Some(view) = $view(row)
-                    && let Some((slot, more)) = slots.split_first_mut()
-                {
-                    *slot = view;
-                    slots = more;
+                if let Some(view) = $view(row) {
+                    let free: &mut [$ty] = slots;
+                    slots = match free.split_first_mut() {
+                        Some((slot, more)) => {
+                            *slot = view;
+                            more
+                        }
+                        None => &mut [],
+                    };
                 }
                 rest = tail;
             }

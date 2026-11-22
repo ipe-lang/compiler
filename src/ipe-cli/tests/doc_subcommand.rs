@@ -836,9 +836,16 @@ fn bare_json_error_names_typed_command() -> io::Result<()> {
         let (ok, stdout, stderr) = run_in(&dir, &["doc", flag]);
         assert!(!ok, "`ipe doc {flag}` must exit non-zero");
         assert!(stdout.is_empty(), "{stdout}");
-        assert!(stderr.contains(&format!("ipe doc {flag}:")), "{stderr}");
-        assert!(stderr.contains(&format!("ipe doc list {flag}")), "{stderr}");
-        assert!(!stderr.contains("generate"), "{stderr}");
+        let refusal = stderr
+            .lines()
+            .find(|line| line.contains(&format!("ipe doc {flag}:")))
+            .unwrap_or_default();
+        assert!(!refusal.is_empty(), "{stderr}");
+        assert!(
+            refusal.contains(&format!("ipe doc list {flag}")),
+            "{stderr}"
+        );
+        assert!(!refusal.contains("generate"), "{stderr}");
     }
     Ok(())
 }

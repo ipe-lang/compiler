@@ -15,15 +15,15 @@ use std::fmt;
 
 use ipe_intern::Interner;
 use ipe_stdlib::{Role, STDLIB, StdlibModule};
-use ipe_syntax::ast::{Exposed, Exposing};
+use ipe_syntax::{Exposed, Exposing};
 
 /// A parsed lookup key: one or more non-empty dotted segments, no whitespace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Key(String);
+pub struct Key(String);
 
 impl Key {
     /// `text` as a key, or `None` when it is not dotted segments.
-    pub(crate) fn parse(text: &str) -> Option<Self> {
+    pub fn parse(text: &str) -> Option<Self> {
         let well_formed = !text.is_empty()
             && text
                 .split('.')
@@ -58,11 +58,11 @@ impl RowSet {
 
 /// One exposed member of a standard-library module.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Row {
+pub struct Row {
     /// The owning module's registry row.
-    pub(crate) module: &'static StdlibModule,
+    pub module: &'static StdlibModule,
     /// The member's name as exposed.
-    pub(crate) name: String,
+    pub name: String,
 }
 
 impl PartialOrd for Row {
@@ -80,14 +80,14 @@ impl Ord for Row {
 
 impl Row {
     /// The fully qualified key, `Ipe.File.readFile`.
-    pub(crate) fn qualified(&self) -> String {
+    pub fn qualified(&self) -> String {
         format!("{}.{}", self.module.dotted, self.name)
     }
 }
 
 /// What a key names.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Resolved<'a> {
+pub enum Resolved<'a> {
     /// Exactly one row.
     One(&'a Row),
     /// More than one row, in qualified-key order.
@@ -96,7 +96,7 @@ pub(crate) enum Resolved<'a> {
 
 /// Why the index could not be built.
 #[derive(Debug)]
-pub(crate) enum DocIndexError {
+pub enum DocIndexError {
     /// A registered module's embedded source did not parse.
     Parse {
         /// The module's dotted name.
@@ -118,7 +118,7 @@ impl fmt::Display for DocIndexError {
 
 /// Every exposed standard-library member, filed under every key that names it.
 #[derive(Debug, Default)]
-pub(crate) struct DocIndex {
+pub struct DocIndex {
     rows: Vec<Row>,
     by_key: BTreeMap<Key, RowSet>,
 }
@@ -130,7 +130,7 @@ pub(crate) struct DocIndex {
 /// is reachable as `Ui.Input` and `Input`, so `Input.labelHidden` names its
 /// member. The resolver's own alias table is import-driven and private to the
 /// canonicaliser, so the rule is stated here over the dotted path.
-pub(crate) fn member_keys(dotted: &str, name: &str) -> Vec<String> {
+pub fn member_keys(dotted: &str, name: &str) -> Vec<String> {
     let segments: Vec<&str> = dotted.split('.').collect();
     let mut keys: Vec<String> = (0..segments.len())
         .filter_map(|from| segments.get(from..))
@@ -142,7 +142,7 @@ pub(crate) fn member_keys(dotted: &str, name: &str) -> Vec<String> {
 
 impl DocIndex {
     /// The index over `members`, each `(module, name)` one row.
-    pub(crate) fn from_members(
+    pub fn from_members(
         members: impl IntoIterator<Item = (&'static StdlibModule, String)>,
     ) -> Self {
         let unique: BTreeSet<Row> = members
@@ -182,9 +182,7 @@ impl DocIndex {
     ///
     /// # Errors
     /// [`DocIndexError::Parse`] when a registered source does not parse.
-    pub(crate) fn build(
-        kernel_members: impl Fn(&str) -> Vec<String>,
-    ) -> Result<Self, DocIndexError> {
+    pub fn build(kernel_members: impl Fn(&str) -> Vec<String>) -> Result<Self, DocIndexError> {
         let mut members = Vec::new();
         for module in STDLIB {
             match module.role {
@@ -211,12 +209,12 @@ impl DocIndex {
     }
 
     /// Every row, in qualified-key order.
-    pub(crate) fn rows(&self) -> &[Row] {
+    pub fn rows(&self) -> &[Row] {
         &self.rows
     }
 
     /// What `text` names, or `None` when it names no row.
-    pub(crate) fn resolve(&self, text: &str) -> Option<Resolved<'_>> {
+    pub fn resolve(&self, text: &str) -> Option<Resolved<'_>> {
         let set = self.by_key.get(&Key::parse(text)?)?;
         let mut rows: Vec<&Row> = set
             .ids()
