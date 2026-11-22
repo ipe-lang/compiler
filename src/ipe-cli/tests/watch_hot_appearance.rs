@@ -2436,6 +2436,66 @@ fn transcript_of(buf: &Mutex<Vec<u8>>) -> Vec<u8> {
         .clone()
 }
 
+/// A pseudo-terminal sized 80x24: its master and its slave.
+#[cfg(target_os = "linux")]
+#[allow(clippy::expect_used)] // a pty the host cannot open is a harness setup failure
+fn open_sized_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open a pty master");
+    grantpt(&master).expect("grant the pty");
+    unlockpt(&master).expect("unlock the pty");
+    let slave_name = ptsname(&master, Vec::new()).expect("name the pty slave");
+    let slave = rustix::fs::open(
+        slave_name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("open the pty slave");
+    rustix::termios::tcsetwinsize(
+        &slave,
+        rustix::termios::Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .expect("size the pty");
+    (master, slave)
+}
+
+/// Copy what `master` reads into `transcript` on a reader thread, up to the
+/// byte and wall ceilings.
+#[cfg(target_os = "linux")]
+fn read_pty_transcript(
+    mut master: std::fs::File,
+    transcript: Arc<Mutex<Vec<u8>>>,
+) -> Result<(), BoxError> {
+    let read_started = Instant::now();
+    std::thread::Builder::new()
+        .name("pty-transcript".to_owned())
+        .spawn(move || {
+            let mut chunk = [0u8; 4096];
+            while read_started.elapsed() < PTY_READ_WALL {
+                let Ok(n) = master.read(&mut chunk) else {
+                    break;
+                };
+                let Some(read) = chunk.get(..n).filter(|r| !r.is_empty()) else {
+                    break;
+                };
+                let mut held = transcript
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if held.len().saturating_add(read.len()) > PTY_TRANSCRIPT_CEILING {
+                    break;
+                }
+                held.extend_from_slice(read);
+            }
+        })
+        .map_err(|e| -> BoxError { format!("spawn the pty reader: {e}").into() })?;
+    Ok(())
+}
+
 /// The byte offset of the last `needle` in `hay`.
 #[cfg(target_os = "linux")]
 fn last_index_of(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -2450,8 +2510,7 @@ fn last_index_of(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 #[allow(clippy::expect_used, clippy::panic)] // a pty or scaffold the host cannot provide is a harness setup failure
 fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError> {
-    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
-    use rustix::termios::{LocalModes, Winsize, tcgetattr, tcsetwinsize};
+    use rustix::termios::{LocalModes, tcgetattr};
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
@@ -2471,26 +2530,7 @@ fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError>
         String::from_utf8_lossy(&init.stderr)
     );
 
-    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open a pty master");
-    grantpt(&master).expect("grant the pty");
-    unlockpt(&master).expect("unlock the pty");
-    let slave_name = ptsname(&master, Vec::new()).expect("name the pty slave");
-    let slave = rustix::fs::open(
-        slave_name.as_c_str(),
-        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
-        rustix::fs::Mode::empty(),
-    )
-    .expect("open the pty slave");
-    tcsetwinsize(
-        &slave,
-        Winsize {
-            ws_row: 24,
-            ws_col: 80,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        },
-    )
-    .expect("size the pty");
+    let (master, slave) = open_sized_pty();
     let stdio = || -> std::process::Stdio {
         std::process::Stdio::from(slave.try_clone().expect("share the pty slave"))
     };
@@ -2517,29 +2557,12 @@ fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError>
         .spawn()
         .map_err(|e| -> BoxError { format!("ipe dev watch must spawn: {e}").into() })?;
 
-    let mut reader = std::fs::File::from(master.try_clone().expect("share the pty master"));
-    let mut keys = std::fs::File::from(master);
     let transcript = Arc::new(Mutex::new(Vec::<u8>::new()));
-    let sink = Arc::clone(&transcript);
-    let read_started = Instant::now();
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 4096];
-        while read_started.elapsed() < PTY_READ_WALL {
-            let Ok(n) = reader.read(&mut chunk) else {
-                break;
-            };
-            let Some(read) = chunk.get(..n).filter(|r| !r.is_empty()) else {
-                break;
-            };
-            let mut held = sink
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if held.len().saturating_add(read.len()) > PTY_TRANSCRIPT_CEILING {
-                break;
-            }
-            held.extend_from_slice(read);
-        }
-    });
+    read_pty_transcript(
+        std::fs::File::from(master.try_clone().expect("share the pty master")),
+        Arc::clone(&transcript),
+    )?;
+    let mut keys = std::fs::File::from(master);
     let shows = |needle: &str| strip_terminal_escapes(&transcript_of(&transcript)).contains(needle);
 
     let started = wait_for(Duration::from_mins(8), || shows("count = 0"));
