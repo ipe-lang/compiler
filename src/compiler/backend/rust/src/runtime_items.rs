@@ -117,13 +117,15 @@ const WEB_HOT_LOGIC: FeaturePredicate = FeaturePredicate::All(&[
     ]),
 ]);
 
-/// The gate of the served web host entry points.
+/// The gate of the served web host entry points and of the `web`-only
+/// submodules they open with (`web::install`).
 const WEB_HOST: FeaturePredicate = FeaturePredicate::All(&[
     FeaturePredicate::Feature(CargoFeature::WebCore),
     FeaturePredicate::Feature(CargoFeature::Web),
 ]);
 
-/// A feature-gated runtime function the backend emits a call to.
+/// A feature-gated runtime item the backend emits a reach to: a function or
+/// type directly in `ipe_runtime::web`, or one inside a gated submodule.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RuntimeItem {
     /// The `update`-arm transition reader.
@@ -144,11 +146,15 @@ pub enum RuntimeItem {
     WebEmbed,
     /// A mountable routed `Web.embed` app.
     WebEmbedRouted,
+    /// The browser-install facts a served app registers.
+    InstallFacts,
+    /// The browser-install registration a served app opens with.
+    InstallRegister,
 }
 
 impl RuntimeItem {
     /// Every row of the table.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::ApplyTransitionHot,
         Self::SubEveryHot,
         Self::ApplyInitHot,
@@ -158,6 +164,8 @@ impl RuntimeItem {
         Self::WebAppRouted,
         Self::WebEmbed,
         Self::WebEmbedRouted,
+        Self::InstallFacts,
+        Self::InstallRegister,
     ];
 
     /// The fully-qualified path the emitted crate names the item by.
@@ -173,6 +181,8 @@ impl RuntimeItem {
             Self::WebAppRouted => "ipe_runtime::web::web_app_routed",
             Self::WebEmbed => "ipe_runtime::web::web_embed",
             Self::WebEmbedRouted => "ipe_runtime::web::web_embed_routed",
+            Self::InstallFacts => "ipe_runtime::web::install::InstallFacts",
+            Self::InstallRegister => "ipe_runtime::web::install::register",
         }
     }
 
@@ -188,7 +198,9 @@ impl RuntimeItem {
             | Self::WebApp
             | Self::WebAppRouted
             | Self::WebEmbed
-            | Self::WebEmbedRouted => WEB_HOST,
+            | Self::WebEmbedRouted
+            | Self::InstallFacts
+            | Self::InstallRegister => WEB_HOST,
         }
     }
 }
@@ -294,6 +306,23 @@ mod tests {
                 matches!(refused, Err(UnselectedRuntimeItem { item: got, .. }) if got == item),
                 "{item:?}: got {refused:?}"
             );
+        }
+    }
+
+    /// The install registration lives in `web::install`, compiled only for a
+    /// served host: the render core alone refuses it.
+    #[test]
+    fn the_render_core_refuses_the_install_registration() {
+        let features = set(&["web-core", "json", "serde", "encoding"]);
+        for item in [RuntimeItem::InstallFacts, RuntimeItem::InstallRegister] {
+            let refused = check_items(&BTreeSet::from([item]), &features);
+            assert!(
+                matches!(refused, Err(UnselectedRuntimeItem { item: got, .. }) if got == item),
+                "{item:?}: got {refused:?}"
+            );
+            let mut served = features.clone();
+            served.insert("web");
+            assert_eq!(check_items(&BTreeSet::from([item]), &served), Ok(()));
         }
     }
 

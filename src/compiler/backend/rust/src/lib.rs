@@ -805,7 +805,9 @@ impl<'a> RustBackend<'a> {
         module_texts: &BTreeMap<ModPath, String>,
     ) -> DResult<EmittedProject> {
         let ctx = EmitCtx::build(self.interner, program, self.settings.clone())?;
-        project::assemble_split_manifest(&ctx, program, spine_text, module_texts)
+        let project = project::assemble_split_manifest(&ctx, program, spine_text, module_texts)?;
+        ctx.check_runtime_items()?;
+        Ok(project)
     }
 }
 

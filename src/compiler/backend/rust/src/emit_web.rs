@@ -619,7 +619,7 @@ fn emit_routed_web_leaf(
     )?;
     let register = format!(
         "{}{}",
-        crate::served_install::register_stmt(&ctx.served_install),
+        crate::served_install::register_stmt(ctx),
         served_register_stmts(ctx)
     );
     let handler = &update.handler;
@@ -682,7 +682,7 @@ fn emit_single_page_web_leaf(
     let msg_set_item = msg_set_descriptor_item(ctx, update_e);
     let register = format!(
         "{}{}",
-        crate::served_install::register_stmt(&ctx.served_install),
+        crate::served_install::register_stmt(ctx),
         served_register_stmts(ctx)
     );
     format!("{{ {register}{tag_const} {msg_set_item}{handle} }}")

@@ -14,6 +14,7 @@ use ipe_backend::{Asset, RelPath};
 use ipe_diagnostics::{DResult, Diagnostic};
 use sha2::{Digest, Sha256};
 
+use crate::runtime_items::RuntimeItem;
 use crate::rust_str_lit;
 
 /// The largest icon accepted, in bytes: 2 MiB.
@@ -220,18 +221,19 @@ pub fn install_assets(
 /// the offer emits byte-identical Rust.
 ///
 /// The name goes through [`rust_str_lit`]; the icon is never inlined.
-pub fn register_stmt(install: &ServedInstall) -> String {
-    match install {
+pub fn register_stmt(ctx: &crate::EmitCtx) -> String {
+    match &ctx.served_install {
         ServedInstall::Off => String::new(),
         ServedInstall::On { name, icon } => {
             let name = rust_str_lit(name);
             let side = icon.side().get();
             let file = rust_str_lit(&format!("/{INSTALL_ICON_FILE}"));
+            let facts = ctx.use_item(RuntimeItem::InstallFacts);
+            let register = ctx.use_item(RuntimeItem::InstallRegister);
             format!(
-                "static INSTALL_FACTS: ipe_runtime::web::install::InstallFacts = \
-                 ipe_runtime::web::install::InstallFacts {{ name: {name}, icon_png: \
+                "static INSTALL_FACTS: {facts} = {facts} {{ name: {name}, icon_png: \
                  include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), {file})), \
-                 icon_side: {side} }}; ipe_runtime::web::install::register(&INSTALL_FACTS); "
+                 icon_side: {side} }}; {register}(&INSTALL_FACTS); "
             )
         }
     }

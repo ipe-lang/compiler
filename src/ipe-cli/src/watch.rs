@@ -1393,7 +1393,7 @@ fn run_inner(
                         let mut screen = crate::screen::Screen::new(crate::screen::Stream::Stderr);
                         let frame = compile_failed_frame(
                             &msg,
-                            failure_fallback(&supervisor),
+                            failure_fallback(&mut supervisor),
                             screen.palette(),
                         );
                         screen.guttered(&frame).emit();
@@ -1735,7 +1735,7 @@ fn run_inner(
                         emit_watch_line(
                             &crate::style::TerminalSafe::sanitize(&format!(
                                 "[ipe dev watch] cargo build failed ({}):\n{msg}",
-                                failure_fallback(&supervisor).text()
+                                failure_fallback(&mut supervisor).text()
                             )),
                             WatchRole::Failure,
                         );
@@ -2858,9 +2858,16 @@ impl FallbackNote {
 }
 
 /// The fallback a failed rebuild leaves in place under `state`.
-const fn failure_fallback(state: &ipe_watch::SupervisorState) -> FallbackNote {
+///
+/// A `Running` state holds the child it last started, which may since have
+/// exited (a crashed app): the child is probed, so the note claims a running
+/// app only while one is. A probe that fails claims nothing is running.
+fn failure_fallback(state: &mut ipe_watch::SupervisorState) -> FallbackNote {
     match state {
-        ipe_watch::SupervisorState::Running { .. } => FallbackNote::LastGoodRunning,
+        ipe_watch::SupervisorState::Running { child, .. } => match child.try_wait() {
+            Ok(None) => FallbackNote::LastGoodRunning,
+            Ok(Some(_)) | Err(_) => FallbackNote::LastGoodStopped,
+        },
         ipe_watch::SupervisorState::NotRunning { last_good: Some(_) } => {
             FallbackNote::LastGoodStopped
         }
@@ -4221,33 +4228,65 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_rebuild_names_the_fallback_the_supervisor_holds() {
-        let fresh = ipe_watch::SupervisorState::fresh();
-        assert_eq!(failure_fallback(&fresh), FallbackNote::NoAppYet);
+        let mut fresh = ipe_watch::SupervisorState::fresh();
+        assert_eq!(failure_fallback(&mut fresh), FallbackNote::NoAppYet);
         assert!(
             !FallbackNote::NoAppYet.text().contains("last-good"),
             "a watch with no build yet claims no last-good binary"
         );
-        let stopped = ipe_watch::SupervisorState::NotRunning {
+        let mut stopped = ipe_watch::SupervisorState::NotRunning {
             last_good: Some(ipe_watch::LastGoodBinary {
                 artifact_path: PathBuf::from("/bin/true"),
                 content_hash: [0; 32],
             }),
         };
-        assert_eq!(failure_fallback(&stopped), FallbackNote::LastGoodStopped);
-        let child =
+        assert_eq!(
+            failure_fallback(&mut stopped),
+            FallbackNote::LastGoodStopped
+        );
+        let mut sleeper = Command::new("/bin/sleep");
+        sleeper.arg("30");
+        let child = ipe_runtime_rust::system::spawn_hardened(sleeper)
+            .expect("hardened /bin/sleep must spawn");
+        let mut running = ipe_watch::SupervisorState::Running {
+            child,
+            artifact: ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/sleep"),
+                content_hash: [0; 32],
+            },
+        };
+        assert_eq!(
+            failure_fallback(&mut running),
+            FallbackNote::LastGoodRunning
+        );
+        if let ipe_watch::SupervisorState::Running { mut child, .. } = running {
+            child.kill().expect("stop /bin/sleep");
+            child.wait().expect("reap /bin/sleep");
+        }
+    }
+
+    /// The supervisor still holds a `Running` state after its app exits on its
+    /// own (a crash between two builds): the failure note must not claim the
+    /// last-good binary stays up.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_rebuild_after_the_app_exited_claims_no_running_app() {
+        let mut child =
             spawn_command(Path::new("/bin/true"), &[]).expect("hardened /bin/true must spawn");
-        let running = ipe_watch::SupervisorState::Running {
+        let status = child.wait().expect("reap /bin/true");
+        assert!(status.success(), "hardened /bin/true must exit 0");
+        let mut exited = ipe_watch::SupervisorState::Running {
             child,
             artifact: ipe_watch::LastGoodBinary {
                 artifact_path: PathBuf::from("/bin/true"),
                 content_hash: [0; 32],
             },
         };
-        assert_eq!(failure_fallback(&running), FallbackNote::LastGoodRunning);
-        if let ipe_watch::SupervisorState::Running { mut child, .. } = running {
-            let status = child.wait().expect("reap /bin/true");
-            assert!(status.success(), "hardened /bin/true must exit 0");
-        }
+        assert_eq!(failure_fallback(&mut exited), FallbackNote::LastGoodStopped);
+        assert!(
+            !FallbackNote::LastGoodStopped.text().contains("stays up"),
+            "the exited-app note claims no running app"
+        );
     }
 
     /// `spawn_command` launches the requested binary through the hardened
