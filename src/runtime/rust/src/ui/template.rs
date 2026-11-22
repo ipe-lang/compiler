@@ -1400,6 +1400,20 @@ mod tests {
         assert_eq!(UiLength::from_length(&three), UiLength::Fill(3));
     }
 
+    /// Refusal of a baked negative size bypassing the inline clamp: a wire
+    /// `Px` / `Vh` / `Vw` below 0 decodes through the same constructor as
+    /// `Ui.px`, so it is 0 on both paths.
+    #[test]
+    fn decoded_negative_base_takes_the_inline_clamp() {
+        assert_eq!(UiLength::Px(-5).to_length(), Length::px(0));
+        assert_eq!(UiLength::Vh(-1).to_length(), Length::vh(0));
+        assert_eq!(UiLength::Vw(i64::MIN).to_length(), Length::vw(0));
+        assert_eq!(
+            UiLength::Max(10, Box::new(UiLength::Px(-5))).to_length(),
+            Length::px(0).at_most(10)
+        );
+    }
+
     /// Refusal of a wire fold that disagrees with the kernels: a non-normal
     /// depth-3 chain decodes to the kernel-built `Length`, re-encodes as the
     /// normal form `Min(lo, Max(hi, base))`, and round-trips stably.

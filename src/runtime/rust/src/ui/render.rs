@@ -2758,9 +2758,12 @@ mod tests {
     /// sweeps.
     fn length_shapes() -> Vec<Length> {
         let bases = [
+            Length::px(-5),
             Length::px(0),
             Length::px(96),
+            Length::vh(-5),
             Length::vh(50),
+            Length::vw(-5),
             Length::vw(50),
             Length::content(),
             Length::fill(Portion::ONE),
@@ -2919,6 +2922,23 @@ mod tests {
         );
         assert_eq!(floored, "width:20px;min-width:0px");
         assert!(!capped.contains("-5px") && !floored.contains("-5px"));
+    }
+
+    /// Refusal: a negative `px` / `vh` / `vw` base renders 0, as the TUI lays it
+    /// out, rather than a negative size the browser drops (leaving the node
+    /// unsized on the web only).
+    #[test]
+    fn negative_base_clamps_to_zero() {
+        use crate::ui::helpers::{ui_px_, ui_vh_, ui_vw_};
+        let cases = [
+            (ui_px_(-5), "width:0px"),
+            (ui_vh_(-5), "width:0vh"),
+            (ui_vw_(i64::MIN), "width:0vw"),
+        ];
+        for (len, want) in cases {
+            let css = size_css(&[Attribute::<TestMsg>::AttrWidth(len)], FlexAxis::Block);
+            assert_eq!(css, want);
+        }
     }
 
     /// Refusal: an explicit `Ui.width Ui.shrink` sizes exactly as a width-less

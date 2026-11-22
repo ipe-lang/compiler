@@ -100,7 +100,14 @@ impl BaseLength {
     }
 }
 
-/// `Ipe.Ui.Length`: a base size clamped by a non-negative px interval.
+/// A size quantity floored at 0: a negative size has no CSS value (a browser
+/// drops the declaration) and no cell count, so every backend reads it as 0.
+const fn non_negative(n: i64) -> i64 {
+    if n < 0 { 0 } else { n }
+}
+
+/// `Ipe.Ui.Length`: a non-negative base size clamped by a non-negative px
+/// interval.
 ///
 /// The flat normal form of every `minimum` / `maximum` chain, folded in nesting
 /// order by [`PxBounds`] when the chain is built, so the carrier is `Copy` at any
@@ -121,10 +128,10 @@ impl Length {
         }
     }
 
-    /// `Ui.px n`.
+    /// `Ui.px n`; a negative `n` is 0, the smallest size any backend lays out.
     #[must_use]
     pub const fn px(n: i64) -> Self {
-        Self::unbounded(BaseLength::Px(n))
+        Self::unbounded(BaseLength::Px(non_negative(n)))
     }
 
     /// `Ui.content` / `Ui.shrink`.
@@ -139,16 +146,16 @@ impl Length {
         Self::unbounded(BaseLength::Fill(portion))
     }
 
-    /// `Ui.vh n`.
+    /// `Ui.vh n`; a negative `n` is 0.
     #[must_use]
     pub const fn vh(n: i64) -> Self {
-        Self::unbounded(BaseLength::Vh(n))
+        Self::unbounded(BaseLength::Vh(non_negative(n)))
     }
 
-    /// `Ui.vw n`.
+    /// `Ui.vw n`; a negative `n` is 0.
     #[must_use]
     pub const fn vw(n: i64) -> Self {
-        Self::unbounded(BaseLength::Vw(n))
+        Self::unbounded(BaseLength::Vw(non_negative(n)))
     }
 
     /// `Ui.fillPortion n`: a fill of `n` shares, or `Content` (`Ui.shrink`) when
