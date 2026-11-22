@@ -506,14 +506,14 @@ fn a_pending_field_value_ends_on_a_message_the_server_sends() {
     );
     let poster = body_of(&source, THE_POSTER);
     assert!(
-        poster.contains("__ipeRetirePending(body.seq);"),
+        poster.contains("__ipeOnPostSuccess(); __ipeRetirePending(body.seq);"),
         "a stale answer ends the values its event carried"
     );
     assert!(
         poster.contains(
-            "if (ipeMark === \"1\" && typeof data.seq === \"number\") __ipeRetirePending(data.seq);"
+            "if (ipeMark === \"1\" && typeof data.seq === \"number\") __ipeRetirePending(body.seq);"
         ),
-        "a marked accept ends the values its event carried"
+        "a marked accept ends the values its event carried, by this tab's seq for it"
     );
     let own = body_of(&source, "__ipeRetireOwnFrame");
     assert!(
@@ -529,6 +529,33 @@ fn a_pending_field_value_ends_on_a_message_the_server_sends() {
     assert!(
         dirty.contains("if (e && e.pendingSeq > 0) return true;"),
         "a field is the user's while its value is pending"
+    );
+}
+
+/// An answer's `seq` is the session's commit count, never this tab's event
+/// seq, so no pending value is retired by it and the frame gate never folds
+/// it (CI job `test`). Read as an event seq it retires a value a later,
+/// unanswered event carries, or holds one past its own answer; folded into
+/// the frame gate it drops a reconnect's resync `patch` frame whose count the
+/// ack already reached.
+#[test]
+fn an_answers_session_seq_neither_retires_nor_gates() {
+    let source = code();
+    for read in [
+        "__ipeRetirePending(data.",
+        "__ipeHandleResponse(data.",
+        "__ipeIngestSeq(data.",
+    ] {
+        assert!(
+            !source.contains(read),
+            "client.js reads an answer's session seq through `{read}`"
+        );
+    }
+    let poster = body_of(&source, THE_POSTER);
+    assert_eq!(
+        poster.matches("__ipeRetirePending(").count(),
+        poster.matches("__ipeRetirePending(body.seq)").count(),
+        "the poster retires by the seq of the event it posted, nothing else"
     );
 }
 

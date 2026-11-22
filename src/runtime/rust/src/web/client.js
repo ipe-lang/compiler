@@ -1876,7 +1876,7 @@ function __ipePostEvent(body, fromQueue) {
           __ipeRetirePending(body.seq);
           if (!data || typeof data.body !== "string") return;
           // The epoch gate orders this render against the DOM on screen; the
-          // seq it carries is the session's, which an earlier ack may equal.
+          // seq it carries is the session's, which an earlier frame may equal.
           __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, data.route);
         }).catch(function() { __ipeLoaderEnd(); });
       case __IPE_EVENT_ANSWER.SESSION_LOST:
@@ -1933,13 +1933,14 @@ function __ipePostEvent(body, fromQueue) {
       __ipeLoaderEnd();
       __ipeOnPostSuccess();
       if (!data) return;
-      // An accepted event is acked with its seq; its render arrives over
-      // the stream, whose frames name the epochs they move between. Any
-      // patches an answer carries have no epoch to gate on: they never
-      // apply.
+      // An accepted event's render arrives over the stream, whose frames
+      // name the epochs they move between. Any patches an answer carries
+      // have no epoch to gate on: they never apply. The answer's `seq` is
+      // the session's commit count, not this tab's event seq, so it neither
+      // retires a value nor moves the frame gate: folded there, it would drop
+      // a `patch` frame (a reconnect's resync) of an equal or lower count.
       // The marked accept of this event ends every value it carries.
-      if (ipeMark === "1" && typeof data.seq === "number") __ipeRetirePending(data.seq);
-      __ipeHandleResponse(data.seq, function() {}, data.globalSeq);
+      if (ipeMark === "1" && typeof data.seq === "number") __ipeRetirePending(body.seq);
     });
   }).catch(function() {
     if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;
