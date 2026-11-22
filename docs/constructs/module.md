@@ -8,8 +8,6 @@ see_also: ["import"]
 
 # `module` — module declarations
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 Every Ipê source file begins with a `module` declaration that gives the file
 its name and controls what it exposes to other modules.
 

@@ -8,8 +8,6 @@ see_also: ["type-alias", "record", "case"]
 
 # `type` — union type declarations
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 A `type` declaration defines a new named type with one or more constructors.
 Each constructor is a distinct shape the value can take, optionally carrying
 payload. You inspect which constructor a value has with `case`.

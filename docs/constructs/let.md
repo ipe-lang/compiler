@@ -8,8 +8,6 @@ see_also: ["case", "lambda", "do"]
 
 # `let` — local bindings
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 A `let` expression gives a name to an intermediate result so you can use it
 without repeating the computation. Every binding in Ipê is immutable — once
 bound, the name always refers to the same value.

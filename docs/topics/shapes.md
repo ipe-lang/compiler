@@ -1,17 +1,17 @@
 ---
 kind: topic
-title: "shapes: the five app entry shapes"
-summary: "The five program shapes (Web, Tui, Cli, Worker, Script) — the entry function that pins each, and when to use it."
+title: "shapes: the app entry shapes"
+summary: "The program entry shapes `ipe init` offers (Web, Tui, Cli, Worker, Server, Script) — the entry function that pins each, and when to use it."
 idiom: false
-aliases: ["app-shapes", "web", "tui", "cli", "worker", "script", "app-entry"]
+aliases: ["app-shapes", "web", "tui", "cli", "worker", "server", "script", "app-entry"]
 see_also: ["main", "state", "effects"]
 ---
 
-# `shapes` — the five app entry shapes
+# `shapes` — the app entry shapes
 
 The code below is Ipê source, not shell. Every program has one `main`; the
 **head of `main`** pins the shape — the compiler reads it, never a config field.
-Five shapes exist:
+`ipe init` offers these shapes:
 
 | Shape | Entry | `view` renders | Scaffold |
 |-------|-------|----------------|----------|
@@ -19,7 +19,12 @@ Five shapes exist:
 | **Tui** | `Tui.tea` | Full-screen terminal cells (`Screen`) | `ipe init app tui` |
 | **Cli** | `Cli.tea` | Line-oriented terminal output (`Lines`) | `ipe init app cli` |
 | **Worker** | `Worker.tea` | *nothing* — a view-less TEA loop | `ipe init app worker` |
-| **Script** | bare `main : Task Error ()` (or `Server.listen`) | *nothing* — a plain effect | `ipe init app script` |
+| **Server** | bare `main : Task Error ()` running `Server.listen` | *nothing* — an HTTP server | `ipe init app server` |
+| **Script** | bare `main : Task Error ()` | *nothing* — a plain effect | `ipe init app script` |
+
+**Server** scaffolds a convenience template, not a distinct compiler shape: the
+generated project is a **Script** program whose starter `main` runs
+`Server.listen`, so it compiles and runs exactly as a Script.
 
 Web / Tui / Cli / Worker follow [The Elm Architecture](https://guide.elm-lang.org/architecture/):
 `init` · `update` · `subscriptions`, plus a `view` for the three that render —
@@ -457,11 +462,15 @@ main =
 - Full-screen terminal UI? → **Tui**
 - Line-oriented terminal app or REPL? → **Cli**
 - Background loop, no UI? → **Worker**
-- One-shot script, tool, or HTTP server? → **Script**
+- One-shot script or tool? → **Script**
+- HTTP server? → **Server** (`ipe init app server` — a Script scaffold
+  preloaded with a `Server.listen` starter)
 
 ## Glossary
 
-- **shape** — one of five `main` entry patterns: Web, Tui, Cli, Worker, Script.
+- **shape** — a `main` entry pattern the compiler reads from `main`'s head: Web,
+  Tui, Cli, Worker, Script. `ipe init` also offers **Server**, a Script scaffold
+  preloaded with an HTTP starter.
 - **`Web.tea`** — browser DOM TEA entry (`Element` view; `served` or `client`).
 - **`Tui.tea`** — full-screen terminal TUI entry (`Screen` view).
 - **`Tui.Sub.onKey`** — the `Tui` key-input subscription

@@ -241,10 +241,6 @@ and the security path type-checks:
 store-secured-owner
 ```
 
-The load-bearing proof is the SEAL: this program is built and run under `IPE_E2E=1`,
-so a language change that broke the secured path — the policy builders, the `…As`
-operations, or the principal-threading — would fail CI here.
-
 ## The why
 
 A `Draft` with no read or write operation, promoted only through a named

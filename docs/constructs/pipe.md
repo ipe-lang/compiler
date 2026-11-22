@@ -8,8 +8,6 @@ see_also: ["lambda", "do", "effects"]
 
 # `|>` — the pipe operator
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 The pipe operator `|>` passes the value on its left as the last argument to the
 function on its right. It lets you write a data-transformation pipeline in the
 order the steps happen, without nesting function calls inside one another.

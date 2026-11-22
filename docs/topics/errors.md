@@ -9,8 +9,6 @@ see_also: ["effects", "main", "state", "arithmetic"]
 
 # `errors` — typed error handling with Result
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 Ipê has no exceptions. A function that can fail returns a `Result` — a value
 that is either `Ok result` (success) or `Err error` (failure). The compiler
 forces you to handle both cases, so a failure can never be silently ignored.

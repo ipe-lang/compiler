@@ -9,8 +9,6 @@ see_also: ["errors", "main"]
 
 # `arithmetic` — Int and Float totality
 
-The code examples in this page are illustrative Ipê source snippets, not shell commands.
-
 `Int` is 64-bit two's-complement; `Float` is IEEE 754 double precision. Every
 arithmetic operation is total: it either returns its exact result, or the
 program ends in a typed error. No operation wraps, saturates, or truncates a
