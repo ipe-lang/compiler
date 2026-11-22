@@ -1024,6 +1024,45 @@ fn a_project_module_shadows_stdlib_by_short_name_only() -> io::Result<()> {
     Ok(())
 }
 
+/// A project module's member answers its `Module.member` key before a stdlib
+/// member filed under the same suffix key: `Input.labelHidden` (one stdlib
+/// owner) and `Parser.int` (two stdlib owners) open the project's member,
+/// while the full stdlib name still opens the stdlib one.
+#[test]
+fn a_project_member_shadows_a_stdlib_suffix_key() -> io::Result<()> {
+    let dir = package_dir("shadow_suffix")?;
+    let src = dir.join("src");
+    fs::write(
+        src.join("Input.ipe"),
+        "module Input exposing (labelHidden)\n\n\
+         -- | A project marker.\n\
+         labelHidden : Int\n\
+         labelHidden =\n    1\n",
+    )?;
+    fs::write(
+        src.join("Parser.ipe"),
+        "module Parser exposing (int)\n\n\
+         -- | A project marker.\n\
+         int : Int\n\
+         int =\n    2\n",
+    )?;
+    for key in ["Input.labelHidden", "Parser.int"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--plain"]);
+        assert!(ok, "`{key}` opens the project member:\n{stdout}\n{stderr}");
+        assert!(
+            stdout.starts_with(&format!("{key} : Int")),
+            "`{key}` is the project's `Int` member:\n{stdout}"
+        );
+    }
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Ipe.Ui.Input.labelHidden", "--plain"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.starts_with("Ipe.Ui.Input.labelHidden : "),
+        "{stdout}"
+    );
+    Ok(())
+}
+
 /// A package at a fresh directory: a manifest and a `src/Main.ipe` entry, the
 /// shape `ipe doc` reads as the current directory's package.
 fn package_dir(tag: &str) -> io::Result<PathBuf> {

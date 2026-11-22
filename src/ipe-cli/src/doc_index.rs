@@ -187,18 +187,27 @@ impl DocIndex {
         for module in STDLIB {
             match module.role {
                 Role::Retired => {}
-                Role::Kernel { .. } => {
+                Role::Kernel { veneer } => {
                     members.extend(
                         kernel_members(module.dotted)
                             .into_iter()
                             .map(|n| (module, n)),
                     );
+                    // A kernel module's types (`Crypto.Key`, `Http.HttpMethod`)
+                    // are declared by its veneer, not its kernel table.
+                    if let Some(source) = veneer {
+                        members.extend(
+                            exposed_names(module.dotted, source, Exposure::TypesOnly)?
+                                .into_iter()
+                                .map(|n| (module, n)),
+                        );
+                    }
                 }
                 Role::Compiled { source, .. }
                 | Role::CompiledVeneer { source, .. }
                 | Role::DocOnly { source } => {
                     members.extend(
-                        exposed_names(module.dotted, source)?
+                        exposed_names(module.dotted, source, Exposure::Every)?
                             .into_iter()
                             .map(|n| (module, n)),
                     );
@@ -229,12 +238,25 @@ impl DocIndex {
     }
 }
 
-/// The names `source`'s `exposing` clause names; for `exposing (..)`, every
+/// Which exposed names [`exposed_names`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exposure {
+    /// Values, unions and aliases.
+    Every,
+    /// Unions and aliases only.
+    TypesOnly,
+}
+
+/// The names `source`'s `exposing` clause names, kept per `exposure`; for `exposing (..)`, every
 /// top-level value, union and alias.
 ///
 /// # Errors
 /// [`DocIndexError::Parse`] when `source` does not parse.
-fn exposed_names(module: &'static str, source: &str) -> Result<Vec<String>, DocIndexError> {
+pub fn exposed_names(
+    module: &'static str,
+    source: &str,
+    exposure: Exposure,
+) -> Result<Vec<String>, DocIndexError> {
     let mut interner = Interner::new();
     let parsed = ipe_parse::parse_module(source, &mut interner).map_err(|diagnostic| {
         DocIndexError::Parse {
@@ -245,13 +267,15 @@ fn exposed_names(module: &'static str, source: &str) -> Result<Vec<String>, DocI
     let symbols: Vec<ipe_intern::Symbol> = match &parsed.exposing.value {
         Exposing::List(items) => items
             .iter()
-            .map(|item| match &item.value {
-                Exposed::Value(symbol) | Exposed::Type(symbol, _) => *symbol,
+            .filter_map(|item| match &item.value {
+                Exposed::Value(symbol) => (exposure == Exposure::Every).then_some(*symbol),
+                Exposed::Type(symbol, _) => Some(*symbol),
             })
             .collect(),
         Exposing::All => parsed
             .values
             .iter()
+            .filter(|_| exposure == Exposure::Every)
             .map(|v| v.value.name.value)
             .chain(parsed.unions.iter().map(|u| u.value.name.value))
             .chain(parsed.aliases.iter().map(|a| a.value.name.value))
