@@ -11613,8 +11613,7 @@ mod static_noise_mime_tests {
 // `update` unwinds into that spawn boundary, ending only the tripping session's
 // driver while the process — and every other session's driver — survives. This
 // module pins that isolation at the spawn boundary the driver uses.
-#[cfg(test)]
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(test, feature = "tokio", not(target_arch = "wasm32")))]
 mod recursion_session_isolation_tests {
     // A session-`update` that trips the recursion guard, spawned exactly as
     // `drive_session` spawns its fold task, dies as a panicking `JoinError`
