@@ -279,9 +279,8 @@ impl Shown {
         use std::fmt::Write as _;
         match self {
             Self::Value(value) => {
-                out.write_char('"')?;
                 value.render(out);
-                out.write_char('"')
+                Ok(())
             }
             Self::Redacted { bytes } => write!(out, "<redacted, {bytes} bytes>"),
         }

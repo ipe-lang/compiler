@@ -247,12 +247,12 @@ impl crate::system::ScrubbedDisplay for MountRefusal {
             Self::NoBody => out.write_str("the document has no <body>"),
             Self::Listener { event, detail } => {
                 out.write_str("addEventListener(")?;
-                out.quote(event);
+                out.write_str(event)?;
                 out.write_str(") failed: ")?;
                 detail.render(out)
             }
             Self::Dom { step, detail } => {
-                out.quote(step);
+                out.write_str(step)?;
                 out.write_str(" failed")?;
                 detail.as_ref().map_or(Ok(()), |detail| {
                     out.write_str(": ")?;
@@ -1107,7 +1107,7 @@ mod tests {
         assert!(refusal.is_some_and(|r| {
             let msg = crate::system::refusal_text(&r);
             r.pattern.raw() == "/u/:id/:id"
-                && msg.contains("route pattern `/u/:id/:id` is malformed")
+                && msg.contains("route pattern \"/u/:id/:id\" is malformed")
                 && msg.contains("parameter `id` appears twice")
         }));
     }
@@ -1152,7 +1152,7 @@ mod tests {
         assert!(refusal.is_some_and(|r| {
             r.pattern.raw() == "/file:id"
                 && crate::system::refusal_text(&r)
-                    .contains("route pattern `/file:id` is malformed: a `:` or `*` at byte 4")
+                    .contains("route pattern \"/file:id\" is malformed: a `:` or `*` at byte 4")
         }));
     }
 
@@ -1179,7 +1179,7 @@ mod tests {
         assert!(
             refusal
                 .map(|r| crate::system::refusal_text(&r))
-                .is_some_and(|m| m.contains("route pattern `/%zz` is malformed"))
+                .is_some_and(|m| m.contains("route pattern \"/%zz\" is malformed"))
         );
         // Even if served, the refused route never matches: no request segment
         // equals a literal that has no decoded value.
@@ -1213,7 +1213,7 @@ mod tests {
             .map(|r| crate::system::refusal_text(&r))
             .unwrap_or_default();
         assert!(
-            message.contains("route pattern `/%zz` is malformed"),
+            message.contains("route pattern \"/%zz\" is malformed"),
             "the refusal names the first malformed pattern: {message}"
         );
         let crate::error::IpeError::Error(kind, _) =
@@ -1263,15 +1263,18 @@ mod tests {
             detail: Some(RefusedText::new("a\\b\n")),
         };
         let line = |r: &MountRefusal| crate::system::ScrubbedLine::of_refusal(r).to_string();
-        assert_eq!(line(&listener), "addEventListener(click) failed: a\\\\b\\n");
-        assert_eq!(line(&dom), "createElement(div) failed: a\\\\b\\n");
+        assert_eq!(
+            line(&listener),
+            "addEventListener(click) failed: \"a\\\\b\\n\""
+        );
+        assert_eq!(line(&dom), "createElement(div) failed: \"a\\\\b\\n\"");
         assert_eq!(
             crate::error::ipe_error_message(listener.into()),
-            "addEventListener(click) failed: a\\b\n"
+            "addEventListener(click) failed: \"a\\b\n\""
         );
         assert_eq!(
             crate::error::ipe_error_message(dom.into()),
-            "createElement(div) failed: a\\b\n"
+            "createElement(div) failed: \"a\\b\n\""
         );
     }
 
@@ -1306,21 +1309,21 @@ mod tests {
                     event: "click",
                     detail: RefusedText::new("a\\b\n"),
                 },
-                "[ipe-wasm:MountFailed] addEventListener(click) failed: a\\\\b\\n",
+                "[ipe-wasm:MountFailed] addEventListener(click) failed: \"a\\\\b\\n\"",
             ),
             (
                 MountRefusal::Dom {
                     step: "createElement(div)",
                     detail: Some(RefusedText::new("a\\b")),
                 },
-                "[ipe-wasm:MountFailed] createElement(div) failed: a\\\\b",
+                "[ipe-wasm:MountFailed] createElement(div) failed: \"a\\\\b\"",
             ),
             (
                 MountRefusal::RouteTable(RoutePatternRefusal {
                     pattern: RefusedText::new("/a\\b"),
                     refusal: RouteSegmentRefusal::Decode(bad_escape()),
                 }),
-                "[ipe-wasm:MountFailed] route pattern `/a\\\\b` is malformed: ",
+                "[ipe-wasm:MountFailed] route pattern \"/a\\\\b\" is malformed: ",
             ),
         ];
         for (refusal, expected) in cases {

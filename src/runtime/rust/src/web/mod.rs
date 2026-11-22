@@ -5037,9 +5037,9 @@ impl crate::system::ScrubbedDisplay for StartupRefusal {
                 e.render(out)
             }
             Self::MountBase { base, refusal } => {
-                out.write_str("web base path `")?;
+                out.write_str("web base path ")?;
                 base.render(out)?;
-                write!(out, "` is not a mount base: {refusal}")
+                write!(out, " is not a mount base: {refusal}")
             }
             Self::Ceiling(refusal) => refusal.render(out),
             Self::FrameAncestors(refusal) => write!(out, "{refusal}"),
@@ -11437,8 +11437,8 @@ mod sse_reconnect_reconcile_tests {
             parse_mount_base("/a\\b").err(),
         ];
         let expected = [
-            "web base path `/%zz\\\\` is not a mount base",
-            "web base path `/a\\\\b` is not a mount base",
+            "web base path \"/%zz\\\\\" is not a mount base",
+            "web base path \"/a\\\\b\" is not a mount base",
         ];
         for (refusal, expected) in refusals.into_iter().zip(expected) {
             let rendered = refusal
@@ -16407,7 +16407,7 @@ mod emitted_router_behavior_tests {
         assert!(
             matches!(
                 &result,
-                IpeResult::Err(message) if message.contains("route pattern `/%zz` is malformed")
+                IpeResult::Err(message) if message.contains("route pattern \"/%zz\" is malformed")
             ),
             "a malformed route table must refuse to start, naming the pattern: {result:?}"
         );
@@ -16498,13 +16498,13 @@ mod emitted_router_behavior_tests {
         assert_eq!(
             crate::error::ipe_error_message(cause.clone().into()),
             "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
-             (host a\\b); fix the connection URL or the server, or set \
+             (\"host a\\b\"); fix the connection URL or the server, or set \
              IPE_WEB_STORE=file|memory"
         );
         assert_eq!(
             crate::system::ScrubbedLine::of_refusal(&cause).to_string(),
             "session store misconfigured: IPE_WEB_STORE=postgres refused at connect \
-             (host a\\\\b); fix the connection URL or the server, or set \
+             (\"host a\\\\b\"); fix the connection URL or the server, or set \
              IPE_WEB_STORE=file|memory"
         );
     }
@@ -16527,7 +16527,7 @@ mod emitted_router_behavior_tests {
         assert_eq!(
             line.trim_start(),
             "[ipe.live] mounted web app disabled: session store misconfigured: \
-             IPE_WEB_STORE=postgres refused at connect (host a\\\\b\\n[ipe.live] forged); \
+             IPE_WEB_STORE=postgres refused at connect (\"host a\\\\b\\n[ipe.live] forged\"); \
              fix the connection URL or the server, or set IPE_WEB_STORE=file|memory"
         );
         assert!(!line.contains("a\\\\\\\\b"), "{line:?}");

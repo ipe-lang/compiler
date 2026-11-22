@@ -552,16 +552,16 @@ impl ScrubbedDisplay for EnvCeilingRefusal {
         } = self;
         match (self.source, self.defect) {
             (CeilingSource::Env, CeilingDefect::NotDecimal) => {
-                write!(out, "{name} must be a {unit} (got \"")?;
+                write!(out, "{name} must be a {unit} (got ")?;
             }
             (CeilingSource::Env, CeilingDefect::Zero) => {
-                write!(out, "{name} must be a positive {unit} (got \"")?;
+                write!(out, "{name} must be a positive {unit} (got ")?;
             }
             (CeilingSource::Env, CeilingDefect::TooLarge) => {
-                write!(out, "{name} is too large for this platform (got \"")?;
+                write!(out, "{name} is too large for this platform (got ")?;
             }
             (CeilingSource::EnvOverBound { max }, _) => {
-                write!(out, "{name} must be at most {max} (got \"")?;
+                write!(out, "{name} must be at most {max} (got ")?;
             }
             (CeilingSource::Default { max }, _) => {
                 write!(out, "{name} is unset and its default ")?;
@@ -583,7 +583,7 @@ impl ScrubbedDisplay for EnvCeilingRefusal {
             }
         }
         shown.render(out);
-        out.write_str("\")")
+        out.write_str(")")
     }
 }
 
@@ -655,9 +655,9 @@ impl ScrubbedDisplay for EnvValueRefusal {
             expected,
             shown,
         } = self;
-        write!(out, "{name} must be {expected} (got \"")?;
+        write!(out, "{name} must be {expected} (got ")?;
         shown.render(out);
-        out.write_str("\")")
+        out.write_str(")")
     }
 }
 
@@ -867,8 +867,9 @@ pub(crate) fn scrub_log_controls(s: &str) -> std::borrow::Cow<'_, str> {
 /// The marker [`scrub_log_controls_capped`] appends when it cuts its output.
 ///
 /// The scrub writes `\` only as the start of `\\`, `\n`, `\r`, `\t` or
-/// `\u{…}`, so `\…` never occurs in scrubbed text: a cut record cannot pass
-/// for an uncut one.
+/// `\u{…}` (and a scrubbed [`Render`] adds only `\"`, ``\` `` and `\xNN`),
+/// so `\…` never occurs in scrubbed text: a cut record cannot pass for an
+/// uncut one.
 pub(crate) const SCRUB_TRUNCATED: &str = "\\…";
 
 /// [`scrub_log_controls`] for an untrusted record, bounded to `max_bytes`.
@@ -944,19 +945,23 @@ impl RefusedText {
 
 impl ScrubbedDisplay for RefusedText {
     fn render(&self, out: &mut Render) -> std::fmt::Result {
-        out.quote(&self.text);
-        if self.cut {
-            out.cut_marker();
-        }
+        out.quote_cut(&self.text, self.cut);
         Ok(())
     }
 }
 
-/// The scrubbed text, for the `Server.listen` refusals that embed it in their
-/// own operator text.
+/// The scrubbed text without its delimiters, for the `Server.listen`
+/// refusals that quote it between backticks in their own operator text: its
+/// `` ` `` and `"` are escaped as in [`Render::quote`], so it cannot end the
+/// span it sits in.
 impl std::fmt::Display for RefusedText {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&render(self, Quote::Scrubbed))
+        let mut out = Render::new(Quote::Scrubbed);
+        out.push_body(&self.text);
+        if self.cut {
+            out.push_cut_marker();
+        }
+        f.write_str(&out.text)
     }
 }
 
@@ -965,15 +970,18 @@ impl std::fmt::Display for RefusedText {
 pub(crate) enum Quote {
     /// As it is: for a text value (an `IpeError` message, a `String`).
     Raw,
-    /// Escaped once by [`scrub_log_controls`]: for an operator line.
+    /// Escaped once for an operator line: [`scrub_log_controls`] plus the
+    /// quote delimiters (see [`Render::quote`]).
     Scrubbed,
 }
 
 /// The text of one refusal rendered in one [`Quote`] mode.
 ///
 /// Fixed words go in through [`std::fmt::Write`]; foreign text only through
-/// [`Self::quote`] or [`Self::quote_bytes`], so the mode decides how every
-/// quoted piece is written and the fixed words are written once for both.
+/// [`Self::quote`], [`Self::quote_bytes`] or [`Self::quote_cut`], each of
+/// which writes the `"` delimiters itself, so the mode decides how every
+/// quoted piece is written, the fixed words are written once for both, and
+/// no quoted piece can sit outside its delimiters.
 pub(crate) struct Render {
     text: String,
     mode: Quote,
@@ -988,21 +996,37 @@ impl Render {
         }
     }
 
-    /// Writes foreign text: raw, or escaped by [`scrub_log_controls`].
+    /// Writes foreign text between `"` delimiters: raw, or escaped by
+    /// [`scrub_log_controls`] with `"` as `\"` and `` ` `` as ``\` ``.
+    ///
+    /// Scrubbed, the span is unforgeable: every `\` it holds starts an
+    /// escape and every `"` in it is escaped, so the first unescaped `"`
+    /// after the opening one is its end and two distinct texts never print
+    /// alike.
     pub(crate) fn quote(&mut self, raw: &str) {
-        match self.mode {
-            Quote::Raw => self.text.push_str(raw),
-            Quote::Scrubbed => self.text.push_str(&scrub_log_controls(raw)),
-        }
+        self.quote_cut(raw, false);
     }
 
-    /// Writes foreign bytes: each UTF-8 run as [`Self::quote`] does, and each
-    /// byte that is not UTF-8 as `\xNN` when scrubbed (an escape the scrub
-    /// never writes otherwise) or as U+FFFD when raw.
+    /// [`Self::quote`] for a text cut at its cap: the cut is marked inside
+    /// the delimiters, [`SCRUB_TRUNCATED`] when scrubbed and `…` when raw.
+    pub(crate) fn quote_cut(&mut self, raw: &str, cut: bool) {
+        self.text.push('"');
+        self.push_body(raw);
+        if cut {
+            self.push_cut_marker();
+        }
+        self.text.push('"');
+    }
+
+    /// Writes foreign bytes between `"` delimiters: each UTF-8 run as
+    /// [`Self::quote`] does, and each byte that is not UTF-8 as `\xNN` when
+    /// scrubbed (an escape the scrub never writes otherwise) or as U+FFFD
+    /// when raw.
     pub(crate) fn quote_bytes(&mut self, raw: &[u8]) {
         use std::fmt::Write as _;
+        self.text.push('"');
         for chunk in raw.utf8_chunks() {
-            self.quote(chunk.valid());
+            self.push_body(chunk.valid());
             for b in chunk.invalid() {
                 match self.mode {
                     Quote::Raw => self.text.push(char::REPLACEMENT_CHARACTER),
@@ -1012,11 +1036,27 @@ impl Render {
                 }
             }
         }
+        self.text.push('"');
     }
 
-    /// Marks a quoted text cut at its cap: [`SCRUB_TRUNCATED`] when scrubbed,
-    /// `…` when raw.
-    pub(crate) fn cut_marker(&mut self) {
+    /// Foreign text without delimiters, in this render's mode.
+    fn push_body(&mut self, raw: &str) {
+        match self.mode {
+            Quote::Raw => self.text.push_str(raw),
+            Quote::Scrubbed => {
+                for c in raw.chars() {
+                    match c {
+                        '"' => self.text.push_str("\\\""),
+                        '`' => self.text.push_str("\\`"),
+                        c => push_scrubbed(c, &mut self.text),
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mark of a text cut at its cap.
+    fn push_cut_marker(&mut self) {
         self.text.push_str(match self.mode {
             Quote::Raw => "\u{2026}",
             Quote::Scrubbed => SCRUB_TRUNCATED,
@@ -5915,21 +5955,21 @@ mod env_ceiling_tests {
             .map_err(|r| r.to_string());
         assert_eq!(
             too_large,
-            Err("the `Test.limit` setting must be at most 100 (got 101)".to_owned())
+            Err("the `Test.limit` setting must be at most 100 (got \"101\")".to_owned())
         );
         let zero = ceiling
             .check_setting("Test.limit", 0)
             .map_err(|r| r.to_string());
         assert_eq!(
             zero,
-            Err("the `Test.limit` setting must be positive (got 0)".to_owned())
+            Err("the `Test.limit` setting must be positive (got \"0\")".to_owned())
         );
         let lowered = EnvCeiling::new("IPE_TEST_CEILING", 7, ZeroCeiling::Refused, "count");
         assert_eq!(lowered.check_default(), Ok(7));
         assert_eq!(
             lowered.at_most(6).check_default().map_err(|r| r.to_string()),
             Err(
-                "IPE_TEST_CEILING is unset and its default 7 is out of range; set IPE_TEST_CEILING to at most 6"
+                "IPE_TEST_CEILING is unset and its default \"7\" is out of range; set IPE_TEST_CEILING to at most 6"
                     .to_owned()
             )
         );
@@ -7412,7 +7452,7 @@ mod scrub_log_controls_tests {
     fn refused_text_with_backslash_logs_once_escaped() {
         let msg = super::ScrubbedLine::from(super::RefusedText::new("a\\b"));
         let line = super::scrubbed_runtime_log_line(LogStream::Stderr, None, "live", &msg);
-        assert_eq!(line.trim_start(), "[ipe.live] a\\\\b");
+        assert_eq!(line.trim_start(), "[ipe.live] \"a\\\\b\"");
         assert!(!line.contains("a\\\\\\\\b"), "{line:?}");
     }
 
@@ -7479,18 +7519,18 @@ mod scrub_log_controls_tests {
         );
         assert!(long.starts_with(cut.raw()));
         assert!(
-            super::refusal_text(&cut).ends_with('\u{2026}'),
+            super::refusal_text(&cut).ends_with("\u{2026}\""),
             "the text value marks the cut"
         );
         let line = ScrubbedLine::of_refusal(&cut).to_string();
         assert!(
-            line.ends_with(SCRUB_TRUNCATED),
+            line.ends_with(&format!("{SCRUB_TRUNCATED}\"")),
             "the operator line marks the cut"
         );
         let huge = RefusedText::new(&"\n".repeat(REFUSED_TEXT_MAX_BYTES * 4));
         assert!(
             ScrubbedLine::of_refusal(&huge).to_string().len()
-                <= 2 * REFUSED_TEXT_MAX_BYTES + SCRUB_TRUNCATED.len(),
+                <= 2 * REFUSED_TEXT_MAX_BYTES + SCRUB_TRUNCATED.len() + 2,
             "a refusal's size never follows its input"
         );
     }
@@ -7535,9 +7575,15 @@ mod scrub_log_controls_tests {
         let ceiling =
             super::EnvCeiling::new("EXAMPLE_CEILING", 7, super::ZeroCeiling::Refused, "count");
         let duration = super::EnvDuration::new("EXAMPLE_DURATION", 30, "duration");
+        fn both<R: super::ScrubbedDisplay>(refusal: &R) -> (String, String) {
+            (
+                super::refusal_text(refusal),
+                super::render(refusal, super::Quote::Scrubbed),
+            )
+        }
         let mut rendered = vec![
-            super::refusal_text(&super::RefusedText::new("plain")),
-            super::refusal_text(&super::EnvValueRefusal::new(
+            both(&super::RefusedText::new("plain")),
+            both(&super::EnvValueRefusal::new(
                 "EXAMPLE",
                 "an IP address",
                 b"v",
@@ -7545,19 +7591,19 @@ mod scrub_log_controls_tests {
         ];
         for raw in ["x", "0", "99", "18446744073709551616"] {
             if let Err(r) = ceiling.parse(Ok(raw.to_owned())) {
-                rendered.push(super::refusal_text(&r));
+                rendered.push(both(&r));
             }
             if let Err(r) = duration.parse(Ok(raw.to_owned())) {
-                rendered.push(super::refusal_text(&r));
+                rendered.push(both(&r));
             }
         }
         for value in [0, 99] {
             if let Err(r) = ceiling.check_setting("example", value) {
-                rendered.push(super::refusal_text(&r));
+                rendered.push(both(&r));
             }
         }
         if let Err(r) = ceiling.at_most(0).check_default() {
-            rendered.push(super::refusal_text(&r));
+            rendered.push(both(&r));
         }
         for class in [
             Class::Tunable,
@@ -7584,17 +7630,13 @@ mod scrub_log_controls_tests {
                     class,
                 },
             ] {
-                rendered.push(super::refusal_text(&refusal));
+                rendered.push(both(&refusal));
             }
         }
         assert!(rendered.len() > 12, "{rendered:?}");
-        for text in rendered {
-            assert!(!text.chars().any(super::is_log_hazard), "{text:?}");
-            assert_eq!(
-                super::render(&super::RefusedText::new(&text), super::Quote::Scrubbed),
-                text,
-                "with harmless quoted text both modes agree"
-            );
+        for (raw, scrubbed) in rendered {
+            assert!(!raw.chars().any(super::is_log_hazard), "{raw:?}");
+            assert_eq!(scrubbed, raw, "with harmless quoted text both modes agree");
         }
     }
 
@@ -7614,6 +7656,73 @@ mod scrub_log_controls_tests {
         let line = super::ScrubbedLine::of_refusal(&refusal).to_string();
         assert!(line.contains("a\\\\b\\n"), "{line:?}");
         assert_eq!(line, super::scrub_log_controls(&message));
+    }
+
+    /// Reads the quoted span opening at the first `"` of `line` back to the
+    /// text it escapes: the decoded text and what follows the closing `"`.
+    fn unquote(line: &str) -> Option<(String, &str)> {
+        let (_, body) = line.split_once('"')?;
+        let mut out = String::new();
+        let mut chars = body.char_indices();
+        while let Some((at, c)) = chars.next() {
+            match c {
+                '"' => return Some((out, body.get(at..)?.strip_prefix('"')?)),
+                '\\' => match chars.next()?.1 {
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    e @ ('\\' | '"' | '`') => out.push(e),
+                    'u' => {
+                        let hex: String = chars
+                            .by_ref()
+                            .map(|(_, c)| c)
+                            .skip(1)
+                            .take_while(|&c| c != '}')
+                            .collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                    }
+                    _ => return None,
+                },
+                c => out.push(c),
+            }
+        }
+        None
+    }
+
+    /// A quoted span on an operator line is unforgeable: whatever the
+    /// refused text holds (a `"`, a backtick, a `\`, a hazard), the first
+    /// unescaped `"` after the opening one closes it, the span decodes back
+    /// to the text exactly, and the fixed words after it are the refusal's
+    /// own. Red when [`super::Render::quote`] leaves `"` unescaped.
+    #[test]
+    fn a_quoted_value_cannot_end_its_own_quote() {
+        use super::{EnvValueRefusal, RefusedText, ScrubbedLine};
+        for raw in [
+            "1\"), something else (\"",
+            "\") forged",
+            "a\\\"b",
+            "a\\",
+            "`x` \"y\" \\n",
+            "\"\u{202e}\n\\\"",
+        ] {
+            let refusal = EnvValueRefusal::new("EXAMPLE_VALUE", "an IP address", raw.as_bytes());
+            let line = ScrubbedLine::of_refusal(&refusal).to_string();
+            assert_eq!(
+                unquote(&line),
+                Some((raw.to_owned(), ")")),
+                "the value ends its own quote: {line:?}"
+            );
+            let text = ScrubbedLine::of_refusal(&RefusedText::new(raw)).to_string();
+            assert_eq!(unquote(&text), Some((raw.to_owned(), "")), "{text:?}");
+            assert!(
+                !RefusedText::new(raw)
+                    .to_string()
+                    .replace("\\\\", "")
+                    .replace("\\`", "")
+                    .contains('`'),
+                "a backtick-quoted text ends its own span: {raw:?}"
+            );
+        }
     }
 }
 
