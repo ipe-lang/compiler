@@ -17,7 +17,7 @@
 //! hold focus is rebuilt from the new markup, so the program's value wins. A
 //! kept field keeps its authority attributes and its `textarea` text, which
 //! the user owns. `client.js` runs the same field rule when it splices live
-//! fields into its swap; `tests/field_keep_parity.rs` pins its tables to these.
+//! fields into its swap; `tests/event_answer_single_table.rs` pins its tables to these.
 
 /// A form field whose value the user edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
