@@ -634,24 +634,212 @@ fn a_miss_lists_the_closest_matches_as_commands() -> io::Result<()> {
     Ok(())
 }
 
-/// Even a query close to nothing gets suggestions (bounded), and a bare member
-/// name lists every module member of that name.
+/// A query that matches no entry lists none, and a bare member name that one
+/// module alone exposes opens that member.
 #[test]
-fn every_miss_suggests_something_and_bare_names_find_members() -> io::Result<()> {
+fn a_far_miss_lists_nothing_and_a_unique_bare_member_opens() -> io::Result<()> {
     let dir = fresh_dir("miss_nearest")?;
     let (ok, _stdout, stderr) = run_in(&dir, &["doc", "qqqqzzzzxxxx"]);
     assert!(!ok);
-    let suggested = stderr.matches("ipe doc ").count();
     assert!(
-        (1..=10).contains(&suggested),
-        "a far miss still suggests a bounded list:\n{stderr}"
+        !stderr.contains("1. ipe doc "),
+        "a far miss lists no unrelated entry:\n{stderr}"
     );
-    let (ok, _stdout, stderr) = run_in(&dir, &["doc", "unixMillis"]);
-    assert!(!ok, "a bare member name is not an exact key");
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "unixMillis", "--plain"]);
+    assert!(ok, "a bare member name one module exposes opens:\n{stderr}");
     assert!(
-        stderr.contains("ipe doc Ipe.Time.unixMillis"),
-        "the bare member name finds the qualified member:\n{stderr}"
+        stdout.starts_with("Ipe.Time.unixMillis : "),
+        "the bare member name opens the qualified member:\n{stdout}"
     );
+    Ok(())
+}
+
+/// The first line a documented member prints is its checked signature, the
+/// same under every format.
+#[test]
+fn documented_member_shows_signature_first() -> io::Result<()> {
+    let dir = fresh_dir("signature_first")?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "String.toInt"]);
+    assert!(ok, "{stderr}");
+    assert!(
+        stdout.contains("Ipe.String.toInt : String -> Maybe Int"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "String.toInt", "--plain"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(
+        stdout.lines().next(),
+        Some("Ipe.String.toInt : String -> Maybe Int"),
+        "{stdout}"
+    );
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "String.toInt", "--json"]);
+    assert!(ok, "{stderr}");
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| io::Error::other(format!("{e}: {stdout}")))?;
+    let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
+    assert_eq!(field("signature"), Some("String -> Maybe Int"), "{stdout}");
+    assert_eq!(field("key"), Some("Ipe.String.toInt"), "{stdout}");
+    Ok(())
+}
+
+/// A member with no doc comment is still a row: bare, module-qualified and
+/// fully qualified, it opens with its signature.
+#[test]
+fn undocumented_member_resolves_bare_and_qualified() -> io::Result<()> {
+    let dir = fresh_dir("undocumented_member")?;
+    for key in ["readFile", "File.readFile", "Ipe.File.readFile"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--plain"]);
+        assert!(ok, "`{key}` must open:\n{stderr}");
+        assert!(
+            stdout.starts_with("Ipe.File.readFile : "),
+            "`{key}`:\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+/// A member opens under the alias `import … as` binds by default for a nested
+/// module, its last path segment.
+#[test]
+fn nested_alias_resolves() -> io::Result<()> {
+    let dir = fresh_dir("nested_alias")?;
+    for (key, qualified) in [
+        ("Input.labelHidden", "Ipe.Ui.Input.labelHidden"),
+        ("Region.heading", "Ipe.Ui.Region.heading"),
+    ] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--plain"]);
+        assert!(ok, "`{key}` must open:\n{stderr}");
+        assert!(
+            stdout.starts_with(&format!("{qualified} : ")),
+            "`{key}`:\n{stdout}"
+        );
+    }
+    Ok(())
+}
+
+/// A key two modules' members share opens neither: the run exits non-zero
+/// and lists every owner as the term that opens it.
+#[test]
+fn shared_suffix_is_ambiguous_not_first() -> io::Result<()> {
+    let dir = fresh_dir("shared_suffix")?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Parser.int", "--plain"]);
+    assert!(!ok, "`Parser.int` names two members:\n{stdout}");
+    assert!(stdout.is_empty(), "{stdout}");
+    for owner in ["Ipe.Parser.int", "Ipe.Url.Parser.int"] {
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.starts_with(&format!("{owner}\t"))),
+            "the miss names {owner}:\n{stderr}"
+        );
+    }
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "Url.Parser.int", "--plain"]);
+    assert!(ok, "a longer suffix names one member:\n{stderr}");
+    assert!(stdout.starts_with("Ipe.Url.Parser.int : "), "{stdout}");
+    Ok(())
+}
+
+/// A query no entry matches lists nothing, under every format.
+#[test]
+fn nothing_matched_lists_nothing() -> io::Result<()> {
+    let dir = fresh_dir("nothing_matched")?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "zzqqxx"]);
+    assert!(!ok);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(!stderr.contains("1. ipe doc "), "{stderr}");
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "zzqqxx", "--json"]);
+    assert!(!ok);
+    assert!(stdout.is_empty(), "{stdout}");
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .map_err(|e| io::Error::other(format!("{e}: {stderr}")))?;
+    let Some(payload) = parsed.get("payload") else {
+        return Err(io::Error::other(format!("no payload: {stderr}")));
+    };
+    assert_eq!(
+        payload
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(0),
+        "{stderr}"
+    );
+    assert_eq!(
+        payload.get("closeness").and_then(serde_json::Value::as_str),
+        Some("nothing"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+/// A malformed query is refused with a typed usage error before any lookup:
+/// no stack trace, and the hazardous text is never echoed raw.
+#[test]
+fn malformed_query_refused() -> io::Result<()> {
+    let dir = fresh_dir("malformed_query")?;
+    let long = "a".repeat(4096);
+    for query in ["", "   ", "map\u{7}", "map\u{1b}[31m", long.as_str()] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", query]);
+        assert!(!ok, "{query:?} must be refused");
+        assert!(stdout.is_empty(), "{query:?}:\n{stdout}");
+        assert!(!stderr.contains("panicked"), "{query:?}:\n{stderr}");
+        assert!(!stderr.contains('\u{7}'), "{query:?}:\n{stderr}");
+        assert!(!stderr.contains('\u{1b}'), "{query:?}:\n{stderr}");
+        assert!(
+            !stderr.contains(&long),
+            "the long query is not echoed whole"
+        );
+        assert!(stderr.contains("ipe doc: the term"), "{query:?}:\n{stderr}");
+    }
+    Ok(())
+}
+
+/// Every member hit under `--json` is one object of one shape, whichever
+/// route found it and whether or not the member is documented.
+#[test]
+fn json_member_shape_single() -> io::Result<()> {
+    let dir = fresh_dir("json_member_shape")?;
+    let shape = [
+        "contract",
+        "examples",
+        "key",
+        "kind",
+        "module",
+        "name",
+        "see_also",
+        "signature",
+    ];
+    for key in ["String.toInt", "readFile", "Input.labelHidden"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", key, "--json"]);
+        assert!(ok, "`{key}`:\n{stderr}");
+        let value: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| io::Error::other(format!("{e}: {stdout}")))?;
+        let Some(object) = value.as_object() else {
+            return Err(io::Error::other(format!("not an object: {stdout}")));
+        };
+        let mut fields: Vec<&str> = object.keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, shape, "`{key}`:\n{stdout}");
+        assert_eq!(
+            object.get("kind").and_then(serde_json::Value::as_str),
+            Some("symbol")
+        );
+    }
+    Ok(())
+}
+
+/// A bare `ipe doc --json` names the command as typed and the command that
+/// would run, never the internal default action, and exits non-zero.
+#[test]
+fn bare_json_error_names_typed_command() -> io::Result<()> {
+    let dir = fresh_dir("bare_json")?;
+    for flag in ["--json", "--plain"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", flag]);
+        assert!(!ok, "`ipe doc {flag}` must exit non-zero");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains(&format!("ipe doc {flag}:")), "{stderr}");
+        assert!(stderr.contains(&format!("ipe doc list {flag}")), "{stderr}");
+        assert!(!stderr.contains("generate"), "{stderr}");
+    }
     Ok(())
 }
 

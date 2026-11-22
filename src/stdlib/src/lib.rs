@@ -21,7 +21,196 @@ pub struct StdModule {
     pub source: &'static str,
 }
 
-/// `Ipe.Basics` — `identity` / `always` / `not` / `fst` / `snd` / `clamp`.
+/// How the toolchain reads one registered stdlib module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// A kernel qualifier of the resolver; `veneer` is its parse-fixture
+    /// source, when it has one.
+    Kernel {
+        /// The kernel veneer's Ipê source, embedded at compile time.
+        veneer: Option<&'static str>,
+    },
+    /// A kernel qualifier the resolver still accepts and `ipe doc` never presents.
+    Retired,
+    /// A module compiled from its Ipê source.
+    Compiled {
+        /// The module's Ipê source, embedded at compile time.
+        source: &'static str,
+        /// How `ipe doc` and the stdlib reference present this module.
+        tier: StdTier,
+    },
+    /// A module compiled from its Ipê source, which is also a kernel veneer
+    /// parse fixture.
+    CompiledVeneer {
+        /// The module's Ipê source, embedded at compile time.
+        source: &'static str,
+        /// How `ipe doc` and the stdlib reference present this module.
+        tier: StdTier,
+    },
+    /// A module documented from its Ipê source and never compiled or injected.
+    DocOnly {
+        /// The module's Ipê source, embedded at compile time.
+        source: &'static str,
+    },
+}
+
+/// One row of the [`STDLIB`] registry: a dotted module name and its [`Role`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StdlibModule {
+    /// The dotted module name as written in an `import`, e.g. `Ipe.Maybe`.
+    pub dotted: &'static str,
+    /// How the toolchain reads the module.
+    pub role: Role,
+}
+
+impl StdlibModule {
+    /// The module's embedded Ipê source, when the row carries one.
+    #[must_use]
+    pub const fn source(&self) -> Option<&'static str> {
+        match self.role {
+            Role::Kernel { veneer } => veneer,
+            Role::Retired => None,
+            Role::Compiled { source, .. }
+            | Role::CompiledVeneer { source, .. }
+            | Role::DocOnly { source } => Some(source),
+        }
+    }
+
+    /// Whether `ipe doc` and the stdlib reference present the module.
+    #[must_use]
+    pub const fn is_documented(&self) -> bool {
+        !matches!(self.role, Role::Retired)
+    }
+}
+
+/// The [`MODULES`] view of a row: a kernel veneer parse fixture.
+const fn veneer_view(row: &StdlibModule) -> Option<StdModule> {
+    match row.role {
+        Role::Kernel {
+            veneer: Some(source),
+        }
+        | Role::CompiledVeneer { source, .. } => Some(StdModule {
+            name: row.dotted,
+            source,
+        }),
+        Role::Kernel { veneer: None }
+        | Role::Retired
+        | Role::Compiled { .. }
+        | Role::DocOnly { .. } => None,
+    }
+}
+
+/// The [`COMPILED_STD_MODULES`] view of a row: a compiled-source module.
+const fn compiled_view(row: &StdlibModule) -> Option<CompiledStdModule> {
+    match row.role {
+        Role::Compiled { source, tier } | Role::CompiledVeneer { source, tier } => {
+            Some(CompiledStdModule {
+                dotted: row.dotted,
+                source,
+                tier,
+            })
+        }
+        Role::Kernel { .. } | Role::Retired | Role::DocOnly { .. } => None,
+    }
+}
+
+/// The [`DOC_ONLY_MODULES`] view of a row: a documentation-only module.
+const fn doc_only_view(row: &StdlibModule) -> Option<DocOnlyModule> {
+    match row.role {
+        Role::DocOnly { source } => Some(DocOnlyModule {
+            dotted: row.dotted,
+            source,
+        }),
+        Role::Kernel { .. }
+        | Role::Retired
+        | Role::Compiled { .. }
+        | Role::CompiledVeneer { .. } => None,
+    }
+}
+
+/// Define a `const` projection of [`STDLIB`]: a count of the rows `$view`
+/// keeps, and the array of those views in registry order.
+macro_rules! projection {
+    ($count:ident, $fill:ident, $ty:ty, $view:ident, $blank:ident) => {
+        /// How many registry rows the view keeps.
+        const fn $count(rows: &[StdlibModule]) -> usize {
+            let mut kept = 0usize;
+            let mut rest = rows;
+            while let Some((row, tail)) = rest.split_first() {
+                if $view(row).is_some() {
+                    kept += 1;
+                }
+                rest = tail;
+            }
+            kept
+        }
+
+        /// The views the registry rows keep, in registry order; `N` is their count.
+        const fn $fill<const N: usize>(rows: &[StdlibModule]) -> [$ty; N] {
+            let mut out = [$blank; N];
+            let mut slots: &mut [$ty] = &mut out;
+            let mut rest = rows;
+            while let Some((row, tail)) = rest.split_first() {
+                if let Some(view) = $view(row)
+                    && let Some((slot, more)) = slots.split_first_mut()
+                {
+                    *slot = view;
+                    slots = more;
+                }
+                rest = tail;
+            }
+            out
+        }
+    };
+}
+
+/// The placeholder a projection array starts from; every slot is overwritten.
+const BLANK_VENEER: StdModule = StdModule {
+    name: "",
+    source: "",
+};
+/// The placeholder a projection array starts from; every slot is overwritten.
+const BLANK_COMPILED: CompiledStdModule = CompiledStdModule {
+    dotted: "",
+    source: "",
+    tier: StdTier::Public,
+};
+/// The placeholder a projection array starts from; every slot is overwritten.
+const BLANK_DOC_ONLY: DocOnlyModule = DocOnlyModule {
+    dotted: "",
+    source: "",
+};
+
+projection!(
+    veneer_count,
+    veneer_rows,
+    StdModule,
+    veneer_view,
+    BLANK_VENEER
+);
+projection!(
+    compiled_count,
+    compiled_rows,
+    CompiledStdModule,
+    compiled_view,
+    BLANK_COMPILED
+);
+projection!(
+    doc_only_count,
+    doc_only_rows,
+    DocOnlyModule,
+    doc_only_view,
+    BLANK_DOC_ONLY
+);
+
+/// The [`MODULES`] projection of [`STDLIB`].
+const VENEER_ROWS: [StdModule; veneer_count(STDLIB)] = veneer_rows(STDLIB);
+/// The [`COMPILED_STD_MODULES`] projection of [`STDLIB`].
+const COMPILED_ROWS: [CompiledStdModule; compiled_count(STDLIB)] = compiled_rows(STDLIB);
+/// The [`DOC_ONLY_MODULES`] projection of [`STDLIB`].
+const DOC_ONLY_ROWS: [DocOnlyModule; doc_only_count(STDLIB)] = doc_only_rows(STDLIB);
+
+/// `Ipe.Basics` —`identity` / `always` / `not` / `fst` / `snd` / `clamp`.
 const BASICS: &str = include_str!("../Ipe/Basics.ipe");
 /// `Ipe.Maybe` — combinators over the `Maybe` ADT.
 const MAYBE: &str = include_str!("../Ipe/Maybe.ipe");
@@ -326,29 +515,9 @@ const URL_PARSER: &str = include_str!("../Ipe/Url/Parser.ipe");
 /// NOT in `STDLIB_MODULE_QUALIFIERS`, so the disjointness invariant holds.
 const STD_MARKDOWN: &str = include_str!("../Ipe/Markdown.ipe");
 
-/// Every embedded `Ipe` module, keyed by its dotted import name.
-pub const MODULES: &[StdModule] = &[
-    StdModule {
-        name: "Ipe.Char",
-        source: CHAR,
-    },
-    StdModule {
-        name: "Ipe.Crypto",
-        source: CRYPTO,
-    },
-    StdModule {
-        name: "Ipe.System",
-        source: SYSTEM,
-    },
-    StdModule {
-        name: "Ipe.Http",
-        source: HTTP,
-    },
-    StdModule {
-        name: "Ipe.Process",
-        source: PROCESS,
-    },
-];
+/// Every kernel veneer parse fixture, keyed by its dotted import name: the
+/// [`STDLIB`] rows a [`Role::Kernel`] veneer or a [`Role::CompiledVeneer`] carries.
+pub const MODULES: &[StdModule] = &VENEER_ROWS;
 
 /// The embedded Ipê source for a dotted `Ipe` module name, or `None` when
 /// the name is not one of the embedded modules.
@@ -713,6 +882,10 @@ const IPE_FFI_KERNEL: &str = include_str!("../Ipe/Ffi/Kernel.ipe");
 /// module-header and the `fn` / `const` signatures + docs so the surface is
 /// discoverable through `ipe doc`.
 const IPE_FFI_RUST: &str = include_str!("../Ipe/Ffi/Rust.ipe");
+
+/// `Ipe.Package` — the schema of a `package.ipe` manifest. Documentation only:
+/// the manifest reader checks a manifest against it, and nothing compiles it.
+const IPE_PACKAGE: &str = include_str!("../Ipe/Package.ipe");
 
 /// `Ipe.Browser.Clipboard` — write text to the system clipboard over `Ipe.Ffi.Js`
 /// ports (compiled source).
@@ -1350,177 +1523,443 @@ const STD_LENGTH: &str = include_str!("../Ipe/Length.ipe");
 /// invariant holds.
 const STD_HTTP_STATUS_CODE: &str = include_str!("../Ipe/Http/StatusCode.ipe");
 
-/// Every compiled-source stdlib module, keyed by its dotted import name.
+/// Every registered standard-library module, one row per module.
 ///
-/// Disjoint from [`MODULES`] (parse fixtures) and from `ipe_canon`'s
-/// `STDLIB_MODULE_QUALIFIERS` (kernel qualifiers) — see the module comment.
-pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
-    CompiledStdModule {
+/// The single registry: [`MODULES`], [`COMPILED_STD_MODULES`] and
+/// [`DOC_ONLY_MODULES`] are `const` projections of it, so a module is declared
+/// once and every view reads the same row. Each `Ipe/**/*.ipe` file is the
+/// source of exactly one row (`every_stdlib_file_registered_once`), and the
+/// kernel and retired rows are exactly `ipe_canon`'s `STDLIB_MODULE_QUALIFIERS`
+/// (`canon_qualifiers_equal_stdlib_projection`).
+pub const STDLIB: &[StdlibModule] = &[
+    // ── Kernel qualifiers: the resolver's `STDLIB_MODULE_QUALIFIERS` ─────────
+    StdlibModule {
+        dotted: "Ipe.Crypto",
+        role: Role::Kernel {
+            veneer: Some(CRYPTO),
+        },
+    },
+    StdlibModule {
+        dotted: "Ipe.Secret",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.CssSafety",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Jwt",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Json.Encode",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Json.Decode",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Json.Decode.Pipeline",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.System",
+        role: Role::Kernel {
+            veneer: Some(SYSTEM),
+        },
+    },
+    StdlibModule {
+        dotted: "Ipe.Process",
+        role: Role::Kernel {
+            veneer: Some(PROCESS),
+        },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http",
+        role: Role::Kernel { veneer: Some(HTTP) },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http.Server",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http.Middleware",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http.RateLimit",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Db",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.App",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Host",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Console",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Db.Decode",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Db.Sql",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Background",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Border",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Font",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Region",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Input",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Lazy",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ui.Keyed",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Html.Events",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Web",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Tui",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Cli",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Worker",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Web.PubSub",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Web.Cmd",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Web.Sub",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Terminal.Cmd",
+        role: Role::Retired,
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Terminal.Sub",
+        role: Role::Retired,
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Tui.Cmd",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Tui.Sub",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Cli.Cmd",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Cli.Sub",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Worker.Cmd",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Tea.Worker.Sub",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Auth",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Auth.Revocation",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http.Server.Stream",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http.Stream",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Http.Server.WebSocket",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Server",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Server.Http",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Server.Middleware",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Server.RateLimit",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Server.Stream",
+        role: Role::Kernel { veneer: None },
+    },
+    StdlibModule {
+        dotted: "Ipe.Server.WebSocket",
+        role: Role::Kernel { veneer: None },
+    },
+    // ── Compiled-source modules ──────────────────────────────────────────────
+    StdlibModule {
         dotted: "Ipe.Palette",
-        source: PALETTE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: PALETTE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Net",
-        source: STD_NET,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_NET,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Duration",
-        source: STD_DURATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_DURATION,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Time.Timestamp — opaque instant newtype; pure Ipê over a raw `Int`
     // epoch-millis carrier. Composes with `Ipe.Duration` for typed arithmetic.
     // The `Time_*` runtime kernels keep their `Int` signatures.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Time.Timestamp",
-        source: STD_TIME_TIMESTAMP,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_TIME_TIMESTAMP,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.ByteSize",
-        source: STD_BYTESIZE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_BYTESIZE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Length -- pure-Ipe SSOT for the shared CSS length-unit spelling
     // (`Px`/`Vh`/`Vw`); `Ipe.Css` folds its shared arms through it. No kernel
     // calls; the language-level mirror of `ipe_runtime::length::CssUnit`.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Length",
-        source: STD_LENGTH,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_LENGTH,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Tuple",
-        source: TUPLE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: TUPLE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Parser — pure-Ipê parser combinators (elm/parser parity); no kernel
     // calls. Defines and pattern-matches its own `Parser`/`Problem`/`Step` data.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Parser",
-        source: PARSER,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: PARSER,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Bitwise — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Bitwise_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Bitwise*` kernels (`ipe_runtime::bitwise::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Bitwise"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Bitwise",
-        source: BITWISE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: BITWISE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Color — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Color_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Color*` kernels (`ipe_runtime::color::*`). Also re-exports the
     // `Color` builtin type. Disjoint from `STDLIB_MODULE_QUALIFIERS` (no
     // `"Color"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Color",
-        source: COLOR,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: COLOR,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Color.Ansi — the terminal colour palette (`black`…`brightWhite`,
     // `default`, `rgb`), each a point-free `Kernel.kernel "TermColor_*"` alias
     // typed `AnsiColor`. Imports `Ipe.Color` for the `AnsiColor` type.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Color.Ansi",
-        source: STD_COLOR_ANSI,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_COLOR_ANSI,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.String — Layer-3 source; every member is a point-free
     // `Kernel.kernel "String_*"` alias resolved by `detect_kernel_alias` to the
     // registered `String*` kernels. Also re-exports the `String` builtin type
     // via the reserved-builtin-type path in `build_module_exports`. Disjoint
     // from `STDLIB_MODULE_QUALIFIERS` (no `"String"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.String",
-        source: STRING,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STRING,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Encoding — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Encoding_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Encoding*` kernels (`ipe_runtime::encoding::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Encoding"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Encoding",
-        source: ENCODING,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: ENCODING,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Debug — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Debug_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Debug*` kernels (`ipe_runtime::debug::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Debug"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Debug",
-        source: DEBUG,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: DEBUG,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Uuid — Layer-3 source; `v4`/`v7`/`parse` are point-free
     // `Kernel.kernel "Uuid_*"` aliases resolved by `detect_kernel_alias` to the
     // registered `UuidV4`/`UuidV7`/`UuidParse` kernels
     // (`ipe_runtime::uuid_kernel::*`). Disjoint from `STDLIB_MODULE_QUALIFIERS`
     // (no `"Uuid"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Uuid",
-        source: UUID,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: UUID,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Time — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Time_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Time*` kernels. Disjoint from `STDLIB_MODULE_QUALIFIERS`
     // (no `"Time"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Time",
-        source: TIME,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: TIME,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Set — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Set_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Set*` kernels (`ipe_runtime::set::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Set"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Set",
-        source: SET,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: SET,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Bytes — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Bytes_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Bytes*` kernels (`ipe_runtime::bytes::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Bytes"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Bytes",
-        source: BYTES,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: BYTES,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Char — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Char_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Char*` kernels (`ipe_runtime::char::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Char"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Char",
-        source: CHAR,
-        tier: StdTier::Public,
+        role: Role::CompiledVeneer {
+            source: CHAR,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Io — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Io_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Io*` kernels (`ipe_runtime::io::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Io"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Io",
-        source: IO,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IO,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Dict — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Dict_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Dict*` kernels (`ipe_runtime::dict::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Dict"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Dict",
-        source: DICT,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: DICT,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.List — Layer-3 source; pure members compile from Ipê; the eleven
     // kernel-backed members (`sort`/`singleton`/`repeat`/`product`/
@@ -1528,652 +1967,862 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     // `Kernel.kernel "List_*"` aliases resolved by `detect_kernel_alias` to the
     // registered `List*` kernels (`ipe_runtime::list::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"List"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.List",
-        source: LIST,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: LIST,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Task — Layer-3 source; members are either point-free
     // `Kernel.kernel "Task_*"` aliases resolved by `detect_kernel_alias` to the
     // registered `Task*` kernels (`ipe_runtime::task::*`), or pure Ipê over
     // those aliases (`BackoffStrategy` / `RetryPolicy`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Task"` entry there).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Task",
-        source: TASK,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: TASK,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Decimal — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Decimal_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Decimal*` kernels (`ipe_runtime::decimal::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Decimal"` entry there after migration).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Decimal",
-        source: DECIMAL,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: DECIMAL,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Random",
-        source: RANDOM,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: RANDOM,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Random.Generator",
-        source: RANDOM_GENERATOR,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: RANDOM_GENERATOR,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Css",
-        source: CSS,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: CSS,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Test",
-        source: IPE_TEST,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_TEST,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Web.Head",
-        source: STD_LIVE_HEAD,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_LIVE_HEAD,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Web.Head.Unsafe — Layer-3 source; the single `unsafeJsonLd` verbatim
     // JSON-LD `<script>` hatch. Its body is pure Ipê over the `Html` kernel
     // qualifier and `Ipe.Html.Unsafe.unsafeRaw` — no new kernel. Importing it
     // discloses the `unsafe` capability.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Web.Head.Unsafe",
-        source: STD_LIVE_HEAD_UNSAFE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_LIVE_HEAD_UNSAFE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Responsive",
-        source: STD_UI_RESPONSIVE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_RESPONSIVE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Chart",
-        source: STD_UI_CHART,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_CHART,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Grid",
-        source: STD_UI_GRID,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_GRID,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Transition",
-        source: STD_UI_TRANSITION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_TRANSITION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Transform",
-        source: STD_UI_TRANSFORM,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_TRANSFORM,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Animation",
-        source: STD_UI_ANIMATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_ANIMATION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Cells",
-        source: STD_UI_CELLS,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_CELLS,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Tui",
-        source: STD_UI_TUI,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_TUI,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Cli",
-        source: STD_UI_CLI,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_CLI,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Codec",
-        source: STD_CODEC,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_CODEC,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Analytics — consent-gated typed analytics. `Pii` is opaque with no
     // reveal path; `PPii` always serialises as `"[redacted]"`. Consent is
     // fail-closed in pure Ipê (drop on Pending/Denied). Two concrete sinks:
     // `Stderr` (via `Io_eprintln`) and `Jsonl Path` (via `File_append`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Analytics",
-        source: STD_ANALYTICS,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_ANALYTICS,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Db.Store — Layer-3 source; codec-driven typed persistence over the
     // audited `Ipe.Db` / `Ipe.Db.Sql` kernels. Pure Ipê, no new kernel.
     // Injection-safe by construction (`validSqlIdent` gate + parameterised
     // binds). The raw-SQL escape stays on `Ipe.Db.Unsafe`.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Db.Store",
-        source: STD_DB_STORE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_DB_STORE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Db.Store.Unsafe — Layer-3 source; the raw string-named query leaves for
     // a `fromColumns` raw store. Imports `Ipe.Db.Store` for the `Cond`
     // constructors. Importing it discloses the `unsafe` capability. Still
     // injection-safe (each column is validated against the store at query build).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Db.Store.Unsafe",
-        source: STD_DB_STORE_UNSAFE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_DB_STORE_UNSAFE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Db.Codec — the codec↔SQL row seam (`codecToBinds` / `codecFromRow`).
     // Pure Ipê over `Ipe.Codec` + the reserved `SqlValue`; reuses the codec's
     // own JSON encoder/decoder via the in-memory `Value` seam. No new kernel is
     // registered here (the two Json `Value` seams live in `Ipe.Json.Decode`).
     // Injection-safe: every value is a bound `SqlValue`, no SQL text is built.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Db.Codec",
-        source: STD_DB_CODEC,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_DB_CODEC,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Money",
-        source: STD_MONEY,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_MONEY,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.WebSocket",
-        source: IPE_CORE_WEBSOCKET,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_CORE_WEBSOCKET,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ffi.Js",
-        source: IPE_CORE_JS,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_CORE_JS,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ffi.Js.CustomElement",
-        source: IPE_CORE_JS_CUSTOM_ELEMENT,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_CORE_JS_CUSTOM_ELEMENT,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Clipboard",
-        source: IPE_BROWSER_CLIPBOARD,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_CLIPBOARD,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Clipboard.Internals",
-        source: IPE_BROWSER_CLIPBOARD_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Clipboard",
+        role: Role::Compiled {
+            source: IPE_BROWSER_CLIPBOARD_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Clipboard",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Geolocation",
-        source: IPE_BROWSER_GEOLOCATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_GEOLOCATION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Geolocation.Internals",
-        source: IPE_BROWSER_GEOLOCATION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Geolocation",
+        role: Role::Compiled {
+            source: IPE_BROWSER_GEOLOCATION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Geolocation",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Notification",
-        source: IPE_BROWSER_NOTIFICATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_NOTIFICATION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Notification.Internals",
-        source: IPE_BROWSER_NOTIFICATION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Notification",
+        role: Role::Compiled {
+            source: IPE_BROWSER_NOTIFICATION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Notification",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Push",
-        source: IPE_BROWSER_PUSH,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_PUSH,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Push.Internals",
-        source: IPE_BROWSER_PUSH_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Push",
+        role: Role::Compiled {
+            source: IPE_BROWSER_PUSH_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Push",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Storage",
-        source: IPE_BROWSER_STORAGE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_STORAGE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Storage.Internals",
-        source: IPE_BROWSER_STORAGE_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Storage",
+        role: Role::Compiled {
+            source: IPE_BROWSER_STORAGE_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Storage",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Vibration",
-        source: IPE_BROWSER_VIBRATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_VIBRATION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Vibration.Internals",
-        source: IPE_BROWSER_VIBRATION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Vibration",
+        role: Role::Compiled {
+            source: IPE_BROWSER_VIBRATION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Vibration",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Share",
-        source: IPE_BROWSER_SHARE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_SHARE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Share.Internals",
-        source: IPE_BROWSER_SHARE_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Share",
+        role: Role::Compiled {
+            source: IPE_BROWSER_SHARE_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Share",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Battery",
-        source: IPE_BROWSER_BATTERY,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_BATTERY,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Battery.Internals",
-        source: IPE_BROWSER_BATTERY_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Battery",
+        role: Role::Compiled {
+            source: IPE_BROWSER_BATTERY_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Battery",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.NetworkInfo",
-        source: IPE_BROWSER_NETWORK_INFO,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_NETWORK_INFO,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.NetworkInfo.Internals",
-        source: IPE_BROWSER_NETWORK_INFO_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.NetworkInfo",
+        role: Role::Compiled {
+            source: IPE_BROWSER_NETWORK_INFO_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.NetworkInfo",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.FilePicker",
-        source: IPE_BROWSER_FILE_PICKER,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_FILE_PICKER,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.FilePicker.Internals",
-        source: IPE_BROWSER_FILE_PICKER_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.FilePicker",
+        role: Role::Compiled {
+            source: IPE_BROWSER_FILE_PICKER_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.FilePicker",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Camera",
-        source: IPE_BROWSER_CAMERA,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_CAMERA,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Camera.Internals",
-        source: IPE_BROWSER_CAMERA_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Camera",
+        role: Role::Compiled {
+            source: IPE_BROWSER_CAMERA_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Camera",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Microphone",
-        source: IPE_BROWSER_MICROPHONE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_MICROPHONE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Microphone.Internals",
-        source: IPE_BROWSER_MICROPHONE_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Microphone",
+        role: Role::Compiled {
+            source: IPE_BROWSER_MICROPHONE_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Microphone",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Speech",
-        source: IPE_BROWSER_SPEECH,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_SPEECH,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Speech.Internals",
-        source: IPE_BROWSER_SPEECH_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Speech",
+        role: Role::Compiled {
+            source: IPE_BROWSER_SPEECH_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Speech",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Permission",
-        source: IPE_BROWSER_PERMISSION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_PERMISSION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Permission.Internals",
-        source: IPE_BROWSER_PERMISSION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Permission",
+        role: Role::Compiled {
+            source: IPE_BROWSER_PERMISSION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Permission",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Gamepad",
-        source: IPE_BROWSER_GAMEPAD,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_GAMEPAD,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Gamepad.Internals",
-        source: IPE_BROWSER_GAMEPAD_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Gamepad",
+        role: Role::Compiled {
+            source: IPE_BROWSER_GAMEPAD_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Gamepad",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Recorder",
-        source: IPE_BROWSER_RECORDER,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_RECORDER,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Recorder.Internals",
-        source: IPE_BROWSER_RECORDER_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Recorder",
+        role: Role::Compiled {
+            source: IPE_BROWSER_RECORDER_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Recorder",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.WebAuthn",
-        source: IPE_BROWSER_WEB_AUTHN,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_WEB_AUTHN,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.WebAuthn.Internals",
-        source: IPE_BROWSER_WEB_AUTHN_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.WebAuthn",
+        role: Role::Compiled {
+            source: IPE_BROWSER_WEB_AUTHN_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.WebAuthn",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Visibility",
-        source: IPE_BROWSER_VISIBILITY,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_VISIBILITY,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Visibility.Internals",
-        source: IPE_BROWSER_VISIBILITY_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Visibility",
+        role: Role::Compiled {
+            source: IPE_BROWSER_VISIBILITY_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Visibility",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.MediaQuery",
-        source: IPE_BROWSER_MEDIA_QUERY,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_MEDIA_QUERY,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.MediaQuery.Internals",
-        source: IPE_BROWSER_MEDIA_QUERY_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.MediaQuery",
+        role: Role::Compiled {
+            source: IPE_BROWSER_MEDIA_QUERY_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.MediaQuery",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Connectivity",
-        source: IPE_BROWSER_CONNECTIVITY,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_CONNECTIVITY,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Connectivity.Internals",
-        source: IPE_BROWSER_CONNECTIVITY_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Connectivity",
+        role: Role::Compiled {
+            source: IPE_BROWSER_CONNECTIVITY_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Connectivity",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Orientation",
-        source: IPE_BROWSER_ORIENTATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_ORIENTATION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Orientation.Internals",
-        source: IPE_BROWSER_ORIENTATION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Orientation",
+        role: Role::Compiled {
+            source: IPE_BROWSER_ORIENTATION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Orientation",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Motion",
-        source: IPE_BROWSER_MOTION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_MOTION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Motion.Internals",
-        source: IPE_BROWSER_MOTION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Motion",
+        role: Role::Compiled {
+            source: IPE_BROWSER_MOTION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Motion",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Channel",
-        source: IPE_BROWSER_CHANNEL,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_CHANNEL,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Channel.Internals",
-        source: IPE_BROWSER_CHANNEL_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Channel",
+        role: Role::Compiled {
+            source: IPE_BROWSER_CHANNEL_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Channel",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Fullscreen",
-        source: IPE_BROWSER_FULLSCREEN,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_FULLSCREEN,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.Fullscreen.Internals",
-        source: IPE_BROWSER_FULLSCREEN_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.Fullscreen",
+        role: Role::Compiled {
+            source: IPE_BROWSER_FULLSCREEN_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.Fullscreen",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.ScreenOrientation",
-        source: IPE_BROWSER_SCREEN_ORIENTATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_BROWSER_SCREEN_ORIENTATION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.ScreenOrientation.Internals",
-        source: IPE_BROWSER_SCREEN_ORIENTATION_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.ScreenOrientation",
+        role: Role::Compiled {
+            source: IPE_BROWSER_SCREEN_ORIENTATION_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.ScreenOrientation",
+            },
         },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Browser.WakeLock",
-        source: IPE_BROWSER_WAKE_LOCK,
-        tier: StdTier::Public,
-    },
-    CompiledStdModule {
-        dotted: "Ipe.Browser.WakeLock.Internals",
-        source: IPE_BROWSER_WAKE_LOCK_INTERNALS,
-        tier: StdTier::PortLayer {
-            of: "Ipe.Browser.WakeLock",
+        role: Role::Compiled {
+            source: IPE_BROWSER_WAKE_LOCK,
+            tier: StdTier::Public,
         },
     },
-    CompiledStdModule {
+    StdlibModule {
+        dotted: "Ipe.Browser.WakeLock.Internals",
+        role: Role::Compiled {
+            source: IPE_BROWSER_WAKE_LOCK_INTERNALS,
+            tier: StdTier::PortLayer {
+                of: "Ipe.Browser.WakeLock",
+            },
+        },
+    },
+    StdlibModule {
         dotted: "Ipe.Env",
-        source: IPE_CORE_ENV,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: IPE_CORE_ENV,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Cache",
-        source: STD_CACHE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_CACHE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Compression",
-        source: STD_COMPRESSION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_COMPRESSION,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Config",
-        source: STD_CONFIG,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_CONFIG,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Csv",
-        source: STD_CSV,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_CSV,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Email",
-        source: STD_EMAIL,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_EMAIL,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Web.Console",
-        source: STD_LIVE_CONSOLE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_LIVE_CONSOLE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.PubSub",
-        source: STD_PUBSUB,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_PUBSUB,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Remote",
-        source: STD_REMOTE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_REMOTE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Trace",
-        source: STD_TRACE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_TRACE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui.Events",
-        source: STD_UI_EVENTS,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_UI_EVENTS,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Http.StatusCode — typed HTTP status code over Int (opaque ctor,
     // `fromInt` / `code` / `isSuccess` / `isRedirect` / `isClientError` /
     // `isServerError`).  Pure Ipê; no Kernel.kernel calls.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Http.StatusCode",
-        source: STD_HTTP_STATUS_CODE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_HTTP_STATUS_CODE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Regex — Layer-3 source, `Kernel.kernel "Regex_*"` aliases route
     // to the registered pure `Regex*` kernels (`ipe_runtime::regex_kernel::*`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Regex",
-        source: REGEX,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: REGEX,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Path — Layer-3 source, `Kernel.kernel "Path_*"` aliases route
     // to the registered pure `Path*` kernels (`ipe_runtime::path::*`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Path",
-        source: PATH,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: PATH,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.File — Layer-3 source over the `File_*` effect kernels
     // (`ipe_runtime::file::*`); `readFileLimit` unwraps its `ByteSize` ceiling.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.File",
-        source: FILE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: FILE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Html.Attributes — Layer-3 source; fixed-key builders are pure Ipê over
     // the retained `Kernel.kernel "Attr_*"` primitives (`ipe_runtime::html::*`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Html.Attributes",
-        source: HTML_ATTRIBUTES,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: HTML_ATTRIBUTES,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Html.Unsafe — Layer-3 source; the single `unsafeRaw` escape hatch is a
     // `Kernel.kernel "Html_unsafeRaw"` alias to the unchanged `HtmlRawNode` kernel.
     // Importing it discloses the `unsafe` capability.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Html.Unsafe",
-        source: HTML_UNSAFE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: HTML_UNSAFE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Db.Unsafe — Layer-3 source; the raw-SQL / untyped-read escape hatches
     // are `Kernel.kernel "Db_*"` / `"Sql_unsafeFragment"` aliases to unchanged (and
     // one new) kernels. Importing it discloses the `unsafe` capability.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Db.Unsafe",
-        source: DB_UNSAFE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: DB_UNSAFE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Db.Dsn — Layer-3 source; the typed, opaque connection descriptor
     // (parse-don't-validate). Defines the `Driver` / `TlsMode` ADTs and wraps the
     // `Db.Dsn_*` parse-surface kernels, marshalling the ADTs to/from small-integer
     // tags. Pure: constructing a `Dsn` performs no I/O and discloses no
     // capability. NOT an `.Unsafe` submodule.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Db.Dsn",
-        source: DB_DSN,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: DB_DSN,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Db.Location — Layer-3 source; the typed location `Db.open` opens.
     // Defines the `Mode` ADT and wraps the `Db.Location_*` constructor kernels.
     // Pure: constructing a location performs no I/O and discloses no capability.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Db.Location",
-        source: DB_LOCATION,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: DB_LOCATION,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Secret.Unsafe — Layer-3 source; the single `unsafeReveal` escape hatch
     // is a `Kernel.kernel "Secret_reveal"` alias to the unchanged `SecretReveal`
     // kernel. Importing it discloses the `unsafe` capability. The scoped
     // `Secret.use` stays on the native `Ipe.Secret` surface (capability-neutral).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Secret.Unsafe",
-        source: SECRET_UNSAFE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: SECRET_UNSAFE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Html — Layer-3 source; element builders are pure Ipê over the retained
     // `Kernel.kernel "Html_node"` / `"Html_voidNode"` primitives, with the native
     // serialiser (`render`/`escape*`) re-aliased (`ipe_runtime::ui::helpers::*`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Html",
-        source: HTML,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: HTML,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Ui — Layer-3 source; the layout builders are pure Ipê over the retained
     // `Kernel.kernel "Ui_node"` / `"Ui_taggedNode"` primitives, with every other
     // member re-aliased to its unchanged native kernel (`ipe_runtime::ui::*`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Ui",
-        source: UI,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: UI,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Markdown — pure Ipê markdown→Ui renderer; no kernel calls.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Markdown",
-        source: STD_MARKDOWN,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: STD_MARKDOWN,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Url — Layer-3 source, `Kernel.kernel "Url_*"` aliases route to the
     // registered pure `Url*` kernels (`ipe_runtime::url::*`).
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Url",
-        source: URL,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: URL,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Url.Parser — pure-Ipê routing combinators over the shipped `Ipe.Url`
     // accessors; no kernel calls.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Url.Parser",
-        source: URL_PARSER,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: URL_PARSER,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Locale — opaque BCP-47 locale handle + locale-aware case mapping.
     // `Locale.fromTag`/`Locale.toTag` resolve via `Kernel.kernel "Locale_*"`;
@@ -2181,52 +2830,94 @@ pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &[
     // / `"String_toLowerIn"`.  The runtime module is `ipe_runtime::locale::*`
     // (feature `locale`).  Disjoint from `STDLIB_MODULE_QUALIFIERS` (no
     // `"Locale"` entry there), so the invariant holds.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Locale",
-        source: LOCALE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: LOCALE,
+            tier: StdTier::Public,
+        },
     },
     // Ipe.Math — Layer-3 source; every member is a point-free
     // `Kernel.kernel "Math_*"` alias resolved by `detect_kernel_alias` to the
     // registered `Math*` kernels (`ipe_runtime::math::*`). Disjoint from
     // `STDLIB_MODULE_QUALIFIERS` (no `"Math"` entry there), so the invariant
     // holds.
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Math",
-        source: MATH,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: MATH,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Basics",
-        source: BASICS,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: BASICS,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Maybe",
-        source: MAYBE,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: MAYBE,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Result",
-        source: RESULT,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: RESULT,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Log",
-        source: LOG,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: LOG,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Level",
-        source: LEVEL,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: LEVEL,
+            tier: StdTier::Public,
+        },
     },
-    CompiledStdModule {
+    StdlibModule {
         dotted: "Ipe.Error",
-        source: ERROR,
-        tier: StdTier::Public,
+        role: Role::Compiled {
+            source: ERROR,
+            tier: StdTier::Public,
+        },
+    },
+    // ── Documentation-only modules ───────────────────────────────────────────
+    StdlibModule {
+        dotted: "Ipe.Ffi.Kernel",
+        role: Role::DocOnly {
+            source: IPE_FFI_KERNEL,
+        },
+    },
+    StdlibModule {
+        dotted: "Ipe.Ffi.Rust",
+        role: Role::DocOnly {
+            source: IPE_FFI_RUST,
+        },
+    },
+    StdlibModule {
+        dotted: "Ipe.Package",
+        role: Role::DocOnly {
+            source: IPE_PACKAGE,
+        },
     },
 ];
+
+/// Every compiled-source stdlib module, keyed by its dotted import name: the
+/// [`STDLIB`] rows a [`Role::Compiled`] or [`Role::CompiledVeneer`] carries.
+///
+/// Disjoint from `ipe_canon`'s `STDLIB_MODULE_QUALIFIERS` (kernel qualifiers) —
+/// see the module comment.
+pub const COMPILED_STD_MODULES: &[CompiledStdModule] = &COMPILED_ROWS;
 
 /// Byte-wise equality; `split_first` keeps the walk free of slice indexing in
 /// a `const fn`.
@@ -2342,19 +3033,10 @@ pub struct DocOnlyModule {
     pub source: &'static str,
 }
 
-/// The reserved FFI qualifiers surfaced for documentation only. Enumerated by
-/// the `ipe doc` module list and the stdlib-reference generator; never compiled
-/// or injected.
-pub const DOC_ONLY_MODULES: &[DocOnlyModule] = &[
-    DocOnlyModule {
-        dotted: "Ipe.Ffi.Kernel",
-        source: IPE_FFI_KERNEL,
-    },
-    DocOnlyModule {
-        dotted: "Ipe.Ffi.Rust",
-        source: IPE_FFI_RUST,
-    },
-];
+/// The modules surfaced for documentation only: the [`STDLIB`] rows a
+/// [`Role::DocOnly`] carries. Enumerated by the `ipe doc` module list and the
+/// stdlib-reference generator; never compiled or injected.
+pub const DOC_ONLY_MODULES: &[DocOnlyModule] = &DOC_ONLY_ROWS;
 
 /// Prose for the members of one kernel registry qualifier.
 ///
@@ -2813,6 +3495,118 @@ mod tests {
                 "kernel doc source {} must parse: {:?}",
                 m.qualifier,
                 parsed.err()
+            );
+        }
+    }
+
+    /// Every `.ipe` file under `dir`, recursively, as `(path, source)`, sorted by path.
+    fn ipe_files(dir: &std::path::Path) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).expect("the stdlib tree reads") {
+                let path = entry.expect("a stdlib tree entry reads").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "ipe") {
+                    let source = std::fs::read_to_string(&path).expect("a stdlib file reads");
+                    found.push((path.display().to_string(), source));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The files of `files` that are not the source of exactly one row of
+    /// `rows`, each with how many rows carry it.
+    fn misregistered<'a>(
+        files: &'a [(String, String)],
+        rows: &[StdlibModule],
+    ) -> Vec<(&'a str, usize)> {
+        files
+            .iter()
+            .filter_map(|(path, source)| {
+                let carriers = rows
+                    .iter()
+                    .filter(|row| row.source() == Some(source.as_str()))
+                    .count();
+                (carriers != 1).then_some((path.as_str(), carriers))
+            })
+            .collect()
+    }
+
+    /// Every `Ipe/**/*.ipe` file is the source of exactly one [`STDLIB`] row: a
+    /// file no row registers is a module `ipe doc` and the compiler never see.
+    #[test]
+    fn every_stdlib_file_registered_once() {
+        let files = ipe_files(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("Ipe"));
+        assert!(!files.is_empty(), "the stdlib tree holds no `.ipe` file");
+        assert_eq!(misregistered(&files, STDLIB), Vec::<(&str, usize)>::new());
+    }
+
+    /// A planted file no row registers, and a file two rows register, are both
+    /// reported: the registration check is not vacuous.
+    #[test]
+    fn a_planted_unregistered_file_is_reported() {
+        let files = vec![
+            (
+                "Ipe/Planted.ipe".to_owned(),
+                "module Ipe.Planted exposing (x)".to_owned(),
+            ),
+            (
+                "Ipe/Twice.ipe".to_owned(),
+                "module Ipe.Twice exposing (y)".to_owned(),
+            ),
+        ];
+        let rows = [
+            StdlibModule {
+                dotted: "Ipe.Twice",
+                role: Role::DocOnly {
+                    source: "module Ipe.Twice exposing (y)",
+                },
+            },
+            StdlibModule {
+                dotted: "Ipe.TwiceAgain",
+                role: Role::Compiled {
+                    source: "module Ipe.Twice exposing (y)",
+                    tier: StdTier::Public,
+                },
+            },
+        ];
+        assert_eq!(
+            misregistered(&files, &rows),
+            vec![("Ipe/Planted.ipe", 0), ("Ipe/Twice.ipe", 2)]
+        );
+    }
+
+    /// The kernel and retired rows of [`STDLIB`] are exactly the resolver's
+    /// `STDLIB_MODULE_QUALIFIERS`, so the two registries cannot drift across the
+    /// crate boundary (the compiled rows are disjoint from it:
+    /// `compiled_vs_kernel_qualifier_disjoint`).
+    #[test]
+    fn canon_qualifiers_equal_stdlib_projection() {
+        let canon: std::collections::BTreeSet<String> = ipe_canon::STDLIB_MODULE_QUALIFIERS
+            .iter()
+            .map(|(segments, _)| segments.join("."))
+            .collect();
+        let kernel: std::collections::BTreeSet<String> = STDLIB
+            .iter()
+            .filter(|row| matches!(row.role, Role::Kernel { .. } | Role::Retired))
+            .map(|row| row.dotted.to_owned())
+            .collect();
+        assert_eq!(kernel, canon);
+    }
+
+    /// Each dotted name is registered once.
+    #[test]
+    fn stdlib_rows_are_unique() {
+        let mut seen = std::collections::BTreeSet::new();
+        for row in STDLIB {
+            assert!(
+                seen.insert(row.dotted),
+                "{} is registered twice",
+                row.dotted
             );
         }
     }
