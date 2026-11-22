@@ -4,6 +4,8 @@
 
 mod support;
 
+#[path = "g_db/db_operator_url_e2e.rs"]
+mod db_operator_url_e2e;
 #[path = "g_db/golden_app_settings_front_door.rs"]
 mod golden_app_settings_front_door;
 #[path = "g_db/golden_authed_store_query_seal.rs"]
