@@ -10,6 +10,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::rust_str_lit;
 use ipe_diagnostics::Diagnostic;
 
 /// One runtime-crate cargo feature an item's gate names.
@@ -88,7 +89,9 @@ impl fmt::Display for FeaturePredicate {
     /// The predicate in `#[cfg(..)]` syntax.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (open, members) = match self {
-            Self::Feature(feature) => return write!(f, "feature = \"{}\"", feature.as_str()),
+            Self::Feature(feature) => {
+                return write!(f, "feature = {}", rust_str_lit(feature.as_str()));
+            }
             Self::All(members) => ("all(", members),
             Self::Any(members) => ("any(", members),
         };
