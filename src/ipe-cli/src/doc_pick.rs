@@ -112,11 +112,12 @@ fn drain_line<R: BufRead>(reader: &mut R) -> bool {
     false
 }
 
-/// The header over a miss list.
+/// The header over a miss list; for a miss that matched nothing, the next
+/// step in place of a list.
 const fn header(miss: &DocMiss) -> &'static str {
     match miss.closeness {
         Closeness::Match => text::cli_doc_suggestions_header(),
-        Closeness::Nearest => text::cli_doc_nearest_header(),
+        Closeness::Nothing => text::cli_doc_nearest_header(),
     }
 }
 
@@ -171,6 +172,9 @@ fn pad_right(text: &str, width: usize) -> String {
 pub fn miss_text(miss: &DocMiss) -> String {
     let mut out = text::cli_doc_not_found(&miss.query).to_string();
     if miss.hits.is_empty() {
+        if matches!(miss.closeness, Closeness::Nothing) {
+            let _ = write!(out, "\n{}", header(miss));
+        }
         return out;
     }
     let _ = write!(out, "\n{}", header(miss));
@@ -448,12 +452,22 @@ mod tests {
     }
 
     #[test]
-    fn a_nearest_list_says_nothing_matched_closely() {
-        let nearest = DocMiss {
-            closeness: Closeness::Nearest,
+    fn a_miss_that_matched_nothing_lists_nothing_and_names_the_next_step() {
+        let nothing = DocMiss {
+            closeness: Closeness::Nothing,
+            hits: Vec::new(),
             ..miss(false)
         };
-        assert!(miss_text(&nearest).contains("No close match; the nearest entries:"));
+        let shown = miss_text(&nothing);
+        assert!(shown.contains("Nothing matched"), "{shown}");
+        assert!(shown.contains("ipe doc list"), "{shown}");
+        assert!(!shown.contains("ipe doc topic:"), "{shown}");
+        let fields = json_fields(&nothing);
+        assert!(fields.contains(&("results", "[]".to_owned())), "{fields:?}");
+        assert!(
+            fields.contains(&("closeness", "\"nothing\"".to_owned())),
+            "{fields:?}"
+        );
     }
 
     #[test]

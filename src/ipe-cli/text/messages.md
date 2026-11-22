@@ -709,7 +709,7 @@ Closest matches:
 
 ## cli-doc-nearest-header
 
-No close match; the nearest entries:
+Nothing matched. Run `ipe doc list` to see every module, or `ipe doc --type "<type>"` to search by type.
 
 ## cli-doc-more-matches
 
@@ -2003,7 +2003,7 @@ ipe doc {sub}: --port applies only to `ipe doc serve`
 
 ## doc-lookup-only-flag
 
-ipe doc {sub}: {flag} applies only to `list`, `<module>` queries, and `<key>` lookups
+ipe doc {sub}: {flag} applies only to `list`, `<module>` queries, and `<key>` lookups (try `ipe doc list {flag}`)
 
 ## doc-unknown-write-format
 

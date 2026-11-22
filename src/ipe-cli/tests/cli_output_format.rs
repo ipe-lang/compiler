@@ -394,7 +394,7 @@ fn doc_lookup_diagnostic_plain_is_ansi_free() {
     );
 }
 
-/// `ipe doc IPE-L0131 --json` emits the `{kind,key,text}` object.
+/// `ipe doc IPE-L0131 --json` emits the `{kind,key,title,body}` object.
 #[test]
 fn doc_lookup_diagnostic_json_emits_object() {
     let r = run(&["doc", "IPE-L0131", "--json"]);
@@ -405,8 +405,8 @@ fn doc_lookup_diagnostic_json_emits_object() {
         "json must start with {{\"kind\":, got: {out:?}"
     );
     assert!(
-        out.contains("\"key\":") && out.contains("\"text\":"),
-        "json must carry key and text fields"
+        out.contains("\"key\":") && out.contains("\"title\":") && out.contains("\"body\":"),
+        "json must carry key, title and body fields"
     );
     assert!(
         out.contains("\"diagnostic\""),
