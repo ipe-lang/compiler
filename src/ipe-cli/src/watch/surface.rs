@@ -5,9 +5,9 @@
 //! per generation from the program's typed shape. Terminal ownership is exclusive:
 //! the [`TerminalLease`] hands it over only across stop, then restore, then spawn.
 
+use std::cell::Cell;
 #[cfg(unix)]
 use std::cell::OnceCell;
-use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::io::Write as _;
 use std::process::{Child, ExitStatus, Stdio};
@@ -289,13 +289,20 @@ impl TerminalRestore for TtyRestore {
 /// apply that leaves no live owner, after the session's shutdown, or when the
 /// owner exits on its own. Never over a live owner, whose raw mode a restore
 /// would clobber.
-#[derive(Debug)]
 pub struct TerminalLease<R: TerminalRestore> {
     restore: R,
     /// The pid of the child that owns the terminal, while one does.
     owner: Cell<Option<u32>>,
     /// The progress row's hand-over, held while a child owns the terminal.
-    handed: RefCell<Option<crate::progress::HandOver>>,
+    handed: Cell<Option<crate::progress::HandOver>>,
+}
+
+impl<R: TerminalRestore> std::fmt::Debug for TerminalLease<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalLease")
+            .field("owner", &self.owner.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<R: TerminalRestore> TerminalLease<R> {
@@ -304,7 +311,7 @@ impl<R: TerminalRestore> TerminalLease<R> {
         Self {
             restore,
             owner: Cell::new(None),
-            handed: RefCell::new(None),
+            handed: Cell::new(None),
         }
     }
 
@@ -330,7 +337,7 @@ impl<R: TerminalRestore> TerminalLease<R> {
         match hand_over {
             TerminalHandOver::Owns => {
                 self.restore.capture();
-                *self.handed.borrow_mut() = Some(crate::progress::hand_over());
+                self.handed.set(Some(crate::progress::hand_over()));
                 hold_output();
                 match spawn() {
                     Ok(child) => {
@@ -381,7 +388,7 @@ impl<R: TerminalRestore> TerminalLease<R> {
         if self.owner.take().is_some() {
             self.restore.restore();
         }
-        drop(self.handed.borrow_mut().take());
+        drop(self.handed.take());
         flush_output();
     }
 

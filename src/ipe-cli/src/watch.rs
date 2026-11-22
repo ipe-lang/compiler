@@ -354,6 +354,14 @@ fn emit_watch_screen(screen: &crate::screen::Screen) {
     }
 }
 
+/// Write `screen` to stderr as progress chatter, or hold it while a dev child
+/// owns the terminal.
+fn emit_watch_chatter(screen: &crate::screen::Screen) {
+    if !surface::defer_output(|| screen.render_chatter(crate::screen::Header::Omitted)) {
+        screen.emit_chatter();
+    }
+}
+
 /// The watch's stderr, which its lines and palette probe target.
 fn stderr_stream() -> std::io::Stderr {
     std::io::stderr()
@@ -1169,7 +1177,11 @@ fn run_inner(
     // hand-over and appearance route — decided once per generation from the
     // shape its entry's `main` pins and whether it binds a first-party HTTP
     // listener. `None` until the first emit.
-    let mut current_surface: Option<ChildSurface> = None;
+    let mut pending_surface: Option<ChildSurface> = None;
+    // The surface of the child that runs now, which an appearance hot-swap
+    // reaches: it follows the apply, never an emit whose cargo build has not
+    // succeeded. `None` while no child the watch knows runs.
+    let mut running_surface: Option<ChildSurface> = None;
     // The terminal as one owning child at a time holds it: restored after every
     // stop of an owner, never over a live one.
     let lease = TerminalLease::new(TtyRestore::default());
@@ -1237,6 +1249,11 @@ fn run_inner(
         return Ok(());
     }
 
+    // How the watch loop ended. Every exit leaves through `break` so the
+    // teardown below runs: the supervised child stops, the terminal it may
+    // own is restored, and the proxy releases the user's port before the
+    // outcome is returned.
+    let mut ended: Result<(), CliError> = Ok(());
     loop {
         // While a dev child owns the terminal, the loop wakes on a bounded
         // poll to notice the child exiting on its own: an interrupted child
@@ -1248,10 +1265,13 @@ fn run_inner(
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     match lease.reap_exited_owner(&mut supervisor) {
                         Some(status) if exited_interrupted(status) => break,
-                        Some(status) => emit_watch_line(
-                            &crate::style::TerminalSafe::sanitize(&app_exited_line(status)),
-                            WatchRole::Info,
-                        ),
+                        Some(status) => {
+                            running_surface = None;
+                            emit_watch_line(
+                                &crate::style::TerminalSafe::sanitize(&app_exited_line(status)),
+                                WatchRole::Info,
+                            );
+                        }
                         None => {}
                     }
                     continue;
@@ -1442,7 +1462,11 @@ fn run_inner(
                     continue; // stale — a newer cycle already superseded this one.
                 }
                 timings.compile = Some(compile);
-                crate::driver::show_frame_reach(reach_after(&outcome, cycle_reach.take()));
+                if let Some(notice) =
+                    crate::driver::frame_reach_notice(reach_after(&outcome, cycle_reach.take()))
+                {
+                    emit_watch_chatter(&notice);
+                }
                 match outcome {
                     CompileOutcome::Cancelled => {
                         emit(opts, WatchEvent::CompileCancelled { generation: g });
@@ -1465,7 +1489,7 @@ fn run_inner(
                         emit(opts, WatchEvent::CompileFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
-                            app_status_port(proxy.as_ref(), opts.port),
+                            app_status_port(running_surface, proxy.as_ref(), opts.port),
                         ) {
                             post_watch_status(app_port, tok, false, &first_error_line(&msg));
                         }
@@ -1509,7 +1533,7 @@ fn run_inner(
                                     // the match is exhaustive so a surface can never
                                     // silently skip the edit. Before any emit no
                                     // child runs, so the edit rebuilds.
-                                    match current_surface.map_or(
+                                    match running_surface.map_or(
                                         AppearanceRoute::Rebuild,
                                         ChildSurface::appearance_route,
                                     ) {
@@ -1611,9 +1635,11 @@ fn run_inner(
                                                             + hot.wirings.len(),
                                                     },
                                                 );
-                                                if let Some(app_port) =
-                                                    app_status_port(proxy.as_ref(), opts.port)
-                                                {
+                                                if let Some(app_port) = app_status_port(
+                                                    running_surface,
+                                                    proxy.as_ref(),
+                                                    opts.port,
+                                                ) {
                                                     post_watch_status(app_port, tok, true, "");
                                                 }
                                                 timings.report(g);
@@ -1693,7 +1719,7 @@ fn run_inner(
                         if appearance_active {
                             running_emitted = Some(emitted.clone());
                         }
-                        current_surface =
+                        pending_surface =
                             Some(ChildSurface::of(shape, emitted_binds_http(&emitted)));
                         // Design doc "First-run vs warm-run UX": the cold
                         // (first) build pays the full dependency-compile
@@ -1726,7 +1752,7 @@ fn run_inner(
                         // an app is already up (a rebuild, not the first build).
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
-                            app_status_port(proxy.as_ref(), opts.port),
+                            app_status_port(running_surface, proxy.as_ref(), opts.port),
                         ) {
                             post_watch_recompiling(app_port, tok);
                         }
@@ -1810,7 +1836,7 @@ fn run_inner(
                         emit(opts, WatchEvent::CargoFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
-                            app_status_port(proxy.as_ref(), opts.port),
+                            app_status_port(running_surface, proxy.as_ref(), opts.port),
                         ) {
                             post_watch_status(app_port, tok, false, &first_error_line(&msg));
                         }
@@ -1836,7 +1862,7 @@ fn run_inner(
                         let restart_started = Instant::now();
                         // Green cargo follows this generation's green emit, which
                         // decided its surface.
-                        let Some(surface) = current_surface else {
+                        let Some(surface) = pending_surface else {
                             continue;
                         };
                         // Deferred blue-green engagement: bind the proxy on the
@@ -1849,9 +1875,15 @@ fn run_inner(
                             && opts.bluegreen
                             && surface.start_order() == StartOrder::Overlap
                         {
-                            let bound = ipe_watch::DevProxy::bind(opts.port).map_err(|e| {
-                                CliError::Usage(text::msg::watch_proxy_bind_failed(&opts.port, &e))
-                            })?;
+                            let bound = match ipe_watch::DevProxy::bind(opts.port) {
+                                Ok(bound) => bound,
+                                Err(e) => {
+                                    ended = Err(CliError::Usage(
+                                        text::msg::watch_proxy_bind_failed(&opts.port, &e),
+                                    ));
+                                    break;
+                                }
+                            };
                             if !opts.quiet {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(&format!(
@@ -1888,7 +1920,7 @@ fn run_inner(
                                     // silently abandoned until an unrelated edit.
                                     if let (Some(tok), Some(app_port)) = (
                                         hot_token.as_deref(),
-                                        app_status_port(Some(proxy), opts.port),
+                                        app_status_port(running_surface, Some(proxy), opts.port),
                                     ) {
                                         post_watch_status(
                                             app_port,
@@ -1971,14 +2003,12 @@ fn run_inner(
                                     readiness,
                                     opts.restart_timeouts,
                                 );
-                                if let (
-                                    Some(proxy),
-                                    ipe_watch::ReadinessCheck::HttpReadyz { port }
-                                    | ipe_watch::ReadinessCheck::TcpConnect { port },
-                                ) = (proxy.as_ref(), readiness)
-                                    && outcome_is_running(&outcome)
-                                {
-                                    proxy.set_upstream(port);
+                                if let Some(proxy) = proxy.as_ref() {
+                                    match stop_first_upstream(&outcome, readiness) {
+                                        UpstreamRoute::Keep => {}
+                                        UpstreamRoute::To(port) => proxy.set_upstream(port),
+                                        UpstreamRoute::Nothing => proxy.set_upstream(0),
+                                    }
                                 }
                                 outcome
                             }
@@ -1988,6 +2018,7 @@ fn run_inner(
                         // hands the terminal back now.
                         lease.release_unless_live(&mut supervisor);
                         timings.restart = Some(restart_started.elapsed());
+                        running_surface = surface_after(&outcome, running_surface, surface);
                         report_restart_outcome(&outcome, opts.quiet);
                         // Clear any "Recompiling app" banner with a soft-green
                         // "Updated!" the moment the rebuilt app is serving. Under
@@ -1997,7 +2028,7 @@ fn run_inner(
                         if outcome_is_running(&outcome)
                             && let (Some(tok), Some(app_port)) = (
                                 hot_token.as_deref(),
-                                app_status_port(proxy.as_ref(), opts.port),
+                                app_status_port(running_surface, proxy.as_ref(), opts.port),
                             )
                         {
                             post_watch_status(app_port, tok, true, "");
@@ -2077,7 +2108,7 @@ fn run_inner(
         let _ = h.join();
     }
     let _ = coalesce_handle.join();
-    Ok(())
+    ended
 }
 
 /// Ask the OS for a free loopback TCP port by binding an ephemeral one and
@@ -3039,8 +3070,17 @@ fn strip_ansi(s: &str) -> String {
 /// so the in-app banner never appears). Route to the proxy's current upstream
 /// instead. `None` when no app is up (no upstream, or the internal port is not
 /// yet known) — there is then no browser to notify. Direct-bind (no proxy) keeps
-/// the app on `port` itself.
-fn app_status_port(proxy: Option<&ipe_watch::DevProxy>, port: u16) -> Option<u16> {
+/// the app on `port` itself. Only a running child that serves a page mounts the
+/// status endpoint, so for any other `running` surface (or none) the token is
+/// posted nowhere: the port it would reach is one no watch child listens on.
+fn app_status_port(
+    running: Option<ChildSurface>,
+    proxy: Option<&ipe_watch::DevProxy>,
+    port: u16,
+) -> Option<u16> {
+    if !running.is_some_and(ChildSurface::serves_page) {
+        return None;
+    }
     proxy.map_or(Some(port), |p| match p.current_upstream() {
         0 => None,
         up => Some(up),
@@ -3120,6 +3160,55 @@ fn warn_if_memory_store() {
 /// that bring a binary up (a fresh spawn, a reload). The last-good-fallback and
 /// nothing-running outcomes did NOT start the new binary, so they must not
 /// trigger the first-run URL announcement.
+/// The surface of the child running after an apply of `applied` left
+/// `outcome`, given the surface `prior` that ran before it.
+const fn surface_after(
+    outcome: &ipe_watch::RestartOutcome,
+    prior: Option<ChildSurface>,
+    applied: ChildSurface,
+) -> Option<ChildSurface> {
+    match outcome {
+        ipe_watch::RestartOutcome::Spawned
+        | ipe_watch::RestartOutcome::Restarted
+        | ipe_watch::RestartOutcome::UnchangedBinary => Some(applied),
+        ipe_watch::RestartOutcome::RespawnedLastGood { .. } => prior,
+        ipe_watch::RestartOutcome::NothingRunning { .. } => None,
+    }
+}
+
+/// Where an engaged proxy forwards after a stop-first apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamRoute {
+    /// The running child is unchanged; so is its upstream.
+    Keep,
+    /// The child now running listens here.
+    To(u16),
+    /// No child listens: the proxy answers 502 rather than forward to a port
+    /// the stopped child released and any local process could bind.
+    Nothing,
+}
+
+/// The upstream a stop-first apply leaves behind an engaged proxy. Every
+/// outcome that stopped the old child either names the port the live child
+/// passed readiness on or routes nothing; an unchanged binary keeps its port,
+/// never the fresh one this generation allocated and nobody bound.
+const fn stop_first_upstream(
+    outcome: &ipe_watch::RestartOutcome,
+    readiness: ipe_watch::ReadinessCheck,
+) -> UpstreamRoute {
+    match outcome {
+        ipe_watch::RestartOutcome::UnchangedBinary => UpstreamRoute::Keep,
+        ipe_watch::RestartOutcome::Spawned
+        | ipe_watch::RestartOutcome::Restarted
+        | ipe_watch::RestartOutcome::RespawnedLastGood { .. } => match readiness {
+            ipe_watch::ReadinessCheck::HttpReadyz { port }
+            | ipe_watch::ReadinessCheck::TcpConnect { port } => UpstreamRoute::To(port),
+            ipe_watch::ReadinessCheck::AliveGrace { .. } => UpstreamRoute::Nothing,
+        },
+        ipe_watch::RestartOutcome::NothingRunning { .. } => UpstreamRoute::Nothing,
+    }
+}
+
 const fn outcome_is_running(outcome: &ipe_watch::RestartOutcome) -> bool {
     matches!(
         outcome,
@@ -3476,12 +3565,13 @@ fn find_executable_path(cargo_json_stdout: &str) -> Option<PathBuf> {
 mod tests {
     use super::{
         AppearanceRoute, BuildAccel, ChildSurface, Command, Duration, FallbackNote,
-        OrchestratorEvent, RESOLVE_RETRY_DELAY, RebuildTimings, WatchRole, apply_build_accel_env,
-        child_command, child_env, choose_build_accel, compile_failed_frame, dir_has_dep_rlib,
-        emitted_binds_http, entry_shape, env_flag_on, failure_fallback, first_error_line,
-        mint_hot_token, mpsc, prove_green_crate, push_control_appearance, resolve_project_sources,
-        schedule_resolve_retry, send_control_frame, spawn_command, strip_ansi, watch_emit_settings,
-        watch_line, watch_runtime_dep, watch_status_body,
+        OrchestratorEvent, RESOLVE_RETRY_DELAY, RebuildTimings, UpstreamRoute, WatchRole,
+        app_status_port, apply_build_accel_env, child_command, child_env, choose_build_accel,
+        compile_failed_frame, dir_has_dep_rlib, emitted_binds_http, entry_shape, env_flag_on,
+        failure_fallback, first_error_line, mint_hot_token, mpsc, prove_green_crate,
+        push_control_appearance, resolve_project_sources, schedule_resolve_retry,
+        send_control_frame, spawn_command, stop_first_upstream, strip_ansi, surface_after,
+        watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
     };
     use crate::delivery::Shape;
     use std::ffi::OsStr;
@@ -3895,6 +3985,169 @@ mod tests {
             apply_order(ChildSurface::HttpListener, true),
             StartOrder::Overlap
         );
+    }
+
+    /// Every way out of the watch loop runs the teardown after it: an early
+    /// `?` or `return` inside the loop would leave the supervised child
+    /// running, the terminal it owns unrestored and the proxy bound.
+    #[test]
+    fn the_watch_loop_leaves_only_through_its_teardown() {
+        let source = include_str!("watch.rs");
+        let body = source
+            .split_once("    let mut ended: Result<(), CliError> = Ok(());\n    loop {\n")
+            .and_then(|(_, rest)| rest.split_once("\n    drop(watcher);\n"))
+            .map(|(body, _)| body);
+        let Some(body) = body else {
+            assert!(body.is_some(), "the watch loop and its teardown are found");
+            return;
+        };
+        let escapes: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| {
+                line.contains(")?")
+                    || line.contains("?;")
+                    || line.ends_with('?')
+                    || line.starts_with("return ")
+                    || line.contains(" return ")
+            })
+            .collect();
+        assert!(
+            escapes.is_empty(),
+            "the watch loop must break to its teardown, never leave early: {escapes:?}"
+        );
+        // While a dev child owns the terminal its stderr draws on, the loop's
+        // output is held: it writes only through the deferring writers.
+        let direct: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| {
+                line.contains("show_frame_reach(")
+                    || line.contains(".emit()")
+                    || line.contains(".emit_chatter()")
+                    || line.contains("write_watch_line(")
+                    || line.contains("chatter_styled(")
+                    || line.contains("eprintln!")
+                    || line.contains("eprint!")
+            })
+            .collect();
+        assert!(
+            direct.is_empty(),
+            "the watch loop must write through the deferring writers: {direct:?}"
+        );
+    }
+
+    /// An appearance hot-swap reaches the child that runs: a candidate that
+    /// failed readiness leaves the last good child's surface in charge, and a
+    /// session with nothing running routes every edit to a rebuild.
+    #[test]
+    fn the_running_surface_follows_the_apply_not_the_emit() {
+        use ipe_watch::RestartOutcome;
+        let web = ChildSurface::WebApp;
+        let tui = ChildSurface::Terminal {
+            listener: super::surface::Listener::None,
+        };
+        for live in [
+            RestartOutcome::Spawned,
+            RestartOutcome::Restarted,
+            RestartOutcome::UnchangedBinary,
+        ] {
+            assert_eq!(surface_after(&live, Some(web), tui), Some(tui), "{live:?}");
+        }
+        let kept = RestartOutcome::RespawnedLastGood {
+            broken: PathBuf::from("broken"),
+        };
+        assert_eq!(surface_after(&kept, Some(web), tui), Some(web));
+        let dead = RestartOutcome::NothingRunning {
+            broken: PathBuf::from("broken"),
+            last_good_error: None,
+        };
+        assert_eq!(surface_after(&dead, Some(web), tui), None);
+    }
+
+    /// The dev token reaches only a running child that mounts the status
+    /// endpoint: with no child, or a child that serves no page, nothing is
+    /// posted to the user's port, which no watch child then listens on.
+    #[test]
+    fn the_status_post_reaches_only_a_running_page() {
+        let port = 40_002;
+        assert_eq!(
+            app_status_port(Some(ChildSurface::WebApp), None, port),
+            Some(port)
+        );
+        assert_eq!(app_status_port(None, None, port), None);
+        for surface in [
+            ChildSurface::HttpListener,
+            ChildSurface::Terminal {
+                listener: super::surface::Listener::None,
+            },
+            ChildSurface::Terminal {
+                listener: super::surface::Listener::Tcp,
+            },
+            ChildSurface::Line,
+            ChildSurface::Worker,
+            ChildSurface::Script,
+        ] {
+            assert_eq!(
+                app_status_port(Some(surface), None, port),
+                None,
+                "{surface:?}"
+            );
+        }
+    }
+
+    /// A stop-first apply behind an engaged proxy never forwards to a port no
+    /// live child passed readiness on: an unchanged binary keeps the running
+    /// upstream (the fresh port this generation allocated is bound by nobody),
+    /// and an outcome with no listening child routes nothing instead of
+    /// leaving the stopped child's released port as the upstream.
+    #[test]
+    fn a_stop_first_apply_routes_only_to_a_live_listener() {
+        use ipe_watch::{ReadinessCheck, RestartOutcome};
+        let fresh = 40_001;
+        let http = ReadinessCheck::HttpReadyz { port: fresh };
+        let tcp = ReadinessCheck::TcpConnect { port: fresh };
+        let none = ReadinessCheck::AliveGrace {
+            grace: Duration::from_millis(1),
+        };
+        assert_eq!(
+            stop_first_upstream(&RestartOutcome::UnchangedBinary, http),
+            UpstreamRoute::Keep
+        );
+        assert_eq!(
+            stop_first_upstream(&RestartOutcome::UnchangedBinary, none),
+            UpstreamRoute::Keep
+        );
+        for live in [
+            RestartOutcome::Spawned,
+            RestartOutcome::Restarted,
+            RestartOutcome::RespawnedLastGood {
+                broken: PathBuf::from("broken"),
+            },
+        ] {
+            assert_eq!(
+                stop_first_upstream(&live, http),
+                UpstreamRoute::To(fresh),
+                "{live:?}"
+            );
+            assert_eq!(
+                stop_first_upstream(&live, tcp),
+                UpstreamRoute::To(fresh),
+                "{live:?}"
+            );
+            assert_eq!(
+                stop_first_upstream(&live, none),
+                UpstreamRoute::Nothing,
+                "{live:?} with no listener"
+            );
+        }
+        let dead = RestartOutcome::NothingRunning {
+            broken: PathBuf::from("broken"),
+            last_good_error: None,
+        };
+        assert_eq!(stop_first_upstream(&dead, http), UpstreamRoute::Nothing);
     }
 
     /// Fail-closed: with NO control port allocated (the child opened no control
