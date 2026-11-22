@@ -34,7 +34,10 @@ fn collect_markdown(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
             if !name.starts_with('.') {
                 collect_markdown(&path, out)?;
             }
-        } else if name.ends_with(".md") {
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
             out.push(path);
         }
     }
