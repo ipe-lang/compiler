@@ -636,16 +636,15 @@ const fn sub_term(sub: &Sub) -> Option<&DocQuery> {
 /// single-key refusal, since quoting would not make it part of the query. The
 /// joined query is parsed before it is echoed, so a hazardous word is refused,
 /// never printed.
-fn extra_word_refusal<'a>(
+fn extra_word_refusal<'r>(
     term: &DocQuery,
     word: &str,
-    rest: impl Iterator<Item = &'a String>,
+    rest: impl Iterator<Item = &'r String>,
 ) -> CliError {
     let mut words = vec![term.text(), word];
-    words.extend(
-        rest.take_while(|next| !next.starts_with('-'))
-            .map(String::as_str),
-    );
+    for next in rest.take_while(|next| !next.starts_with('-')) {
+        words.push(next);
+    }
     let names_a_path = words
         .iter()
         .skip(1)
