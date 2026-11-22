@@ -108,6 +108,7 @@ Each module listed below links to a detail page with the full documentation and 
 - [Maybe](#maybe)
 - [Money](#money)
 - [Net](#net)
+- [Package](#package)
 - [Palette](#palette)
 - [Parser](#parser)
 - [Path](#path)
@@ -2479,6 +2480,54 @@ Ipe.Net — typed network primitives.
 | `toInt` | `toInt port` — recover the raw port number for the runtime boundary. |
 | `min` | The smallest valid port (`1`).  A total value — useful as the seed for |
 | `max` | The largest valid port (`65535`).  A total value. |
+
+## Package
+
+[Full reference](stdlib/Package.md)
+
+| Export | Summary |
+|--------|----------|
+| `Package` | The whole manifest. Only `name` is strictly required; every other field |
+| `Capabilities` | The security capabilities a package declares and pre-accepts. |
+| `Program` | One named build target: an entry module file (relative to the source root) |
+| `Dependency` | One Ipê dependency: its name and its source. Constructed with the `dep` / |
+| `RustDependency` | One crates.io crate bound as a foreign-function dependency, with its version |
+| `DependencySource` | The source of a `Dependency`: index by semver requirement, a git repository |
+| `Database` | The SQL driver the emitted project targets. Defaults to `Sqlite`. |
+| `Shape` | The declared shape of a program's entry: a `Web` server, a `WebView` |
+| `Allocator` | The static-link allocator. Defaults to `AutoAlloc` (resolve by target). |
+| `Target` | The build target: the host, or a cross-compile rustc triple. The triple is |
+| `WasmClient` | The wasm client target. `Off` (the default) builds no wasm bundle; `On` |
+| `WasmMode` | The rendering strategy of a wasm client bundle. |
+| `WasmOptions` | The options of an active wasm client bundle. `publicEnv` is a default-deny |
+| `WrapperSpec` | A local Rust-crate wrapper binding. `NoWrapper` (the default) declares none. |
+| `WrapperOptions` | A wrapper's package-jailed local path, the functions it exposes, and the |
+| `Build` | The build settings. Every field defaults to its unset value when omitted: |
+| `Delivery` | Per-host delivery configuration. |
+| `Ship` | One delivery `ipe release` produces. The `ships` list declares *what* a |
+| `binary` | The shape's own co-located artifact on the host triple (for `web`, |
+| `staticBinary` | The musl static binary (`--static`). Co-located shapes only. |
+| `crossBinary` | A cross-compiled co-located binary for a Rust target triple, validated at |
+| `desktop` | The `web desktop` webview-native desktop bundle. Web shape only. |
+| `client` | The `web client` browser wasm bundle. Web shape only. |
+| `clientDesktop` | The `web client desktop` wasm bundle plus a native webview shell. |
+| `clientIos` | The `web client ios` wasm bundle plus an iOS shell. |
+| `clientAndroid` | The `web client android` wasm bundle plus an Android shell. |
+| `DesktopConfig` | Configuration for the `web desktop` (webview-native) host. |
+| `MobileConfig` | Configuration for the `web client ios` / `web client android` mobile hosts. |
+| `PushConfig` | `delivery.mobile.push`: the APNs environment and the Firebase client |
+| `ApnsEnvironment` | The APNs environment an iOS shell registers in: `Development` for a |
+| `FcmConfig` | The Firebase client identifiers the Android shell registers with. They are |
+| `BrowserConfig` | Configuration for the browser host. |
+| `Orientation` | The allowed screen orientations for a mobile host. |
+| `Capability` | The security-capability vocabulary a manifest may name in `declares` / |
+| `WebCapability` | The closed per-Web-API sub-axis a `JsPort` capability discloses. A browser |
+| `dep` | An index dependency: resolved from the package index by a semver |
+| `depGit` | A git dependency with no pinned revision. |
+| `depGitRev` | A git dependency pinned to a revision (commit, tag, or branch). |
+| `depPath` | A local-path dependency, relative to the manifest: `../` steps (at most |
+| `rustDep` | A Rust dependency with no extra features. |
+| `rustDepWith` | A Rust dependency with a feature list. |
 
 ## Palette
 
