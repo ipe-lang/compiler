@@ -643,6 +643,7 @@ impl<'u> DriverParityQuery<'u> {
 /// [`ConfiguredHost`]. Holds the URL's credentials, so it has no `Debug` or
 /// `Display`.
 #[cfg_attr(not(feature = "db"), allow(dead_code))]
+#[derive(Clone)]
 pub(crate) struct UnambiguousUrl {
     raw: String,
     parsed: Url,

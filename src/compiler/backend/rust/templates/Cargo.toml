@@ -23,13 +23,16 @@ db = []
 encoding = []
 # Declared but inert in the vendored escape hatch: `zeroize` / `subtle` / `rsa`
 # stay non-optional below. The `#[cfg(feature = "secret")]` gates in the vendored
-# runtime source (`app_config.rs::resolve_db_url_override`, `secret.rs`) need
+# runtime source (`secret.rs`) need
 # this entry to compile — without it rustc emits E0425 for the gated functions.
 secret = []
 # The dev-loop build intent. `dev_posture_cargo_toml` promotes it into `default`
 # for an `ipe dev build` / `ipe dev run` / `ipe test` / `ipe dev watch` emit; a release emit
 # leaves it off, so the vendored console default stays closed.
 dev-posture = []
+# Declared for the vendored runtime's `#[cfg(feature = "db-operator")]` start
+# check; promoted into `default` for a program that reaches `Db.connect`.
+db-operator = []
 # Declared but inert in the vendored escape hatch: `serde` / `serde_json` /
 # `serde_urlencoded` stay non-optional below. The floor serde derives
 # (`IpeMaybe`/`IpeResult`/`IpeError`/`Decimal`/`Patch`) and the `dom/form`

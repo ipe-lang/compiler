@@ -16,26 +16,11 @@ compile_error!(
 pub type DbPool = sqlx::sqlite::SqlitePool;
 #[cfg(feature = "db")]
 pub type DbRow = sqlx::sqlite::SqliteRow;
-#[cfg(feature = "db")]
-pub fn ipe_db_url() -> String {
-    // One config precedence `env > setting-in-code > fallback`: `DATABASE_URL`
-    // wins, else an installed `Db.url` setting (a `Secret`, revealed only here at
-    // the point of use, never logged), else the built-in local fallback.
-    crate::system::read_env_var("DATABASE_URL")
-        .ok()
-        .or_else(crate::app_config::resolve_db_url_override)
-        .unwrap_or_else(|| "sqlite://ipe.db?mode=rwc".to_string())
-}
 
 #[cfg(not(feature = "db"))]
 pub type DbPool = ();
 #[cfg(not(feature = "db"))]
 pub type DbRow = ();
-#[cfg(not(feature = "db"))]
-#[must_use]
-pub fn ipe_db_url() -> String {
-    String::new()
-}
 
 // Backend-portability helpers. In generated projects these are
 // REPLACED by Project.hs's per-driver impls (sqlite/mysql/postgres). The

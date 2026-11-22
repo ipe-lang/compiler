@@ -5024,6 +5024,9 @@ pub(crate) enum StartupRefusal {
     Bind(crate::system::EnvValueRefusal),
     /// The auth configuration asks for a session gate the app cannot enforce.
     Auth(crate::app_config::AuthStartupRefusal),
+    /// `DATABASE_URL` or the `Db.url` setting is set but refused.
+    #[cfg(feature = "db-operator")]
+    Database(crate::db::OperatorUrlRefusal),
 }
 
 #[cfg(feature = "web")]
@@ -5045,6 +5048,8 @@ impl crate::system::ScrubbedDisplay for StartupRefusal {
             Self::FrameAncestors(refusal) => write!(out, "{refusal}"),
             Self::Bind(refusal) => refusal.render(out),
             Self::Auth(refusal) => refusal.render(out),
+            #[cfg(feature = "db-operator")]
+            Self::Database(refusal) => write!(out, "{refusal}"),
         }
     }
 }
@@ -8063,6 +8068,10 @@ where
     // The framing policy every page carries is parsed here, so a value with no
     // header representation refuses the router; the page path re-checks it.
     crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
+    // A `DATABASE_URL` or `Db.url` that is set but refused stops the start
+    // before a port binds, never at the first request.
+    #[cfg(feature = "db-operator")]
+    crate::db::check_operator_url_at_start().map_err(StartupRefusal::Database)?;
     let sse_route = MethodSet::GET.on(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               strict: Option<axum::Extension<crate::server::StrictUrl>>,

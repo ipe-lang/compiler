@@ -7,7 +7,7 @@
 // through `ipe_backend_rust::project`'s `RUNTIME_CONFIG_RS_DB_POSTGRES`.
 //
 // Every symbol name matches `config.rs`'s sqlite variant exactly (`DbPool`,
-// `DbRow`, `ipe_db_url`, `db_last_insert_id`, `db_format_sql`,
+// `DbRow`, `db_last_insert_id`, `db_format_sql`,
 // `DB_USES_RETURNING_ID`, `db_auto_id_column`) so `db.rs` — copied verbatim
 // across both driver builds — never needs a driver-specific `#[cfg]`.
 
@@ -15,27 +15,11 @@
 pub type DbPool = sqlx::postgres::PgPool;
 #[cfg(feature = "db")]
 pub type DbRow = sqlx::postgres::PgRow;
-#[cfg(feature = "db")]
-pub fn ipe_db_url() -> String {
-    // One config precedence `env > setting-in-code > fallback`: `DATABASE_URL`
-    // wins, else an installed `Db.url` setting (a `Secret`, revealed only here at
-    // the point of use, never logged), else the built-in local fallback.
-    // `DbUrl::parse` fixes the TLS mode: the `localhost` fallback dials with
-    // `prefer`, and a URL naming any remote host must verify the server.
-    crate::system::read_env_var("DATABASE_URL")
-        .ok()
-        .or_else(crate::app_config::resolve_db_url_override)
-        .unwrap_or_else(|| "postgres://postgres@localhost/ipe".to_string())
-}
 
 #[cfg(not(feature = "db"))]
 pub type DbPool = ();
 #[cfg(not(feature = "db"))]
 pub type DbRow = ();
-#[cfg(not(feature = "db"))]
-pub fn ipe_db_url() -> String {
-    String::new()
-}
 
 // Backend-portability helpers. Mirrors `config.rs`'s sqlite shape.
 #[cfg(feature = "db")]
