@@ -206,7 +206,7 @@ impl Case {
     }
 
     /// The backend configured for this case.
-    fn backend<'i>(&self, interner: &'i Interner) -> RustBackend<'i> {
+    const fn backend<'i>(&self, interner: &'i Interner) -> RustBackend<'i> {
         RustBackend::new(interner)
             .with_runtime_dep(Some(RuntimeDep {
                 content: RuntimeContentId::from_digest_bytes([0; 16]),

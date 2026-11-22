@@ -87,12 +87,12 @@ impl FeaturePredicate {
 impl fmt::Display for FeaturePredicate {
     /// The predicate in `#[cfg(..)]` syntax.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let (word, members) = match self {
+        let (open, members) = match self {
             Self::Feature(feature) => return write!(f, "feature = \"{}\"", feature.as_str()),
-            Self::All(members) => ("all", members),
-            Self::Any(members) => ("any", members),
+            Self::All(members) => ("all(", members),
+            Self::Any(members) => ("any(", members),
         };
-        write!(f, "{word}(")?;
+        f.write_str(open)?;
         for (i, member) in members.iter().enumerate() {
             if i > 0 {
                 write!(f, ", ")?;

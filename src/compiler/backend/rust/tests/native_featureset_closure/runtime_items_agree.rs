@@ -190,7 +190,7 @@ fn backend_sources() -> Vec<PathBuf> {
                 if name != "tests" {
                     stack.push(path);
                 }
-            } else if name.ends_with(".rs")
+            } else if path.extension().is_some_and(|ext| ext == "rs")
                 && name != TABLE_FILE
                 && name != "tests.rs"
                 && !name.ends_with("_tests.rs")

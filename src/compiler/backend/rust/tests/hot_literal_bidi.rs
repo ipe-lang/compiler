@@ -340,7 +340,7 @@ fn end_to_end_hot_init_renders_bidi_string() -> DResult<()> {
 
 /// `prog` with every module re-flagged as the `shape` view.
 fn reshaped(mut prog: Program, shape: Shape) -> Program {
-    for module in prog.modules.iter_mut() {
+    for module in &mut prog.modules {
         module.uses_ui = shape == Shape::Tui;
         module.uses_web = shape == Shape::Web;
         module.uses_tui = shape == Shape::Tui;
@@ -417,7 +417,7 @@ fn subs_hot_program(interner: &mut Interner) -> DResult<Program> {
         },
     };
     let mut prog = tea_program(main_mod, vec![subs_fn], None);
-    for module in prog.modules.iter_mut() {
+    for module in &mut prog.modules {
         module.types.push(TypeDef::Enum(EnumDef {
             name: msg,
             home: ModPath(vec![main_mod]),
