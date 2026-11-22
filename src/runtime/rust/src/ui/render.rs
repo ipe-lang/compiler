@@ -394,11 +394,10 @@ fn collect_html_attrs<M: Clone>(attrs: &[Attribute<M>]) -> Vec<HtmlAttribute<M>>
                 out.push(HtmlAttribute::PageHref(route.clone()));
             }
             // Checkedness is a boolean attribute: present when true, absent when
-            // false, never the string "false".
+            // false, never the string "false". The false state still reaches
+            // the render sink, which marks the field as the view's.
             Attribute::AttrChecked(checked) => {
-                if *checked {
-                    out.push(HtmlAttribute::BoolAttr("checked".to_owned(), true));
-                }
+                out.push(HtmlAttribute::BoolAttr("checked".to_owned(), *checked));
             }
             Attribute::AttrDescribe(desc) => {
                 // Emit ARIA roles / landmark attributes for semantic elements.
@@ -2321,8 +2320,9 @@ mod tests {
     }
 
     /// `AttrChecked(true)` lowers to a present `checked` attribute and
-    /// `AttrChecked(false)` to none, never to the string "false". Red without the
-    /// `AttrChecked` arm in `collect_html_attrs`.
+    /// `AttrChecked(false)` to none, never to the string "false", and both mark
+    /// the box as the view's. Red without the `AttrChecked` arm in
+    /// `collect_html_attrs`.
     #[test]
     fn checked_attr_lowers_to_bool_attr() {
         let input = |checked: bool| -> Element<TestMsg> {
@@ -2342,6 +2342,10 @@ mod tests {
         assert!(
             !off.contains("checked"),
             "unchecked emits no attribute: {off}"
+        );
+        assert!(
+            off.contains("ipe-controlled=\"\""),
+            "an unchecked box the view owns carries the controlled marker: {off}"
         );
     }
 

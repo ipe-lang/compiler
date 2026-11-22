@@ -466,3 +466,95 @@ fn a_refusal_notice_stands_for_a_connection_that_is_up() {
         "the statuses tabs share are the connection's three; a refusal notice is one tab's own"
     );
 }
+
+/// Every pending field value ends on a message the server sends, so the
+/// view's value reaches a field once the user's edit has landed (CI job
+/// `test`). The ends are the accept, the stale answer, and a stream frame of
+/// this tab's own event; no end waits on an ack field the server never writes.
+#[test]
+fn a_pending_field_value_ends_on_a_message_the_server_sends() {
+    let source = code();
+    assert!(
+        !source.contains("ackInputs"),
+        "client.js reads `ackInputs`, which no server writes; a value pending on it never ends"
+    );
+    let entry = body_of(&source, "__ipeInputEntry");
+    assert!(
+        entry.contains("liveValue: \"\", edited: false, pendingSeq: 0, refusedValue: null"),
+        "an input entry holds its live value, its edit flag, its pending seq and its refused value"
+    );
+    let stamp = body_of(&source, "__ipeStampEdited");
+    assert!(
+        stamp.contains("if (!e.edited) continue; e.pendingSeq = seq; e.edited = false;"),
+        "an event stamps the fields edited since the last event, never by their value"
+    );
+    let send = body_of(&source, "__ipeSend");
+    assert!(
+        send.contains("__ipeStampEdited(mySeq); var snapshot = __ipeInputsSnapshot();"),
+        "`__ipeSend` stamps the edited fields before it reads the snapshot"
+    );
+    let snapshot = body_of(&source, "__ipeInputsSnapshot");
+    assert!(
+        snapshot.contains("if (e.pendingSeq === 0) continue;")
+            && snapshot.contains("out[ids[i]] = {value: e.liveValue, seq: e.pendingSeq};"),
+        "the snapshot carries pending values only"
+    );
+    let retire = body_of(&source, "__ipeRetirePending");
+    assert!(
+        retire.contains("if (e.pendingSeq > 0 && e.pendingSeq <= seq) e.pendingSeq = 0;"),
+        "an answer to an event ends every value pending at or before it"
+    );
+    let poster = body_of(&source, THE_POSTER);
+    assert!(
+        poster.contains("__ipeRetirePending(body.seq);"),
+        "a stale answer ends the values its event carried"
+    );
+    assert!(
+        poster.contains(
+            "if (ipeMark === \"1\" && typeof data.seq === \"number\") __ipeRetirePending(data.seq);"
+        ),
+        "a marked accept ends the values its event carried"
+    );
+    let own = body_of(&source, "__ipeRetireOwnFrame");
+    assert!(
+        own.contains("frame.tab !== __ipeTabId")
+            && own.contains("__ipeRetirePending(frame.tabSeq);"),
+        "a stream frame ends only this tab's own event's values"
+    );
+    assert!(
+        source.matches("__ipeRetireOwnFrame(frame);").count() == 2,
+        "both stream render frames, `patch` and `patches`, end this tab's own event's values"
+    );
+    let dirty = body_of(&source, "__ipeIsDirty");
+    assert!(
+        dirty.contains("if (e && e.pendingSeq > 0) return true;"),
+        "a field is the user's while its value is pending"
+    );
+}
+
+/// The live value mirrors the field after every server write, and the entry
+/// of a field the page no longer holds is dropped (CI job `test`).
+#[test]
+fn the_input_table_follows_the_live_document() {
+    let source = code();
+    let swap = body_of(&source, "__ipeSwapPreservingFocus");
+    assert!(
+        swap.contains("__ipeResyncInputs();"),
+        "a swap re-reads every entry's field and drops the gone ones"
+    );
+    let resync = body_of(&source, "__ipeResyncInputs");
+    assert!(
+        resync.contains("if (!__ipeIsField(el)) { delete __ipeInputs[ids[i]]; continue; }")
+            && resync.contains("__ipeInputs[ids[i]].liveValue = String(__ipeFieldValue(el));"),
+        "the resync drops a gone field's entry and re-reads a live one"
+    );
+    assert!(
+        source.contains("if (wroteAuthority) __ipeResyncField(el);"),
+        "an attribute patch that writes a field's value re-reads it"
+    );
+    let placeholder = body_of(&source, "__ipePlaceholderUncontrolled");
+    assert!(
+        placeholder.contains("if (placeholder.hasAttribute(__IPE_CONTROLLED_ATTR)) return false;"),
+        "a field the view marks as its own is never kept as the user's"
+    );
+}

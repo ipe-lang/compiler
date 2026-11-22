@@ -9,12 +9,15 @@
 //! so a field's typed value, selection and input-method composition survive.
 //!
 //! A form field (an `input`, `textarea` or `select`) is kept only while it
-//! holds focus or its new markup leaves it uncontrolled: no authority
-//! attribute, no `textarea` text, no `option[selected]`. A controlled field
-//! that does not hold focus is rebuilt from the new markup, so the program's
-//! value wins. A kept field keeps its authority attributes and its `textarea`
-//! text, which the user owns. `client.js` runs the same field rule when it
-//! splices live fields into its swap; a test pins its tables to these.
+//! holds focus or its new markup leaves it uncontrolled: no [`CONTROLLED_ATTR`]
+//! marker, no authority attribute, no `textarea` text, no `option[selected]`.
+//! The render sink writes the marker on every field whose view names an
+//! authority attribute, true or false, so a view-owned field whose value is
+//! off or empty still reads as controlled. A controlled field that does not
+//! hold focus is rebuilt from the new markup, so the program's value wins. A
+//! kept field keeps its authority attributes and its `textarea` text, which
+//! the user owns. `client.js` runs the same field rule when it splices live
+//! fields into its swap; `tests/field_keep_parity.rs` pins its tables to these.
 
 /// A form field whose value the user edits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +64,13 @@ pub const FIELD_TAGS: [&str; 3] = [
 /// The attributes that carry a field's value, which a kept field keeps.
 pub const AUTHORITY_ATTRS: [&str; 3] = ["value", "checked", "selected"];
 
+/// The reserved marker the render sink writes on a field whose view owns its
+/// value.
+///
+/// It is written whenever the view names an authority attribute, whatever that
+/// attribute's value: an unticked box carries the marker and no `checked`.
+pub const CONTROLLED_ATTR: &str = "ipe-controlled";
+
 /// The elements a swap always rebuilds: a frame keeps the sandbox its document
 /// loaded under whatever its attribute now says, and a template's children
 /// live in its inert content, out of the walk.
@@ -74,23 +84,41 @@ pub fn is_authority_attr(name: &str) -> bool {
         .any(|attr| attr.eq_ignore_ascii_case(name))
 }
 
+/// Whether a field's new markup carries [`CONTROLLED_ATTR`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// The markup carries the marker: the view owns the value.
+    Present,
+    /// The markup carries no marker.
+    Absent,
+}
+
 /// What the new markup says about a field's value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Control {
-    /// The markup sets the value: an authority attribute, `textarea` text, or
-    /// an `option[selected]` below a `select`.
+    /// The markup sets the value: the [`CONTROLLED_ATTR`] marker, an authority
+    /// attribute, `textarea` text, or an `option[selected]` below a `select`.
     Controlled,
     /// The markup sets none, so the user's state is the value.
     Uncontrolled,
 }
 
 impl Control {
-    /// The control of a `field` whose new markup holds an authority attribute
-    /// when `authority`, non-empty text when `text`, and an `option[selected]`
-    /// when `selected_option`.
+    /// The control of a `field` whose new markup carries `marker`.
+    ///
+    /// The markup also holds an authority attribute when `authority`,
+    /// non-empty text when `text`, and an `option[selected]` when
+    /// `selected_option`.
     #[must_use]
-    pub const fn of(field: Field, authority: bool, text: bool, selected_option: bool) -> Self {
-        let controlled = authority
+    pub const fn of(
+        field: Field,
+        marker: Marker,
+        authority: bool,
+        text: bool,
+        selected_option: bool,
+    ) -> Self {
+        let controlled = matches!(marker, Marker::Present)
+            || authority
             || match field {
                 Field::Input => false,
                 Field::Textarea => text,
@@ -137,9 +165,7 @@ pub fn keep(tag: &str, focused: bool, control: impl FnOnce(Field) -> Control) ->
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-    use super::{AUTHORITY_ATTRS, Control, FIELD_TAGS, Field, Keep, is_authority_attr, keep};
-
-    const CLIENT_JS: &str = include_str!("../web/client.js");
+    use super::{Control, FIELD_TAGS, Field, Keep, Marker, is_authority_attr, keep};
 
     #[test]
     fn a_plain_element_is_kept() {
@@ -179,12 +205,47 @@ mod tests {
 
     #[test]
     fn control_reads_each_fields_own_markup() {
-        let of = Control::of;
+        let of = |field, authority, text, selected| {
+            Control::of(field, Marker::Absent, authority, text, selected)
+        };
         assert_eq!(of(Field::Input, true, false, false), Control::Controlled);
         assert_eq!(of(Field::Input, false, true, true), Control::Uncontrolled);
         assert_eq!(of(Field::Textarea, false, true, false), Control::Controlled);
         assert_eq!(of(Field::Select, false, false, true), Control::Controlled);
         assert_eq!(of(Field::Select, false, true, false), Control::Uncontrolled);
+    }
+
+    /// A marked field whose view value is off or empty is still the view's.
+    #[test]
+    fn the_marker_alone_makes_a_field_controlled() {
+        for field in Field::ALL {
+            assert_eq!(
+                Control::of(field, Marker::Present, false, false, false),
+                Control::Controlled
+            );
+            assert_eq!(
+                Control::of(field, Marker::Absent, false, false, false),
+                Control::Uncontrolled
+            );
+        }
+    }
+
+    #[test]
+    fn an_unfocused_marked_field_is_rebuilt() {
+        for tag in FIELD_TAGS {
+            let kept = keep(tag, false, |field| {
+                Control::of(field, Marker::Present, false, false, false)
+            });
+            assert_eq!(kept, Keep::Rebuild);
+        }
+    }
+
+    #[test]
+    fn a_focused_marked_field_is_kept() {
+        let kept = keep("input", true, |field| {
+            Control::of(field, Marker::Present, false, false, false)
+        });
+        assert_eq!(kept, Keep::Field(Field::Input));
     }
 
     #[test]
@@ -199,45 +260,5 @@ mod tests {
     fn authority_names_fold_ascii_case() {
         assert!(is_authority_attr("VALUE"));
         assert!(!is_authority_attr("name"));
-    }
-
-    /// `client.js` splices the same fields and keeps the same authority
-    /// attributes when it keeps a live field across its swap.
-    #[test]
-    fn client_field_tables_match_the_keep_rule() {
-        let selector = FIELD_TAGS.join(", ");
-        assert!(
-            CLIENT_JS.contains(&format!("__ipeNode.queryAll(container, \"{selector}\")")),
-            "client.js splices the fields of FIELD_TAGS"
-        );
-        let authority = AUTHORITY_ATTRS
-            .iter()
-            .map(|name| format!("n === \"{name}\""))
-            .collect::<Vec<_>>()
-            .join(" || ");
-        assert!(
-            CLIENT_JS.contains(&format!("return {authority};")),
-            "client.js keeps the attributes of AUTHORITY_ATTRS"
-        );
-        for name in AUTHORITY_ATTRS {
-            assert!(
-                CLIENT_JS.contains(&format!(
-                    "if (placeholder.hasAttribute(\"{name}\")) return false;"
-                )),
-                "client.js reads `{name}` as control"
-            );
-        }
-        assert!(
-            CLIENT_JS.contains(
-                "if (tag === \"TEXTAREA\") {\n    return (placeholder.textContent || \"\").length === 0;"
-            ),
-            "client.js reads a textarea's text as control"
-        );
-        assert!(
-            CLIENT_JS.contains(
-                "return placeholder.querySelectorAll(\"option[selected]\").length === 0;"
-            ),
-            "client.js reads a select's selected option as control"
-        );
     }
 }
