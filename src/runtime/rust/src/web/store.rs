@@ -2370,20 +2370,24 @@ pub enum StoreConfigError {
     },
 }
 
+/// The variable a [`StoreConfigError`] names in its fix.
+const STORE_VAR: &str = "IPE_WEB_STORE";
+
 impl crate::system::ScrubbedDisplay for StoreConfigError {
     fn render(&self, out: &mut crate::system::Render) -> std::fmt::Result {
         use std::fmt::Write as _;
         match self {
             Self::FeatureAbsent { backend, feature } => write!(
                 out,
-                "IPE_WEB_STORE={backend} requested but this build has no `{feature}` feature; \
-                 build with `{feature}` or set IPE_WEB_STORE=file|memory"
+                "{STORE_VAR}={backend} requested but this build has no `{feature}` feature; \
+                 build with `{feature}` or set {STORE_VAR}=file|memory"
             ),
             Self::Refused { backend, cause } => {
-                write!(out, "IPE_WEB_STORE={backend} refused at connect (")?;
+                write!(out, "{STORE_VAR}={backend} refused at connect (")?;
                 cause.render(out)?;
-                out.write_str(
-                    "); fix the connection URL or the server, or set IPE_WEB_STORE=file|memory",
+                write!(
+                    out,
+                    "); fix the connection URL or the server, or set {STORE_VAR}=file|memory"
                 )
             }
         }
