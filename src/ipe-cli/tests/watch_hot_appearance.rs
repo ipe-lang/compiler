@@ -2382,3 +2382,208 @@ fn a_fresh_tui_project_builds_under_the_hot_watch() -> Result<(), BoxError> {
     let _ = std::fs::remove_dir_all(ipe_dir.parent().unwrap_or(&ipe_dir));
     Ok(())
 }
+
+/// The most bytes the pty transcript reader keeps.
+#[cfg(target_os = "linux")]
+const PTY_TRANSCRIPT_CEILING: usize = 16 * 1024 * 1024;
+
+/// The longest the pty transcript reader runs.
+#[cfg(target_os = "linux")]
+const PTY_READ_WALL: Duration = Duration::from_mins(10);
+
+/// `bytes` as text with every terminal escape removed: CSI and OSC sequences
+/// and two-byte escapes, so a frame's painted text reads contiguously.
+#[cfg(target_os = "linux")]
+fn strip_terminal_escapes(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        let _ = chars.next();
+                        break;
+                    }
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    out
+}
+
+/// The pty transcript so far.
+#[cfg(target_os = "linux")]
+fn transcript_of(buf: &Mutex<Vec<u8>>) -> Vec<u8> {
+    buf.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+/// The byte offset of the last `needle` in `hay`.
+#[cfg(target_os = "linux")]
+fn last_index_of(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w == needle)
+}
+
+/// `ipe dev watch` over a fresh `ipe init --shape tui` project on a real
+/// pseudo-terminal: the app stays up past its readiness probe, reads the keys
+/// typed at the terminal, and a SIGTERM to the watch leaves the terminal in
+/// the main screen and cooked mode.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::expect_used, clippy::panic)] // a pty or scaffold the host cannot provide is a harness setup failure
+fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError> {
+    use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+    use rustix::termios::{LocalModes, Winsize, tcgetattr, tcsetwinsize};
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        eprintln!("skipping (set IPE_E2E=1 to run)");
+        return Ok(());
+    }
+    let (ipe_dir, out_dir) = fresh_dirs("tui_pty")?;
+    let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
+    let init = std::process::Command::new(&ipe_bin)
+        .args(["init", "--shape", "tui"])
+        .arg(&ipe_dir)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run ipe init");
+    assert!(
+        init.status.success(),
+        "ipe init --shape tui succeeds; stderr: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+
+    let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("open a pty master");
+    grantpt(&master).expect("grant the pty");
+    unlockpt(&master).expect("unlock the pty");
+    let slave_name = ptsname(&master, Vec::new()).expect("name the pty slave");
+    let slave = rustix::fs::open(
+        slave_name.as_c_str(),
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("open the pty slave");
+    tcsetwinsize(
+        &slave,
+        Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        },
+    )
+    .expect("size the pty");
+    let stdio = || -> std::process::Stdio {
+        std::process::Stdio::from(slave.try_clone().expect("share the pty slave"))
+    };
+
+    let mut cmd = std::process::Command::new(&ipe_bin);
+    if let Some(dir) = e2e_support::child_shared_target_from_env() {
+        e2e_support::target::set_target_dir_env(&mut cmd, Path::new(&dir));
+    }
+    let runtime_dir = e2e_support::require_runtime().into_path_buf();
+    cmd.args(["dev", "watch"])
+        .arg(&ipe_dir)
+        .arg("--out")
+        .arg(&out_dir)
+        .arg("--runtime")
+        .arg(&runtime_dir)
+        .arg("--port")
+        .arg("19199")
+        .env("TERM", "xterm-256color")
+        .env("NO_COLOR", "1")
+        .stdin(stdio())
+        .stdout(stdio())
+        .stderr(stdio());
+    let mut watch = cmd
+        .spawn()
+        .map_err(|e| -> BoxError { format!("ipe dev watch must spawn: {e}").into() })?;
+
+    let mut reader = std::fs::File::from(master.try_clone().expect("share the pty master"));
+    let mut keys = std::fs::File::from(master);
+    let transcript = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = Arc::clone(&transcript);
+    let read_started = Instant::now();
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        while read_started.elapsed() < PTY_READ_WALL {
+            let Ok(n) = reader.read(&mut chunk) else {
+                break;
+            };
+            let Some(read) = chunk.get(..n).filter(|r| !r.is_empty()) else {
+                break;
+            };
+            let mut held = sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if held.len().saturating_add(read.len()) > PTY_TRANSCRIPT_CEILING {
+                break;
+            }
+            held.extend_from_slice(read);
+        }
+    });
+    let shows = |needle: &str| strip_terminal_escapes(&transcript_of(&transcript)).contains(needle);
+
+    let started = wait_for(Duration::from_mins(8), || shows("count = 0"));
+    // The app must still be up past its readiness probe before the key goes in.
+    std::thread::sleep(Duration::from_secs(2));
+    let refused_early = shows("failed its readiness probe");
+    let counted = started && {
+        keys.write_all(b"\x1b[A").expect("type the up arrow");
+        wait_for(Duration::from_secs(30), || shows("count = 1"))
+    };
+
+    let pid = rustix::process::Pid::from_child(&watch);
+    let _ = rustix::process::kill_process(pid, rustix::process::Signal::TERM);
+    let exited = wait_for(Duration::from_secs(60), || {
+        matches!(watch.try_wait(), Ok(Some(_)))
+    });
+    if !exited {
+        let _ = watch.kill();
+        let _ = watch.wait();
+    }
+    // The restore bytes reach the transcript once the reader drains them.
+    std::thread::sleep(Duration::from_millis(500));
+    let modes = tcgetattr(&slave).expect("read the pty modes").local_modes;
+    let bytes = transcript_of(&transcript);
+    let text = strip_terminal_escapes(&bytes);
+    let _ = std::fs::remove_dir_all(ipe_dir.parent().unwrap_or(&ipe_dir));
+
+    assert!(started, "the tui app never painted `count = 0`:\n{text}");
+    assert!(
+        !refused_early && !text.contains("failed its readiness probe"),
+        "the tui app must pass its readiness probe:\n{text}"
+    );
+    assert!(counted, "the up arrow never reached the app:\n{text}");
+    assert!(exited, "the watch must end on SIGTERM:\n{text}");
+    let entered = last_index_of(&bytes, b"\x1b[?1049h");
+    let left = last_index_of(&bytes, b"\x1b[?1049l");
+    assert!(
+        matches!((entered, left), (Some(on), Some(off)) if off > on),
+        "the alternate screen must be left after it was last entered \
+         (entered {entered:?}, left {left:?})"
+    );
+    assert!(
+        modes.contains(LocalModes::ICANON | LocalModes::ECHO),
+        "the terminal must be back in cooked mode with echo, got {modes:?}"
+    );
+    Ok(())
+}
