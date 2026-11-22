@@ -131,6 +131,7 @@ use crate::doc_index::{DocIndex, Resolved as MemberHit, Row};
 use crate::doc_pick::Pick;
 use crate::doc_search::{Closeness, DocMiss, DocQuery, MAX_QUERY_CHARS, QueryRefusal, Ranked};
 use crate::doc_signature::WrittenSignatures;
+use crate::doc_term::{ServedName, SyntaxToken, TermShape, is_module_name};
 use crate::progress::{Indicator, Mode};
 use crate::project_root::{ProjectRoot, RootArg};
 use crate::text;
@@ -418,7 +419,9 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
             // Any other positional is a term, routed on its trimmed text; a
             // project path is left unconsumed for `parse_doc_flags`. The `-`
             // operator is a term too, never a flag.
-            Some(first) if !first.starts_with('-') || is_operator_term(first.trim()) => {
+            Some(first)
+                if !first.starts_with('-') || TermShape::of(first.trim(), false).is_symbolic() =>
+            {
                 let generate_flags = rest.iter().any(|a| a == "--out" || a == "--write-format");
                 let sub = route_term(first, generate_flags)?;
                 if !matches!(sub, Sub::Generate) {
@@ -458,57 +461,36 @@ fn parse_doc_with(rest: &[String], notice: &mut dyn FnMut(&str)) -> Result<DocMo
     })
 }
 
-/// The subcommand a positional term names, routed on its trimmed text.
+/// The subcommand a positional term names, routed by its [`TermShape`].
 ///
-/// A lookup or module term is parsed here, once, so edge whitespace can never
-/// route a term one way and look it up another. `generate_flags` is whether
-/// `--out` or `--write-format` appears, which marks the positional a project
-/// path. A [`Sub::Generate`] leaves the raw positional for the flag scan.
+/// The shape is decided by the trimmed spelling alone, never by what exists
+/// on disk, so one term routes one way in every directory. A lookup or module
+/// term is parsed here, once, so edge whitespace can never route a term one
+/// way and look it up another. `generate_flags` is whether `--out` or
+/// `--write-format` appears. A [`Sub::Generate`] leaves the raw positional for
+/// the flag scan.
 ///
 /// # Errors
 /// [`CliError::Usage`] naming the [`QueryRefusal`] of a lookup or module term.
 fn route_term(raw: &str, generate_flags: bool) -> Result<Sub, CliError> {
-    let term = raw.trim();
-    // A binary operator's text (`//`, `|>`) names its documentation, checked
-    // before any host-path test so its `/` or `|` never reads as a path; a
-    // path spelled like an operator is written `./`-prefixed.
-    if is_operator_term(term) {
-        return parsed_term(raw).map(Sub::Lookup);
+    match TermShape::of(raw.trim(), generate_flags) {
+        TermShape::Operator | TermShape::Qualified | TermShape::Member | TermShape::Word => {
+            parsed_term(raw).map(Sub::Lookup)
+        }
+        TermShape::Token(token) => token_term(token).map(Sub::Lookup),
+        TermShape::Module => DocQuery::parse(raw).map(Sub::Query).map_err(query_refused),
+        TermShape::Path => Ok(Sub::Generate),
     }
-    let uppercase = term.chars().next().is_some_and(|c| c.is_ascii_uppercase());
-    // A `kind:key` term whose prefix is a known kind is a bundle lookup,
-    // whatever its key holds (an operator symbol may carry `/`).
-    if is_qualified(term) && !generate_flags {
-        return parsed_term(raw).map(Sub::Lookup);
-    }
-    // A diagnostic code (`IPE-X0000`) or a symbol key (`List.map`) routes to
-    // the content index: both start uppercase, a code contains a `-`, and a
-    // symbol key a `.` followed by a lowercase letter.
-    if uppercase && (term.contains('-') || is_symbol_key(term)) {
-        return parsed_term(raw).map(Sub::Lookup);
-    }
-    // A module path is a module API query only when every dot-separated
-    // segment satisfies the module-name grammar. A host path never does: `/`,
-    // `\` and `:` are not grammar characters, so a Windows drive path
-    // (`D:\pkg`) or a separator path is never read as a module.
-    if is_module_name(term) {
-        return DocQuery::parse(raw).map(Sub::Query).map_err(query_refused);
-    }
-    // An uppercase-led term that fails the module grammar is a host path. A
-    // lowercase word is a lookup key unless it carries host-path syntax (`/`,
-    // `\`, `:`) or a generate-only flag marks it a project path.
-    if uppercase || has_host_path_syntax(term) || generate_flags {
-        return Ok(Sub::Generate);
-    }
-    parsed_term(raw).map(Sub::Lookup)
 }
 
-/// Whether `term` is the source text of a binary operator.
+/// The lookup a syntax token opens: its construct's page.
 ///
-/// The operator set is the parser's closed [`ipe_syntax::BinOp`], so a term
-/// routes as an operator exactly when the parser reads it as one.
-const fn is_operator_term(term: &str) -> bool {
-    ipe_syntax::BinOp::from_text(term).is_some()
+/// # Errors
+/// [`CliError::Usage`] naming the [`QueryRefusal`]; unreachable for a table
+/// row, whose stem is a plain construct name.
+fn token_term(token: SyntaxToken) -> Result<LookupTerm, CliError> {
+    let kind = DocKind::Construct.prefix();
+    parsed_term(&format!("{kind}:{}", token.construct))
 }
 
 /// A lookup term parsed into its [`LookupTerm`], the key part of a `kind:key`
@@ -624,8 +606,8 @@ fn parse_doc_flags(
                 return Err(CliError::Usage(text::msg::unknown_flag(&"doc", &flag)));
             }
             positional => {
-                if matches!(sub, Sub::Query(_) | Sub::Lookup(_)) {
-                    return Err(CliError::Usage(text::msg::doc_single_key()));
+                if let Some(term) = sub_term(sub) {
+                    return Err(extra_word_refusal(term, positional, it));
                 }
                 if flags.path.is_some() {
                     return Err(CliError::Usage(text::msg::doc_single_path()));
@@ -635,6 +617,46 @@ fn parse_doc_flags(
         }
     }
     Ok(())
+}
+
+/// The term a lookup or module query was given; `None` for any other
+/// subcommand.
+const fn sub_term(sub: &Sub) -> Option<&DocQuery> {
+    match sub {
+        Sub::Query(term)
+        | Sub::Lookup(LookupTerm::Bare(term) | LookupTerm::Qualified { term, .. }) => Some(term),
+        Sub::Generate | Sub::Serve | Sub::Check | Sub::List | Sub::CheckExamples => None,
+    }
+}
+
+/// The refusal of a positional `word` after the query `term`.
+///
+/// The words up to the first flag are the query the user meant: they are
+/// refused with the fix, the whole query quoted. A path-shaped word keeps the
+/// single-key refusal, since quoting would not make it part of the query. The
+/// joined query is parsed before it is echoed, so a hazardous word is refused,
+/// never printed.
+fn extra_word_refusal<'a>(
+    term: &DocQuery,
+    word: &str,
+    rest: impl Iterator<Item = &'a String>,
+) -> CliError {
+    let mut words = vec![term.text(), word];
+    words.extend(
+        rest.take_while(|next| !next.starts_with('-'))
+            .map(String::as_str),
+    );
+    let names_a_path = words
+        .iter()
+        .skip(1)
+        .any(|next| matches!(TermShape::of(next.trim(), false), TermShape::Path));
+    if names_a_path {
+        return CliError::Usage(text::msg::doc_single_key());
+    }
+    match DocQuery::parse(&words.join(" ")) {
+        Ok(query) => CliError::Usage(text::msg::doc_quote_query(&query.text())),
+        Err(refusal) => query_refused(refusal),
+    }
 }
 
 /// The subcommand's name for an error message.
@@ -679,45 +701,6 @@ fn parse_port(value: &str) -> Result<u16, CliError> {
 // `include_dir!` static that feeds `DocBundle::build`. A new
 // `docs/constructs/<name>.md` file is automatically available everywhere; no
 // hand-maintained table is required.
-
-/// Return `true` when `s` looks like a member key: it contains a `.` and its last segment starts
-/// lowercase — a value of a module, e.g.
-///
-/// `List.map`, `Ipe.List.map`, `Ipe.Time.unixMillis`. This distinguishes a member lookup from a
-/// plain module name (`Ipe.List`, `List`), which is routed to the API query instead.
-fn is_symbol_key(s: &str) -> bool {
-    s.rsplit_once('.')
-        .and_then(|(_, member)| member.chars().next())
-        .is_some_and(|c| c.is_ascii_lowercase())
-}
-
-/// Return `true` when every dot-separated segment of `s` is a valid module
-/// name segment: an ASCII-uppercase first letter, then only ASCII
-/// alphanumerics or `_`.
-///
-/// No separator (`/`, `\`), drive colon (`:`) or other punctuation is a
-/// grammar character, so a host path can never satisfy this grammar on any
-/// platform — the parse stays pure and host-independent.
-fn is_module_name(s: &str) -> bool {
-    !s.is_empty()
-        && s.split('.').all(|segment| {
-            let mut chars = segment.chars();
-            chars.next().is_some_and(|c| c.is_ascii_uppercase())
-                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
-}
-
-/// Return `true` when `s` carries a host-path syntax character — a separator
-/// (`/`, `\`) or a drive colon (`:`).
-///
-/// None of these is a grammar character in a module name or a content-index
-/// key, on any platform; a positional that contains one is always a host
-/// path, whatever its case. Checked independently of [`is_module_name`] so
-/// the exclusion also covers the lowercase content-index arm, which has no
-/// case restriction to lean on.
-fn has_host_path_syntax(s: &str) -> bool {
-    s.contains(['/', '\\', ':'])
-}
 
 /// Build the `ipe_docs` index, wiring in the CLI command registry.
 ///
@@ -1183,15 +1166,7 @@ fn rerun_term(entry: &DocEntry, stdlib_modules: &[String]) -> String {
                     StdlibCandidate::One(only) if only == entry.key
                 )
         }
-        DocKind::Symbol => {
-            entry
-                .key
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase())
-                && is_symbol_key(&entry.key)
-                && !has_host_path_syntax(&entry.key)
-        }
+        DocKind::Symbol => matches!(TermShape::of(&entry.key, false), TermShape::Member),
         DocKind::Diagnostic
         | DocKind::Construct
         | DocKind::Idiom
@@ -6619,40 +6594,33 @@ impl crate::loopback_http::Site for DocSite<'_> {
     }
 
     /// The built file `path` names (`/` is `index.html`), whatever the method,
-    /// or a `404` when it names no built file.
+    /// or a `404` when it is no [`ServedName`] or names no built file.
+    ///
+    /// A refused name and an absent one get the same reply, byte for byte.
     fn respond(
         &self,
         _method: crate::loopback_http::Method,
         path: &str,
     ) -> crate::loopback_http::Reply<'_> {
         use crate::loopback_http::{Reply, Status};
-        let name = serve_file_name(path);
-        self.pages.get(&name).map_or(
-            Reply {
-                status: Status::NotFound,
-                content_type: "text/plain; charset=utf-8",
-                body: b"not found\n",
-            },
-            |body| Reply {
-                status: Status::Ok,
-                content_type: content_type(&name),
-                body: body.as_bytes(),
-            },
-        )
-    }
-}
-
-/// Map a request path to a built-file key: `/` (or empty) → `index.html`,
-/// otherwise the leading `/` is stripped and any `?query`/`#frag` dropped. The
-/// result is a bare filename — a `..` or nested path simply misses the flat site
-/// map and 404s, so no traversal can escape it.
-fn serve_file_name(path: &str) -> String {
-    let path = path.split(['?', '#']).next().unwrap_or(path);
-    let trimmed = path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        "index.html".to_owned()
-    } else {
-        trimmed.to_owned()
+        ServedName::parse(path)
+            .and_then(|name| {
+                self.pages
+                    .get(name.as_str())
+                    .map(|body| (content_type(name.as_str()), body))
+            })
+            .map_or(
+                Reply {
+                    status: Status::NotFound,
+                    content_type: "text/plain; charset=utf-8",
+                    body: b"not found\n",
+                },
+                |(content_type, body)| Reply {
+                    status: Status::Ok,
+                    content_type,
+                    body: body.as_bytes(),
+                },
+            )
     }
 }
 
@@ -7805,6 +7773,7 @@ mod tests {
     /// A member key routes to the lookup, whatever the case of the module path.
     #[test]
     fn a_member_key_is_a_symbol_key() {
+        use crate::doc_term::is_symbol_key;
         assert!(is_symbol_key("Ipe.Time.unixMillis"));
         assert!(is_symbol_key("List.map"));
         assert!(!is_symbol_key("Ipe.List"));
@@ -8055,11 +8024,11 @@ mod tests {
 
     #[test]
     fn host_path_syntax_detection_covers_separators_and_drive_colon() {
-        assert!(has_host_path_syntax("src/x"));
-        assert!(has_host_path_syntax("d:\\pkg"));
-        assert!(has_host_path_syntax("D:\\pkg"));
-        assert!(!has_host_path_syntax("list"));
-        assert!(!has_host_path_syntax("Ipe.List"));
+        for path in ["src/x", "d:\\pkg", "D:\\pkg", "D:\\my-pkg"] {
+            assert_eq!(TermShape::of(path, false), TermShape::Path, "{path:?}");
+        }
+        assert_ne!(TermShape::of("list", false), TermShape::Path);
+        assert_ne!(TermShape::of("Ipe.List", false), TermShape::Path);
     }
 
     #[test]
@@ -9185,14 +9154,49 @@ serve app
         );
     }
 
+    /// Every file of the served site is reachable: its key is a served name
+    /// that parses back to itself.
     #[test]
-    fn serve_file_name_maps_root_and_strips_query() {
-        assert_eq!(serve_file_name("/"), "index.html");
-        assert_eq!(serve_file_name(""), "index.html");
-        assert_eq!(serve_file_name("/M.html"), "M.html");
-        assert_eq!(serve_file_name("/style.css?v=1"), "style.css");
-        // A traversal attempt is just a filename that misses the flat map.
-        assert_eq!(serve_file_name("/../etc/passwd"), "../etc/passwd");
+    fn every_site_file_is_a_served_name() {
+        let docs = build_stdlib_only_docs().expect("the stdlib docs build");
+        let bundle = build_doc_bundle(&repo_overlay()).expect("bundle builds");
+        for key in render_site_for_serve(&docs, &bundle).keys() {
+            let request = format!("/{key}");
+            assert_eq!(
+                ServedName::parse(&request).as_ref().map(ServedName::as_str),
+                Some(key.as_str()),
+                "{key:?} is not reachable through the serve loop"
+            );
+        }
+    }
+
+    #[test]
+    fn served_name_refusal_answers_like_an_absent_name() {
+        let mut pages = BTreeMap::new();
+        pages.insert("index.html".to_owned(), "home".to_owned());
+        pages.insert("x".to_owned(), "x".to_owned());
+        pages.insert("a/b".to_owned(), "ab".to_owned());
+        let site = doc_site(&pages);
+        let reply = |path: &str| {
+            let r =
+                crate::loopback_http::Site::respond(&site, crate::loopback_http::Method::Get, path);
+            (r.status, r.content_type, r.body.to_vec())
+        };
+        let absent = reply("/absent.html");
+        assert_eq!(absent.0, Status::NotFound);
+        for refused in [
+            "/../x",
+            "/%2e%2e/x",
+            "/a//b",
+            "/a\\b",
+            "/\0",
+            "/a%00",
+            "//x",
+        ] {
+            assert_eq!(reply(refused), absent, "{refused:?}");
+        }
+        assert_eq!(reply("/").2, b"home".to_vec());
+        assert_eq!(reply("/a/b").2, b"ab".to_vec());
     }
 
     #[test]
@@ -10142,17 +10146,6 @@ serve app
             script.contains("<script>"),
             "search script contains <script> tag"
         );
-    }
-
-    #[test]
-    fn serve_file_name_handles_subdirectory_paths() {
-        // Paths like /module/index.html must map correctly.
-        assert_eq!(serve_file_name("/module/index.html"), "module/index.html");
-        assert_eq!(
-            serve_file_name("/diagnostic/index.html"),
-            "diagnostic/index.html"
-        );
-        assert_eq!(serve_file_name("/cli/index.html"), "cli/index.html");
     }
 
     /// Extract every relative `href="…"` from an HTML page, dropping absolute

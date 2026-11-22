@@ -681,6 +681,8 @@ messages! {
     doc_serve_port_needs_number = "doc-serve-port-needs-number";
     /// `ipe doc <key>` given more than one key.
     doc_single_key = "doc-single-key";
+    /// `ipe doc <key>` given a query as several unquoted words.
+    doc_quote_query(query) = "doc-quote-query";
     /// `ipe doc` given more than one path.
     doc_single_path = "doc-single-path";
     /// `ipe add`'s inspector binary is missing.

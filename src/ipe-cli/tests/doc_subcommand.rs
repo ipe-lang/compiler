@@ -771,6 +771,80 @@ fn nothing_matched_lists_nothing() -> io::Result<()> {
     Ok(())
 }
 
+/// A human miss that matched nothing still names the next step.
+#[test]
+fn a_far_miss_names_the_next_step() -> io::Result<()> {
+    let dir = fresh_dir("far_miss_next_step")?;
+    let (ok, _stdout, stderr) = run_in(&dir, &["doc", "zzqqxx"]);
+    assert!(!ok);
+    assert!(stderr.contains("`ipe doc list`"), "{stderr}");
+    Ok(())
+}
+
+/// `->` is a syntax token, not a flag: it opens the lambda construct page.
+#[test]
+fn arrow_is_a_term_not_a_flag() -> io::Result<()> {
+    let dir = fresh_dir("arrow_term")?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "->", "--plain"]);
+    assert!(ok, "`ipe doc ->` opens a page:\n{stderr}");
+    let (ok, expected, stderr) = run_in(&dir, &["doc", "construct:lambda", "--plain"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout, expected);
+    Ok(())
+}
+
+/// `\` is a syntax token, not a path: it opens the lambda construct page.
+#[test]
+fn backslash_is_a_term_not_a_path() -> io::Result<()> {
+    let dir = fresh_dir("backslash_term")?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "\\", "--plain"]);
+    assert!(ok, "`ipe doc \\` opens a page:\n{stderr}");
+    let (ok, expected, stderr) = run_in(&dir, &["doc", "construct:lambda", "--plain"]);
+    assert!(ok, "{stderr}");
+    assert_eq!(stdout, expected);
+    Ok(())
+}
+
+/// A term routes by its spelling alone: a directory of the same name in the
+/// working directory changes nothing.
+#[test]
+fn route_ignores_disk() -> io::Result<()> {
+    let empty = fresh_dir("route_disk_empty")?;
+    let shadowed = fresh_dir("route_disk_shadowed")?;
+    for term in ["case", "List", "Read"] {
+        fs::create_dir_all(shadowed.join(term))?;
+    }
+    for term in ["case", "List", "Read"] {
+        let in_empty = run_in(&empty, &["doc", term, "--plain"]);
+        let in_shadowed = run_in(&shadowed, &["doc", term, "--plain"]);
+        assert_eq!(in_empty, in_shadowed, "{term:?} routed by disk");
+    }
+    Ok(())
+}
+
+/// An unquoted multi-word query is refused with the quoted command as the fix.
+#[test]
+fn unquoted_two_words_names_the_quote_fix() -> io::Result<()> {
+    let dir = fresh_dir("unquoted_words")?;
+    let (ok, stdout, stderr) = run_in(&dir, &["doc", "read", "file"]);
+    assert!(!ok);
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.contains("`ipe doc \"read file\"`"), "{stderr}");
+    Ok(())
+}
+
+/// A path after a query keeps the single-key refusal: quoting would not make
+/// a path part of the query.
+#[test]
+fn a_path_after_a_query_is_not_quoted_into_it() -> io::Result<()> {
+    let dir = fresh_dir("path_after_query")?;
+    let (ok, _stdout, stderr) = run_in(&dir, &["doc", "List", "src/x"]);
+    assert!(!ok);
+    assert!(!stderr.contains("ipe doc \""), "{stderr}");
+    assert!(stderr.contains("single <key>"), "{stderr}");
+    Ok(())
+}
+
 /// A malformed query is refused with a typed usage error before any lookup:
 /// no stack trace, and the hazardous text is never echoed raw.
 #[test]
