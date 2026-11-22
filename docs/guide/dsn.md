@@ -29,9 +29,8 @@ Four knots.
   discloses `network` and returns a `Connection ReadOnly`, whose read-only posture
   is a *type*, not a runtime flag: a write against it is a compile error.
 - **The app database URL verifies a remote server too.** The URL the app's own
-  pool dials (`DATABASE_URL`, else the `Db.url` setting, else
-  `postgres://postgres@localhost/ipe`) is not a `Dsn`, but its transport follows
-  the same rule. With no `sslmode`, a remote server is dialled with
+  pool dials (`DATABASE_URL`, else the `Db.url` setting) is not a `Dsn`, but its
+  transport follows the same rule. With no `sslmode`, a remote server is dialled with
   `sslmode=verify-full`. `sslmode=disable`, `allow`, `prefer` and `require` are
   admitted only when every host the URL names is a loopback address,
   `localhost` or a Unix socket (with no `sslmode` there, the connection uses
