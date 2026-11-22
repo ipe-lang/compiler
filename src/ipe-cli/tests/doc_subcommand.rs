@@ -845,6 +845,41 @@ fn a_path_after_a_query_is_not_quoted_into_it() -> io::Result<()> {
     Ok(())
 }
 
+/// The quote fix is offered only when the quoted query routes as a lookup:
+/// an operator or `kind:key` beside a word makes the joined text a path, so
+/// echoing it quoted would name a different command.
+#[test]
+fn a_quote_fix_that_would_route_as_a_path_is_not_offered() -> io::Result<()> {
+    let dir = fresh_dir("quote_fix_routes_as_path")?;
+    for args in [
+        ["doc", "read", "//"],
+        ["doc", "//", "read"],
+        ["doc", "read", "construct:case"],
+    ] {
+        let (ok, stdout, stderr) = run_in(&dir, &args);
+        assert!(!ok, "{args:?}");
+        assert!(stdout.is_empty(), "{args:?}:\n{stdout}");
+        assert!(!stderr.contains("ipe doc \""), "{args:?}:\n{stderr}");
+        assert!(stderr.contains("single <key>"), "{args:?}:\n{stderr}");
+    }
+    Ok(())
+}
+
+/// A hazardous second word is refused by the query parse, never echoed in the
+/// quote fix.
+#[test]
+fn a_hazardous_extra_word_is_never_echoed() -> io::Result<()> {
+    let dir = fresh_dir("hazardous_extra_word")?;
+    for word in ["file\u{1b}[31m", "file\u{7}", "file\u{202e}"] {
+        let (ok, stdout, stderr) = run_in(&dir, &["doc", "read", word]);
+        assert!(!ok, "{word:?}");
+        assert!(stdout.is_empty(), "{word:?}:\n{stdout}");
+        assert!(!stderr.contains(word), "{word:?}:\n{stderr}");
+        assert!(!stderr.contains("ipe doc \""), "{word:?}:\n{stderr}");
+    }
+    Ok(())
+}
+
 /// A malformed query is refused with a typed usage error before any lookup:
 /// no stack trace, and the hazardous text is never echoed raw.
 #[test]

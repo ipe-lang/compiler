@@ -633,9 +633,14 @@ const fn sub_term(sub: &Sub) -> Option<&DocQuery> {
 ///
 /// The words up to the first flag are the query the user meant: they are
 /// refused with the fix, the whole query quoted. A path-shaped word keeps the
-/// single-key refusal, since quoting would not make it part of the query. The
-/// joined query is parsed before it is echoed, so a hazardous word is refused,
-/// never printed.
+/// single-key refusal, since quoting would not make it part of the query.
+///
+/// The fix is offered only when the quoted query routes, through
+/// [`route_term`] itself, to a lookup: a joined query that routes another way
+/// (an operator or `kind:key` beside a word, whose `/` or `:` makes the whole
+/// a path) keeps the single-key refusal, so the echoed command never names a
+/// route the user did not ask for. The joined query is parsed before it is
+/// echoed, so a hazardous word is refused, never printed.
 fn extra_word_refusal<'r>(
     term: &DocQuery,
     word: &str,
@@ -649,13 +654,27 @@ fn extra_word_refusal<'r>(
         .iter()
         .skip(1)
         .any(|next| matches!(TermShape::of(next.trim(), false), TermShape::Path));
-    if names_a_path {
-        return CliError::Usage(text::msg::doc_single_key());
-    }
-    match DocQuery::parse(&words.join(" ")) {
-        Ok(query) => CliError::Usage(text::msg::doc_quote_query(&query.text())),
-        Err(refusal) => query_refused(refusal),
-    }
+    let quoted = match route_term(&words.join(" "), false) {
+        Ok(Sub::Lookup(LookupTerm::Bare(query) | LookupTerm::Qualified { term: query, .. })) => {
+            Some(query)
+        }
+        Ok(
+            Sub::Query(_)
+            | Sub::Generate
+            | Sub::Serve
+            | Sub::Check
+            | Sub::List
+            | Sub::CheckExamples,
+        ) => None,
+        Err(refusal) => return refusal,
+    };
+    CliError::Usage(
+        quoted
+            .filter(|_| !names_a_path)
+            .map_or_else(text::msg::doc_single_key, |query| {
+                text::msg::doc_quote_query(&query.text())
+            }),
+    )
 }
 
 /// The subcommand's name for an error message.

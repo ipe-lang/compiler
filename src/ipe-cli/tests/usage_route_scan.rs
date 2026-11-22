@@ -82,7 +82,7 @@ const ADMITTED: &[(&str, &str, usize, &str)] = &[
     (
         "doc.rs",
         "extra_word_refusal",
-        2,
+        1,
         "an `ipe doc` query given as several unquoted words, or followed by a path",
     ),
     (
