@@ -5,6 +5,6 @@ import Ipe.Package exposing (..)
 
 package : Package
 package =
-    { name = "shared_msg_class_seal"
+    { name = "shared-msg-class-seal"
     , version = "0.1.0"
     }

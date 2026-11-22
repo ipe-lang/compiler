@@ -39,6 +39,7 @@ use crate::delivery_set::ShipEntry;
 use crate::output_dir::held::{
     BackedUp, BackupName, Created, EntryKind, HeldDir, ReadMiss, Unread, read_miss,
 };
+use crate::package_name::{NameRefusal, PackageName};
 use crate::project::BundleId;
 use crate::screen::Interactive;
 use crate::verb::Verb;
@@ -519,14 +520,15 @@ pub fn run_init(rest: &[String]) -> Result<(), CliError> {
 
     let target = args.target_arg.as_deref().unwrap_or(".");
     let target_dir = PathBuf::from(target);
-    let project_name = project_name_for(&target_dir)?;
+    let package_name = project_name_for(&target_dir)?;
+    let project_name = package_name.as_str();
 
     if args.lib {
-        let files = library_files(&project_name);
+        let files = library_files(project_name);
         return run_scaffold(
             target,
             &target_dir,
-            &project_name,
+            project_name,
             &files,
             args.force,
             ScaffoldKind::Library,
@@ -561,11 +563,11 @@ pub fn run_init(rest: &[String]) -> Result<(), CliError> {
     // conflict — is refused, never silently reshaped (spec § 8).
     guard_rerun_conflict(&target_dir, shape, args.shape, args.runtime)?;
 
-    let files = managed_files(&project_name, shape, runtime);
+    let files = managed_files(project_name, shape, runtime);
     run_scaffold(
         target,
         &target_dir,
-        &project_name,
+        project_name,
         &files,
         args.force,
         ScaffoldKind::App { shape, runtime },
@@ -1183,8 +1185,78 @@ fn placed_report(placed: &[(&ManagedFile, Placed)], announce_created: bool) -> S
     body
 }
 
-/// Derive the project name from the last path component of the resolved target.
-fn project_name_for(target_dir: &Path) -> Result<String, CliError> {
+/// Derive the package name from the last path component of the resolved target.
+///
+/// A directory name outside the package-name grammar is derived into it
+/// ([`derive_package_name`]) and the derived name is printed.
+///
+/// # Errors
+/// [`CliError::Usage`] when the target has no last component;
+/// [`CliError::ProjectRefused`] when no package name can be derived from it.
+fn project_name_for(target_dir: &Path) -> Result<PackageName, CliError> {
+    let dir = target_dir_name(target_dir)?;
+    let name = derive_package_name(&dir).map_err(|why| {
+        let reason = why.package_reason();
+        CliError::ProjectRefused(shown_dir_name(&dir).map_or_else(
+            || text::msg::init_no_derivable_name_unshown(&reason),
+            |shown| text::msg::init_no_derivable_name(&shown, &reason),
+        ))
+    })?;
+    if name != dir.as_str() {
+        crate::screen::chatter(
+            crate::screen::Stream::Stdout,
+            crate::screen::Tone::Aux,
+            &derived_name_notice(&dir, &name),
+        );
+    }
+    Ok(name)
+}
+
+/// The line `init` prints when it names the package `name`, derived from the
+/// directory name `dir`.
+fn derived_name_notice(dir: &str, name: &PackageName) -> text::Message {
+    shown_dir_name(dir).map_or_else(
+        || text::msg::init_derived_name_unshown(name),
+        |shown| text::msg::init_derived_name(&shown, name),
+    )
+}
+
+/// A directory name as one inert token: control characters and line breaks
+/// escaped as in [`str::escape_debug`], a backtick escaped so the name cannot
+/// close the code span it is shown in, and the result terminal-sanitised.
+///
+/// `None` for a name longer than [`NameRefusal::MAX_LEN`] bytes: like an
+/// over-long manifest name value, it is not echoed.
+fn shown_dir_name(dir: &str) -> Option<style::TerminalSafe> {
+    (dir.len() <= NameRefusal::MAX_LEN)
+        .then(|| style::TerminalSafe::sanitize(&dir.escape_debug().to_string().replace('`', "\\`")))
+}
+
+/// The package name derived from directory name `dir`.
+///
+/// ASCII letters are lowercased; every run of `_`, `.`, `-` and whitespace
+/// becomes one `-`; a leading or trailing `-` is dropped. The result is then
+/// judged by the package-name grammar, so a name still outside it (another
+/// character, nothing left, too long) is refused, never altered further.
+fn derive_package_name(dir: &str) -> Result<PackageName, NameRefusal> {
+    let mut derived = String::with_capacity(dir.len());
+    let mut pending_dash = false;
+    for c in dir.chars() {
+        if c == '_' || c == '.' || c == '-' || c.is_whitespace() {
+            pending_dash = true;
+            continue;
+        }
+        if pending_dash && !derived.is_empty() {
+            derived.push('-');
+        }
+        pending_dash = false;
+        derived.push(c.to_ascii_lowercase());
+    }
+    PackageName::judged(&derived)
+}
+
+/// The last path component of the resolved target, as text.
+fn target_dir_name(target_dir: &Path) -> Result<String, CliError> {
     let absolute = if target_dir.is_absolute() {
         target_dir.to_path_buf()
     } else {
@@ -2293,67 +2365,148 @@ mod tests {
         );
     }
 
-    #[test]
-    fn scaffolded_manifest_survives_a_hostile_project_name() {
-        // A directory named with a quote, backslash, and newline would break out
-        // of the quoted `.ipe` literal without escaping. The scaffolded manifest
-        // must still re-parse, and the name must round-trip exactly.
-        let hostile = "evil\"\\\n }, injected = True { ";
-        let files = managed_files(hostile, InitShape::Web, Runtime::Served);
+    /// Write the `package.ipe` `init` scaffolds for `name` under a fresh root
+    /// named by `tag`, and read it back.
+    fn scaffold_and_read(
+        tag: &str,
+        name: &str,
+    ) -> Result<crate::project::ProjectManifest, CliError> {
+        let files = managed_files(name, InitShape::Web, Runtime::Served);
         let manifest = files
             .iter()
             .find(|f| f.rel() == Path::new("package.ipe"))
             .expect("init writes a package.ipe");
-
-        let root = ipe_test_temp::temp_root().join("ipe_init_hostile_name_roundtrip");
+        let root = ipe_test_temp::temp_root().join(tag);
         let _ = std::fs::remove_dir_all(&root);
         write_stub_src(&root);
         let path = root.join("package.ipe");
         std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
-
-        let parsed = crate::project::parse_manifest(&path)
-            .expect("scaffolded manifest with a hostile name re-parses");
-        assert_eq!(
-            parsed.name, hostile,
-            "the hostile name round-trips through the escaped literal unchanged"
-        );
-        assert_eq!(
-            parsed.delivery.mobile.bundle_id,
-            Some(BundleId::derived(hostile)),
-            "the scaffolded bundleId is the name's derived id"
-        );
+        let parsed = crate::project::parse_manifest(&path);
         let _ = std::fs::remove_dir_all(&root);
+        parsed
+    }
+
+    #[test]
+    fn a_hostile_directory_name_derives_no_package_name() {
+        let hostile = "evil\"\\\n }, injected = True { ";
+        assert_eq!(derive_package_name(hostile), Err(NameRefusal::BadChar));
+    }
+
+    #[test]
+    fn a_hostile_scaffolded_name_stays_one_literal_refused_at_its_field() {
+        // A quote, backslash, and newline would break out of the quoted `.ipe`
+        // literal without escaping. The escape is the second layer behind
+        // derivation: the name stays one literal, so the reader refuses it at
+        // the `name` field instead of reading an injected field.
+        let hostile = "evil\"\\\n }, injected = True { ";
+        let parsed = scaffold_and_read("ipe_init_hostile_name_literal", hostile);
+        assert!(
+            matches!(&parsed, Err(CliError::ProjectRefused(msg))
+                if msg.contains("`name` value") && !msg.contains('\n')),
+            "the hostile name is refused at its own field: {:?}",
+            parsed.map(|m| m.name)
+        );
     }
 
     #[test]
     fn scaffolded_bundle_id_is_the_derived_id_and_re_parses() {
-        for (index, name) in ["my-app", "9lives", "class", "{bundle_id}", "{ships}"]
-            .into_iter()
-            .enumerate()
-        {
-            let files = managed_files(name, InitShape::Web, Runtime::Served);
-            let manifest = files
-                .iter()
-                .find(|f| f.rel() == Path::new("package.ipe"))
-                .expect("init writes a package.ipe");
-
-            let root =
-                ipe_test_temp::temp_root().join(format!("ipe_init_derived_bundle_id_{index}"));
-            let _ = std::fs::remove_dir_all(&root);
-            write_stub_src(&root);
-            let path = root.join("package.ipe");
-            std::fs::write(&path, &manifest.content).expect("write scaffolded package.ipe");
-
-            let parsed = crate::project::parse_manifest(&path)
+        for (index, name) in ["my-app", "9lives", "class"].into_iter().enumerate() {
+            let parsed = scaffold_and_read(&format!("ipe_init_derived_bundle_id_{index}"), name)
                 .expect("scaffolded manifest re-parses under the bundle-id grammar");
-            assert_eq!(parsed.name, name, "a name spelling a hole stays literal");
+            assert_eq!(parsed.name, name);
             assert_eq!(
                 parsed.delivery.mobile.bundle_id,
                 Some(BundleId::derived(name)),
                 "the scaffolded bundleId for `{name}` is its derived id"
             );
-            let _ = std::fs::remove_dir_all(&root);
         }
+    }
+
+    #[test]
+    fn a_name_spelling_a_hole_stays_literal() {
+        for (index, name) in ["{bundle_id}", "{ships}"].into_iter().enumerate() {
+            let parsed = scaffold_and_read(&format!("ipe_init_hole_name_{index}"), name);
+            assert!(
+                matches!(&parsed, Err(CliError::ProjectRefused(msg))
+                    if msg.contains("`name` value") && msg.contains(name)),
+                "`{name}` stays the literal name and is refused at its field: {:?}",
+                parsed.map(|m| m.name)
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_name_outside_the_grammar_derives_one_inside_it() {
+        for (dir, derived) in [
+            ("my-app", "my-app"),
+            ("My_App", "my-app"),
+            ("My App.v2", "my-app-v2"),
+            ("__lead_and_trail__", "lead-and-trail"),
+            ("a-_-. b", "a-b"),
+            ("Shop", "shop"),
+        ] {
+            assert_eq!(
+                derive_package_name(dir).map(|name| name.as_str().to_owned()),
+                Ok(derived.to_owned()),
+                "{dir:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_name_with_nothing_conforming_is_refused() {
+        assert_eq!(derive_package_name("_._"), Err(NameRefusal::Empty));
+        assert_eq!(
+            derive_package_name(&"A".repeat(NameRefusal::MAX_LEN + 1)),
+            Err(NameRefusal::TooLong)
+        );
+        assert_eq!(derive_package_name("caf\u{e9}"), Err(NameRefusal::BadChar));
+        assert_eq!(derive_package_name("\u{e9}"), Err(NameRefusal::BadStart));
+    }
+
+    #[test]
+    fn the_longest_derivable_name_is_accepted() {
+        let dir = "A".repeat(NameRefusal::MAX_LEN);
+        assert_eq!(
+            derive_package_name(&dir).map(|name| name.as_str().len()),
+            Ok(NameRefusal::MAX_LEN)
+        );
+    }
+
+    #[test]
+    fn a_non_derivable_directory_is_a_project_refusal_naming_it_escaped() {
+        let refused = project_name_for(Path::new("caf\u{e9}\u{1b}[2J`x"));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(msg))
+                if msg.contains("caf\u{e9}") && !msg.contains('\u{1b}') && msg.contains("\\`x")),
+            "{refused:?}"
+        );
+        let long = "a".repeat(NameRefusal::MAX_LEN + 1);
+        let refused = project_name_for(Path::new(&long));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(msg)) if !msg.contains(&long)),
+            "a too-long directory name is not echoed: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn an_over_long_directory_name_is_not_echoed() {
+        let separators = "_".repeat(NameRefusal::MAX_LEN);
+        let refused = project_name_for(Path::new(&format!("{separators}\u{e9}")));
+        assert!(
+            matches!(&refused, Err(CliError::ProjectRefused(msg))
+                if msg.contains("no package name can be derived") && !msg.contains(&separators)),
+            "a directory name over the bound is not echoed in the refusal: {refused:?}"
+        );
+        let dir = format!("{separators}shop");
+        let name = derive_package_name(&dir).expect("the separators drop away");
+        let notice = derived_name_notice(&dir, &name).to_string();
+        assert!(
+            notice.contains("`shop`") && !notice.contains(&separators),
+            "a directory name over the bound is not echoed in the notice: {notice}"
+        );
+        let notice = derived_name_notice("My_Shop", &name).to_string();
+        assert!(notice.contains("`My_Shop`"), "a short one is: {notice}");
     }
 
     // Every quit key a shape's hint advertises is one its `Main.ipe` handles:

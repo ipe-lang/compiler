@@ -70,6 +70,7 @@ pub mod pack;
 pub mod package_manifest;
 pub mod package_name;
 pub mod pkg;
+pub mod program_name;
 pub mod progress;
 pub mod project;
 pub mod project_root;

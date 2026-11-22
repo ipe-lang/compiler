@@ -97,6 +97,63 @@ fn init_scaffolds_project_files() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Run `ipe init <target>` as the binary, with no colour and no terminal.
+#[allow(clippy::expect_used)] // test helper: a binary that cannot run IS the failure
+fn init_binary(target: &std::path::Path) -> std::process::Output {
+    std::process::Command::new(e2e_support::cargo_bin!("ipe").into_path_buf())
+        .arg("init")
+        .arg(target)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run ipe init")
+}
+
+/// `ipe init` into a directory name outside the package-name grammar names the
+/// package by the derived name, and prints it.
+#[test]
+fn init_derives_a_package_name_from_a_non_conforming_directory() {
+    let dir = fresh_dir("derived_name");
+    let target = dir.join("My_Shop.v2");
+    let output = init_binary(&target);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "init succeeds; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("so the package is named `my-shop-v2`"),
+        "the derived name is printed: {stdout}"
+    );
+    let manifest = fs::read_to_string(target.join("package.ipe")).unwrap_or_default();
+    assert!(
+        manifest.contains("name = \"my-shop-v2\""),
+        "package.ipe carries the derived name, got:\n{manifest}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `ipe init` into a directory name from which no package name derives is
+/// refused before anything is written.
+#[test]
+fn init_refuses_a_directory_name_no_package_name_derives_from() {
+    let dir = fresh_dir("underivable_name");
+    let target = dir.join("_._");
+    let output = init_binary(&target);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "init is refused");
+    assert!(
+        stderr.contains("no package name can be derived from the directory name `_._`"),
+        "the refusal names the directory: {stderr}"
+    );
+    assert!(
+        !target.join("package.ipe").exists(),
+        "nothing is scaffolded"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// `ipe init` writes `AGENTS.md` as exactly the stamp line and the embedded guide.
 #[test]
 fn rendered_is_stamp_plus_asset() {

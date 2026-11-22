@@ -9,6 +9,8 @@
 use ipe_runtime_rust::encoding::{FrameOriginEntries, FrameOriginEntry};
 use ipe_runtime_rust::frames::{DELEGATION_FEATURES, DelegationFeature, FeatureClass};
 
+use crate::program_name::ProgramName;
+
 /// The notice's opening words, before the listed origins.
 const NOTICE_LEAD: &str = "This app lists trusted frame origins";
 
@@ -63,7 +65,7 @@ impl FrameReach {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FrameProgram {
     /// The program's name, as `package.ipe` writes it.
-    name: String,
+    name: ProgramName,
     /// The entry file, `src/<Module/Path>.ipe`; its segments are module
     /// segments, so it holds no line break or control character.
     file: String,
@@ -72,17 +74,17 @@ pub struct FrameProgram {
 impl FrameProgram {
     /// The program `name` whose entry module is `module`.
     #[must_use]
-    pub fn new(name: &str, module: &[String]) -> Self {
+    pub fn new(name: &ProgramName, module: &[String]) -> Self {
         Self {
-            name: name.to_owned(),
+            name: name.clone(),
             file: format!("src/{}.ipe", module.join("/")),
         }
     }
 
     /// The program's name, as `package.ipe` writes it.
     #[must_use]
-    pub fn name(&self) -> &str {
-        &self.name
+    pub const fn name(&self) -> &str {
+        self.name.as_str()
     }
 
     /// The entry file, `src/<Module/Path>.ipe`.
@@ -203,6 +205,11 @@ pub fn notice_naming(origins: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The program named `raw`, a name inside the grammar.
+    fn program_name(raw: &str) -> ProgramName {
+        ProgramName::parse(raw).expect("a program name")
+    }
+
     /// The entries of `texts`, each a well-formed frame origin.
     #[allow(clippy::expect_used)] // every vector is a well-formed origin
     fn entries(texts: &[&str]) -> FrameOriginEntries {
@@ -262,8 +269,8 @@ mod tests {
         assert!(reach.is_some());
         let Some(reach) = reach else { return };
         let module = |path: &[&str]| path.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        let web = FrameProgram::new("web", &module(&["Web", "Main"]));
-        let cli = FrameProgram::new("cli", &module(&["Cli"]));
+        let web = FrameProgram::new(&program_name("web"), &module(&["Web", "Main"]));
+        let cli = FrameProgram::new(&program_name("cli"), &module(&["Cli"]));
         assert_eq!(web.file(), "src/Web/Main.ipe");
         let both = FrameReport::of(reach.clone(), web.clone(), vec![web.clone(), cli.clone()]);
         assert!(both.is_some());

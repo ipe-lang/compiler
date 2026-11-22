@@ -312,11 +312,11 @@ impl ShellIdentity {
         } = &manifest.delivery.mobile;
         let identifier = bundle_id
             .clone()
-            .unwrap_or_else(|| BundleId::derived(&manifest.name));
+            .unwrap_or_else(|| BundleId::derived(manifest.name.as_str()));
         let version = manifest.version.as_ref().map(ToString::to_string);
         Self {
             identity: super::desktop::BundleIdentity::new(
-                &manifest.name,
+                manifest.name.as_str(),
                 version.as_deref(),
                 identifier,
             ),

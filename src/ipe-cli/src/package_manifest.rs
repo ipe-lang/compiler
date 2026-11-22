@@ -65,6 +65,8 @@ use ipe_runtime_rust::encoding::{
 use crate::CliError;
 use crate::delivery_set::{BinaryTarget, ShipEntry};
 use crate::output_dir::held::{HeldDir, Replaced};
+use crate::package_name::{NameRefusal, PackageName};
+use crate::program_name::ProgramName;
 use crate::project::{
     ApnsEnvironment, BUNDLE_ID_EXAMPLE, BrowserDelivery, BundleId, BundleIdRefusal, Capability,
     DeliveryConfig, DesktopDelivery, EntryShape, FcmApiKey, FcmApplicationId, FcmIdentifierRefusal,
@@ -344,6 +346,31 @@ fn located_refusal(src: &str, manifest_path: &Path, span: Span, reason: &str) ->
     ))
 }
 
+/// The reason a manifest name `field` refuses `raw` for `why`.
+///
+/// The value is shown as one inert token: control characters and line breaks
+/// escaped as in [`str::escape_debug`], a backtick escaped so the value cannot
+/// close the code span it is shown in, and the result terminal-sanitised. A
+/// too-long value is not shown at all.
+fn name_refusal(field: &str, raw: &str, why: NameRefusal, reason: &text::Message) -> String {
+    match why {
+        NameRefusal::TooLong => text::msg::manifest_name_refused_unshown(&field, reason),
+        NameRefusal::Empty
+        | NameRefusal::BadStart
+        | NameRefusal::BadChar
+        | NameRefusal::DoubledDash
+        | NameRefusal::TrailingDash => {
+            let shown = raw.escape_debug().to_string().replace('`', "\\`");
+            text::msg::manifest_name_refused(
+                &field,
+                &crate::style::TerminalSafe::sanitize(&shown),
+                reason,
+            )
+        }
+    }
+    .to_string()
+}
+
 /// The located text of a refused `delivery.servers` entry.
 ///
 /// The entry is shown through its `Debug` escape, which renders every control
@@ -395,7 +422,7 @@ struct Reader<'a> {
 /// struct a fully-specified record with defaulted sections would.
 #[derive(Default)]
 struct ManifestFields {
-    name: Option<String>,
+    name: Option<PackageName>,
     version: Option<semver::Version>,
     src_rel: Option<String>,
     icon: Option<IconField>,
@@ -624,7 +651,7 @@ impl Reader<'_> {
         let mut delivery_span = None;
         for (fname, value) in record {
             match self.text(fname.value) {
-                "name" => fields.name = Some(self.expect_string(value)?),
+                "name" => fields.name = Some(self.read_package_name(value)?),
                 "version" => {
                     let raw = self.expect_string(value)?;
                     let version = semver::Version::parse(&raw).map_err(|e| {
@@ -967,6 +994,35 @@ impl Reader<'_> {
         let raw = self.expect_string(arg)?;
         crate::package_name::PackageName::parse(&raw)
             .map_err(|refusal| self.reject(arg.span, &format!("{refusal}")))
+    }
+
+    /// Read the package `name` field into a [`PackageName`], refused at the
+    /// value when it is outside the name grammar.
+    fn read_package_name(&self, value: &Expr) -> Result<PackageName, CliError> {
+        let raw = self.expect_string(value)?;
+        PackageName::judged(&raw).map_err(|why| {
+            self.reject(
+                value.span,
+                &name_refusal("name", &raw, why, &why.package_reason()),
+            )
+        })
+    }
+
+    /// Read a program's `name` field into a [`ProgramName`], refused at the
+    /// value when it is outside the name grammar.
+    fn read_program_name(&self, value: &Expr) -> Result<ProgramName, CliError> {
+        let raw = self.expect_string(value)?;
+        ProgramName::parse(&raw).map_err(|why| {
+            self.reject(
+                value.span,
+                &name_refusal(
+                    "programs[].name",
+                    &raw,
+                    why,
+                    &ProgramName::refusal_reason(why),
+                ),
+            )
+        })
     }
 
     /// Read one dependency builder call into its `(name, IpeDep)`.
@@ -1655,7 +1711,7 @@ impl Reader<'_> {
     /// defaults to `Main.ipe`; `shape` is absent unless the record sets one.
     fn read_programs(&self, expr: &Expr) -> Result<Vec<Program>, CliError> {
         let mut programs = Vec::new();
-        let mut seen_names: BTreeSet<String> = BTreeSet::new();
+        let mut seen_names: BTreeSet<ProgramName> = BTreeSet::new();
         for item in self.expect_list(expr)? {
             let program = self.read_one_program(item)?;
             if !seen_names.insert(program.name.clone()) {
@@ -1663,7 +1719,7 @@ impl Reader<'_> {
                     item.span,
                     &format!(
                         "duplicate program name {:?} — each program's `name` must be unique",
-                        program.name
+                        program.name.as_str()
                     ),
                 ));
             }
@@ -1674,12 +1730,12 @@ impl Reader<'_> {
 
     /// Read one `{ name, entry, shape }` program record into a [`Program`].
     fn read_one_program(&self, expr: &Expr) -> Result<Program, CliError> {
-        let mut name: Option<String> = None;
+        let mut name: Option<ProgramName> = None;
         let mut entry: Option<String> = None;
         let mut shape: Option<EntryShape> = None;
         for (fname, value) in self.expect_record(expr)? {
             match self.text(fname.value) {
-                "name" => name = Some(self.expect_string(value)?),
+                "name" => name = Some(self.read_program_name(value)?),
                 "entry" => entry = Some(self.expect_string(value)?),
                 "shape" => shape = Some(self.read_shape(value)?),
                 other => {
@@ -1943,7 +1999,7 @@ fn line_col(src: &str, off: u32) -> (usize, usize) {
 #[must_use]
 pub fn render_manifest_record(manifest: &ProjectManifest) -> String {
     let mut fields: Vec<String> = Vec::new();
-    fields.push(format!("name = {}", quote(&manifest.name)));
+    fields.push(format!("name = {}", quote(manifest.name.as_str())));
     if let Some(version) = &manifest.version {
         fields.push(format!("version = {}", quote(&version.to_string())));
     }
@@ -2169,7 +2225,7 @@ fn render_programs(programs: &[Program]) -> String {
         .iter()
         .map(|p| {
             let mut parts = vec![
-                format!("name = {}", quote(&p.name)),
+                format!("name = {}", quote(p.name.as_str())),
                 format!("entry = {}", quote(&p.entry)),
             ];
             if let Some(shape) = p.shape {
@@ -4307,12 +4363,12 @@ mod tests {
             m.programs,
             vec![
                 Program {
-                    name: "server".to_owned(),
+                    name: ProgramName::parse("server").expect("a program name"),
                     entry: "Main.ipe".to_owned(),
                     shape: Some(EntryShape::Web),
                 },
                 Program {
-                    name: "cli".to_owned(),
+                    name: ProgramName::parse("cli").expect("a program name"),
                     entry: "Cli/Main.ipe".to_owned(),
                     shape: Some(EntryShape::Terminal),
                 },
@@ -4333,7 +4389,7 @@ mod tests {
         assert_eq!(
             m.programs,
             vec![Program {
-                name: "app".to_owned(),
+                name: ProgramName::parse("app").expect("a program name"),
                 entry: "Main.ipe".to_owned(),
                 shape: None,
             }]
@@ -4397,6 +4453,95 @@ mod tests {
             ),
         );
         assert_rejected(&r);
+    }
+
+    /// The refusal message of `result`, or the empty string for an accepted
+    /// manifest or another refusal.
+    fn project_refusal(result: &Result<ProjectManifest, CliError>) -> String {
+        let Err(CliError::ProjectRefused(msg)) = result else {
+            return String::new();
+        };
+        msg.to_string()
+    }
+
+    #[test]
+    fn a_program_name_outside_the_grammar_is_refused_at_its_field() {
+        let r = read(
+            "reject_program_name_grammar",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", programs = [ {{ name = \"Admin_Tool\" }} ] }}\n"
+            ),
+        );
+        let msg = project_refusal(&r);
+        assert!(
+            msg.contains(":4:41:") && msg.contains("`programs[].name` value `Admin_Tool`"),
+            "the refusal names the field at its line and column: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_package_name_outside_the_grammar_is_refused_at_its_field() {
+        let r = read(
+            "reject_package_name_grammar",
+            &format!("{HEADER}package =\n    {{ name = \"Bad_Pkg\" }}\n"),
+        );
+        let msg = project_refusal(&r);
+        assert!(
+            msg.contains(":4:14:") && msg.contains("`name` value `Bad_Pkg`"),
+            "the refusal names the field at its line and column: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_program_name_is_refused_not_echoed_raw() {
+        let r = read(
+            "reject_program_name_hostile",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", programs = [ {{ name = \"sync\\n`forged`\" }} ] }}\n"
+            ),
+        );
+        let msg = project_refusal(&r);
+        assert!(
+            msg.contains(r"`programs[].name` value `sync\n\`forged\``"),
+            "the value is shown escaped as one token: {r:?}"
+        );
+        assert!(
+            !msg.contains('\n') && !msg.contains("`forged`"),
+            "no raw line break or unescaped backtick reaches the message: {msg:?}"
+        );
+    }
+
+    #[test]
+    fn an_overlong_program_name_is_not_echoed() {
+        let long = "a".repeat(64 * 1024);
+        let r = read(
+            "reject_program_name_overlong",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", programs = [ {{ name = \"{long}\" }} ] }}\n"
+            ),
+        );
+        let msg = project_refusal(&r);
+        assert!(
+            msg.contains("`programs[].name` value is refused") && msg.len() < 512,
+            "the overlong value is named by its field, not echoed: {} bytes",
+            msg.len()
+        );
+    }
+
+    #[test]
+    fn the_longest_program_name_is_accepted() {
+        let longest = "a".repeat(NameRefusal::MAX_LEN);
+        let m = read(
+            "accept_program_name_longest",
+            &format!(
+                "{HEADER}package =\n    {{ name = \"x\", programs = [ {{ name = \"{longest}\" }} ] }}\n"
+            ),
+        )
+        .expect("a name at the length bound is accepted");
+        assert_eq!(
+            m.programs.first().map(|p| p.name.as_str()),
+            Some(longest.as_str())
+        );
     }
 
     #[test]

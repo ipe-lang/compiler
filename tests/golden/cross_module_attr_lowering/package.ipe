@@ -5,6 +5,6 @@ import Ipe.Package exposing (..)
 
 package : Package
 package =
-    { name = "cross_module_attr_lowering"
+    { name = "cross-module-attr-lowering"
     , version = "0.1.0"
     }

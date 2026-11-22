@@ -2279,6 +2279,22 @@ ipe init: unknown runtime `{word}` — expected 1-2, or `{runtime}` (press Enter
 
 init: cannot derive a project name from target {target}
 
+## init-derived-name
+
+init: the directory name `{dir}` is not a package name, so the package is named `{name}`
+
+## init-derived-name-unshown
+
+init: the directory name is not a package name, so the package is named `{name}`
+
+## init-no-derivable-name
+
+init: no package name can be derived from the directory name `{dir}`: {why} — rename the directory or pass a directory whose name is lowercase letters, digits, and `-`
+
+## init-no-derivable-name-unshown
+
+init: no package name can be derived from the directory name: {why} — rename the directory or pass a shorter one
+
 ## init-restore-ask
 
 Restore {file}?
@@ -3329,3 +3345,35 @@ a package name may contain only ASCII lowercase letters, digits, and `-`
 ## package-name-trailing-dash
 
 a package name must not end with `-`
+
+## manifest-name-refused
+
+`{field}` value `{raw}` is refused: {why}
+
+## manifest-name-refused-unshown
+
+a `{field}` value is refused: {why}
+
+## program-name-empty
+
+a program name must not be empty
+
+## program-name-too-long
+
+a program name must be at most {max} bytes
+
+## program-name-bad-start
+
+a program name must start with an ASCII lowercase letter or digit
+
+## program-name-doubled-dash
+
+a program name must not contain a doubled `-`
+
+## program-name-bad-char
+
+a program name may contain only ASCII lowercase letters, digits, and `-`
+
+## program-name-trailing-dash
+
+a program name must not end with `-`

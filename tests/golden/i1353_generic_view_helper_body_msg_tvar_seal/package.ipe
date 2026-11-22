@@ -5,6 +5,6 @@ import Ipe.Package exposing (..)
 
 package : Package
 package =
-    { name = "i1353_generic_view_helper_body_msg_tvar_seal"
+    { name = "i1353-generic-view-helper-body-msg-tvar-seal"
     , version = "0.1.0"
     }
