@@ -2510,11 +2510,11 @@ fn last_index_of(hay: &[u8], needle: &[u8]) -> Option<usize> {
 #[test]
 #[allow(clippy::expect_used, clippy::panic)] // a pty or scaffold the host cannot provide is a harness setup failure
 fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError> {
-    use rustix::termios::{LocalModes, tcgetattr};
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
+    use rustix::termios::{LocalModes, tcgetattr};
     let (ipe_dir, out_dir) = fresh_dirs("tui_pty")?;
     let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
     let init = std::process::Command::new(&ipe_bin)
@@ -2535,10 +2535,15 @@ fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError>
         std::process::Stdio::from(slave.try_clone().expect("share the pty slave"))
     };
 
-    let mut cmd = std::process::Command::new(&ipe_bin);
-    if let Some(dir) = e2e_support::child_shared_target_from_env() {
-        e2e_support::target::set_target_dir_env(&mut cmd, Path::new(&dir));
-    }
+    // `ipe dev watch` emits the fixed package `ipe-app`, so it builds in a
+    // private tree a concurrent build in the shared target cannot overwrite.
+    let isolated =
+        e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
+    let Ok(isolated) = isolated else {
+        return Err(format!("isolated build target: {isolated:?}").into());
+    };
+    let target = e2e_support::target::BuildTarget::Isolated(isolated);
+    let mut cmd = e2e_support::target::ipe_command(&ipe_bin, &target);
     let runtime_dir = e2e_support::require_runtime().into_path_buf();
     cmd.args(["dev", "watch"])
         .arg(&ipe_dir)

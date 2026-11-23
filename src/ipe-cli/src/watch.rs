@@ -3576,13 +3576,15 @@ mod tests {
     use super::{
         AppearanceRoute, BuildAccel, ChildSurface, Command, Duration, FallbackNote,
         OrchestratorEvent, RESOLVE_RETRY_DELAY, RebuildTimings, UpstreamRoute, WatchRole,
-        after_owner_exit, app_status_port, apply_build_accel_env, child_command, child_env,
-        choose_build_accel, compile_failed_frame, dir_has_dep_rlib, emitted_binds_http,
-        entry_shape, env_flag_on, failure_fallback, first_error_line, mint_hot_token, mpsc,
-        prove_green_crate, push_control_appearance, resolve_project_sources,
-        schedule_resolve_retry, send_control_frame, spawn_command, stop_first_upstream, strip_ansi,
-        surface_after, watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
+        after_owner_exit, app_status_port, apply_build_accel_env, child_env, choose_build_accel,
+        compile_failed_frame, dir_has_dep_rlib, emitted_binds_http, entry_shape, env_flag_on,
+        first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
+        resolve_project_sources, schedule_resolve_retry, send_control_frame, stop_first_upstream,
+        strip_ansi, surface_after, watch_emit_settings, watch_line, watch_runtime_dep,
+        watch_status_body,
     };
+    #[cfg(unix)]
+    use super::{child_command, failure_fallback, spawn_command};
     use crate::delivery::Shape;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -4813,11 +4815,13 @@ mod tests {
     }
 
     /// Counts the restores a lease performs.
+    #[cfg(unix)]
     #[derive(Default)]
     struct RestoreRecorder {
         restores: std::rc::Rc<std::cell::Cell<usize>>,
     }
 
+    #[cfg(unix)]
     impl super::surface::TerminalRestore for RestoreRecorder {
         fn capture(&self) {}
         fn restore(&self) {
