@@ -1419,9 +1419,9 @@ pub(crate) struct EmitCtx<'a> {
     /// `ipe_runtime/mod.rs`, on EITHER target.
     pub(crate) uses_env_public: bool,
     /// `true` when the program reaches `Db.connect`, the kernel that reads
-    /// `DATABASE_URL` and the `Db.url` setting. Selects the `db-operator`
-    /// runtime feature, so a server start judges those values before it binds.
-    /// Never set without [`Self::uses_db`].
+    /// `DATABASE_URL` and the `Db.url` setting. With [`Self::serves`] it selects
+    /// the `db-operator` runtime feature, so a server start judges those values
+    /// before it binds. Never set without [`Self::uses_db`].
     pub(crate) uses_db_operator: bool,
     /// `true` when the program reaches at least one reactor-requiring kernel
     /// (async IO, timer, spawn, network, database, or any FFI call). Selects
@@ -2743,6 +2743,14 @@ impl<'a> EmitCtx<'a> {
             || self.uses_web
             || self.uses_webview
             || self.reaches_jwt()
+    }
+
+    /// `true` when the program serves HTTP: a `Server.listen` surface or a
+    /// `web` app. The one predicate behind the `server` runtime feature, the
+    /// server module append, the axum manifest, and the `db-operator` start
+    /// check, whose only callers are server starts.
+    pub(crate) const fn serves(&self) -> bool {
+        self.uses_server || self.uses_web
     }
 
     /// `true` when the emitted crate reaches the heavy `crypto_core` floor — the

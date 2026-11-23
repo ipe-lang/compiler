@@ -591,10 +591,12 @@ debugger = ["control-wire", "async", "tokio/net", "tokio/io-util"]
 # production, so a release artifact keeps the console closed until
 # `IPE_CONSOLE_AUTH` names a credential mode.
 dev-posture = []
-# `db-operator`: the program reaches `Db.connect`, so a server start judges
-# `DATABASE_URL` and the `Db.url` setting before it binds. A `Db.open`-only
-# program leaves it off and never reads `DATABASE_URL`.
-db-operator = ["db"]
+# `db-operator`: the program serves and reaches `Db.connect`, so a server start
+# judges `DATABASE_URL` and the `Db.url` setting before it binds. The start
+# check's only callers are server starts, so the feature implies `server`: no
+# selection can compile the check without a caller. A `Db.open`-only program,
+# or a `Db.connect` program that never serves, leaves it off.
+db-operator = ["db", "server"]
 # Browser-WASM TEA sink (`src/wasm/`): mount + patch-apply + delegated events.
 # Compiles only on wasm32 (the module is target-cfg'd); NOT in `full` — native
 # builds never link the wasm glue.

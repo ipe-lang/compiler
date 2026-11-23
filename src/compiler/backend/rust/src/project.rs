@@ -2909,7 +2909,7 @@ const MOD_APPENDS: &[ModAppend] = &[
         append: RUNTIME_MOD_RS_TEA_APPEND,
     },
     ModAppend {
-        gate: |ctx| ctx.uses_server || ctx.uses_web,
+        gate: |ctx| ctx.serves(),
         append: RUNTIME_MOD_RS_SERVER_APPEND,
     },
     ModAppend {
@@ -3372,7 +3372,7 @@ fn assemble_project_text(
     // `web` app need axum + tower-http; a desktop-webview delivery does NOT (it
     // renders over a local IPC bridge, no HTTP server), so it is excluded — its
     // render core is the server-free `web-core` promoted by `webview_cargo_toml`.
-    let cargo_toml = if ctx.uses_server || ctx.uses_web {
+    let cargo_toml = if ctx.serves() {
         server_cargo_toml(&cargo_toml)?
     } else {
         cargo_toml

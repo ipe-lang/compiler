@@ -194,10 +194,11 @@ pub enum RuntimeFeature {
     /// console default open, and only on a loopback bind; without it every
     /// absent posture resolves to production and the console stays closed.
     DevPosture,
-    /// `db-operator` — the program reaches `Db.connect`
-    /// ([`EmitCtx::uses_db_operator`]), so a web app or `Server.listen` judges
-    /// `DATABASE_URL` and the `Db.url` setting before it binds. Implies `db`; a
-    /// `Db.open`-only program selects it not and never reads `DATABASE_URL`.
+    /// `db-operator` — the program serves and reaches `Db.connect`
+    /// ([`EmitCtx::uses_db_operator`] with [`EmitCtx::serves`]), so a web app or
+    /// `Server.listen` judges `DATABASE_URL` and the `Db.url` setting before it
+    /// binds. Implies `db` and `server`, the start check's only callers; a
+    /// `Db.open`-only or non-serving program selects it not.
     DbOperator,
 }
 
@@ -409,11 +410,11 @@ impl RuntimeFeature {
             | Self::Compression
             | Self::CsvKernel
             | Self::CacheKernel => TokioProjection::SPINE,
-            Self::DbSqlite | Self::DbPostgres | Self::DbOperator => TokioProjection {
+            Self::DbSqlite | Self::DbPostgres => TokioProjection {
                 enables_tokio: true,
                 features: &[Sync, Net],
             },
-            Self::Server => TokioProjection {
+            Self::Server | Self::DbOperator => TokioProjection {
                 enables_tokio: true,
                 features: &[Net, Sync, Signal],
             },
@@ -550,6 +551,7 @@ impl RuntimeFeature {
                 "json",
                 "secret",
                 "serde",
+                "server",
                 "time-core",
             ],
         }
@@ -1318,17 +1320,29 @@ mod tests {
         }
     }
 
-    /// T17b: `db-operator` follows `Db.connect` alone — a `Db.open`-only program
-    /// never compiles the start check that reads `DATABASE_URL`, and the flag
-    /// without the database layer selects nothing.
+    /// T17b: `db-operator` follows a serving `Db.connect` program alone — a
+    /// `Db.open`-only program never compiles the start check that reads
+    /// `DATABASE_URL`, a `Db.connect` program that never serves has no start to
+    /// check (the check would compile with no caller), and the flag without the
+    /// database layer selects nothing.
     #[test]
-    fn db_operator_feature_selected_by_db_connect_only() {
+    fn db_operator_feature_selected_by_serving_db_connect_only() {
         let mut interner = Interner::new();
         let main = interner.intern("Main").expect("intern Main");
         let mut connect = db_module(&mut interner, main);
         connect.uses_db_operator = true;
-        let open_only = db_module(&mut interner, main);
-        let flag_only = ctx_module(main, |m| m.uses_db_operator = true);
+        connect.uses_server = true;
+        let mut web = db_module(&mut interner, main);
+        web.uses_db_operator = true;
+        web.uses_web = true;
+        let mut script = db_module(&mut interner, main);
+        script.uses_db_operator = true;
+        let mut open_only = db_module(&mut interner, main);
+        open_only.uses_server = true;
+        let flag_only = ctx_module(main, |m| {
+            m.uses_db_operator = true;
+            m.uses_server = true;
+        });
 
         let features = |modules: Vec<Module>| {
             let prog = Program {
@@ -1342,7 +1356,20 @@ mod tests {
         };
 
         let f = features(vec![connect]);
-        assert!(f.contains(&"db-operator"), "`Db.connect` selects it: {f:?}");
+        assert!(
+            f.contains(&"db-operator"),
+            "a served `Db.connect` selects it: {f:?}"
+        );
+        let f = features(vec![web]);
+        assert!(
+            f.contains(&"db-operator"),
+            "a web `Db.connect` selects it: {f:?}"
+        );
+        let f = features(vec![script]);
+        assert!(
+            !f.contains(&"db-operator"),
+            "a `Db.connect` program that never serves does not: {f:?}"
+        );
         let f = features(vec![open_only]);
         assert!(
             !f.contains(&"db-operator"),

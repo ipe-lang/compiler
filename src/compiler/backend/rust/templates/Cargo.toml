@@ -31,8 +31,9 @@ secret = []
 # leaves it off, so the vendored console default stays closed.
 dev-posture = []
 # Declared for the vendored runtime's `#[cfg(feature = "db-operator")]` start
-# check; promoted into `default` for a program that reaches `Db.connect`.
-db-operator = []
+# check; promoted into `default` for a serving program that reaches
+# `Db.connect`. Implies `db` and `server`, mirroring the runtime crate.
+db-operator = ["db", "server"]
 # Declared but inert in the vendored escape hatch: `serde` / `serde_json` /
 # `serde_urlencoded` stay non-optional below. The floor serde derives
 # (`IpeMaybe`/`IpeResult`/`IpeError`/`Decimal`/`Patch`) and the `dom/form`

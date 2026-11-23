@@ -2946,6 +2946,15 @@ const fn url_example(engine: DbEngine) -> &'static str {
     }
 }
 
+/// The store an `engine` build opens when no URL is configured, as the
+/// refusals name it.
+const fn default_store_shown(engine: DbEngine) -> &'static str {
+    match engine {
+        DbEngine::Sqlite => DEFAULT_SQLITE_FILE,
+        DbEngine::Postgres => LOCAL_POSTGRES_DEFAULT,
+    }
+}
+
 /// Where an operator database URL was configured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OperatorUrlSource {
@@ -3081,10 +3090,18 @@ pub(crate) enum OperatorUrlRefusal {
 
 impl std::fmt::Display for OperatorUrlRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write_for(KERNEL_ENGINE, f)
+    }
+}
+
+impl OperatorUrlRefusal {
+    /// The refusal as an `engine` build shows it: the example URL and the
+    /// default store are that engine's.
+    fn write_for(self, engine: DbEngine, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let source = match self {
             Self::EnvEmpty | Self::EnvNotUnicode => OperatorUrlSource::Env,
             Self::SettingEmpty => OperatorUrlSource::Setting,
-            Self::Malformed { source, .. } => *source,
+            Self::Malformed { source, .. } => source,
         };
         f.write_str("db: ")?;
         f.write_str(source.shown())?;
@@ -3096,13 +3113,12 @@ impl std::fmt::Display for OperatorUrlRefusal {
         write!(
             f,
             "; set it to a URL for this app's database, for example {}, or unset it so the app \
-             uses {DEFAULT_SQLITE_FILE}",
-            url_example(KERNEL_ENGINE)
+             uses {}",
+            url_example(engine),
+            default_store_shown(engine)
         )
     }
-}
 
-impl OperatorUrlRefusal {
     /// The refusal as the caller's error.
     ///
     /// A dial-target ceiling is `LimitExceeded`; every other refusal is
@@ -8725,6 +8741,39 @@ mod tests {
             assert!(!shown.contains("DATABASE_URL is"), "{shown}");
             assert!(!shown.contains("hunter2"), "{shown}");
         }
+    }
+
+    /// A refusal names the store its own engine's build falls back to: a
+    /// PostgreSQL build never offers the SQLite file, nor a SQLite build the
+    /// local server.
+    #[test]
+    fn operator_url_refusal_names_the_engine_default_store() {
+        struct Shown(OperatorUrlRefusal, DbEngine);
+        impl std::fmt::Display for Shown {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.write_for(self.1, f)
+            }
+        }
+        for refused in [
+            OperatorUrlRefusal::EnvEmpty,
+            OperatorUrlRefusal::EnvNotUnicode,
+            OperatorUrlRefusal::SettingEmpty,
+        ] {
+            let sqlite = Shown(refused, DbEngine::Sqlite).to_string();
+            assert!(sqlite.ends_with("so the app uses ipe.db"), "{sqlite}");
+            assert!(!sqlite.contains("postgres"), "{sqlite}");
+            let postgres = Shown(refused, DbEngine::Postgres).to_string();
+            assert!(
+                postgres.ends_with("so the app uses postgres://postgres@localhost/ipe"),
+                "{postgres}"
+            );
+            assert!(!postgres.contains("ipe.db"), "{postgres}");
+            assert!(!postgres.contains("sqlite"), "{postgres}");
+        }
+        assert_eq!(
+            OperatorUrlRefusal::EnvEmpty.to_string(),
+            Shown(OperatorUrlRefusal::EnvEmpty, KERNEL_ENGINE).to_string()
+        );
     }
 
     /// T6: `DATABASE_URL` outranks the setting, which outranks the default.

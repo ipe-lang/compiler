@@ -86,15 +86,16 @@ pub const CAPABILITIES: &[RuntimeCapability] = &[
         wasip1_legal: false,
     },
     // `Db.connect` reads `DATABASE_URL` and the `Db.url` setting; this feature
-    // judges them at a server start. A `Db.open`-only program selects it not.
+    // judges them at a server start, so it needs both. A `Db.open`-only or a
+    // non-serving program selects it not.
     RuntimeCapability {
-        gate: |ctx| ctx.uses_db_operator,
+        gate: |ctx| ctx.uses_db_operator && ctx.serves(),
         select: |_| RuntimeFeature::DbOperator,
         covers: &[RuntimeFeature::DbOperator],
         wasip1_legal: false,
     },
     RuntimeCapability {
-        gate: |ctx| ctx.uses_server || ctx.uses_web,
+        gate: |ctx| ctx.serves(),
         select: |_| RuntimeFeature::Server,
         covers: &[RuntimeFeature::Server],
         wasip1_legal: false,
