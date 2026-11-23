@@ -43,7 +43,9 @@ use crate::dom::{
         FOCUS_DROP_EVENT, FocusLink, Now, Recorded, WINDOW_FOCUS_MOVES, arms, carries,
         chain_from_ancestry, drop_answers, landing, settle_due,
     },
-    keep::{AUTHORITY_ATTRS, Control, Field, Keep, is_authority_attr, keep},
+    keep::{
+        AUTHORITY_ATTRS, CONTROLLED_ATTR, Control, Field, Keep, Marker, is_authority_attr, keep,
+    },
 };
 use crate::frames::{EscapedPopups, PageAuthority};
 use crate::html::frame_patch::{
@@ -2071,7 +2073,12 @@ fn control_of(field: Field, el: &web_sys::Element) -> Control {
     let authority = AUTHORITY_ATTRS.iter().any(|name| el.has_attribute(name));
     let text = el.text_content().is_some_and(|t| !t.is_empty());
     let selected = !matches!(el.query_selector("option[selected]"), Ok(None));
-    Control::of(field, authority, text, selected)
+    let marker = if el.has_attribute(CONTROLLED_ATTR) {
+        Marker::Present
+    } else {
+        Marker::Absent
+    };
+    Control::of(field, marker, authority, text, selected)
 }
 
 /// Write `pair.live`'s children to `pair.parsed`'s, keeping each live child

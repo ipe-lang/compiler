@@ -500,11 +500,12 @@ fn diff_attrs<M>(
 
 /// Insert one of [`attribute_pairs`]' pairs into a patch.
 ///
-/// The page-link marker is a pair only a `PageHref` yields, since
-/// `attribute_pairs` drops every program-built reserved name, so it takes the
-/// runtime marker gate; every other pair takes [`insert_safe_attr`].
+/// The page-link marker and the controlled-field marker are pairs only the
+/// sink itself writes, since `attribute_pairs` drops every program-built
+/// reserved name, so they take the runtime marker gate; every other pair takes
+/// [`insert_safe_attr`].
 fn insert_pair(p: &mut Patch, key: &str, val: Option<&str>) {
-    if key == crate::html::PAGE_NAV_ATTR {
+    if key == crate::html::PAGE_NAV_ATTR || key == crate::dom::keep::CONTROLLED_ATTR {
         insert_marker_attr(p, key, val);
     } else {
         insert_safe_attr(p, key, val);

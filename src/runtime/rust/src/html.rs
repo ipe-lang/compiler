@@ -3,6 +3,7 @@ use std::collections::HashMap;
 
 use super::css_safety;
 use crate::csp::StyleNonce;
+use crate::dom::keep::{CONTROLLED_ATTR, Field, is_authority_attr};
 use crate::frames::{
     Delegation, EscapedPopups, FrameGrants, FramePolicy, ListedOrigin, PageAuthority,
 };
@@ -622,6 +623,10 @@ fn render_into_ctx<M>(
                     // Only a `PageHref` yields this pair: `attribute_pairs`
                     // drops every program-built reserved name first.
                     PAGE_NAV_ATTR
+                } else if *k == CONTROLLED_ATTR {
+                    // Only `attribute_pairs` itself writes this pair, after it
+                    // has dropped every program-built reserved name.
+                    CONTROLLED_ATTR
                 } else {
                     let Some(safe_key) = SafeAttrName::parse(k) else {
                         continue;
@@ -1804,8 +1809,25 @@ pub(crate) fn attribute_pairs_under<'a, M>(
             None => *existing = Cow::Borrowed(v),
         }
     }
+    if names_owned_field_value(tag, attrs) {
+        pairs.push((Cow::Borrowed(CONTROLLED_ATTR), Cow::Borrowed("")));
+    }
     paint_frame(tag, &mut pairs, policy, stamp);
     pairs
+}
+
+/// Whether `tag` is a form field whose `attrs` name an authority attribute.
+///
+/// A false `BoolAttr` counts: an unticked box is the view's, though it paints
+/// no `checked`.
+fn names_owned_field_value<M>(tag: &str, attrs: &[Attribute<M>]) -> bool {
+    Field::parse(tag).is_some()
+        && attrs.iter().any(|a| match a {
+            Attribute::Attr(k, _) | Attribute::BoolAttr(k, _) => is_authority_attr(k),
+            Attribute::EventAttr(_) | Attribute::NoAttr => false,
+            #[cfg(feature = "web-core")]
+            Attribute::PageHref(_) => false,
+        })
 }
 
 /// Paint a frame element `tag`'s grant over its collected `pairs`, under
@@ -4010,9 +4032,12 @@ mod tests {
         let s = render_html(&t);
         assert!(s.contains(r#"<div class="x" ipe-id="r">"#), "{s}");
         // Attrs are sorted alphabetically; BoolAttr renders as `k="true"`; void
-        // elements self-close.
+        // elements self-close; a field the view gives a value carries the
+        // controlled marker.
         assert!(
-            s.contains(r#"<input disabled="true" ipe-id="r_0_input" value="a&lt;b" />"#),
+            s.contains(
+                r#"<input disabled="true" ipe-controlled="" ipe-id="r_0_input" value="a&lt;b" />"#
+            ),
             "{s}"
         );
         assert!(s.contains("1 &lt; 2"));
@@ -5859,5 +5884,89 @@ mod tests {
                 page.as_str()
             );
         }
+    }
+
+    /// A checkbox whose view says it is `ticked`.
+    fn checkbox(ticked: bool) -> Html<()> {
+        bare(
+            "input",
+            vec![
+                attr("type", "checkbox"),
+                Attribute::BoolAttr("checked".into(), ticked),
+            ],
+        )
+    }
+
+    /// An unticked box the view owns paints the marker and no `checked`, so
+    /// the client reads it as the view's (CI job `test`).
+    #[test]
+    fn a_false_checked_paints_the_controlled_marker() {
+        let out = render_html(&checkbox(false));
+        assert!(out.contains(" ipe-controlled=\"\""), "{out}");
+        assert!(!out.contains("checked"), "{out}");
+        let out = render_html(&checkbox(true));
+        assert!(out.contains(" ipe-controlled=\"\""), "{out}");
+        assert!(out.contains(" checked"), "{out}");
+    }
+
+    /// An empty value and an empty textarea the view owns still carry the
+    /// marker (CI job `test`).
+    #[test]
+    fn an_empty_owned_value_paints_the_controlled_marker() {
+        let out = render_html(&bare("input", vec![attr("value", "")]));
+        assert!(out.contains(" ipe-controlled=\"\""), "{out}");
+        let out = render_html(&bare("textarea", vec![attr("value", "")]));
+        assert!(out.contains(" ipe-controlled=\"\""), "{out}");
+    }
+
+    /// A field whose view names no authority attribute, and any element that
+    /// is not a field, paint no marker (CI job `test`).
+    #[test]
+    fn an_unowned_field_paints_no_marker() {
+        let out = render_html(&bare("input", vec![attr("type", "text")]));
+        assert!(!out.contains(CONTROLLED_ATTR), "{out}");
+        let out = render_html(&bare("div", vec![attr("value", "x")]));
+        assert!(!out.contains(CONTROLLED_ATTR), "{out}");
+    }
+
+    /// A program-spelled marker is dropped: only the render sink writes it
+    /// (CI job `test`).
+    #[test]
+    fn a_program_spelled_marker_is_dropped() {
+        for name in ["ipe-controlled", "IPE-CONTROLLED"] {
+            let out = render_html(&bare("input", vec![attr(name, "x")]));
+            assert!(!out.to_ascii_lowercase().contains(CONTROLLED_ATTR), "{out}");
+            let out = render_html(&bare("div", vec![attr(name, "")]));
+            assert!(!out.to_ascii_lowercase().contains(CONTROLLED_ATTR), "{out}");
+        }
+    }
+
+    /// Unticking a box patches the removal of `checked` and leaves the marker
+    /// alone; a box the view starts owning gains the marker on the patch path
+    /// (CI job `test`).
+    #[test]
+    fn a_ticked_to_unticked_diff_patches_checked_not_the_marker() {
+        let stamp = |mut h: Html<()>| {
+            crate::assign_ipe_ids(&mut h, "r");
+            h
+        };
+        let patches = crate::dom::diff::diff(
+            &stamp(checkbox(true)),
+            &stamp(checkbox(false)),
+            &RenderCtx::Unstamped,
+        );
+        let attrs: Vec<(&String, &Option<String>)> =
+            patches.iter().flat_map(|p| p.attrs.iter()).collect();
+        assert_eq!(attrs, vec![(&"checked".to_owned(), &None)], "{patches:?}");
+
+        let patches = crate::dom::diff::diff(
+            &stamp(bare("input", vec![attr("type", "checkbox")])),
+            &stamp(checkbox(false)),
+            &RenderCtx::Unstamped,
+        );
+        let gained = patches
+            .iter()
+            .find_map(|p| p.attrs.get(CONTROLLED_ATTR).cloned());
+        assert_eq!(gained, Some(Some(String::new())), "{patches:?}");
     }
 }

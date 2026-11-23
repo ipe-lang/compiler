@@ -466,3 +466,201 @@ fn a_refusal_notice_stands_for_a_connection_that_is_up() {
         "the statuses tabs share are the connection's three; a refusal notice is one tab's own"
     );
 }
+
+/// Every pending field value ends on a message the server sends, so the
+/// view's value reaches a field once the user's edit has landed (CI job
+/// `test`). The ends are the accept, the stale answer, and a stream frame of
+/// this tab's own event; no end waits on an ack field the server never writes.
+#[test]
+fn a_pending_field_value_ends_on_a_message_the_server_sends() {
+    let source = code();
+    assert!(
+        !source.contains("ackInputs"),
+        "client.js reads `ackInputs`, which no server writes; a value pending on it never ends"
+    );
+    let entry = body_of(&source, "__ipeInputEntry");
+    assert!(
+        entry.contains("liveValue: \"\", edited: false, pendingSeq: 0, refusedValue: null"),
+        "an input entry holds its live value, its edit flag, its pending seq and its refused value"
+    );
+    let stamp = body_of(&source, "__ipeStampEdited");
+    assert!(
+        stamp.contains("if (!e.edited) continue; e.pendingSeq = seq; e.edited = false;"),
+        "an event stamps the fields edited since the last event, never by their value"
+    );
+    let send = body_of(&source, "__ipeSend");
+    assert!(
+        send.contains("__ipeStampEdited(mySeq); var snapshot = __ipeInputsSnapshot();"),
+        "`__ipeSend` stamps the edited fields before it reads the snapshot"
+    );
+    let snapshot = body_of(&source, "__ipeInputsSnapshot");
+    assert!(
+        snapshot.contains("if (e.pendingSeq === 0) continue;")
+            && snapshot.contains("out[ids[i]] = {value: e.liveValue, seq: e.pendingSeq};"),
+        "the snapshot carries pending values only"
+    );
+    let retire = body_of(&source, "__ipeRetirePending");
+    assert!(
+        retire.contains("if (e.pendingSeq > 0 && e.pendingSeq <= seq) e.pendingSeq = 0;"),
+        "an answer to an event ends every value pending at or before it"
+    );
+    let poster = body_of(&source, THE_POSTER);
+    assert!(
+        poster.contains("__ipeOnPostSuccess(); __ipeRetirePending(body.seq);"),
+        "a stale answer ends the values its event carried"
+    );
+    assert!(
+        poster.contains(
+            "if (ipeMark === \"1\" && typeof data.seq === \"number\") __ipeRetirePending(body.seq);"
+        ),
+        "a marked accept ends the values its event carried, by this tab's seq for it"
+    );
+    let own = body_of(&source, "__ipeRetireOwnFrame");
+    assert!(
+        own.contains("frame.tab !== __ipeTabId")
+            && own.contains("__ipeRetirePending(frame.tabSeq);"),
+        "a stream frame ends only this tab's own event's values"
+    );
+    assert!(
+        source.matches("__ipeRetireOwnFrame(frame);").count() == 2,
+        "both stream render frames, `patch` and `patches`, end this tab's own event's values"
+    );
+    let dirty = body_of(&source, "__ipeIsDirty");
+    assert!(
+        dirty.contains("if (e && e.pendingSeq > 0) return true;"),
+        "a field is the user's while its value is pending"
+    );
+}
+
+/// An answer's `seq` is the session's commit count, never this tab's event
+/// seq, so no pending value is retired by it and the frame gate never folds
+/// it (CI job `test`). Read as an event seq it retires a value a later,
+/// unanswered event carries, or holds one past its own answer; folded into
+/// the frame gate it drops a reconnect's resync `patch` frame whose count the
+/// ack already reached.
+#[test]
+fn an_answers_session_seq_neither_retires_nor_gates() {
+    let source = code();
+    for read in [
+        "__ipeRetirePending(data.",
+        "__ipeHandleResponse(data.",
+        "__ipeIngestSeq(data.",
+    ] {
+        assert!(
+            !source.contains(read),
+            "client.js reads an answer's session seq through `{read}`"
+        );
+    }
+    let poster = body_of(&source, THE_POSTER);
+    assert_eq!(
+        poster.matches("__ipeRetirePending(").count(),
+        poster.matches("__ipeRetirePending(body.seq)").count(),
+        "the poster retires by the seq of the event it posted, nothing else"
+    );
+}
+
+/// The live value mirrors the field after every server write, and the entry
+/// of a field the page no longer holds is dropped (CI job `test`).
+#[test]
+fn the_input_table_follows_the_live_document() {
+    let source = code();
+    let swap = body_of(&source, "__ipeSwapPreservingFocus");
+    assert!(
+        swap.contains("__ipeResyncInputs();"),
+        "a swap re-reads every entry's field and drops the gone ones"
+    );
+    let resync = body_of(&source, "__ipeResyncInputs");
+    assert!(
+        resync.contains("if (!__ipeIsField(el)) { delete __ipeInputs[ids[i]]; continue; }")
+            && resync.contains("__ipeInputs[ids[i]].liveValue = String(__ipeFieldValue(el));"),
+        "the resync drops a gone field's entry and re-reads a live one"
+    );
+    assert!(
+        source.contains("if (wroteAuthority) __ipeResyncField(el);"),
+        "an attribute patch that writes a field's value re-reads it"
+    );
+    let placeholder = body_of(&source, "__ipePlaceholderUncontrolled");
+    assert!(
+        placeholder.contains("if (placeholder.hasAttribute(__IPE_CONTROLLED_ATTR)) return false;"),
+        "a field the view marks as its own is never kept as the user's"
+    );
+}
+
+/// `client.js` keeps form fields by the same tables `dom/keep.rs` declares.
+///
+/// The browser client decides which live field survives a swap, and which
+/// server attribute write a field the user is editing refuses, from three
+/// tables: the field tags, the authority attributes, and the controlled
+/// marker. Each is declared once in `dom::keep` and once in `client.js`; these
+/// checks render the Rust tables as the JS declarations and require exactly
+/// that declaration in the client, so a tag or attribute added on one side
+/// alone fails here. The client's own spelled-out copies of the tables are
+/// refused, so every client decision reads the declared table.
+mod field_keep_parity {
+    use super::CLIENT_JS;
+    use ipe_runtime_rust::dom::keep::{AUTHORITY_ATTRS, CONTROLLED_ATTR, FIELD_TAGS};
+
+    /// The JS declaration `var NAME = ["a", "b"];` of a string list.
+    fn list_decl(name: &str, items: &[&str]) -> String {
+        let quoted: Vec<String> = items.iter().map(|item| format!("\"{item}\"")).collect();
+        format!("var {name} = [{}];", quoted.join(", "))
+    }
+
+    /// Exactly one line of the client is `decl`, and no other line declares `name`.
+    fn assert_declared_once(name: &str, decl: &str) {
+        let head = format!("var {name} =");
+        let declared: Vec<&str> = CLIENT_JS
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with(&head))
+            .collect();
+        assert_eq!(declared, vec![decl], "client.js must declare `{decl}`");
+    }
+
+    /// The client's field tags are `dom::keep::FIELD_TAGS`, in order.
+    #[test]
+    fn client_field_tags_match_the_runtime() {
+        assert_declared_once(
+            "__IPE_FIELD_TAGS",
+            &list_decl("__IPE_FIELD_TAGS", &FIELD_TAGS),
+        );
+    }
+
+    /// The client's authority attributes are `dom::keep::AUTHORITY_ATTRS`, in order.
+    #[test]
+    fn client_authority_attrs_match_the_runtime() {
+        assert_declared_once(
+            "__IPE_AUTHORITY_ATTRS",
+            &list_decl("__IPE_AUTHORITY_ATTRS", &AUTHORITY_ATTRS),
+        );
+    }
+
+    /// The client's controlled marker is `dom::keep::CONTROLLED_ATTR`.
+    #[test]
+    fn client_controlled_marker_matches_the_runtime() {
+        assert_declared_once(
+            "__IPE_CONTROLLED_ATTR",
+            &format!("var __IPE_CONTROLLED_ATTR = \"{CONTROLLED_ATTR}\";"),
+        );
+    }
+
+    /// No client decision spells a table out instead of reading it.
+    #[test]
+    fn client_spells_no_table_out() {
+        for spelled in [
+            "\"input, textarea, select\"",
+            "n === \"value\"",
+            "k === \"value\" || k === \"checked\"",
+            "hasAttribute(\"value\")",
+            "hasAttribute(\"checked\")",
+            "hasAttribute(\"selected\")",
+            "tag === \"INPUT\" || tag === \"TEXTAREA\"",
+            "focusTag === \"INPUT\"",
+        ] {
+            assert!(
+                !CLIENT_JS.contains(spelled),
+                "client.js spells `{spelled}` instead of reading the declared table"
+            );
+        }
+    }
+}

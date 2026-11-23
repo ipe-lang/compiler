@@ -4172,8 +4172,8 @@ _CLAIM_ENV: dict[str, frozenset[str] | None] = {
     "CARGO_TERM_COLOR": frozenset({"always", "never", "auto"}),
     "CARGO_INCREMENTAL": frozenset({"0", "1"}),
     # Read by other steps of the job (the `ipe` CLI and the geo-clipboard,
-    # layout-fill, focus-across-patch, csp-styles, install-offer and
-    # page-navigation servers);
+    # layout-fill, focus-across-patch, csp-styles, install-offer,
+    # page-navigation and control-sync servers);
     # neither cargo nor rustc reads them, and no build script of the tree does
     # (`test_inert_claim_env_unread_by_build_scripts`).
     "IPE_RUNTIME_DIR": None,
@@ -4184,6 +4184,7 @@ _CLAIM_ENV: dict[str, frozenset[str] | None] = {
     "IPE_INSTALL_OFFER_PORT": None,
     "IPE_INSTALL_OFFER_OFF_PORT": None,
     "IPE_PAGE_NAVIGATION_PORT": None,
+    "IPE_CONTROL_SYNC_PORT": None,
 }
 # The `.cargo/config.toml` a claimed run reads: its admitted tables, the keys
 # of `[build]` and of a `[target]` table that applies to the claim platform,

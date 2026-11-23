@@ -1669,11 +1669,12 @@ const fn standing_after(_scope: &pubsub::SessionScope, _wake: Wake) -> Standing 
     Standing::Live
 }
 
-/// SSE patches envelope. The browser client (`live/client.js`) consumes the
+/// SSE patches envelope. The browser client (`web/client.js`) consumes the
 /// `event: patches` frame as `{globalSeq, patches}` and routes it through
-/// `__ipeHandleResponse(undefined, _, _, globalSeq)` → `__ipeApplyPatches`.
-/// We use `globalSeq` (the server-owned broadcast counter) rather than the
-/// local `seq` so it never collides with the client's own POST-local seq gate.
+/// `__ipeHandleResponse(undefined, _, globalSeq)` → `__ipeApplyPatches`.
+/// `globalSeq` is the session's commit count; it is carried apart from the
+/// `seq` of a full-body `patch` frame, so each frame kind keeps its own
+/// monotonic gate in the client.
 ///
 /// `from` / `to` are the epochs the commit moved between: the client applies
 /// the patches only onto the DOM of `from`, then adopts `to`. `route` is the
