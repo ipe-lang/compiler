@@ -298,8 +298,10 @@ pub struct SandboxProfile {
     pub network: bool,
     /// The filesystem scope.
     pub filesystem: FilesystemScope,
-    /// The environment variables re-exported into the scrubbed env (the `env`
-    /// axis's allowlist). Empty when `env` is absent.
+    /// The environment variables re-exported into the scrubbed env.
+    /// [`profile_from_capabilities`] fills it from the `env` axis's names alone
+    /// (empty when `env` is absent); a caller that grants a variable with
+    /// another capability adds it here, so the capability floor records it.
     pub env_allowlist: Vec<String>,
     /// `true` iff `subprocess` is granted — the seccomp filter permits the
     /// task-creation family. `false` → the create family is denied (threads
