@@ -1266,7 +1266,7 @@ fn run_inner(
                     match lease.reap_exited_owner(&mut supervisor) {
                         Some(status) if exited_interrupted(status) => break,
                         Some(status) => {
-                            running_surface = None;
+                            running_surface = after_owner_exit(proxy.as_ref());
                             emit_watch_line(
                                 &crate::style::TerminalSafe::sanitize(&app_exited_line(status)),
                                 WatchRole::Info,
@@ -3156,10 +3156,6 @@ fn warn_if_memory_store() {
     }
 }
 
-/// Whether a restart outcome left an app actually serving — the two outcomes
-/// that bring a binary up (a fresh spawn, a reload). The last-good-fallback and
-/// nothing-running outcomes did NOT start the new binary, so they must not
-/// trigger the first-run URL announcement.
 /// The surface of the child running after an apply of `applied` left
 /// `outcome`, given the surface `prior` that ran before it.
 const fn surface_after(
@@ -3209,6 +3205,20 @@ const fn stop_first_upstream(
     }
 }
 
+/// What the watch keeps once the terminal owner exited on its own: no running
+/// surface, and an engaged proxy routes nothing, so the port the owner
+/// released is never an upstream any local process could bind.
+fn after_owner_exit(proxy: Option<&ipe_watch::DevProxy>) -> Option<ChildSurface> {
+    if let Some(proxy) = proxy {
+        proxy.set_upstream(0);
+    }
+    None
+}
+
+/// Whether a restart outcome left an app actually serving — the two outcomes
+/// that bring a binary up (a fresh spawn, a reload). The last-good-fallback and
+/// nothing-running outcomes did NOT start the new binary, so they must not
+/// trigger the first-run URL announcement.
 const fn outcome_is_running(outcome: &ipe_watch::RestartOutcome) -> bool {
     matches!(
         outcome,
@@ -3566,12 +3576,12 @@ mod tests {
     use super::{
         AppearanceRoute, BuildAccel, ChildSurface, Command, Duration, FallbackNote,
         OrchestratorEvent, RESOLVE_RETRY_DELAY, RebuildTimings, UpstreamRoute, WatchRole,
-        app_status_port, apply_build_accel_env, child_command, child_env, choose_build_accel,
-        compile_failed_frame, dir_has_dep_rlib, emitted_binds_http, entry_shape, env_flag_on,
-        failure_fallback, first_error_line, mint_hot_token, mpsc, prove_green_crate,
-        push_control_appearance, resolve_project_sources, schedule_resolve_retry,
-        send_control_frame, spawn_command, stop_first_upstream, strip_ansi, surface_after,
-        watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
+        after_owner_exit, app_status_port, apply_build_accel_env, child_command, child_env,
+        choose_build_accel, compile_failed_frame, dir_has_dep_rlib, emitted_binds_http,
+        entry_shape, env_flag_on, failure_fallback, first_error_line, mint_hot_token, mpsc,
+        prove_green_crate, push_control_appearance, resolve_project_sources,
+        schedule_resolve_retry, send_control_frame, spawn_command, stop_first_upstream, strip_ansi,
+        surface_after, watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
     };
     use crate::delivery::Shape;
     use std::ffi::OsStr;
@@ -4001,17 +4011,22 @@ mod tests {
             assert!(body.is_some(), "the watch loop and its teardown are found");
             return;
         };
+        // Any `?` operator (every `?` but a `{:?}` format's), any `return`
+        // word, and any process exit; a false hit fails closed.
+        let leaves_early = |line: &str| {
+            let try_operator = line
+                .match_indices('?')
+                .any(|(at, _)| line.get(at..).is_none_or(|rest| !rest.starts_with("?}")));
+            let returns = line
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| word == "return");
+            try_operator || returns || line.contains("process::")
+        };
         let escapes: Vec<&str> = body
             .lines()
             .map(str::trim)
             .filter(|line| !line.starts_with("//"))
-            .filter(|line| {
-                line.contains(")?")
-                    || line.contains("?;")
-                    || line.ends_with('?')
-                    || line.starts_with("return ")
-                    || line.contains(" return ")
-            })
+            .filter(|line| leaves_early(line))
             .collect();
         assert!(
             escapes.is_empty(),
@@ -4096,6 +4111,27 @@ mod tests {
                 "{surface:?}"
             );
         }
+    }
+
+    /// A terminal owner that exited on its own released its port: an engaged
+    /// proxy stops forwarding there, and no surface is left running for a
+    /// status post or an appearance route to reach.
+    #[test]
+    fn an_owner_that_exits_leaves_the_proxy_routing_nothing() {
+        let bound = super::free_loopback_port().and_then(ipe_watch::DevProxy::bind);
+        assert!(
+            bound.is_ok(),
+            "a loopback proxy binds: {:?}",
+            bound.as_ref().err()
+        );
+        let Ok(mut proxy) = bound else {
+            return;
+        };
+        proxy.set_upstream(40_003);
+        assert_eq!(after_owner_exit(Some(&proxy)), None);
+        assert_eq!(proxy.current_upstream(), 0);
+        assert_eq!(after_owner_exit(None), None);
+        proxy.shutdown();
     }
 
     /// A stop-first apply behind an engaged proxy never forwards to a port no
