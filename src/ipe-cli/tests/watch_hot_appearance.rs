@@ -2514,7 +2514,6 @@ fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError>
         eprintln!("skipping (set IPE_E2E=1 to run)");
         return Ok(());
     }
-    use rustix::termios::{LocalModes, tcgetattr};
     let (ipe_dir, out_dir) = fresh_dirs("tui_pty")?;
     let ipe_bin = e2e_support::cargo_bin!("ipe").into_path_buf();
     let init = std::process::Command::new(&ipe_bin)
@@ -2590,7 +2589,9 @@ fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError>
     }
     // The restore bytes reach the transcript once the reader drains them.
     std::thread::sleep(Duration::from_millis(500));
-    let modes = tcgetattr(&slave).expect("read the pty modes").local_modes;
+    let modes = rustix::termios::tcgetattr(&slave)
+        .expect("read the pty modes")
+        .local_modes;
     let bytes = transcript_of(&transcript);
     let text = strip_terminal_escapes(&bytes);
     let _ = std::fs::remove_dir_all(ipe_dir.parent().unwrap_or(&ipe_dir));
@@ -2610,7 +2611,7 @@ fn a_fresh_tui_stays_up_and_reads_keys_under_the_watch() -> Result<(), BoxError>
          (entered {entered:?}, left {left:?})"
     );
     assert!(
-        modes.contains(LocalModes::ICANON | LocalModes::ECHO),
+        modes.contains(rustix::termios::LocalModes::ICANON | rustix::termios::LocalModes::ECHO),
         "the terminal must be back in cooked mode with echo, got {modes:?}"
     );
     Ok(())
