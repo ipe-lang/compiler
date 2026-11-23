@@ -25,7 +25,7 @@ pub use bin::{
 pub use target::{SharedBuild, child_shared_target_from_env};
 
 use std::io::{BufRead, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -690,12 +690,35 @@ pub fn build_and_run_rust_with_env(
     let exe = build_emitted_binary_with_env(golden_name, emitted_dir, envs)?;
 
     let run = Command::new(&exe)
+        .current_dir(run_dir(&exe)?)
         .output()
         .map_err(|e| format!("{golden_name}: emitted binary `{exe}` must run: {e}"))?;
     Ok(RunResult {
         stdout: String::from_utf8_lossy(&run.stdout).into_owned(),
         exit_code: run.status.code(),
     })
+}
+
+/// A fresh working directory for one run of the emitted binary `exe`: the
+/// sibling `<exe>.run`, emptied now and removed when the calling test ends.
+///
+/// A program that writes beside itself (the `Db.connect` default `ipe.db`)
+/// then writes into its own run, never into the test process's directory.
+///
+/// # Errors
+/// Returns a message if `exe` has no file name or the directory cannot be
+/// created.
+pub fn run_dir(exe: &Path) -> Result<PathBuf, String> {
+    let name = exe
+        .file_name()
+        .ok_or_else(|| format!("emitted binary `{}` has no file name", exe.display()))?;
+    let mut run_name = name.to_os_string();
+    run_name.push(".run");
+    let dir = exe.with_file_name(run_name);
+    scratch::fresh(&dir);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("run directory `{}` must be created: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Build the emitted Rust project at `emitted_dir` and return the guard holding

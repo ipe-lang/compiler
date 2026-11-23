@@ -583,7 +583,20 @@ pub fn build_and_run_emitted_with_stdin(
         };
     };
 
+    let run_dir = e2e_support::run_dir(&exe);
+    assert!(
+        run_dir.is_ok(),
+        "{golden_name}: {:?}",
+        run_dir.as_ref().err()
+    );
+    let Ok(run_dir) = run_dir else {
+        return RunOutcome {
+            stdout: String::new(),
+            exit_code: None,
+        };
+    };
     let child = Command::new(&exe)
+        .current_dir(run_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn();
@@ -795,14 +808,19 @@ pub fn run_with_stdin_deadline(
     stdin_bytes: &[u8],
     deadline: std::time::Duration,
 ) -> TimedRunOutcome {
+    let run_dir = e2e_support::run_dir(exe);
     // The clock starts before the spawn, so the measured wall time bounds the
     // child's whole lifetime from above.
     let started = std::time::Instant::now();
-    let child = Command::new(exe)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
+    let child = run_dir.and_then(|run_dir| {
+        Command::new(exe)
+            .current_dir(run_dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())
+    });
     assert!(
         child.is_ok(),
         "{golden_name}: failed to spawn `{}`: {:?}",
@@ -1031,7 +1049,13 @@ pub fn build_and_run_emitted_capturing_stderr_with_env(
             exit_code: None,
         };
     };
-    let output = Command::new(&exe).envs(env.iter().copied()).output();
+    let output = e2e_support::run_dir(&exe).and_then(|run_dir| {
+        Command::new(&exe)
+            .current_dir(run_dir)
+            .envs(env.iter().copied())
+            .output()
+            .map_err(|e| e.to_string())
+    });
     assert!(
         output.is_ok(),
         "{golden_name}: failed to spawn `{}`: {:?}",

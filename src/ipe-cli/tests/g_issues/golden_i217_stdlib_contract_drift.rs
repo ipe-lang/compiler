@@ -74,18 +74,14 @@ fn e2e_build_and_run(name: &str, expect_stdout_contains: &str) {
         built.err()
     );
 
-    // The emitted binary is run by the oracle with the TEST process's cwd
-    // (`crates/ipe`), and `Db.connect ()` writes the default `ipe.db` there.
-    // A `ipe.db` left by a PRIOR run (or a fixture edit that changed a
-    // migration's SQL) would trip the checksum guard on the next run — a
-    // spurious runtime failure unrelated to the contract under test. Clear the
-    // stray DB from the likely cwd locations so each run starts clean; the
-    // fixture also recovers migration errors to keep the SEAL check robust.
-    for dir in [root.join("src").join("ipe-cli"), root.clone()] {
-        for suffix in ["ipe.db", "ipe.db-shm", "ipe.db-wal"] {
-            let _ = std::fs::remove_file(dir.join(suffix));
-        }
-    }
+    // T20: each run has its own working directory, so the `Db.connect`
+    // default store never lands in the test process's directory or the repo.
+    // A store an older checkout left there is judged by its modification time.
+    let strays = [root.join("src").join("ipe-cli"), root].map(|dir| {
+        let stray = dir.join("ipe.db");
+        let before = std::fs::metadata(&stray).and_then(|m| m.modified()).ok();
+        (stray, before)
+    });
 
     let outcome = crate::support::build_and_run_emitted(name, &out);
     assert_eq!(
@@ -99,6 +95,15 @@ fn e2e_build_and_run(name: &str, expect_stdout_contains: &str) {
         "{name} stdout must contain {expect_stdout_contains:?}; got: {:?}",
         outcome.stdout
     );
+    for (stray, before) in strays {
+        let after = std::fs::metadata(&stray).and_then(|m| m.modified()).ok();
+        assert_eq!(
+            after,
+            before,
+            "{name}: a golden run wrote `{}`",
+            stray.display()
+        );
+    }
 }
 
 /// `Jwt.withClaim` accepts a `JsonEnc.Value` argument (string AND int claims).

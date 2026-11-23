@@ -1648,7 +1648,7 @@ const RUNTIME_CONFIG_RS_DB_SQLITE: &str =
 
 /// The `ipe_runtime/config.rs` emitted for db-enabled programs targeting
 /// Postgres (when `package.ipe` selects `Package.postgres`). Same symbol
-/// surface as [`RUNTIME_CONFIG_RS_DB_SQLITE`] (`DbPool`/`DbRow`/`ipe_db_url`/
+/// surface as [`RUNTIME_CONFIG_RS_DB_SQLITE`] (`DbPool`/`DbRow`/
 /// `db_last_insert_id`/`db_format_sql`/`DB_USES_RETURNING_ID`/
 /// `db_auto_id_column`), so `db.rs` is byte-identical across both driver
 /// builds.
@@ -2909,7 +2909,7 @@ const MOD_APPENDS: &[ModAppend] = &[
         append: RUNTIME_MOD_RS_TEA_APPEND,
     },
     ModAppend {
-        gate: |ctx| ctx.uses_server || ctx.uses_web,
+        gate: |ctx| ctx.serves(),
         append: RUNTIME_MOD_RS_SERVER_APPEND,
     },
     ModAppend {
@@ -3372,7 +3372,7 @@ fn assemble_project_text(
     // `web` app need axum + tower-http; a desktop-webview delivery does NOT (it
     // renders over a local IPC bridge, no HTTP server), so it is excluded — its
     // render core is the server-free `web-core` promoted by `webview_cargo_toml`.
-    let cargo_toml = if ctx.uses_server || ctx.uses_web {
+    let cargo_toml = if ctx.serves() {
         server_cargo_toml(&cargo_toml)?
     } else {
         cargo_toml
@@ -3526,8 +3526,7 @@ fn assemble_project_text(
     // Ipe.Secret: promote the `secret` feature when the program reaches the
     // secret surface. The vendored `secret.rs` compiles unconditionally, but the
     // functions that mint a `Secret` from another module — `io.rs::io_read_secret`
-    // (`Io.readSecret`), `app_config.rs::resolve_db_url_override` — are
-    // `#[cfg(feature = "secret")]`, so a `Secret`-reaching program must have the
+    // (`Io.readSecret`) — are `#[cfg(feature = "secret")]`, so a `Secret`-reaching program must have the
     // feature on. Idempotent: `db_cargo_toml` already added it for db programs.
     let cargo_toml = if ctx.reaches_secret() {
         secret_cargo_toml(&cargo_toml)?
@@ -4222,9 +4221,9 @@ fn pub_crate_item(rendered: &str) -> String {
 /// small and the two edits are unambiguous anchors.
 fn db_cargo_toml(base: &str, driver: crate::DbDriver) -> DResult<String> {
     const DEFAULT_LINE: &str = r#"default = ["tokio", "json"]"#;
-    // `"secret"` is required alongside `"db"`: the vendored `config.rs` calls
-    // `crate::app_config::resolve_db_url_override`, which is gated on
-    // `#[cfg(feature = "secret")]`. Activating the feature makes it visible.
+    // `"secret"` is required alongside `"db"`, mirroring the runtime crate's
+    // `db` feature: the vendored `db.rs` reveals the installed `Db.url`
+    // `Secret` when it resolves the operator store.
     const DEFAULT_LINE_DB: &str = r#"default = ["tokio", "json", "db", "secret"]"#;
     // The sqlx line is appended to the `[dependencies]` table.
     // Both drivers are unconditional — see the doc comment above for why. The
@@ -5325,9 +5324,9 @@ fn jwt_cargo_toml(base: &str) -> DResult<String> {
 /// secret;` in the emitted `ipe_runtime/mod.rs`), so the `Secret` TYPE resolves
 /// with the feature off. The feature still gates the FUNCTIONS that live in other
 /// modules but hand back a `Secret` — the vendored `io.rs::io_read_secret`
-/// (`Io.readSecret`) and `app_config.rs::resolve_db_url_override` are
-/// `#[cfg(feature = "secret")]`. Without this promotion a vendored `Io.readSecret`
-/// program would emit a wrapper calling a cfg'd-out runtime function (E0425).
+/// (`Io.readSecret`) is `#[cfg(feature = "secret")]`. Without this promotion a
+/// vendored `Io.readSecret` program would emit a wrapper calling a cfg'd-out
+/// runtime function (E0425).
 ///
 /// Idempotent: a no-op when `"secret"` is already in the default list (e.g. a
 /// db program, whose [`db_cargo_toml`] already added it).
@@ -6036,9 +6035,8 @@ mod tests {
         let def = default_line(&out);
         // `"crypto"` is NOT expected: it is gated by `crypto_core_heavy_cargo_toml`
         // (crypto / jwt / auth), which this db+server composition does not reach.
-        // `"secret"` IS expected: `db_cargo_toml` adds it alongside `"db"` because
-        // the vendored `config.rs` calls `resolve_db_url_override` which is gated on
-        // `#[cfg(feature = "secret")]`.
+        // `"secret"` IS expected: `db_cargo_toml` adds it alongside `"db"`,
+        // mirroring the runtime crate's `db` feature.
         for feat in &[
             r#""tokio""#,
             r#""json""#,

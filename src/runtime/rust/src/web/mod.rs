@@ -5025,6 +5025,9 @@ pub(crate) enum StartupRefusal {
     Bind(crate::system::EnvValueRefusal),
     /// The auth configuration asks for a session gate the app cannot enforce.
     Auth(crate::app_config::AuthStartupRefusal),
+    /// `DATABASE_URL` or the `Db.url` setting is set but refused.
+    #[cfg(feature = "db-operator")]
+    Database(crate::db::OperatorUrlRefusal),
 }
 
 #[cfg(feature = "web")]
@@ -5046,6 +5049,8 @@ impl crate::system::ScrubbedDisplay for StartupRefusal {
             Self::FrameAncestors(refusal) => write!(out, "{refusal}"),
             Self::Bind(refusal) => refusal.render(out),
             Self::Auth(refusal) => refusal.render(out),
+            #[cfg(feature = "db-operator")]
+            Self::Database(refusal) => write!(out, "{refusal}"),
         }
     }
 }
@@ -8064,6 +8069,10 @@ where
     // The framing policy every page carries is parsed here, so a value with no
     // header representation refuses the router; the page path re-checks it.
     crate::telemetry::frame_ancestors_config().map_err(StartupRefusal::FrameAncestors)?;
+    // A `DATABASE_URL` or `Db.url` that is set but refused stops the start
+    // before a port binds, never at the first request.
+    #[cfg(feature = "db-operator")]
+    crate::db::check_operator_url_at_start().map_err(StartupRefusal::Database)?;
     let sse_route = MethodSet::GET.on(
         move |st: axum::extract::State<WebState<Model, Msg, FInit, FUpdate, FView, FSubs>>,
               strict: Option<axum::Extension<crate::server::StrictUrl>>,
@@ -16568,6 +16577,8 @@ mod emitted_router_behavior_tests {
             StartupRefusal::FrameAncestors(crate::telemetry::FrameAncestorsRefusal::Blank),
             StartupRefusal::Bind(env()),
             StartupRefusal::Auth(crate::app_config::AuthStartupRefusal::Revocation(env())),
+            #[cfg(feature = "db-operator")]
+            StartupRefusal::Database(crate::db::OperatorUrlRefusal::EnvEmpty),
         ];
         let mut seen = std::collections::BTreeSet::new();
         for cause in &samples {
@@ -16579,6 +16590,8 @@ mod emitted_router_behavior_tests {
                 StartupRefusal::FrameAncestors(_) => ("frame", false),
                 StartupRefusal::Bind(_) => ("bind", true),
                 StartupRefusal::Auth(_) => ("auth", true),
+                #[cfg(feature = "db-operator")]
+                StartupRefusal::Database(_) => ("database", false),
             };
             seen.insert(kind);
             let line = crate::system::scrubbed_runtime_log_line(
@@ -16599,7 +16612,8 @@ mod emitted_router_behavior_tests {
                 assert!(line.contains("a\\\\b\\n"), "{kind}: {line:?}");
             }
         }
-        assert_eq!(seen.len(), 7, "one sample per variant: {seen:?}");
+        let variants = 7 + usize::from(cfg!(feature = "db-operator"));
+        assert_eq!(seen.len(), variants, "one sample per variant: {seen:?}");
     }
 
     /// A mounted routed app whose table holds a malformed pattern answers every

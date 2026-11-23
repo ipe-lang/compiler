@@ -216,6 +216,10 @@ handleAddNote _ principal =
         )
 ```
 
+`Db.connect ()` opens the app's database: `DATABASE_URL`, else the `Db.url`
+setting, else `ipe.db` in the working directory with a one-time warning (see
+[Connection descriptors](dsn.md)).
+
 The handler is reachable only behind an authenticated route, where the middleware
 mints the `principal`:
 

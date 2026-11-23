@@ -8,7 +8,8 @@
 //! `wasm_featureset_closure`:
 //!
 //! 1. each surface flag, alone, plus each build mode (the database drivers,
-//!    the development intent, the debugger, the watch-mode terminal channel)
+//!    the development intent, the debugger, the watch-mode terminal channel,
+//!    `Db.connect` as a script and as a served program)
 //!    is asked of the real backend for its native feature set;
 //! 2. the union of those sets must name every native feature the runtime
 //!    feature enum declares, so a new feature without a basis case goes red;
@@ -146,6 +147,9 @@ fn module_with(name: Symbol, surface: Option<Surface>) -> Module {
         uses_locale: on(Surface::Locale),
         uses_time: on(Surface::Time),
         uses_env_public: on(Surface::EnvPublic),
+        // Meaningful only beside the database layer: `basis_sets` carries the
+        // `Db.connect` cases on `db_module`.
+        uses_db_operator: false,
         uses_http: on(Surface::Http),
         uses_config: on(Surface::Config),
         uses_compression: on(Surface::Compression),
@@ -267,6 +271,15 @@ fn basis_sets() -> BTreeSet<BTreeSet<String>> {
         driver: DbDriver::Postgres,
         ..Case::release(postgres)
     });
+    // `Db.connect`: a script (no start to check) and a served program (the
+    // operator-URL start check and its callers).
+    let mut connect_script = db_module(&mut interner, main);
+    connect_script.uses_db_operator = true;
+    cases.push(Case::release(connect_script));
+    let mut connect_served = db_module(&mut interner, main);
+    connect_served.uses_db_operator = true;
+    connect_served.uses_server = true;
+    cases.push(Case::release(connect_served));
     cases.push(Case {
         intent: BuildIntent::Development,
         ..Case::release(module_with(main, None))

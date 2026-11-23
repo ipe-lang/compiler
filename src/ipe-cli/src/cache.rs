@@ -780,7 +780,7 @@ pub fn compute_project_key(
 /// Domain-separation tag for the lowered-IR content-address key —
 /// distinct from [`KEY_TAG`] because this tier's key excludes `db_driver`
 /// (see [`compute_ir_key`]'s doc for why).
-const IR_KEY_TAG: &[u8] = b"ipec-build-cache-ir-key-v1";
+const IR_KEY_TAG: &[u8] = b"ipec-build-cache-ir-key-v2";
 
 /// Compute the content-address key for the lowered-IR cache tier:
 /// a pure function of every input that determines
@@ -2904,6 +2904,7 @@ mod tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,

@@ -28,9 +28,21 @@ Four knots.
   safe and side-effect-free. `Dsn.open` — which actually dials the host —
   discloses `network` and returns a `Connection ReadOnly`, whose read-only posture
   is a *type*, not a runtime flag: a write against it is a compile error.
+- **The app database URL is chosen once, in a fixed order.** `Db.connect ()`
+  dials `DATABASE_URL`, else the `Db.url` setting, else a default: `ipe.db` in
+  the working directory (created if missing), or
+  `postgres://postgres@localhost/ipe` in a Postgres build. The default is never
+  silent — the first `Db.connect` prints one warning naming where the data
+  goes and how to choose, for example
+  `DATABASE_URL=sqlite://app.db?mode=rwc` (without `mode=rwc` a fresh host's
+  first open fails). A value that is set but empty or malformed is refused,
+  never replaced by the default: a web app or `Server.listen` refuses to start
+  before it binds, and the refusal names the variable, never its value. A
+  program that only calls `Db.open` never reads `DATABASE_URL`. Under
+  `ipe release run`, a program granted `database` sees the variable inside its
+  jail, exactly as an unjailed run does.
 - **The app database URL verifies a remote server too.** The URL the app's own
-  pool dials (`DATABASE_URL`, else the `Db.url` setting) is not a `Dsn`, but its
-  transport follows the same rule. With no `sslmode`, a remote server is dialled with
+  pool dials is not a `Dsn`, but its transport follows the same rule. With no `sslmode`, a remote server is dialled with
   `sslmode=verify-full`. `sslmode=disable`, `allow`, `prefer` and `require` are
   admitted only when every host the URL names is a loopback address,
   `localhost` or a Unix socket (with no `sslmode` there, the connection uses

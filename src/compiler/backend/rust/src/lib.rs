@@ -1418,6 +1418,11 @@ pub(crate) struct EmitCtx<'a> {
     /// appends `pub mod env_public; pub use env_public::*;` to the emitted
     /// `ipe_runtime/mod.rs`, on EITHER target.
     pub(crate) uses_env_public: bool,
+    /// `true` when the program reaches `Db.connect`, the kernel that reads
+    /// `DATABASE_URL` and the `Db.url` setting. With [`Self::serves`] it selects
+    /// the `db-operator` runtime feature, so a server start judges those values
+    /// before it binds. Never set without [`Self::uses_db`].
+    pub(crate) uses_db_operator: bool,
     /// `true` when the program reaches at least one reactor-requiring kernel
     /// (async IO, timer, spawn, network, database, or any FFI call). Selects
     /// the emitted entry point and manifest floor:
@@ -2272,6 +2277,8 @@ impl<'a> EmitCtx<'a> {
         let uses_time = program.modules.iter().any(|m| m.uses_time);
         // detect Ipe.Env `Env.public` kernel usage.
         let uses_env_public = program.modules.iter().any(|m| m.uses_env_public);
+        // detect `Db.connect` usage: the operator store's start check.
+        let uses_db_operator = uses_db && program.modules.iter().any(|m| m.uses_db_operator);
 
         // detect outbound Ipe.WebSocket client usage.
         let uses_websocket = program.modules.iter().any(|m| m.uses_websocket);
@@ -2430,6 +2437,7 @@ impl<'a> EmitCtx<'a> {
             uses_ffi,
             ffi,
             uses_env_public,
+            uses_db_operator,
             uses_async_runtime,
             wasm_public_env,
             mount_base,
@@ -2735,6 +2743,14 @@ impl<'a> EmitCtx<'a> {
             || self.uses_web
             || self.uses_webview
             || self.reaches_jwt()
+    }
+
+    /// `true` when the program serves HTTP: a `Server.listen` surface or a
+    /// `web` app. The one predicate behind the `server` runtime feature, the
+    /// server module append, the axum manifest, and the `db-operator` start
+    /// check, whose only callers are server starts.
+    pub(crate) const fn serves(&self) -> bool {
+        self.uses_server || self.uses_web
     }
 
     /// `true` when the emitted crate reaches the heavy `crypto_core` floor — the
@@ -4924,6 +4940,7 @@ mod record_struct_namespace_tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,
@@ -5019,6 +5036,7 @@ mod record_struct_namespace_tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,
@@ -5095,6 +5113,7 @@ mod record_struct_namespace_tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,

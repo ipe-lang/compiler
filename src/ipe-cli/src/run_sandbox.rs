@@ -83,6 +83,10 @@ pub const fn axis_for_driver(
     }
 }
 
+/// The variable the runtime's `Db.connect` reads the operator database URL
+/// from; the jail passes it through to a program granted `Database`.
+pub const OPERATOR_DB_ENV: &str = "DATABASE_URL";
+
 /// Build the [`SandboxProfile`] for a program from its resolved capabilities and
 /// the project's database driver.
 ///
@@ -97,19 +101,26 @@ pub fn build_profile(
     let union = caps.union();
     let has_database = union.contains(&Capability::Database);
     let axis = axis_for_driver(driver, has_database);
-    // The env allowlist is empty in the first cut: the manifest declares the
-    // `env` axis (on/off), not per-variable names. Fewer re-exported vars is
-    // the tighter, fail-closed direction; per-name env is a tracked refinement.
-    let env_allowlist: Vec<String> = Vec::new();
-    run_jail::profile_from_capabilities(&caps.inferred, &caps.declared, axis, &env_allowlist)
-        .map_err(|e| {
-            let shared: SharedDiag = RunJailDefect::Profile(e).into();
-            CliError::Pipeline {
-                file: std::path::PathBuf::new(),
-                src: String::new(),
-                diag: Box::new(shared),
-            }
-        })
+    // The env allowlist the `env` axis re-exports is empty: the manifest
+    // declares the axis (on/off), not per-variable names.
+    let mut profile =
+        run_jail::profile_from_capabilities(&caps.inferred, &caps.declared, axis, &[]).map_err(
+            |e| {
+                let shared: SharedDiag = RunJailDefect::Profile(e).into();
+                CliError::Pipeline {
+                    file: std::path::PathBuf::new(),
+                    src: String::new(),
+                    diag: Box::new(shared),
+                }
+            },
+        )?;
+    // A program granted `Database` sees the operator URL whatever its `env`
+    // axis: the runtime's `Db.connect` reads it, and an unjailed run reads the
+    // same variable. Every other variable stays outside the jail.
+    if has_database {
+        profile.env_allowlist = vec![OPERATOR_DB_ENV.to_owned()];
+    }
+    Ok(profile)
 }
 
 /// Exec `app` inside the jail, with no unconfined fallback of any kind.
@@ -678,6 +689,43 @@ mod tests {
         let p = build_profile(&c, ipe_backend_rust::DbDriver::Sqlite).expect("profile");
         assert!(p.network);
         assert!(p.subprocess);
+    }
+
+    /// T18: the release-run jail passes `DATABASE_URL` through exactly when the
+    /// program holds `Database`, under either driver, and nothing else.
+    #[test]
+    fn release_run_profile_passes_database_url_only_with_database_cap() {
+        for driver in [
+            ipe_backend_rust::DbDriver::Sqlite,
+            ipe_backend_rust::DbDriver::Postgres,
+        ] {
+            for (inferred, declared) in [
+                (&[Capability::Database][..], &[][..]),
+                (&[][..], &[Capability::Database][..]),
+            ] {
+                let p = build_profile(&caps(inferred, declared), driver).expect("profile");
+                assert_eq!(
+                    p.env_allowlist,
+                    vec![OPERATOR_DB_ENV.to_owned()],
+                    "{driver:?}"
+                );
+            }
+            let p = build_profile(&caps(&[Capability::Database, Capability::Env], &[]), driver)
+                .expect("profile");
+            assert_eq!(
+                p.env_allowlist,
+                vec![OPERATOR_DB_ENV.to_owned()],
+                "{driver:?}"
+            );
+            for other in [&[Capability::Network][..], &[Capability::Env][..]] {
+                let p = build_profile(&caps(other, &[]), driver).expect("profile");
+                assert!(
+                    p.env_allowlist.is_empty(),
+                    "{driver:?}: {:?}",
+                    p.env_allowlist
+                );
+            }
+        }
     }
 
     #[test]
