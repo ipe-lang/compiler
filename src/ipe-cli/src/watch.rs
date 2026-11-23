@@ -97,6 +97,12 @@ use crate::text;
 use crate::threads::{self, ThreadRole};
 use crate::{CliError, write_emitted_project};
 
+mod surface;
+
+use surface::{
+    AppearanceRoute, ChildStdin, ChildSurface, StartOrder, TerminalLease, TtyRestore, apply_order,
+};
+
 /// A lifecycle notification from a running watch session.
 ///
 /// Delivered synchronously (before the orchestrator moves on) through
@@ -295,7 +301,7 @@ pub const SIGTERM_TEARDOWN_MARKER: &str = "[ipe dev watch] SIGTERM received; shu
 /// carry. Callers construct it via [`crate::style::TerminalSafe::sanitize`] at the
 /// message boundary, so an unsanitised watch message is unrepresentable here.
 fn watch_line(text: &crate::style::TerminalSafe, role: WatchRole) -> String {
-    let p = crate::style::Palette::for_stream(&std::io::stderr());
+    let p = crate::style::Palette::for_stream(&stderr_stream());
     let (colour, glyph, reset) = match role {
         WatchRole::Info => (p.dim, "", p.reset),
         WatchRole::Success => (p.green, "", p.reset),
@@ -325,12 +331,50 @@ fn watch_line(text: &crate::style::TerminalSafe, role: WatchRole) -> String {
     format!("{prefix}{text}")
 }
 
-/// Write one [`watch_line`] to stderr as progress chatter.
+/// Write one [`watch_line`] to stderr as progress chatter, or hold it while a
+/// dev child owns the terminal.
 fn emit_watch_line(text: &crate::style::TerminalSafe, role: WatchRole) {
+    if !surface::defer_output(|| format!("{}\n", watch_line(text, role))) {
+        write_watch_line(text, role);
+    }
+}
+
+/// Write one [`watch_line`] to stderr as progress chatter now.
+fn write_watch_line(text: &crate::style::TerminalSafe, role: WatchRole) {
     crate::screen::chatter_styled(
         crate::screen::Stream::Stderr,
         &format!("{}\n", watch_line(text, role)),
     );
+}
+
+/// Write `screen` to stderr, or hold it while a dev child owns the terminal.
+fn emit_watch_screen(screen: &crate::screen::Screen) {
+    if !surface::defer_output(|| screen.render(crate::screen::Header::Omitted)) {
+        screen.emit();
+    }
+}
+
+/// Write `screen` to stderr as progress chatter, or hold it while a dev child
+/// owns the terminal.
+fn emit_watch_chatter(screen: &crate::screen::Screen) {
+    if !surface::defer_output(|| screen.render_chatter(crate::screen::Header::Omitted)) {
+        screen.emit_chatter();
+    }
+}
+
+/// The watch's stderr, which its lines and palette probe target.
+fn stderr_stream() -> std::io::Stderr {
+    std::io::stderr()
+}
+
+/// Whether the watch's stderr is a terminal a dev child could draw over.
+fn stderr_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&stderr_stream())
+}
+
+/// Whether the watch's stdout is a terminal a dev child could leave in a mode.
+fn stdout_is_terminal() -> bool {
+    std::io::IsTerminal::is_terminal(&std::io::stdout())
 }
 
 /// Per-phase wall-clock timing for ONE rebuild cycle, printed to stderr as a
@@ -447,9 +491,10 @@ impl RebuildTimings {
             total.as_secs_f64() * 1000.0,
             residual.as_secs_f64() * 1000.0,
         );
-        crate::screen::Screen::new(crate::screen::Stream::Stderr)
-            .line(crate::screen::Tone::Aux, &body)
-            .emit();
+        emit_watch_screen(
+            crate::screen::Screen::new(crate::screen::Stream::Stderr)
+                .line(crate::screen::Tone::Aux, &body),
+        );
     }
 }
 
@@ -815,7 +860,11 @@ pub fn spawn(
 }
 
 enum CompileOutcome {
-    Green(Arc<ipe_backend::EmittedProject>),
+    /// The emitted project, and the shape its entry's `main` pins.
+    Green {
+        emitted: Arc<ipe_backend::EmittedProject>,
+        shape: crate::delivery::Shape,
+    },
     Red(String),
     /// Cancelled via salsa (a newer generation superseded it) — never
     /// reported to the user; the newer cycle already took over.
@@ -829,7 +878,7 @@ fn reach_after(
     reach: Option<crate::frame_reach::FrameReach>,
 ) -> Option<crate::frame_reach::FrameReach> {
     match outcome {
-        CompileOutcome::Green(_) => reach,
+        CompileOutcome::Green { .. } => reach,
         CompileOutcome::Red(_) | CompileOutcome::Cancelled => None,
     }
 }
@@ -1067,7 +1116,10 @@ fn run_inner(
                 // can wait for this line as an explicit ack rather than
                 // guessing a delay. Not `--quiet`-gated: a shutdown-on-signal
                 // notice is a load-bearing operational fact, not chatter.
-                emit_watch_line(
+                // Written now even while a dev child holds the terminal: the
+                // ack is load-bearing, and the teardown it announces is
+                // about to restore the terminal anyway.
+                write_watch_line(
                     &crate::style::TerminalSafe::sanitize(SIGTERM_TEARDOWN_MARKER),
                     WatchRole::Info,
                 );
@@ -1102,8 +1154,8 @@ fn run_inner(
     // and can only front a crate that binds a first-party HTTP listener
     // (`web_app` / `server_listen`, detected on the emitted `main.rs`). Whether a
     // crate binds one is not knowable before the first emit, so the proxy is
-    // bound lazily at the first green build (see `ensure_proxy_bound`) only when
-    // `current_binds_http && opts.bluegreen`. A CLI/TUI/worker or a
+    // bound lazily at the first green build only when the surface overlaps
+    // (`StartOrder::Overlap`) and `opts.bluegreen`. A CLI/TUI/worker or a
     // third-party/non-HTTP server never engages it — watch rebuilds and restarts
     // such a crate directly, binding no proxy on the user's port.
     let mut proxy: Option<ipe_watch::DevProxy> = None;
@@ -1120,23 +1172,19 @@ fn run_inner(
     // The session's build directory, parsed for the host linker before the
     // first rebuild and handed unchanged to every later one.
     let mut session_target: Option<LinkableTargetDir> = None;
-    // Set at `CompileDone` (Green), consumed at `CargoDone` (Green) — the
-    // readiness strategy is a property of the SOURCE (does it call
-    // `Web.tea`?), decided once per generation right after emit, not
-    // re-derived from the built executable (which carries no such marker).
-    let mut current_is_web = false;
-    // Set alongside `current_is_web` at each emit: does the built crate bind a
-    // first-party HTTP listener (`web_app` OR `server_listen`)? This — not the
-    // program's shape — gates blue-green proxy engagement: a CLI/TUI/worker or a
-    // third-party/non-HTTP server emits neither and is rebuilt+restarted
-    // directly, never fronted by a proxy that cannot discover its port.
-    let mut current_binds_http = false;
-    // Set alongside `current_is_web` at each emit: is the built crate a Ipe.Tui
-    // app? A tui child has no HTTP endpoint, so an appearance-only edit is
-    // delivered over the loopback CONTROL SOCKET (`send_control_frame`) rather
-    // than the web `/_ipe/hot-appearance` POST — the shape-agnostic control
-    // channel's tui delivery path.
-    let mut current_is_tui = false;
+    // Set at `CompileDone` (Green), consumed at `CargoDone` (Green): what the
+    // generation's child is — its stdin, readiness, start order, terminal
+    // hand-over and appearance route — decided once per generation from the
+    // shape its entry's `main` pins and whether it binds a first-party HTTP
+    // listener. `None` until the first emit.
+    let mut pending_surface: Option<ChildSurface> = None;
+    // The surface of the child that runs now, which an appearance hot-swap
+    // reaches: it follows the apply, never an emit whose cargo build has not
+    // succeeded. `None` while no child the watch knows runs.
+    let mut running_surface: Option<ChildSurface> = None;
+    // The terminal as one owning child at a time holds it: restored after every
+    // stop of an owner, never over a live one.
+    let lease = TerminalLease::new(TtyRestore::default());
     // The prominent "open this URL" line is printed once, after the first web
     // app settles into a running state — so the address the user must open is
     // the last thing on screen, not a line that scrolled away above the cargo
@@ -1201,7 +1249,41 @@ fn run_inner(
         return Ok(());
     }
 
-    while let Ok(event) = evt_rx.recv() {
+    // How the watch loop ended. Every exit leaves through `break` so the
+    // teardown below runs: the supervised child stops, the terminal it may
+    // own is restored, and the proxy releases the user's port before the
+    // outcome is returned.
+    let mut ended: Result<(), CliError> = Ok(());
+    loop {
+        // While a dev child owns the terminal, the loop wakes on a bounded
+        // poll to notice the child exiting on its own: an interrupted child
+        // ends the watch, any other exit hands the terminal back and waits
+        // for the next save.
+        let event = if lease.is_held() {
+            match evt_rx.recv_timeout(CHILD_EXIT_POLL) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    match lease.reap_exited_owner(&mut supervisor) {
+                        Some(status) if exited_interrupted(status) => break,
+                        Some(status) => {
+                            running_surface = after_owner_exit(proxy.as_ref());
+                            emit_watch_line(
+                                &crate::style::TerminalSafe::sanitize(&app_exited_line(status)),
+                                WatchRole::Info,
+                            );
+                        }
+                        None => {}
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match evt_rx.recv() {
+                Ok(event) => event,
+                Err(mpsc::RecvError) => break,
+            }
+        };
         match event {
             OrchestratorEvent::FsBatch { settle } => {
                 generation += 1;
@@ -1344,7 +1426,10 @@ fn run_inner(
                                 cfg,
                             )
                         })) {
-                            Ok(Ok(emitted)) => CompileOutcome::Green(Arc::new(emitted)),
+                            Ok(Ok(emitted)) => CompileOutcome::Green {
+                                emitted: Arc::new(emitted),
+                                shape: entry_shape(&sources, &entry_path),
+                            },
                             Ok(Err(e)) => CompileOutcome::Red(e.to_string()),
                             Err(_cancelled) => CompileOutcome::Cancelled,
                         };
@@ -1377,7 +1462,11 @@ fn run_inner(
                     continue; // stale — a newer cycle already superseded this one.
                 }
                 timings.compile = Some(compile);
-                crate::driver::show_frame_reach(reach_after(&outcome, cycle_reach.take()));
+                if let Some(notice) =
+                    crate::driver::frame_reach_notice(reach_after(&outcome, cycle_reach.take()))
+                {
+                    emit_watch_chatter(&notice);
+                }
                 match outcome {
                     CompileOutcome::Cancelled => {
                         emit(opts, WatchEvent::CompileCancelled { generation: g });
@@ -1396,11 +1485,11 @@ fn run_inner(
                             failure_fallback(&mut supervisor),
                             screen.palette(),
                         );
-                        screen.guttered(&frame).emit();
+                        emit_watch_screen(screen.guttered(&frame));
                         emit(opts, WatchEvent::CompileFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
-                            app_status_port(proxy.as_ref(), opts.port),
+                            app_status_port(running_surface, proxy.as_ref(), opts.port),
                         ) {
                             post_watch_status(app_port, tok, false, &first_error_line(&msg));
                         }
@@ -1408,7 +1497,7 @@ fn run_inner(
                         // no restart) — report the partial breakdown here.
                         timings.report(g);
                     }
-                    CompileOutcome::Green(emitted) => {
+                    CompileOutcome::Green { emitted, shape } => {
                         // Appearance hot-swap: if the flag is on and we already
                         // have a running binary, classify this emit against it.
                         // An AppearanceOnly delta (only hoisted style-literal
@@ -1440,10 +1529,14 @@ fn run_inner(
                                 {
                                     // The running shape decides where — or whether
                                     // — an appearance swap can be delivered out of
-                                    // band. Each shape maps to exactly one route;
-                                    // the match is exhaustive so a shape can never
-                                    // silently skip the edit (see `appearance_route`).
-                                    match appearance_route(current_is_tui, current_is_web) {
+                                    // band. Each surface maps to exactly one route;
+                                    // the match is exhaustive so a surface can never
+                                    // silently skip the edit. Before any emit no
+                                    // child runs, so the edit rebuilds.
+                                    match running_surface.map_or(
+                                        AppearanceRoute::Rebuild,
+                                        ChildSurface::appearance_route,
+                                    ) {
                                         // A Ipe.Tui child has no HTTP endpoint: its
                                         // appearance hot-swap rides the loopback
                                         // control socket, not the web POST path.
@@ -1542,9 +1635,11 @@ fn run_inner(
                                                             + hot.wirings.len(),
                                                     },
                                                 );
-                                                if let Some(app_port) =
-                                                    app_status_port(proxy.as_ref(), opts.port)
-                                                {
+                                                if let Some(app_port) = app_status_port(
+                                                    running_surface,
+                                                    proxy.as_ref(),
+                                                    opts.port,
+                                                ) {
                                                     post_watch_status(app_port, tok, true, "");
                                                 }
                                                 timings.report(g);
@@ -1624,9 +1719,8 @@ fn run_inner(
                         if appearance_active {
                             running_emitted = Some(emitted.clone());
                         }
-                        current_is_web = emitted_is_web(&emitted);
-                        current_binds_http = emitted_binds_http(&emitted);
-                        current_is_tui = emitted_is_tui(&emitted);
+                        pending_surface =
+                            Some(ChildSurface::of(shape, emitted_binds_http(&emitted)));
                         // Design doc "First-run vs warm-run UX": the cold
                         // (first) build pays the full dependency-compile
                         // cost and can take minutes; every subsequent
@@ -1658,7 +1752,7 @@ fn run_inner(
                         // an app is already up (a rebuild, not the first build).
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
-                            app_status_port(proxy.as_ref(), opts.port),
+                            app_status_port(running_surface, proxy.as_ref(), opts.port),
                         ) {
                             post_watch_recompiling(app_port, tok);
                         }
@@ -1742,7 +1836,7 @@ fn run_inner(
                         emit(opts, WatchEvent::CargoFailed { generation: g });
                         if let (Some(tok), Some(app_port)) = (
                             hot_token.as_deref(),
-                            app_status_port(proxy.as_ref(), opts.port),
+                            app_status_port(running_surface, proxy.as_ref(), opts.port),
                         ) {
                             post_watch_status(app_port, tok, false, &first_error_line(&msg));
                         }
@@ -1766,15 +1860,30 @@ fn run_inner(
                             }
                         };
                         let restart_started = Instant::now();
+                        // Green cargo follows this generation's green emit, which
+                        // decided its surface.
+                        let Some(surface) = pending_surface else {
+                            continue;
+                        };
                         // Deferred blue-green engagement: bind the proxy on the
-                        // user's port the first time a green build is known to bind
-                        // a first-party HTTP listener. A bind failure here is fatal
-                        // for the SAME reason a direct port-in-use is — the user
-                        // asked for that port and it is unavailable.
-                        if proxy.is_none() && opts.bluegreen && current_binds_http {
-                            let bound = ipe_watch::DevProxy::bind(opts.port).map_err(|e| {
-                                CliError::Usage(text::msg::watch_proxy_bind_failed(&opts.port, &e))
-                            })?;
+                        // user's port the first time a green build's surface
+                        // overlaps (it binds a first-party HTTP listener). A bind
+                        // failure here is fatal for the SAME reason a direct
+                        // port-in-use is — the user asked for that port and it is
+                        // unavailable.
+                        if proxy.is_none()
+                            && opts.bluegreen
+                            && surface.start_order() == StartOrder::Overlap
+                        {
+                            let bound = match ipe_watch::DevProxy::bind(opts.port) {
+                                Ok(bound) => bound,
+                                Err(e) => {
+                                    ended = Err(CliError::Usage(
+                                        text::msg::watch_proxy_bind_failed(&opts.port, &e),
+                                    ));
+                                    break;
+                                }
+                            };
                             if !opts.quiet {
                                 emit_watch_line(
                                     &crate::style::TerminalSafe::sanitize(&format!(
@@ -1787,17 +1896,12 @@ fn run_inner(
                             }
                             proxy = Some(bound);
                         }
-                        let outcome = if let Some(proxy) = proxy.as_ref() {
-                            // Blue-green: the new binary binds a FRESH internal
-                            // port behind the proxy; readiness is probed on
-                            // that internal port; on ready, the proxy cuts over
-                            // to it and the old binary is drained — the
-                            // user-facing port (held by the proxy) never stops
-                            // answering. A web app gets the precise
-                            // `/_ipe/readyz` probe; every other shape falls
-                            // back to a short alive-grace, exactly as the
-                            // direct path does.
-                            let internal_port = match free_loopback_port() {
+                        // While the proxy holds the user's port, every child
+                        // binds a FRESH internal loopback port behind it and is
+                        // probed there; without one, the child binds the
+                        // user's port itself.
+                        let child_port = if let Some(proxy) = proxy.as_ref() {
+                            match free_loopback_port() {
                                 Ok(p) => p,
                                 Err(e) => {
                                     emit_watch_line(
@@ -1816,7 +1920,7 @@ fn run_inner(
                                     // silently abandoned until an unrelated edit.
                                     if let (Some(tok), Some(app_port)) = (
                                         hot_token.as_deref(),
-                                        app_status_port(Some(proxy), opts.port),
+                                        app_status_port(running_surface, Some(proxy), opts.port),
                                     ) {
                                         post_watch_status(
                                             app_port,
@@ -1828,80 +1932,93 @@ fn run_inner(
                                     schedule_resolve_retry(&evt_tx);
                                     continue;
                                 }
-                            };
-                            let readiness = if current_is_web {
-                                ipe_watch::ReadinessCheck::HttpReadyz {
-                                    port: internal_port,
-                                }
-                            } else if current_binds_http {
-                                // A first-party HTTP server (Ipe.Http.Server) has
-                                // no `/_ipe/readyz`, but it DOES bind a TCP
-                                // listener on the internal port — so readiness is
-                                // "the port accepts a connection", not merely "the
-                                // child is still alive". A bare alive-grace could
-                                // cut the proxy over to an upstream that has not
-                                // finished binding, yielding a transient 502.
-                                ipe_watch::ReadinessCheck::TcpConnect {
-                                    port: internal_port,
-                                }
-                            } else {
-                                ipe_watch::ReadinessCheck::AliveGrace {
-                                    grace: Duration::from_millis(300),
-                                }
-                            };
-                            let crate_dir = built.path().to_path_buf();
-                            let tok = hot_token.clone();
-                            let cp = control_port;
-                            let reset_state = opts.reset_state;
-                            supervisor.apply_green_behind_proxy(
-                                &exe_path,
-                                internal_port,
-                                move |path, port| {
-                                    spawn_command(
-                                        path,
-                                        &child_env(
-                                            port,
-                                            &crate_dir,
-                                            tok.as_deref(),
-                                            cp,
-                                            true,
-                                            reset_state,
-                                        ),
-                                    )
-                                },
-                                readiness,
-                                opts.restart_timeouts,
-                                |ready_port| proxy.set_upstream(ready_port),
-                            )
+                            }
                         } else {
-                            let readiness = if current_is_web {
-                                ipe_watch::ReadinessCheck::HttpReadyz { port: opts.port }
-                            } else if current_binds_http {
-                                // Direct-bind HTTP server (blue-green off): the
-                                // app owns `opts.port` itself; readiness is the
-                                // port accepting a connection.
-                                ipe_watch::ReadinessCheck::TcpConnect { port: opts.port }
-                            } else {
-                                ipe_watch::ReadinessCheck::AliveGrace {
-                                    grace: Duration::from_millis(300),
-                                }
-                            };
-                            let env = child_env(
-                                opts.port,
-                                built.path(),
-                                hot_token.as_deref(),
-                                control_port,
-                                false,
-                                opts.reset_state,
-                            );
-                            supervisor.apply_green(
-                                &exe_path,
-                                move |path| spawn_command(path, &env),
-                                readiness,
-                                opts.restart_timeouts,
-                            )
+                            opts.port
                         };
+                        // A web app gets the precise `/_ipe/readyz` probe, a
+                        // first-party HTTP listener "the port accepts a
+                        // connection" (a bare alive-grace could cut the proxy
+                        // over to an upstream that has not finished binding),
+                        // and a surface with no port a short alive-grace.
+                        let readiness = surface.readiness(child_port);
+                        let stdin = surface.stdin();
+                        let outcome = match (apply_order(surface, proxy.is_some()), proxy.as_ref())
+                        {
+                            // Blue-green: the new binary starts behind the proxy
+                            // while the old one still serves; on ready, the proxy
+                            // cuts over to it and the old binary is drained — the
+                            // user-facing port (held by the proxy) never stops
+                            // answering.
+                            (StartOrder::Overlap, Some(proxy)) => {
+                                let crate_dir = built.path().to_path_buf();
+                                let tok = hot_token.clone();
+                                let cp = control_port;
+                                let reset_state = opts.reset_state;
+                                supervisor.apply_green_behind_proxy(
+                                    &exe_path,
+                                    child_port,
+                                    move |path, port| {
+                                        spawn_command(
+                                            path,
+                                            &child_env(
+                                                port,
+                                                &crate_dir,
+                                                tok.as_deref(),
+                                                cp,
+                                                true,
+                                                reset_state,
+                                            ),
+                                            stdin,
+                                        )
+                                    },
+                                    readiness,
+                                    opts.restart_timeouts,
+                                    |ready_port| proxy.set_upstream(ready_port),
+                                )
+                            }
+                            // Stop-first: the old child stops before the new one
+                            // spawns, so the lease restores the terminal between
+                            // them. A proxy an earlier generation engaged keeps
+                            // the user's port; it is pointed at the new child only
+                            // when that child listens.
+                            (StartOrder::StopFirst, _) | (StartOrder::Overlap, None) => {
+                                let env = child_env(
+                                    child_port,
+                                    built.path(),
+                                    hot_token.as_deref(),
+                                    control_port,
+                                    proxy.is_some(),
+                                    opts.reset_state,
+                                );
+                                let hand_over = surface.terminal();
+                                let lease = &lease;
+                                let outcome = supervisor.apply_green(
+                                    &exe_path,
+                                    move |path| {
+                                        lease.spawn_after_stop(hand_over, || {
+                                            spawn_command(path, &env, stdin)
+                                        })
+                                    },
+                                    readiness,
+                                    opts.restart_timeouts,
+                                );
+                                if let Some(proxy) = proxy.as_ref() {
+                                    match stop_first_upstream(&outcome, readiness) {
+                                        UpstreamRoute::Keep => {}
+                                        UpstreamRoute::To(port) => proxy.set_upstream(port),
+                                        UpstreamRoute::Nothing => proxy.set_upstream(0),
+                                    }
+                                }
+                                outcome
+                            }
+                        };
+                        // An apply that leaves no live terminal owner (nothing
+                        // running, or an old owner drained behind the proxy)
+                        // hands the terminal back now.
+                        lease.release_unless_live(&mut supervisor);
                         timings.restart = Some(restart_started.elapsed());
+                        running_surface = surface_after(&outcome, running_surface, surface);
                         report_restart_outcome(&outcome, opts.quiet);
                         // Clear any "Recompiling app" banner with a soft-green
                         // "Updated!" the moment the rebuilt app is serving. Under
@@ -1911,7 +2028,7 @@ fn run_inner(
                         if outcome_is_running(&outcome)
                             && let (Some(tok), Some(app_port)) = (
                                 hot_token.as_deref(),
-                                app_status_port(proxy.as_ref(), opts.port),
+                                app_status_port(running_surface, proxy.as_ref(), opts.port),
                             )
                         {
                             post_watch_status(app_port, tok, true, "");
@@ -1923,13 +2040,14 @@ fn run_inner(
                         // only (a failed readiness keeps the last-good app, so
                         // its URL — already shown — still stands).
                         if !opts.quiet
-                            && current_is_web
+                            && surface.serves_page()
                             && !url_announced
                             && outcome_is_running(&outcome)
                         {
-                            crate::screen::Screen::new(crate::screen::Stream::Stderr)
-                                .guttered(&open_url_block(opts.port))
-                                .emit();
+                            emit_watch_screen(
+                                crate::screen::Screen::new(crate::screen::Stream::Stderr)
+                                    .guttered(&open_url_block(opts.port)),
+                            );
                             url_announced = true;
                         }
                         emit(
@@ -1977,6 +2095,9 @@ fn run_inner(
             .supersede();
     }
     supervisor.shutdown(opts.restart_timeouts);
+    // The supervised child is down, so the terminal it may have owned is
+    // restored before the watch exits, on the SIGTERM path as on any other.
+    lease.release();
     // Stop the front proxy AFTER the supervised child is down: it held the
     // user's port for the whole session, so releasing it last means the port
     // is answered until the very end of teardown rather than flapping.
@@ -1987,7 +2108,7 @@ fn run_inner(
         let _ = h.join();
     }
     let _ = coalesce_handle.join();
-    Ok(())
+    ended
 }
 
 /// Ask the OS for a free loopback TCP port by binding an ephemeral one and
@@ -2007,49 +2128,54 @@ fn free_loopback_port() -> std::io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// Where an appearance-only hot-swap is delivered for the running TEA shape —
-/// one variant per delivery mechanism, so a shape can never fall between the
-/// arms and silently drop an edit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppearanceRoute {
-    /// Ipe.Tui: the child owns a loopback control socket; the swap rides a
-    /// `HotAppearance` control frame.
-    ControlSocket,
-    /// Ipe.Web: the child serves `/_ipe/hot-appearance`; the swap rides an HTTP
-    /// POST on the app port.
-    WebPost,
-    /// Every viewless-or-line-oriented shape — cli (`console_app`) and worker
-    /// (`worker_app`) — has no out-of-band apply path, so an appearance swap is
-    /// N/A: the edit takes a full structural rebuild. Never a silent skip.
-    Rebuild,
+/// How often the watch checks whether a terminal-owning dev child exited on its own.
+const CHILD_EXIT_POLL: Duration = Duration::from_millis(200);
+
+/// The notice for a dev child that exited on its own; the status follows it.
+const APP_EXITED: &str = "[ipe dev watch] app exited";
+
+/// The notice that a dev child exited with `status` and the next save restarts it.
+fn app_exited_line(status: std::process::ExitStatus) -> String {
+    status.code().map_or_else(
+        || format!("{APP_EXITED} ({status}); save to restart"),
+        |code| format!("{APP_EXITED} (status {code}); save to restart"),
+    )
 }
 
-/// Route an appearance-only hot-swap by the running shape. Tui and web each have
-/// a delivery channel; any other shape (cli, worker, a bare HTTP server) has
-/// none, so it rebuilds. Total over the two shape flags by construction — the
-/// `Rebuild` fallback is the fail-safe that keeps a `HotSwappable` classification
-/// from ever no-op'ing on a shape that cannot apply it.
-const fn appearance_route(is_tui: bool, is_web: bool) -> AppearanceRoute {
-    if is_tui {
-        AppearanceRoute::ControlSocket
-    } else if is_web {
-        AppearanceRoute::WebPost
-    } else {
-        AppearanceRoute::Rebuild
-    }
+/// Whether a dev child's exit reports an interrupt (Ctrl-C): exit code 130,
+/// or death by `SIGINT`.
+fn exited_interrupted(status: std::process::ExitStatus) -> bool {
+    #[cfg(unix)]
+    let by_signal = std::os::unix::process::ExitStatusExt::signal(&status)
+        == Some(rustix::process::Signal::INT.as_raw());
+    #[cfg(not(unix))]
+    let by_signal = false;
+    status.code() == Some(130) || by_signal
+}
+
+/// The delivery shape the entry module's `main` pins, read from the module
+/// texts the compile consumed.
+///
+/// An entry missing from `sources` pins no shape, exactly as an absent `main`.
+fn entry_shape(
+    sources: &BTreeMap<Vec<String>, (PathBuf, String)>,
+    entry_path: &[String],
+) -> crate::delivery::Shape {
+    sources.get(entry_path).map_or_else(
+        || crate::driver::EntryMain::Absent.delivery_shape(),
+        |(_, text)| crate::driver::EntryMain::of(text).delivery_shape(),
+    )
 }
 
 /// Does any emitted `.rs` file contain `needle` — a FULLY-QUALIFIED runtime
-/// entry call (`ipe_runtime::web::web_app`, `…::server::server_listen`,
-/// `…::tui::tui_app_ui`) the backend emits ONLY at the app entry?
+/// entry call (`ipe_runtime::web::web_app`, `…::server::server_listen`) the
+/// backend emits ONLY at the app entry?
 ///
 /// Scans the WHOLE emitted source, not just `src/main.rs`: the entry call lands
 /// in `src/main.rs` for a single-file app but in a module file
 /// (`src/ipe_mods/ipe_mod_main.rs`) for a multi-module project, where `src/main.rs`
-/// is only a generic `ipe_main()` shim. Scanning `src/main.rs` alone therefore
-/// misclassified every multi-module app as neither-web-nor-tui — routing its
-/// appearance hot-swaps to a full rebuild and leaving the blue-green proxy
-/// disengaged. The emitted tree is compiler-controlled and the needle is a
+/// is only a generic `ipe_main()` shim, so `src/main.rs` alone would miss every
+/// multi-module listener. The emitted tree is compiler-controlled and the needle is a
 /// fully-qualified path (never a bare token a user symbol could shadow — the
 /// `unqualified_*` refusal tests pin this), so a substring check across it is
 /// sound.
@@ -2065,33 +2191,14 @@ fn emitted_source_contains(emitted: &ipe_backend::EmittedProject, needle: &str) 
         .any(|(_, text)| text.contains(needle))
 }
 
-/// The emitted crate is a live Ipe.Web app — its entry emission always contains
-/// the literal `ipe_runtime::web::web_app` call
-/// (`crates/ipe_backend_rust/src/emit_web.rs`). Ipe.Web apps get the precise
-/// `/_ipe/readyz` readiness probe and appearance hot-swap.
-fn emitted_is_web(emitted: &ipe_backend::EmittedProject) -> bool {
-    emitted_source_contains(emitted, "ipe_runtime::web::web_app")
-}
-
-/// The emitted crate is a Ipe.Tui app — its entry emission always contains the
-/// literal `ipe_runtime::tui::tui_app_ui` call (`emit_tui.rs`). A tui child has
-/// no HTTP endpoint, so its appearance hot-swap rides the loopback CONTROL
-/// SOCKET (`send_control_frame`) rather than the web `/_ipe/hot-appearance` POST.
-/// A match on the fully-qualified emitted path (not a bare token) so a user
-/// symbol or string literal cannot masquerade as the runtime entry.
-fn emitted_is_tui(emitted: &ipe_backend::EmittedProject) -> bool {
-    emitted_source_contains(emitted, "ipe_runtime::tui::tui_app_ui")
-}
-
 /// The emitted crate binds a FIRST-PARTY HTTP listener whose port `ipe`
 /// controls via the injected `IPE_*_PORT` env — exactly the two entrypoints an
 /// L7 proxy can front: `web_app` (Ipe.Web) or `server_listen` (Ipe.Http.Server).
-/// This — not the program's shape — decides whether the blue-green proxy
-/// engages: a `Shape::Script` `main = Server.listen …` binds an HTTP port and
-/// emits `server_listen`, so it too is proxied; a CLI/TUI/worker or a
-/// third-party/non-HTTP server (ftp/irc/raw socket) emits neither, so watch
-/// rebuilds and restarts it directly rather than fronting a port it cannot
-/// discover or relocate.
+/// With the entry's shape it decides the child's [`ChildSurface`]: a
+/// `Shape::Script` `main = Server.listen …` emits `server_listen`, so it is an
+/// [`ChildSurface::HttpListener`] and proxied; a third-party/non-HTTP server
+/// (ftp/irc/raw socket) emits neither, so watch rebuilds and restarts it
+/// directly rather than fronting a port it cannot discover or relocate.
 fn emitted_binds_http(emitted: &ipe_backend::EmittedProject) -> bool {
     // Match the FULLY-QUALIFIED emitted call path, not a bare token: the kernel
     // emits `ipe_runtime::server::server_listen(` / `ipe_runtime::web::web_app(`.
@@ -2808,13 +2915,18 @@ fn post_hot_wiring(port: u16, token: &str, body: &str) -> std::io::Result<bool> 
     Ok(head.starts_with("HTTP/1.1 200"))
 }
 
-/// The dev child's launch `Command`: `exe_path` with `env` applied and stdin closed.
-fn child_command(exe_path: &Path, env: &[(String, String)]) -> Command {
+/// The dev child's launch `Command`: `exe_path` with `env` applied and `stdin` wired.
+///
+/// The child stays in the watch's own process group, the terminal's foreground
+/// group: a child moved to a background group would be stopped on its first
+/// terminal read, and a stopped child is alive, so it would pass an alive-grace
+/// readiness probe falsely.
+fn child_command(exe_path: &Path, env: &[(String, String)], stdin: ChildStdin) -> Command {
     let mut cmd = Command::new(exe_path);
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.stdin(std::process::Stdio::null());
+    cmd.stdin(stdin.stdio());
     cmd
 }
 
@@ -2829,8 +2941,12 @@ fn child_command(exe_path: &Path, env: &[(String, String)]) -> Command {
 /// and on every Unix the child inherits stdio and no other descriptor of
 /// `ipe dev watch`. A refused hardened spawn surfaces as a spawn error; it never degrades to an
 /// unhardened spawn.
-fn spawn_command(exe_path: &Path, env: &[(String, String)]) -> std::io::Result<Child> {
-    ipe_runtime_rust::system::spawn_hardened(child_command(exe_path, env))
+fn spawn_command(
+    exe_path: &Path,
+    env: &[(String, String)],
+    stdin: ChildStdin,
+) -> std::io::Result<Child> {
+    ipe_runtime_rust::system::spawn_hardened(child_command(exe_path, env, stdin))
         .map_err(std::io::Error::from)
 }
 
@@ -2954,8 +3070,17 @@ fn strip_ansi(s: &str) -> String {
 /// so the in-app banner never appears). Route to the proxy's current upstream
 /// instead. `None` when no app is up (no upstream, or the internal port is not
 /// yet known) — there is then no browser to notify. Direct-bind (no proxy) keeps
-/// the app on `port` itself.
-fn app_status_port(proxy: Option<&ipe_watch::DevProxy>, port: u16) -> Option<u16> {
+/// the app on `port` itself. Only a running child that serves a page mounts the
+/// status endpoint, so for any other `running` surface (or none) the token is
+/// posted nowhere: the port it would reach is one no watch child listens on.
+fn app_status_port(
+    running: Option<ChildSurface>,
+    proxy: Option<&ipe_watch::DevProxy>,
+    port: u16,
+) -> Option<u16> {
+    if !running.is_some_and(ChildSurface::serves_page) {
+        return None;
+    }
     proxy.map_or(Some(port), |p| match p.current_upstream() {
         0 => None,
         up => Some(up),
@@ -3031,6 +3156,65 @@ fn warn_if_memory_store() {
     }
 }
 
+/// The surface of the child running after an apply of `applied` left
+/// `outcome`, given the surface `prior` that ran before it.
+const fn surface_after(
+    outcome: &ipe_watch::RestartOutcome,
+    prior: Option<ChildSurface>,
+    applied: ChildSurface,
+) -> Option<ChildSurface> {
+    match outcome {
+        ipe_watch::RestartOutcome::Spawned
+        | ipe_watch::RestartOutcome::Restarted
+        | ipe_watch::RestartOutcome::UnchangedBinary => Some(applied),
+        ipe_watch::RestartOutcome::RespawnedLastGood { .. } => prior,
+        ipe_watch::RestartOutcome::NothingRunning { .. } => None,
+    }
+}
+
+/// Where an engaged proxy forwards after a stop-first apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpstreamRoute {
+    /// The running child is unchanged; so is its upstream.
+    Keep,
+    /// The child now running listens here.
+    To(u16),
+    /// No child listens: the proxy answers 502 rather than forward to a port
+    /// the stopped child released and any local process could bind.
+    Nothing,
+}
+
+/// The upstream a stop-first apply leaves behind an engaged proxy. Every
+/// outcome that stopped the old child either names the port the live child
+/// passed readiness on or routes nothing; an unchanged binary keeps its port,
+/// never the fresh one this generation allocated and nobody bound.
+const fn stop_first_upstream(
+    outcome: &ipe_watch::RestartOutcome,
+    readiness: ipe_watch::ReadinessCheck,
+) -> UpstreamRoute {
+    match outcome {
+        ipe_watch::RestartOutcome::UnchangedBinary => UpstreamRoute::Keep,
+        ipe_watch::RestartOutcome::Spawned
+        | ipe_watch::RestartOutcome::Restarted
+        | ipe_watch::RestartOutcome::RespawnedLastGood { .. } => match readiness {
+            ipe_watch::ReadinessCheck::HttpReadyz { port }
+            | ipe_watch::ReadinessCheck::TcpConnect { port } => UpstreamRoute::To(port),
+            ipe_watch::ReadinessCheck::AliveGrace { .. } => UpstreamRoute::Nothing,
+        },
+        ipe_watch::RestartOutcome::NothingRunning { .. } => UpstreamRoute::Nothing,
+    }
+}
+
+/// What the watch keeps once the terminal owner exited on its own: no running
+/// surface, and an engaged proxy routes nothing, so the port the owner
+/// released is never an upstream any local process could bind.
+fn after_owner_exit(proxy: Option<&ipe_watch::DevProxy>) -> Option<ChildSurface> {
+    if let Some(proxy) = proxy {
+        proxy.set_upstream(0);
+    }
+    None
+}
+
 /// Whether a restart outcome left an app actually serving — the two outcomes
 /// that bring a binary up (a fresh spawn, a reload). The last-good-fallback and
 /// nothing-running outcomes did NOT start the new binary, so they must not
@@ -3048,7 +3232,7 @@ const fn outcome_is_running(outcome: &ipe_watch::RestartOutcome) -> bool {
 /// guttered, soft-green line naming the address to open. Coloured when stderr is
 /// a colour terminal, plain otherwise.
 fn open_url_block(port: u16) -> String {
-    let p = crate::style::Palette::for_stream(&std::io::stderr());
+    let p = crate::style::Palette::for_stream(&stderr_stream());
     let body = format!(
         "{g}➜  Open{r}   {g}http://localhost:{port}{r}",
         g = p.green,
@@ -3390,14 +3574,16 @@ fn find_executable_path(cargo_json_stdout: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppearanceRoute, BuildAccel, Command, Duration, FallbackNote, OrchestratorEvent,
-        RESOLVE_RETRY_DELAY, RebuildTimings, WatchRole, appearance_route, apply_build_accel_env,
-        child_command, child_env, choose_build_accel, compile_failed_frame, dir_has_dep_rlib,
-        emitted_binds_http, emitted_is_tui, emitted_is_web, env_flag_on, failure_fallback,
-        first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
-        resolve_project_sources, schedule_resolve_retry, send_control_frame, spawn_command,
-        strip_ansi, watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
+        AppearanceRoute, BuildAccel, ChildSurface, Command, Duration, FallbackNote,
+        OrchestratorEvent, RESOLVE_RETRY_DELAY, RebuildTimings, UpstreamRoute, WatchRole,
+        after_owner_exit, app_status_port, apply_build_accel_env, child_command, child_env,
+        choose_build_accel, compile_failed_frame, dir_has_dep_rlib, emitted_binds_http,
+        entry_shape, env_flag_on, failure_fallback, first_error_line, mint_hot_token, mpsc,
+        prove_green_crate, push_control_appearance, resolve_project_sources,
+        schedule_resolve_retry, send_control_frame, spawn_command, stop_first_upstream, strip_ansi,
+        surface_after, watch_emit_settings, watch_line, watch_runtime_dep, watch_status_body,
     };
+    use crate::delivery::Shape;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
 
@@ -3475,7 +3661,10 @@ mod tests {
         };
         let reach = crate::frame_reach::FrameReach::of(&entries);
         assert!(reach.is_some());
-        let green = super::CompileOutcome::Green(std::sync::Arc::new(emitted_with_main("")));
+        let green = super::CompileOutcome::Green {
+            emitted: std::sync::Arc::new(emitted_with_main("")),
+            shape: Shape::Script,
+        };
         assert_eq!(super::reach_after(&green, reach.clone()), reach);
         let red = super::CompileOutcome::Red("refused".to_owned());
         assert_eq!(super::reach_after(&red, reach.clone()), None);
@@ -3523,72 +3712,82 @@ mod tests {
         }
     }
 
-    /// A live web app emits `web_app`: it is BOTH a web project and an HTTP binder.
+    /// A live web app emits `web_app`: it is an HTTP binder, and with the web
+    /// shape it is a [`ChildSurface::WebApp`].
     #[test]
-    fn web_app_emit_is_web_and_binds_http() {
+    fn web_app_emit_binds_http() {
         let p = emitted_with_main("fn main() { ipe_runtime::web::web_app(a, b, c, d, e); }");
-        assert!(emitted_is_web(&p), "web_app must classify as web");
         assert!(emitted_binds_http(&p), "web_app must be an HTTP binder");
+        assert_eq!(
+            ChildSurface::of(Shape::Web, emitted_binds_http(&p)),
+            ChildSurface::WebApp
+        );
     }
 
-    /// Prove the regression fix: a MULTI-MODULE web app emits its `web_app` entry
-    /// into `src/ipe_mods/ipe_mod_main.rs`, not `src/main.rs` (a bare shim). The
-    /// shape detectors must scan the whole emitted surface, not just `src/main.rs`
-    /// — otherwise every multi-module web app is misclassified as neither-web-nor-
-    /// tui, routing its appearance edits to a full rebuild (not `AppearanceHotSwapped`)
-    /// and leaving the blue-green proxy disengaged (the client socket dropped on
-    /// rebuild).
+    /// A MULTI-MODULE web app emits its `web_app` entry into
+    /// `src/ipe_mods/ipe_mod_main.rs`, not `src/main.rs` (a bare shim): the
+    /// listener detector scans the whole emitted surface, so the blue-green proxy
+    /// still engages and appearance edits still ride the hot POST.
     #[test]
     fn multi_module_web_entry_is_detected_outside_main_rs() {
         let p = emitted_with_module_entry(
             "pub fn ipe_main() -> _ { ipe_runtime::tea::WebApp(ipe_runtime::web::web_app(a,b,c,d,e)) }",
         );
         assert!(
-            emitted_is_web(&p),
-            "a web_app entry in a module file must still classify as web"
-        );
-        assert!(
             emitted_binds_http(&p),
             "a web_app entry in a module file must still engage the blue-green proxy"
         );
         assert_eq!(
-            appearance_route(emitted_is_tui(&p), emitted_is_web(&p)),
+            ChildSurface::of(Shape::Web, emitted_binds_http(&p)).appearance_route(),
             AppearanceRoute::WebPost,
             "a multi-module web app must route appearance edits to the hot POST, not a rebuild"
         );
     }
 
-    /// The tui counterpart: a multi-module tui app's `tui_app_ui` entry also lives
-    /// in a module file and must still be detected (control-socket route, not rebuild).
+    /// The shape a watch generation runs is the one its entry's `main` pins,
+    /// read from the compiled sources: a tui entry is a terminal surface, and an
+    /// entry the sources lack pins none (a script).
     #[test]
-    fn multi_module_tui_entry_is_detected_outside_main_rs() {
-        let p = emitted_with_module_entry(
-            "pub fn ipe_main() -> _ { ipe_runtime::tea::TuiApp(ipe_runtime::tui::tui_app_ui(a,b,c,d)) }",
+    fn a_generation_takes_the_shape_its_entry_pins() {
+        let entry = vec!["Main".to_owned()];
+        let mut sources = std::collections::BTreeMap::new();
+        sources.insert(
+            entry.clone(),
+            (
+                PathBuf::from("Main.ipe"),
+                "module Main exposing (main)\n\nimport Ipe.Tea.Tui as Tui\n\nmain =\n    Tui.tea { init = init, update = update, view = view, subscriptions = subscriptions }\n"
+                    .to_owned(),
+            ),
         );
-        assert!(
-            emitted_is_tui(&p),
-            "a tui entry in a module file must classify as tui"
-        );
-        assert!(!emitted_is_web(&p), "a tui app is not a web project");
+        assert_eq!(entry_shape(&sources, &entry), Shape::Tui);
         assert_eq!(
-            appearance_route(emitted_is_tui(&p), emitted_is_web(&p)),
+            ChildSurface::of(entry_shape(&sources, &entry), false).appearance_route(),
             AppearanceRoute::ControlSocket,
-            "a multi-module tui app must route over the control socket, not a rebuild"
+            "a tui app routes appearance edits over the control socket"
+        );
+        assert_eq!(
+            entry_shape(&sources, &["Other".to_owned()]),
+            Shape::Script,
+            "an entry missing from the sources pins no shape"
         );
     }
 
-    /// An `Ipe.Http.Server` emits `server_listen`: an HTTP binder, but NOT web —
-    /// so the proxy engages (T2) while readiness uses `TcpConnect`, not readyz (T3).
-    /// This holds regardless of program shape: a `Shape::Script main = Server.listen`
-    /// emits `server_listen` and is detected by the emitted symbol, not the shape.
+    /// An `Ipe.Http.Server` emits `server_listen`: an HTTP binder, so a script
+    /// that listens is an [`ChildSurface::HttpListener`] — proxied, probed by
+    /// `TcpConnect`, not readyz.
     #[test]
     fn server_listen_emit_binds_http_but_is_not_web() {
         let p = emitted_with_main("fn main() { ipe_runtime::server::server_listen(8000i64, rs); }");
-        assert!(!emitted_is_web(&p), "a bare server is not a web project");
         assert!(
             emitted_binds_http(&p),
             "server_listen must engage the HTTP proxy"
         );
+        let surface = ChildSurface::of(Shape::Script, emitted_binds_http(&p));
+        assert_eq!(surface, ChildSurface::HttpListener);
+        assert!(matches!(
+            surface.readiness(8000),
+            ipe_watch::ReadinessCheck::TcpConnect { port: 8000 }
+        ));
     }
 
     /// Prove the refusal: detection matches the FULLY-QUALIFIED emitted call, so
@@ -3618,98 +3817,373 @@ mod tests {
     #[test]
     fn non_http_emit_binds_no_first_party_listener() {
         let p = emitted_with_main("fn main() { ipe_runtime::cli::run(update, view); }");
-        assert!(!emitted_is_web(&p));
         assert!(
             !emitted_binds_http(&p),
             "a non-HTTP program must NOT engage the proxy — no spurious port bind"
         );
-    }
-
-    /// A Ipe.Tui app emits `tui_app_ui`: it is a tui child (control-socket
-    /// hot-swap) and NOT a web project nor an HTTP binder.
-    #[test]
-    fn tui_app_emit_is_tui_not_web_or_http() {
-        let p = emitted_with_main(
+        let tui = emitted_with_main(
             "fn main() { ipe_runtime::tea::TuiApp(ipe_runtime::tui::tui_app_ui(a,b,c,d)); }",
         );
-        assert!(emitted_is_tui(&p), "tui_app_ui must classify as tui");
-        assert!(!emitted_is_web(&p), "a tui app is not a web project");
-        assert!(!emitted_binds_http(&p), "a tui app binds no HTTP listener");
-    }
-
-    /// A cli (`console_app`) app is neither tui nor web, so an appearance-only
-    /// edit routes to a full structural REBUILD, never an out-of-band swap: a cli
-    /// renders its `LinesView` synchronously on the next fold and has no control
-    /// socket or `/_ipe/hot-appearance` endpoint to deliver a patch to.
-    #[test]
-    fn cli_app_emit_is_neither_tui_nor_web() {
-        let p = emitted_with_main(
-            "fn main() { ipe_runtime::tea::CliApp(ipe_runtime::console_app(a,b,c,d)); }",
-        );
-        let (is_tui, is_web) = (emitted_is_tui(&p), emitted_is_web(&p));
-        assert!(!is_tui, "a cli app is not a tui app");
-        assert!(!is_web, "a cli app is not a web app");
-        assert_eq!(
-            appearance_route(is_tui, is_web),
-            AppearanceRoute::Rebuild,
-            "a cli appearance edit must rebuild — no out-of-band apply path exists"
-        );
-    }
-
-    /// A worker (`worker_app`) app has NO view surface at all, so appearance
-    /// hot-swap is genuinely N/A: every edit — appearance-classified or not —
-    /// routes to a full structural rebuild.
-    #[test]
-    fn worker_app_emit_is_neither_tui_nor_web() {
-        let p = emitted_with_main(
-            "fn main() { ipe_runtime::tea::WorkerApp(ipe_runtime::worker_app(a,b,c)); }",
-        );
-        let (is_tui, is_web) = (emitted_is_tui(&p), emitted_is_web(&p));
-        assert!(!is_tui, "a worker app is not a tui app");
-        assert!(!is_web, "a worker app is not a web app");
-        assert_eq!(
-            appearance_route(is_tui, is_web),
-            AppearanceRoute::Rebuild,
-            "a worker has no view surface — every edit rebuilds, never hot-swaps"
-        );
-    }
-
-    /// The full shape→route table, pinned exhaustively: only tui takes the
-    /// control socket, only web takes the HTTP POST, and every viewless/
-    /// line-oriented shape (the `false, false` case cli and worker both land on)
-    /// falls to a rebuild. This is the fail-safe: no shape silently skips an edit.
-    #[test]
-    fn appearance_route_covers_every_shape() {
-        assert_eq!(
-            appearance_route(true, false),
-            AppearanceRoute::ControlSocket,
-            "tui delivers over the loopback control socket"
-        );
-        assert_eq!(
-            appearance_route(false, true),
-            AppearanceRoute::WebPost,
-            "web delivers over the /_ipe/hot-appearance POST"
-        );
-        assert_eq!(
-            appearance_route(false, false),
-            AppearanceRoute::Rebuild,
-            "cli/worker/other rebuild — the fail-safe against a silent skip"
-        );
-    }
-
-    /// Prove the refusal: tui detection matches the FULLY-QUALIFIED emitted call,
-    /// so a user function or a string literal carrying the bare token is not
-    /// mistaken for the runtime tui entry (no spurious control-socket delivery).
-    #[test]
-    fn unqualified_tui_token_is_not_a_tui_app() {
-        let user_fn =
-            emitted_with_main("fn tui_app_ui() {} fn main() { let _ = \"tui_app_ui text\"; }");
         assert!(
-            !emitted_is_tui(&user_fn),
-            "a user symbol / string literal is not the runtime tui entry"
+            !emitted_binds_http(&tui),
+            "a tui app binds no HTTP listener"
         );
-        let web = emitted_with_main("fn main() { ipe_runtime::web::web_app(a,b,c,d,e); }");
-        assert!(!emitted_is_tui(&web), "a web app is not a tui app");
+    }
+
+    /// Every surface decides every contract, as the table pins it: stdin,
+    /// readiness, start order, terminal hand-over and appearance route.
+    ///
+    /// Only a terminal surface takes the control socket and only the web app
+    /// the hot POST; every other surface rebuilds, so no surface silently
+    /// skips an appearance edit.
+    #[test]
+    fn every_surface_decides_every_contract() {
+        use super::surface::{ALIVE_GRACE, ChildStdin, Listener, StartOrder, TerminalHandOver};
+        use ipe_watch::ReadinessCheck;
+        let grace = ReadinessCheck::AliveGrace { grace: ALIVE_GRACE };
+        let tcp = ReadinessCheck::TcpConnect { port: 7 };
+        let table = [
+            (
+                ChildSurface::WebApp,
+                ChildStdin::Null,
+                ReadinessCheck::HttpReadyz { port: 7 },
+                StartOrder::Overlap,
+                TerminalHandOver::None,
+                AppearanceRoute::WebPost,
+            ),
+            (
+                ChildSurface::HttpListener,
+                ChildStdin::Null,
+                tcp,
+                StartOrder::Overlap,
+                TerminalHandOver::None,
+                AppearanceRoute::Rebuild,
+            ),
+            (
+                ChildSurface::Terminal {
+                    listener: Listener::None,
+                },
+                ChildStdin::Inherit,
+                grace,
+                StartOrder::StopFirst,
+                TerminalHandOver::Owns,
+                AppearanceRoute::ControlSocket,
+            ),
+            (
+                ChildSurface::Terminal {
+                    listener: Listener::Tcp,
+                },
+                ChildStdin::Inherit,
+                tcp,
+                StartOrder::StopFirst,
+                TerminalHandOver::Owns,
+                AppearanceRoute::ControlSocket,
+            ),
+            (
+                ChildSurface::Line,
+                ChildStdin::Inherit,
+                grace,
+                StartOrder::StopFirst,
+                TerminalHandOver::Owns,
+                AppearanceRoute::Rebuild,
+            ),
+            (
+                ChildSurface::Worker,
+                ChildStdin::Null,
+                grace,
+                StartOrder::StopFirst,
+                TerminalHandOver::None,
+                AppearanceRoute::Rebuild,
+            ),
+            (
+                ChildSurface::Script,
+                ChildStdin::Inherit,
+                grace,
+                StartOrder::StopFirst,
+                TerminalHandOver::None,
+                AppearanceRoute::Rebuild,
+            ),
+        ];
+        for (surface, stdin, readiness, order, terminal, route) in table {
+            assert_eq!(surface.stdin(), stdin, "{surface:?} stdin");
+            // `ReadinessCheck` carries no equality; its debug form names every field.
+            assert_eq!(
+                format!("{:?}", surface.readiness(7)),
+                format!("{readiness:?}"),
+                "{surface:?} readiness"
+            );
+            assert_eq!(surface.start_order(), order, "{surface:?} start order");
+            assert_eq!(surface.terminal(), terminal, "{surface:?} terminal");
+            assert_eq!(surface.appearance_route(), route, "{surface:?} route");
+        }
+    }
+
+    /// The entry's shape and its first-party HTTP listener decide the surface:
+    /// a non-web, non-terminal shape that binds HTTP is probed as a listener.
+    #[test]
+    fn every_shape_takes_one_surface() {
+        use super::surface::Listener;
+        let shapes = [
+            (Shape::Web, false, ChildSurface::WebApp),
+            (Shape::Web, true, ChildSurface::WebApp),
+            (
+                Shape::Tui,
+                false,
+                ChildSurface::Terminal {
+                    listener: Listener::None,
+                },
+            ),
+            (
+                Shape::Tui,
+                true,
+                ChildSurface::Terminal {
+                    listener: Listener::Tcp,
+                },
+            ),
+            (Shape::Cli, false, ChildSurface::Line),
+            (Shape::Cli, true, ChildSurface::HttpListener),
+            (Shape::Worker, false, ChildSurface::Worker),
+            (Shape::Worker, true, ChildSurface::HttpListener),
+            (Shape::Script, false, ChildSurface::Script),
+            (Shape::Script, true, ChildSurface::HttpListener),
+        ];
+        for (shape, binds_http, surface) in shapes {
+            assert_eq!(
+                ChildSurface::of(shape, binds_http),
+                surface,
+                "{shape:?} binds_http={binds_http}"
+            );
+        }
+    }
+
+    /// Prove the refusal: a terminal-owning surface never overlaps its
+    /// predecessor, even behind a proxy an earlier generation engaged, so two
+    /// children never own the terminal at once; only an overlapping surface
+    /// behind an engaged proxy overlaps.
+    #[test]
+    fn a_terminal_surface_never_overlaps_behind_an_engaged_proxy() {
+        use super::surface::{Listener, StartOrder, TerminalHandOver, apply_order};
+        let all = [
+            ChildSurface::WebApp,
+            ChildSurface::HttpListener,
+            ChildSurface::Terminal {
+                listener: Listener::None,
+            },
+            ChildSurface::Terminal {
+                listener: Listener::Tcp,
+            },
+            ChildSurface::Line,
+            ChildSurface::Worker,
+            ChildSurface::Script,
+        ];
+        for surface in all {
+            if surface.terminal() == TerminalHandOver::Owns {
+                assert_eq!(
+                    apply_order(surface, true),
+                    StartOrder::StopFirst,
+                    "{surface:?} behind an engaged proxy"
+                );
+            }
+            assert_eq!(
+                apply_order(surface, false),
+                StartOrder::StopFirst,
+                "{surface:?} with no proxy"
+            );
+        }
+        assert_eq!(apply_order(ChildSurface::WebApp, true), StartOrder::Overlap);
+        assert_eq!(
+            apply_order(ChildSurface::HttpListener, true),
+            StartOrder::Overlap
+        );
+    }
+
+    /// Every way out of the watch loop runs the teardown after it: an early
+    /// `?` or `return` inside the loop would leave the supervised child
+    /// running, the terminal it owns unrestored and the proxy bound.
+    #[test]
+    fn the_watch_loop_leaves_only_through_its_teardown() {
+        let source = include_str!("watch.rs");
+        let body = source
+            .split_once("    let mut ended: Result<(), CliError> = Ok(());\n    loop {\n")
+            .and_then(|(_, rest)| rest.split_once("\n    drop(watcher);\n"))
+            .map(|(body, _)| body);
+        let Some(body) = body else {
+            assert!(body.is_some(), "the watch loop and its teardown are found");
+            return;
+        };
+        // Any `?` operator (every `?` but a `{:?}` format's), any `return`
+        // word, and any process exit; a false hit fails closed.
+        let leaves_early = |line: &str| {
+            let try_operator = line
+                .match_indices('?')
+                .any(|(at, _)| line.get(at..).is_none_or(|rest| !rest.starts_with("?}")));
+            let returns = line
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| word == "return");
+            try_operator || returns || line.contains("process::")
+        };
+        let escapes: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| leaves_early(line))
+            .collect();
+        assert!(
+            escapes.is_empty(),
+            "the watch loop must break to its teardown, never leave early: {escapes:?}"
+        );
+        // While a dev child owns the terminal its stderr draws on, the loop's
+        // output is held: it writes only through the deferring writers.
+        let direct: Vec<&str> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| {
+                line.contains("show_frame_reach(")
+                    || line.contains(".emit()")
+                    || line.contains(".emit_chatter()")
+                    || line.contains("write_watch_line(")
+                    || line.contains("chatter_styled(")
+                    || line.contains("eprintln!")
+                    || line.contains("eprint!")
+            })
+            .collect();
+        assert!(
+            direct.is_empty(),
+            "the watch loop must write through the deferring writers: {direct:?}"
+        );
+    }
+
+    /// An appearance hot-swap reaches the child that runs: a candidate that
+    /// failed readiness leaves the last good child's surface in charge, and a
+    /// session with nothing running routes every edit to a rebuild.
+    #[test]
+    fn the_running_surface_follows_the_apply_not_the_emit() {
+        use ipe_watch::RestartOutcome;
+        let web = ChildSurface::WebApp;
+        let tui = ChildSurface::Terminal {
+            listener: super::surface::Listener::None,
+        };
+        for live in [
+            RestartOutcome::Spawned,
+            RestartOutcome::Restarted,
+            RestartOutcome::UnchangedBinary,
+        ] {
+            assert_eq!(surface_after(&live, Some(web), tui), Some(tui), "{live:?}");
+        }
+        let kept = RestartOutcome::RespawnedLastGood {
+            broken: PathBuf::from("broken"),
+        };
+        assert_eq!(surface_after(&kept, Some(web), tui), Some(web));
+        let dead = RestartOutcome::NothingRunning {
+            broken: PathBuf::from("broken"),
+            last_good_error: None,
+        };
+        assert_eq!(surface_after(&dead, Some(web), tui), None);
+    }
+
+    /// The dev token reaches only a running child that mounts the status
+    /// endpoint: with no child, or a child that serves no page, nothing is
+    /// posted to the user's port, which no watch child then listens on.
+    #[test]
+    fn the_status_post_reaches_only_a_running_page() {
+        let port = 40_002;
+        assert_eq!(
+            app_status_port(Some(ChildSurface::WebApp), None, port),
+            Some(port)
+        );
+        assert_eq!(app_status_port(None, None, port), None);
+        for surface in [
+            ChildSurface::HttpListener,
+            ChildSurface::Terminal {
+                listener: super::surface::Listener::None,
+            },
+            ChildSurface::Terminal {
+                listener: super::surface::Listener::Tcp,
+            },
+            ChildSurface::Line,
+            ChildSurface::Worker,
+            ChildSurface::Script,
+        ] {
+            assert_eq!(
+                app_status_port(Some(surface), None, port),
+                None,
+                "{surface:?}"
+            );
+        }
+    }
+
+    /// A terminal owner that exited on its own released its port: an engaged
+    /// proxy stops forwarding there, and no surface is left running for a
+    /// status post or an appearance route to reach.
+    #[test]
+    fn an_owner_that_exits_leaves_the_proxy_routing_nothing() {
+        let bound = super::free_loopback_port().and_then(ipe_watch::DevProxy::bind);
+        assert!(
+            bound.is_ok(),
+            "a loopback proxy binds: {:?}",
+            bound.as_ref().err()
+        );
+        let Ok(mut proxy) = bound else {
+            return;
+        };
+        proxy.set_upstream(40_003);
+        assert_eq!(after_owner_exit(Some(&proxy)), None);
+        assert_eq!(proxy.current_upstream(), 0);
+        assert_eq!(after_owner_exit(None), None);
+        proxy.shutdown();
+    }
+
+    /// A stop-first apply behind an engaged proxy never forwards to a port no
+    /// live child passed readiness on: an unchanged binary keeps the running
+    /// upstream (the fresh port this generation allocated is bound by nobody),
+    /// and an outcome with no listening child routes nothing instead of
+    /// leaving the stopped child's released port as the upstream.
+    #[test]
+    fn a_stop_first_apply_routes_only_to_a_live_listener() {
+        use ipe_watch::{ReadinessCheck, RestartOutcome};
+        let fresh = 40_001;
+        let http = ReadinessCheck::HttpReadyz { port: fresh };
+        let tcp = ReadinessCheck::TcpConnect { port: fresh };
+        let none = ReadinessCheck::AliveGrace {
+            grace: Duration::from_millis(1),
+        };
+        assert_eq!(
+            stop_first_upstream(&RestartOutcome::UnchangedBinary, http),
+            UpstreamRoute::Keep
+        );
+        assert_eq!(
+            stop_first_upstream(&RestartOutcome::UnchangedBinary, none),
+            UpstreamRoute::Keep
+        );
+        for live in [
+            RestartOutcome::Spawned,
+            RestartOutcome::Restarted,
+            RestartOutcome::RespawnedLastGood {
+                broken: PathBuf::from("broken"),
+            },
+        ] {
+            assert_eq!(
+                stop_first_upstream(&live, http),
+                UpstreamRoute::To(fresh),
+                "{live:?}"
+            );
+            assert_eq!(
+                stop_first_upstream(&live, tcp),
+                UpstreamRoute::To(fresh),
+                "{live:?}"
+            );
+            assert_eq!(
+                stop_first_upstream(&live, none),
+                UpstreamRoute::Nothing,
+                "{live:?} with no listener"
+            );
+        }
+        let dead = RestartOutcome::NothingRunning {
+            broken: PathBuf::from("broken"),
+            last_good_error: None,
+        };
+        assert_eq!(stop_first_upstream(&dead, http), UpstreamRoute::Nothing);
     }
 
     /// Fail-closed: with NO control port allocated (the child opened no control
@@ -4206,7 +4680,11 @@ mod tests {
             ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV.to_string(),
             "4321".to_string(),
         )];
-        let mut cmd = child_command(Path::new("/usr/bin/env"), &env);
+        let mut cmd = child_command(
+            Path::new("/usr/bin/env"),
+            &env,
+            super::surface::ChildStdin::Null,
+        );
         cmd.stdout(std::process::Stdio::piped());
         let child = ipe_runtime_rust::system::spawn_hardened(cmd)
             .map_err(std::io::Error::from)
@@ -4219,6 +4697,235 @@ mod tests {
                 .lines()
                 .any(|l| l == format!("{}=4321", ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV)),
             "child env must carry the requested port: {printed}"
+        );
+    }
+
+    /// The env var that turns [`child_command_inherits_stdin_only_for_terminal_owners`]'s
+    /// re-executed copy into the probe running on a pseudo-terminal stdin.
+    #[cfg(target_os = "linux")]
+    const STDIN_PROBE_ENV: &str = "IPE_WATCH_STDIN_PROBE";
+
+    /// A terminal owner's child reads the watch's own terminal; an HTTP
+    /// surface's child gets a closed stdin, so two overlapping generations
+    /// never share the keyboard.
+    ///
+    /// The test re-runs itself with a pseudo-terminal as stdin; that copy
+    /// spawns `test -t 0` through [`child_command`] for each surface.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[allow(clippy::expect_used)] // a pty the host cannot open is a test-environment bug
+    fn child_command_inherits_stdin_only_for_terminal_owners() {
+        use super::surface::Listener;
+        let stdin_is_tty = |surface: ChildSurface| {
+            let mut cmd = child_command(Path::new("/bin/sh"), &[], surface.stdin());
+            cmd.args(["-c", "test -t 0"]);
+            ipe_runtime_rust::system::spawn_hardened(cmd)
+                .map_err(std::io::Error::from)
+                .expect("hardened /bin/sh must spawn")
+                .wait()
+                .expect("reap /bin/sh")
+                .success()
+        };
+        if ipe_env::var(STDIN_PROBE_ENV).is_ok() {
+            assert!(
+                rustix::termios::isatty(std::io::stdin()),
+                "the probe runs on a pseudo-terminal stdin"
+            );
+            assert!(
+                stdin_is_tty(ChildSurface::Terminal {
+                    listener: Listener::None
+                }),
+                "a terminal owner reads the watch's terminal"
+            );
+            assert!(
+                stdin_is_tty(ChildSurface::Line),
+                "a line app reads the watch's terminal"
+            );
+            assert!(
+                !stdin_is_tty(ChildSurface::HttpListener),
+                "an HTTP listener's stdin is closed"
+            );
+            assert!(
+                !stdin_is_tty(ChildSurface::WebApp),
+                "a web app's stdin is closed"
+            );
+            return;
+        }
+        let master =
+            rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+                .expect("open a pty master");
+        rustix::pty::grantpt(&master).expect("grant the pty");
+        rustix::pty::unlockpt(&master).expect("unlock the pty");
+        let name = rustix::pty::ptsname(&master, Vec::new()).expect("name the pty slave");
+        let slave = rustix::fs::open(
+            name.as_c_str(),
+            rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("open the pty slave");
+        let status = Command::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "watch::tests::child_command_inherits_stdin_only_for_terminal_owners",
+                "--nocapture",
+            ])
+            .env(STDIN_PROBE_ENV, "1")
+            .stdin(std::process::Stdio::from(slave))
+            .status()
+            .expect("re-run the test on a pty stdin");
+        drop(master);
+        assert!(status.success(), "the pty probe failed: {status}");
+    }
+
+    /// The release bytes undo every terminal mode the TUI runtime sets.
+    ///
+    /// The runtime's enable sequences are listed here because the runtime keeps
+    /// them private: alternate screen, hidden cursor, and click tracking with
+    /// SGR coordinates. Each must have its reset in [`RELEASE_BYTES`], and the
+    /// alternate screen is left last so the restored cursor lands on the main
+    /// screen.
+    ///
+    /// [`RELEASE_BYTES`]: super::surface::RELEASE_BYTES
+    #[test]
+    fn the_release_bytes_reset_every_mode_the_runtime_sets() {
+        use super::surface::RELEASE_BYTES;
+        let runtime_enables: [(&str, &[&str]); 3] = [
+            ("\x1b[?1049h", &["\x1b[?1049l"]),
+            ("\x1b[?25l", &["\x1b[?25h"]),
+            ("\x1b[?1000;1006h", &["\x1b[?1000l", "\x1b[?1006l"]),
+        ];
+        for (enable, resets) in runtime_enables {
+            for reset in resets {
+                assert!(
+                    RELEASE_BYTES.contains(reset),
+                    "{enable:?} has no reset {reset:?} in the release bytes"
+                );
+            }
+        }
+        assert!(
+            RELEASE_BYTES.starts_with('\x18'),
+            "a half-written escape is cancelled first"
+        );
+        assert!(
+            RELEASE_BYTES.ends_with("\x1b[?1049l"),
+            "the alternate screen is left last"
+        );
+    }
+
+    /// Counts the restores a lease performs.
+    #[derive(Default)]
+    struct RestoreRecorder {
+        restores: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+
+    impl super::surface::TerminalRestore for RestoreRecorder {
+        fn capture(&self) {}
+        fn restore(&self) {
+            self.restores.set(self.restores.get().saturating_add(1));
+        }
+    }
+
+    /// Prove the refusal: the lease never restores the terminal over its live
+    /// owner, and restores it once that owner has exited.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a host without /bin/sleep is a test-environment bug
+    fn the_lease_never_restores_over_a_live_terminal_child() {
+        use super::surface::{TerminalHandOver, TerminalLease};
+        let recorder = RestoreRecorder::default();
+        let restores = std::rc::Rc::clone(&recorder.restores);
+        let lease = TerminalLease::new(recorder);
+        let child = lease
+            .spawn_after_stop(TerminalHandOver::Owns, || {
+                Command::new("/bin/sleep").arg("30").spawn()
+            })
+            .expect("spawn /bin/sleep");
+        assert!(lease.is_held(), "a terminal owner holds the lease");
+        let mut supervisor = ipe_watch::SupervisorState::Running {
+            child,
+            artifact: ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/sleep"),
+                content_hash: [0; 32],
+            },
+        };
+        lease.release_unless_live(&mut supervisor);
+        assert_eq!(restores.get(), 0, "no restore over a live owner");
+        assert!(lease.reap_exited_owner(&mut supervisor).is_none());
+        assert!(lease.is_held(), "a live owner keeps the lease");
+        if let ipe_watch::SupervisorState::Running { child, .. } = &mut supervisor {
+            child.kill().expect("kill /bin/sleep");
+            child.wait().expect("reap /bin/sleep");
+        }
+        lease.release_unless_live(&mut supervisor);
+        assert_eq!(restores.get(), 1, "an exited owner's terminal is restored");
+        assert!(!lease.is_held());
+        lease.release();
+        assert_eq!(restores.get(), 1, "a released lease restores nothing again");
+    }
+
+    /// An owner that exits on its own is reaped once: the lease restores the
+    /// terminal and the supervisor keeps the binary as its last good one.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::expect_used)] // a host without /bin/true is a test-environment bug
+    fn an_owner_that_exits_hands_the_terminal_back() {
+        use super::surface::{TerminalHandOver, TerminalLease};
+        let recorder = RestoreRecorder::default();
+        let restores = std::rc::Rc::clone(&recorder.restores);
+        let lease = TerminalLease::new(recorder);
+        let child = lease
+            .spawn_after_stop(TerminalHandOver::Owns, || Command::new("/bin/true").spawn())
+            .expect("spawn /bin/true");
+        let mut supervisor = ipe_watch::SupervisorState::Running {
+            child,
+            artifact: ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/true"),
+                content_hash: [0; 32],
+            },
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = lease.reap_exited_owner(&mut supervisor) {
+                break Some(status);
+            }
+            if std::time::Instant::now() > deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.is_some_and(|s| s.success()), "the owner exited 0");
+        assert_eq!(restores.get(), 1, "the terminal is restored once");
+        assert!(
+            matches!(
+                supervisor,
+                ipe_watch::SupervisorState::NotRunning { last_good: Some(_) }
+            ),
+            "the exited owner's binary stays the last good one"
+        );
+        assert!(!super::exited_interrupted(status.expect("checked above")));
+    }
+
+    /// Ctrl-C ends the watch: a child exiting 130 or by `SIGINT` reports an
+    /// interrupt, any other exit does not.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_interrupted_exit_ends_the_watch() {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert!(super::exited_interrupted(
+            std::process::ExitStatus::from_raw(130 << 8)
+        ));
+        assert!(super::exited_interrupted(
+            std::process::ExitStatus::from_raw(rustix::process::Signal::INT.as_raw())
+        ));
+        assert!(!super::exited_interrupted(
+            std::process::ExitStatus::from_raw(1 << 8)
+        ));
+        assert!(!super::exited_interrupted(
+            std::process::ExitStatus::from_raw(0)
+        ));
+        assert_eq!(
+            super::app_exited_line(std::process::ExitStatus::from_raw(1 << 8)),
+            "[ipe dev watch] app exited (status 1); save to restart"
         );
     }
 
@@ -4271,8 +4978,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_failed_rebuild_after_the_app_exited_claims_no_running_app() {
-        let mut child =
-            spawn_command(Path::new("/bin/true"), &[]).expect("hardened /bin/true must spawn");
+        let mut child = spawn_command(
+            Path::new("/bin/true"),
+            &[],
+            super::surface::ChildStdin::Null,
+        )
+        .expect("hardened /bin/true must spawn");
         let status = child.wait().expect("reap /bin/true");
         assert!(status.success(), "hardened /bin/true must exit 0");
         let mut exited = ipe_watch::SupervisorState::Running {
@@ -4294,8 +5005,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_command_launches_through_the_hardened_spawner() {
-        let mut child =
-            spawn_command(Path::new("/bin/true"), &[]).expect("hardened /bin/true must spawn");
+        let mut child = spawn_command(
+            Path::new("/bin/true"),
+            &[],
+            super::surface::ChildStdin::Null,
+        )
+        .expect("hardened /bin/true must spawn");
         let status = child.wait().expect("reap /bin/true");
         assert!(status.success(), "hardened /bin/true must exit 0");
     }

@@ -488,13 +488,24 @@ fn frame_notice_screen(
 ///
 /// It is a notice, never a refusal, so a build's exit status is unchanged.
 pub fn show_frame_reach(reach: Option<crate::frame_reach::FrameReach>) {
-    if let Some(reach) = claim_frame_notice(reach, &FRAME_NOTICE_SHOWN) {
+    if let Some(notice) = frame_reach_notice(reach) {
+        notice.emit_chatter();
+    }
+}
+
+/// The trusted-frames notice [`show_frame_reach`] writes, claimed for a
+/// caller that decides when it reaches stderr; `None` when there is nothing
+/// to show or the session already showed it.
+#[must_use]
+pub fn frame_reach_notice(
+    reach: Option<crate::frame_reach::FrameReach>,
+) -> Option<crate::screen::Screen> {
+    claim_frame_notice(reach, &FRAME_NOTICE_SHOWN).map(|reach| {
         frame_notice_screen(
             crate::screen::Screen::new(crate::screen::Stream::Stderr),
             &reach,
         )
-        .emit_chatter();
-    }
+    })
 }
 
 /// The canonical directory that owns a project's manifest — the seed for the
