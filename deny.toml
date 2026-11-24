@@ -22,7 +22,10 @@ features = ["full", "wasi_run"]
 # https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
 [advisories]
 # Every entry is "ignore now, replace later": an accepted exposure, revisited
-# when its upstream fix or a replacement lands, never a permanent waiver.
+# when its upstream fix or a replacement lands, never a permanent waiver. An
+# entry the judged graph no longer encounters is an error in security.yml
+# (`-D advisory-not-detected`, verify-manifest.py check 31), so a dropped
+# exposure takes its ignore with it and a returning one is judged afresh.
 ignore = [
     # RUSTSEC-2023-0071 — rsa 0.9.x "Marvin Attack" (PKCS#1 v1.5 timing
     # sidechannel). No fixed upstream release exists (the advisory's own
@@ -35,15 +38,6 @@ ignore = [
     # tracked; revisit when `rsa` ships a fix or a vetted constant-time
     # RS256 alternative replaces it.
     "RUSTSEC-2023-0071",
-    # RUSTSEC-2026-0235 — rkyv 0.7.46 OOB reads when deserializing archives
-    # containing Rc/Arc. rkyv is an optional serialization backend of
-    # rust_decimal (feature "rkyv"); it appears in the lockfile because cargo
-    # v4 lockfiles record all optional packages of every dep in the graph, even
-    # unactivated ones. No code in this repo activates rust_decimal's "rkyv"
-    # feature, and no rkyv archive is ever deserialized — the OOB path is
-    # unreachable. Fix would require rust_decimal >= 0.8 (a semver-breaking
-    # jump); accepted until that line is available and rust_decimal updates.
-    "RUSTSEC-2026-0235",
     # RUSTSEC-2026-0459 — bundled SQLite before 3.54.0 can return uninitialized
     # page-cache memory when a database is opened with a sibling `-wal` file of
     # a different page size. Reached through the runtime's `db` feature
@@ -108,13 +102,16 @@ workspace-default-features = "allow"
 external-default-features = "allow"
 # Roots come from `webpki-roots` 1.x only. A spec is `name:<semver req>`
 # (`name@<version>` is an exact version, so `@<1` bans 1.x and `@<1.0.0`
-# bans nothing). The OS root stores reach the tree only through the CLI's
-# `reqwest` 0.13 chain, named by `wrappers`; the runtime's own closure is
-# walked exactly in the `ipe` test `legacy_roots_are_refused_in_every_lock`.
+# bans nothing). The OS root stores are banned with no `wrappers`: the judged
+# graph holds neither, so a crate that brings one in fails this gate until a
+# reviewed exemption names it (an exemption the graph does not reach is an
+# error in security.yml, verify-manifest.py check 31). The runtime's own
+# closure is walked exactly in the `ipe` test
+# `legacy_roots_are_refused_in_every_lock`.
 deny = [
     { crate = "webpki-roots:<1", reason = "RUSTSEC-2026-0381: roots come from webpki-roots 1.x only" },
-    { crate = "rustls-native-certs", wrappers = ["rustls-platform-verifier"], reason = "runtime roots are webpki-roots, never the OS store" },
-    { crate = "rustls-platform-verifier", wrappers = ["reqwest"], reason = "runtime roots are webpki-roots, never the OS store" },
+    { crate = "rustls-native-certs", reason = "runtime roots are webpki-roots, never the OS store" },
+    { crate = "rustls-platform-verifier", reason = "runtime roots are webpki-roots, never the OS store" },
 ]
 
 # https://embarkstudios.github.io/cargo-deny/checks/sources/cfg.html
