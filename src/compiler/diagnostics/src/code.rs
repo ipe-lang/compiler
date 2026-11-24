@@ -1003,4 +1003,28 @@ mod tests {
             "IPE-N0030 has no explain page"
         );
     }
+
+    /// `IPE-E0013`'s remedies must each clear the gap they name: a distro musl
+    /// package only builds for the host's own architecture, so the page pairs
+    /// those packages with the same-architecture case and sends a cross build
+    /// to `CC_<triple>`; the std remedy names rustup's `--toolchain` form.
+    #[test]
+    fn e0013_page_scopes_musl_packages_to_same_architecture() {
+        let page = explain_page(IPE_E0013).unwrap_or("");
+        let musl_block = page
+            .split("\n\n")
+            .flat_map(|para| para.split("\n- "))
+            .find(|block| block.contains("`musl-tools`"))
+            .unwrap_or("");
+        for needle in ["same architecture", "cross build", "`CC_<triple>`"] {
+            assert!(
+                musl_block.contains(needle),
+                "the block advising `musl-tools` must name `{needle}`:\n{musl_block}"
+            );
+        }
+        assert!(
+            page.contains("`rustup target add --toolchain <toolchain> <triple>`"),
+            "the std remedy must name rustup's --toolchain form"
+        );
+    }
 }

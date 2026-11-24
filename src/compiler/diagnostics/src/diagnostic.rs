@@ -2805,38 +2805,14 @@ pub enum Diagnostic {
     },
     /// The host is missing a toolchain component a build needs (`IPE-E0013`).
     ///
-    /// Span-free: the defect is in the host environment, not in the user's
-    /// source. `kind` is matchable by callers that need to branch on which
-    /// component is missing; `detail` is the fully rendered remedy text.
+    /// Span-free: the defect is in the host environment (a C compiler, a
+    /// linker, or a target's Rust standard library), not in the user's source.
+    /// Which component is missing is typed once, by the producer's gap type in
+    /// the CLI; this variant carries only that gap's rendered remedy.
     HostToolchainMissing {
-        /// Which toolchain component is missing.
-        kind: ToolchainMissingKind,
-        /// The rendered remedy, ready for display.
+        /// The missing component and how to install it, ready for display.
         detail: String,
     },
-}
-
-/// Which host toolchain component a build found missing (`IPE-E0013`).
-///
-/// Kept distinct from `detail`'s free text so a caller (a health check, a
-/// test) can match the kind directly instead of re-parsing rendered prose.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ToolchainMissingKind {
-    /// No host linker was found at all.
-    LinkerMissing,
-    /// macOS: the Xcode Command Line Tools are not installed.
-    AppleDeveloperToolsMissing,
-    /// Windows: the MSVC build tools are not installed.
-    MsvcBuildToolsMissing,
-    /// Linux: a C library's development headers are not installed.
-    LibcDevFilesMissing,
-    /// No host C compiler was found at all.
-    CCompilerMissing,
-    /// A C compiler was found, but not one able to target another triple
-    /// (a musl or cross build).
-    CCompilerTargetsOther,
-    /// The target triple's Rust standard library is not installed.
-    TargetStdMissing,
 }
 
 /// Result alias used throughout the compiler.
@@ -4787,6 +4763,9 @@ mod code_family_tests {
                 detail: "test".to_owned(),
             },
             Diagnostic::HostLinkerCannotOpenInput {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::HostToolchainMissing {
                 detail: "test".to_owned(),
             },
         ]

@@ -288,7 +288,7 @@ fn prose_band(d: &Diagnostic) -> String {
                  Run `{DOC_HINT_CMD} IPE-E0003` for more help."
             )
         }
-        Diagnostic::HostToolchainMissing { detail, .. } => {
+        Diagnostic::HostToolchainMissing { detail } => {
             format!(
                 "The host is missing a toolchain component your build needs. This is a \
                  problem with what is installed on your machine — not a mistake in your \
