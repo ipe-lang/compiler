@@ -15729,7 +15729,8 @@ impl StdlibKernel {
     /// This is the single classifying match that populates [`KernelDef::serves`];
     /// [`SERVING_KERNELS`] lists the same kernels and a const assertion binds
     /// the two.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines)] // one arm per listener kind; the exhaustive match IS the table
+    #[allow(clippy::match_same_arms)] // the non-serving set is split so each or-pattern stays under the panic-scan nesting ceiling
     const fn serves_classification(self) -> Option<ServedListenerKind> {
         match self {
             Self::ServerListen => Some(ServedListenerKind::ServerPortArg),
@@ -16035,8 +16036,8 @@ impl StdlibKernel {
             | Self::StoreDefaultText
             | Self::StoreDefaultInt
             | Self::StoreCompositePrimaryKey2
-            | Self::StoreCompositePrimaryKey3
-            | Self::StoreOwnerColumn
+            | Self::StoreCompositePrimaryKey3 => None,
+            Self::StoreOwnerColumn
             | Self::StoreImmutable
             | Self::StoreMask
             | Self::StoreCorrelate
@@ -16335,8 +16336,8 @@ impl StdlibKernel {
             | Self::TaskLoop
             | Self::TaskRetryWith
             | Self::TaskLinearBackoff
-            | Self::TaskExponentialBackoff
-            | Self::TaskWithJitter
+            | Self::TaskExponentialBackoff => None,
+            Self::TaskWithJitter
             | Self::TaskRetryOn
             | Self::TaskWithRetryOn
             | Self::TaskDefaultRetryPolicy
@@ -16635,8 +16636,8 @@ impl StdlibKernel {
             | Self::FontFocusColor
             | Self::FontActiveColor
             | Self::FontDisabledColor
-            | Self::FontHoverSize
-            | Self::TerminalAppLines
+            | Self::FontHoverSize => None,
+            Self::TerminalAppLines
             | Self::TeaWorker
             | Self::AuthHashPassword
             | Self::AuthHashPasswordCost

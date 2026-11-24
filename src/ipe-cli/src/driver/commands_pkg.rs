@@ -2372,17 +2372,22 @@ pub fn verify_test_quiet(path: Option<&str>) -> Result<(), CliError> {
 
 pub fn run_capabilities(rest: &[String]) -> Result<(), CliError> {
     let (format, positional) = cli_args::split_format(rest, "capabilities")?;
-    let (caps, frames) = capabilities_in(&working_dir()?, positional.first().copied())?;
+    let (caps, served, frames) = capabilities_in(&working_dir()?, positional.first().copied())?;
     let names: Vec<&'static str> = caps.iter().map(|c| c.as_str()).collect();
     crate::screen::emit_report(
         format,
-        &render_capabilities(&names, frames.as_ref(), format, &std::io::stdout()),
+        &render_capabilities(&names, &served, frames.as_ref(), format, &std::io::stdout()),
     );
     Ok(())
 }
 
 /// The capabilities what `arg` names in the project at `cwd` exercises, with
-/// what its trusted frame origins mean for the analysed programs.
+/// the listener the built program serves and what its trusted frame origins
+/// mean for the analysed programs.
+///
+/// The served listener is the built program's
+/// ([`project::ProjectManifest::resolved_entry`]), read from its lowered
+/// program when it is among the analysed entries, and `NotServed` otherwise.
 ///
 /// No argument (or a directory, or `package.ipe`) is every entry of the
 /// project, their sets unioned. A file argument must name one of the
@@ -2408,6 +2413,7 @@ pub fn capabilities_in(
 ) -> Result<
     (
         std::collections::BTreeSet<ipe_ir::Capability>,
+        ipe_ir::ServedListener,
         Option<crate::frame_reach::FrameReport>,
     ),
     CliError,
@@ -2428,17 +2434,19 @@ pub fn capabilities_in(
             )));
         }
     }
+    let built_module = root.manifest().resolved_entry()?;
     let frame_origins = &root.manifest().delivery.frame_origins;
     let (Some(first), Some(reach)) = (
         frame_origins.entries().next(),
         FrameReach::of(frame_origins),
     ) else {
-        return Ok((target_capabilities(&target, FrameJudge::Unlisted)?, None));
+        let (caps, served) =
+            target_inference(&target, FrameJudge::Unlisted, Some(built_module.as_slice()))?;
+        return Ok((caps, served, None));
     };
     let EntrySet::Programs(programs) = root.entries() else {
         return Err(super::build_pipeline::no_web_leaf_refusal(first));
     };
-    let built_module = root.manifest().resolved_entry()?;
     let built = programs
         .iter()
         .find(|entry| entry.module() == built_module.as_slice())
@@ -2459,14 +2467,19 @@ pub fn capabilities_in(
         // still answers whether the build accepts it.
         judge_built_frame_list(&root, built.module())?;
     }
-    let caps = target_capabilities(
+    let (caps, served) = target_inference(
         &target,
         FrameJudge::Served {
             root: &root,
             built: built.module(),
         },
+        Some(built.module()),
     )?;
-    Ok((caps, FrameReport::of(reach, built_program, analysed)))
+    Ok((
+        caps,
+        served,
+        FrameReport::of(reach, built_program, analysed),
+    ))
 }
 
 /// Refuse the frame list of `root` when `built`, the entry module its build
@@ -2529,12 +2542,35 @@ fn target_capabilities(
     target: &AnalysisTarget<'_>,
     judge: FrameJudge<'_>,
 ) -> Result<std::collections::BTreeSet<ipe_ir::Capability>, CliError> {
+    target_inference(target, judge, None).map(|(caps, _)| caps)
+}
+
+/// [`target_capabilities`], with the listener the entry module `built` serves
+/// when it is among the analysed entries, and `NotServed` otherwise.
+///
+/// # Errors
+/// As [`target_capabilities`].
+fn target_inference(
+    target: &AnalysisTarget<'_>,
+    judge: FrameJudge<'_>,
+    built: Option<&[String]>,
+) -> Result<
+    (
+        std::collections::BTreeSet<ipe_ir::Capability>,
+        ipe_ir::ServedListener,
+    ),
+    CliError,
+> {
     crate::threads::run_compile(|| {
         let mut caps = std::collections::BTreeSet::new();
+        let mut served = ipe_ir::ServedListener::NotServed;
         for (module, graph) in entry_graphs(target)? {
             let program = graph.run_attributed(graph.entry_path(), |db, root, file| {
                 ipe_db::lower_program(db, root, file).clone()
             })?;
+            if built.is_some_and(|built| module == built) {
+                served = ipe_lower::program_served_listener(&program);
+            }
             match judge {
                 FrameJudge::Served {
                     root: project,
@@ -2551,7 +2587,7 @@ fn target_capabilities(
                 &program,
             ));
         }
-        Ok(caps)
+        Ok((caps, served))
     })?
 }
 
@@ -2570,15 +2606,20 @@ fn target_capabilities(
 ///   at all for a pure program — the scriptable form pipelines already
 ///   consume), then one `frame:<origin>` line per trusted frame origin when
 ///   the list applies, one `frame-program:<file>` line for the built program
-///   and one `frame-not-applicable:<file>` line per other analysed program.
+///   and one `frame-not-applicable:<file>` line per other analysed program;
+///   a served program adds one `serves:<web|server>:<port|dynamic>` line
+///   (`serves:several` when it reaches two listener hosts).
 /// - `--json`: the shared `{schema, status, command, payload}` machine envelope
 ///   (`ipe.cli.capabilities/1`), with the sorted capability name array under
-///   `payload.capabilities` (empty for a pure program); with a `frames`
+///   `payload.capabilities` (empty for a pure program) and the served
+///   listener's `<web|server>:<port|dynamic>` token under `payload.serves`
+///   (`null` when the program serves nothing); with a `frames`
 ///   report, `payload.frameProgram` and `payload.frameNotApplicable`, and
 ///   `payload.frameOrigins` and `payload.undisclosedThroughFrames` when the
 ///   list applies.
 pub fn render_capabilities(
     names: &[&str],
+    served: &ipe_ir::ServedListener,
     frames: Option<&crate::frame_reach::FrameReport>,
     format: cli_args::OutputFormat,
     stream: &impl std::io::IsTerminal,
@@ -2605,6 +2646,9 @@ pub fn render_capabilities(
                     let _ = writeln!(out, "frame-not-applicable:{}", program.file());
                 }
             }
+            if let Some(token) = served_token(served) {
+                let _ = writeln!(out, "serves:{token}");
+            }
             out
         }
         Json => {
@@ -2616,7 +2660,14 @@ pub fn render_capabilities(
                     ("file", cli_args::json::string(program.file())),
                 ])
             };
-            let mut fields = vec![("capabilities", cli_args::json::string_array(names))];
+            let mut fields = vec![
+                ("capabilities", cli_args::json::string_array(names)),
+                (
+                    "serves",
+                    served_token(served)
+                        .map_or_else(|| "null".to_owned(), |t| cli_args::json::string(&t)),
+                ),
+            ];
             if let Some(reach) = reach {
                 let origins: Vec<&str> = reach.origins().iter().map(String::as_str).collect();
                 let undisclosed: Vec<&str> = crate::frame_reach::FrameReach::undisclosed()
@@ -2674,6 +2725,9 @@ pub fn render_capabilities(
                     );
                 }
             }
+            if let Some(line) = served_line(served) {
+                let _ = writeln!(body, "{line}");
+            }
             let mut out = style::frame(&style::gutter(&body));
             if let Some(report) = frames {
                 out.push_str(&style::frame(&style::gutter(&frame_report_block(report))));
@@ -2681,6 +2735,54 @@ pub fn render_capabilities(
             out
         }
     }
+}
+
+/// The machine token of the listener a program serves, `None` when it serves nothing.
+///
+/// `web:<port>`, `server:<port>` or `server:dynamic`, the forms the capability
+/// floor's `listen=` field spells; `several` for a program reaching two hosts.
+fn served_token(served: &ipe_ir::ServedListener) -> Option<String> {
+    use ipe_ir::{ServedListener, ServedPort};
+    let ServedListener::Serves(port) = served else {
+        return None;
+    };
+    Some(match port {
+        ServedPort::WebDefault => format!(
+            "web:{}",
+            ipe_runtime_rust::env_registry::web::WEB_DEFAULT_PORT
+        ),
+        ServedPort::ServerLiteral(literal) => format!("server:{}", literal.get()),
+        ServedPort::ServerDynamic => "server:dynamic".to_owned(),
+        ServedPort::Several => "several".to_owned(),
+    })
+}
+
+/// The human line naming the listener a program serves, `None` when it serves nothing.
+fn served_line(served: &ipe_ir::ServedListener) -> Option<String> {
+    use ipe_ir::{ServedListener, ServedPort};
+    use ipe_sandbox::run_jail::ListenKey;
+    let ServedListener::Serves(port) = served else {
+        return None;
+    };
+    let web = ListenKey::Web.operator_key().entry().name();
+    let server = ListenKey::Server.operator_key().entry().name();
+    Some(match port {
+        ServedPort::WebDefault => format!(
+            "It serves inbound connections on one port: {} unless `{web}` names another.",
+            ipe_runtime_rust::env_registry::web::WEB_DEFAULT_PORT
+        ),
+        ServedPort::ServerLiteral(literal) => format!(
+            "It serves inbound connections on one port: {} unless `{server}` names another.",
+            literal.get()
+        ),
+        ServedPort::ServerDynamic => format!(
+            "It serves inbound connections on one port, the one it computes unless `{server}` \
+             names another."
+        ),
+        ServedPort::Several => "It reaches both a `Web` host and `Server.listen`, two \
+                                listeners; a release refuses it."
+            .to_owned(),
+    })
 }
 
 /// The human block of a frame report: the frame notice when the list
@@ -3914,6 +4016,56 @@ pub fn infer_on(
             .iter()
             .map(|m| (m.provenance(), infer_entry(db, source_root, package, m))),
     )
+}
+
+/// The listener the built program entry `entry` serves, read from its lowered program.
+///
+/// The fact is the built entry's own: a sibling entry or a library module that
+/// serves never grants this program a listener. A package whose `entry` is not
+/// its program entry (a library) serves nothing.
+///
+/// # Errors
+/// A lowering refusal framed against the entry module; a program entry with no
+/// source file in the root is a refusal, never a skip.
+pub fn served_on(
+    db: &ipe_db::IpeDatabase,
+    source_root: ipe_db::SourceRoot,
+    package: &PackageSourceSet,
+    entry: &[String],
+) -> Result<ipe_ir::ServedListener, CliError> {
+    let Some(module) = package.entries.iter().find(|m| {
+        m.module_path() == entry
+            && matches!(
+                m.provenance(),
+                project::ModuleProvenance::User(project::EntryRole::Main)
+            )
+    }) else {
+        return Ok(ipe_ir::ServedListener::NotServed);
+    };
+    let Some(entry_file) = source_root.files(db).get(module.module_path()).copied() else {
+        return Err(CliError::Pipeline {
+            file: module.path().to_path_buf(),
+            src: String::new(),
+            diag: Box::new(Diagnostic::CompilerBug {
+                where_: "ipe.served_listener",
+                detail: format!(
+                    "entry module {} has no source file in the package root",
+                    module.module_path().join(".")
+                ),
+            }),
+        });
+    };
+    match ipe_db::lower_program(db, source_root, entry_file) {
+        Ok(program) => Ok(ipe_lower::program_served_listener(&program)),
+        Err(err) => Err(attribute_entry_lowering_error(
+            db,
+            source_root,
+            package,
+            module,
+            entry_file,
+            err.clone(),
+        )),
+    }
 }
 
 /// One entry's capability-inference outcome: its capability set, or the
@@ -5555,7 +5707,13 @@ mod mobile_base_tests {
         };
         let stream = std::io::stdout();
         for names in [&[][..], &["network"][..]] {
-            let human = render_capabilities(names, report.as_ref(), OutputFormat::Human, &stream);
+            let human = render_capabilities(
+                names,
+                &NOT_SERVED,
+                report.as_ref(),
+                OutputFormat::Human,
+                &stream,
+            );
             assert!(human.contains(&reach.notice()), "{human}");
             assert!(!human.contains("pure"), "{human}");
             assert!(
@@ -5572,7 +5730,13 @@ mod mobile_base_tests {
                     "{human}"
                 );
             }
-            let plain = render_capabilities(names, report.as_ref(), OutputFormat::Plain, &stream);
+            let plain = render_capabilities(
+                names,
+                &NOT_SERVED,
+                report.as_ref(),
+                OutputFormat::Plain,
+                &stream,
+            );
             let lines: Vec<&str> = plain.lines().collect();
             let mut want: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
             want.extend(
@@ -5584,7 +5748,13 @@ mod mobile_base_tests {
             want.push("frame-program:src/Main.ipe".to_owned());
             want.push("frame-not-applicable:src/Cli.ipe".to_owned());
             assert_eq!(lines, want, "{plain}");
-            let json = render_capabilities(names, report.as_ref(), OutputFormat::Json, &stream);
+            let json = render_capabilities(
+                names,
+                &NOT_SERVED,
+                report.as_ref(),
+                OutputFormat::Json,
+                &stream,
+            );
             assert!(json.contains("\"frameOrigins\""), "{json}");
             for origin in reach.origins() {
                 assert!(json.contains(&format!("\"{origin}\"")), "{json}");
@@ -5598,20 +5768,76 @@ mod mobile_base_tests {
             assert!(json.contains("\"frameNotApplicable\""), "{json}");
             assert!(json.contains("\"src/Cli.ipe\""), "{json}");
         }
-        let pure_human = render_capabilities(&[], None, OutputFormat::Human, &stream);
+        let pure_human = render_capabilities(&[], &NOT_SERVED, None, OutputFormat::Human, &stream);
         assert!(pure_human.contains("This program is pure"), "{pure_human}");
         assert!(!pure_human.contains("frame"), "{pure_human}");
         assert_eq!(
-            render_capabilities(&["network"], None, OutputFormat::Plain, &stream),
+            render_capabilities(
+                &["network"],
+                &NOT_SERVED,
+                None,
+                OutputFormat::Plain,
+                &stream
+            ),
             "network\n"
         );
-        let json = render_capabilities(&["network"], None, OutputFormat::Json, &stream);
+        let json =
+            render_capabilities(&["network"], &NOT_SERVED, None, OutputFormat::Json, &stream);
         assert!(
             !json.contains("frameOrigins")
                 && !json.contains("undisclosedThroughFrames")
                 && !json.contains("frameProgram"),
             "{json}"
         );
+    }
+
+    /// The listener of a program that serves nothing.
+    const NOT_SERVED: ipe_ir::ServedListener = ipe_ir::ServedListener::NotServed;
+
+    /// A served program's listener shows in every form: one human line naming
+    /// the port and its operator variable, one `serves:` plain line, and the
+    /// `payload.serves` token; a program serving nothing shows none of them.
+    #[test]
+    fn capabilities_report_discloses_the_served_listener() {
+        use crate::cli_args::OutputFormat;
+        use ipe_ir::{ServedListener, ServedPort, SourcePortLiteral};
+        let stream = std::io::stdout();
+        let cases = [
+            (ServedPort::WebDefault, "web:8000", "IPE_WEB_PORT"),
+            (
+                ServedPort::ServerLiteral(SourcePortLiteral::new(9000)),
+                "server:9000",
+                "IPE_SERVER_PORT",
+            ),
+            (
+                ServedPort::ServerDynamic,
+                "server:dynamic",
+                "IPE_SERVER_PORT",
+            ),
+        ];
+        for (port, token, variable) in cases {
+            let served = ServedListener::NotServed.with(port);
+            let human = render_capabilities(&[], &served, None, OutputFormat::Human, &stream);
+            assert!(
+                human.contains("serves inbound connections on one port"),
+                "{human}"
+            );
+            assert!(human.contains(variable), "{human}");
+            assert_eq!(
+                render_capabilities(&["network"], &served, None, OutputFormat::Plain, &stream),
+                format!("network\nserves:{token}\n")
+            );
+            let json = render_capabilities(&[], &served, None, OutputFormat::Json, &stream);
+            assert!(json.contains(&format!("\"serves\":\"{token}\"")), "{json}");
+        }
+        let human = render_capabilities(&[], &NOT_SERVED, None, OutputFormat::Human, &stream);
+        assert!(!human.contains("serves"), "{human}");
+        assert_eq!(
+            render_capabilities(&[], &NOT_SERVED, None, OutputFormat::Plain, &stream),
+            ""
+        );
+        let json = render_capabilities(&[], &NOT_SERVED, None, OutputFormat::Json, &stream);
+        assert!(json.contains("\"serves\":null"), "{json}");
     }
 
     /// DP-12: a report on programs a build does not compile names no origin
@@ -5629,7 +5855,13 @@ mod mobile_base_tests {
             "{report:?}"
         );
         let stream = std::io::stdout();
-        let human = render_capabilities(&[], report.as_ref(), OutputFormat::Human, &stream);
+        let human = render_capabilities(
+            &[],
+            &NOT_SERVED,
+            report.as_ref(),
+            OutputFormat::Human,
+            &stream,
+        );
         assert!(human.contains("This program is pure"), "{human}");
         assert!(!human.contains("trusted frame origins ("), "{human}");
         assert!(
@@ -5638,10 +5870,22 @@ mod mobile_base_tests {
         );
         assert!(human.contains("program `web` (src/Main.ipe)"), "{human}");
         assert_eq!(
-            render_capabilities(&["network"], report.as_ref(), OutputFormat::Plain, &stream),
+            render_capabilities(
+                &["network"],
+                &NOT_SERVED,
+                report.as_ref(),
+                OutputFormat::Plain,
+                &stream
+            ),
             "network\nframe-program:src/Main.ipe\nframe-not-applicable:src/Cli.ipe\n"
         );
-        let json = render_capabilities(&[], report.as_ref(), OutputFormat::Json, &stream);
+        let json = render_capabilities(
+            &[],
+            &NOT_SERVED,
+            report.as_ref(),
+            OutputFormat::Json,
+            &stream,
+        );
         assert!(
             !json.contains("frameOrigins") && !json.contains("undisclosedThroughFrames"),
             "{json}"
