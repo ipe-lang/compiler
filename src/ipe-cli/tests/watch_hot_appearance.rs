@@ -20,7 +20,9 @@
 //! `cargo build` and spawns the emitted binary. Linux-only for the PID-liveness
 //! check via `/proc`, exactly as `watch_integration.rs`.
 
+#[cfg(target_os = "linux")]
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
