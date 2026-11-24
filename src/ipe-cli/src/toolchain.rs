@@ -483,6 +483,15 @@ impl RustcVersion {
             .map_err(Clone::clone)
     }
 
+    /// The version of the compiler a `cargo build` runs, queried as the build
+    /// runs it, under [`RUSTC_QUERY_LIMITS`].
+    ///
+    /// # Errors
+    /// The [`RustcQueryRefusal`] of [`RustcVersion::query`].
+    fn of_build(rustc: &BuildRustc) -> Result<Self, RustcQueryRefusal> {
+        Self::query(build_rustc::compiler_command(rustc), RUSTC_QUERY_LIMITS)
+    }
+
     /// Run `rustc` with `-vV` under `ceiling` and parse its report.
     ///
     /// # Errors
@@ -819,7 +828,7 @@ pub fn resolve_build_rustc(build: &Command) -> Result<BuildRustc, ToolchainFloor
 
 /// Refuse a build whose compiler, `rustc`, is older than the pin.
 ///
-/// `rustc -vV` runs as the build runs its compiler ([`BuildRustc::command`]):
+/// `rustc -vV` runs as the build runs its compiler ([`RustcVersion::of_build`]):
 /// the same program, in the same directory, under the same environment
 /// overrides, so `rustup` resolves the same toolchain for the query as for
 /// the build (a `rust-toolchain.toml` above it, an override,
@@ -837,7 +846,7 @@ pub fn require_floor(rustc: &BuildRustc) -> Result<(), ToolchainFloorRefusal> {
         return Ok(());
     }
     judge_floor(
-        RustcVersion::query(rustc.command(), RUSTC_QUERY_LIMITS),
+        RustcVersion::of_build(rustc),
         rustc.source(),
         PINNED_RELEASE,
     )?;

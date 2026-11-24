@@ -134,11 +134,11 @@ impl BuildRustc {
             .get_envs()
             .map(|(key, value)| (key.to_os_string(), value.map(OsStr::to_os_string)))
             .collect();
-        let var = |key: &str| build_var(&env, key);
-        let config = config_rustc(&cwd, cargo_home(&cwd, var("CARGO_HOME")).as_deref())?;
-        let source = if let Some(rustc) = var("RUSTC").and_then(|v| v.into_string().ok()) {
+        let var = |key: BuildVar| key.value_in(&env);
+        let config = config_rustc(&cwd, cargo_home(&cwd, var(BuildVar::CargoHome)).as_deref())?;
+        let source = if let Some(rustc) = var(BuildVar::Rustc).and_then(|v| v.into_string().ok()) {
             RustcSource::RustcVar(program_at(&cwd, &rustc, true))
-        } else if let Some(rustc) = var("CARGO_BUILD_RUSTC") {
+        } else if let Some(rustc) = var(BuildVar::CargoBuildRustc) {
             let rustc = rustc
                 .into_string()
                 .map_err(|_| RustcUnresolved::NonUnicodeVar)?;
@@ -156,22 +156,24 @@ impl BuildRustc {
     pub const fn source(&self) -> &RustcSource {
         &self.source
     }
+}
 
-    /// The compiler run as the build would run it: same program, working
-    /// directory and environment overrides, so `rustup` resolves the same
-    /// toolchain and `PATH` finds the same program.
-    #[must_use]
-    pub fn command(&self) -> Command {
-        let mut rustc = Command::new(self.source.program());
-        rustc.current_dir(&self.dir);
-        for (key, value) in &self.env {
-            match value {
-                Some(value) => rustc.env(key, value),
-                None => rustc.env_remove(key),
-            };
-        }
-        rustc
+/// The compiler `build` names, run as the build would run it: same program,
+/// working directory and environment overrides, so `rustup` resolves the same
+/// toolchain and `PATH` finds the same program.
+///
+/// Only [`super::RustcVersion::of_build`] runs it, under the `rustc` query's
+/// ceiling.
+pub(super) fn compiler_command(build: &BuildRustc) -> Command {
+    let mut rustc = Command::new(build.source.program());
+    rustc.current_dir(&build.dir);
+    for (key, value) in &build.env {
+        match value {
+            Some(value) => rustc.env(key, value),
+            None => rustc.env_remove(key),
+        };
     }
+    rustc
 }
 
 /// Whether a `\` marks a configured value as a path, as it does for cargo on
@@ -188,12 +190,44 @@ fn program_at(base: &Path, value: &str, backslash: bool) -> PathBuf {
     }
 }
 
-/// The build's value of `key`: its override when the command sets or
-/// removes it, else the process's own.
-fn build_var(env: &[(OsString, Option<OsString>)], key: &str) -> Option<OsString> {
-    env.iter()
-        .find(|(name, _)| same_var(name, key))
-        .map_or_else(|| ipe_env::var_os(key), |(_, value)| value.clone())
+/// A Cargo variable that selects the build's compiler or its configuration.
+#[derive(Debug, Clone, Copy)]
+enum BuildVar {
+    /// `RUSTC`.
+    Rustc,
+    /// `CARGO_BUILD_RUSTC`.
+    CargoBuildRustc,
+    /// `CARGO_HOME`.
+    CargoHome,
+}
+
+impl BuildVar {
+    /// The variable's name.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Rustc => "RUSTC",
+            Self::CargoBuildRustc => "CARGO_BUILD_RUSTC",
+            Self::CargoHome => "CARGO_HOME",
+        }
+    }
+
+    /// The process's own value, which the build inherits unless it
+    /// overrides the variable.
+    fn inherited(self) -> Option<OsString> {
+        match self {
+            Self::Rustc => ipe_env::var_os("RUSTC"),
+            Self::CargoBuildRustc => ipe_env::var_os("CARGO_BUILD_RUSTC"),
+            Self::CargoHome => ipe_env::var_os("CARGO_HOME"),
+        }
+    }
+
+    /// The build's value: its override when the command sets or removes the
+    /// variable, else the inherited one.
+    fn value_in(self, env: &[(OsString, Option<OsString>)]) -> Option<OsString> {
+        env.iter()
+            .find(|(name, _)| same_var(name, self.name()))
+            .map_or_else(|| self.inherited(), |(_, value)| value.clone())
+    }
 }
 
 /// Whether the variable `name` is `key`; case-insensitive on Windows, as
@@ -558,6 +592,38 @@ mod tests {
             ),
             "{verdict:?}"
         );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable
+    fn a_flooding_build_rustc_is_cut_off_by_the_query_ceiling() {
+        let flood = StubRustc::new("build_flood", "head -c 70000 /dev/zero\nsleep 30\nexit 0")
+            .expect("write the stub rustc");
+        let mut build = build_in(flood.dir());
+        build.env("RUSTC", flood.program());
+        let started = std::time::Instant::now();
+        let verdict = judged(&build);
+        assert!(
+            matches!(
+                &verdict,
+                Err(ToolchainFloorRefusal {
+                    found: FloorReading::Unread(
+                        crate::toolchain::RustcQueryRefusal::Run(
+                            crate::toolchain::RustcRunFailure::Exceeded(
+                                crate::remote_ingest::LocalRefusal {
+                                    limit: crate::remote_ingest::IngestLimit::Bytes(_),
+                                    ..
+                                }
+                            )
+                        ),
+                        RustcSource::RustcVar(_)
+                    ),
+                    ..
+                })
+            ),
+            "{verdict:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]
