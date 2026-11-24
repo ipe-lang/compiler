@@ -56,7 +56,7 @@ fn canonicalise_main(stubs: &[&str], main: &str) -> (DResult<Module>, Interner) 
 /// The dot-joined home of the constructor `main`'s body names, if its body is a
 /// bare `Get` reference.
 fn main_get_home(module: &Module, interner: &Interner) -> Option<String> {
-    let body = module.decls.values.iter().find_map(|def| match def {
+    let body = module.defs.iter().find_map(|def| match def {
         Def::Untyped { name, body, .. } | Def::Typed { name, body, .. }
             if interner.resolve(name.value) == Some("main") =>
         {
