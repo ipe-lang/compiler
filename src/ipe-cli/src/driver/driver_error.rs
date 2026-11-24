@@ -467,11 +467,12 @@ pub enum CliError {
     /// the typed [`toolchain::ToolchainMissing`] naming what the command was
     /// doing and whether the toolchain is uninstalled or merely off the `PATH`.
     ToolchainMissing(toolchain::ToolchainMissing),
-    /// The toolchain cargo would use for an emitted build is older than the
-    /// release the emitted manifests require, or its version could not be
-    /// read. An environment failure judged before cargo runs, not a
-    /// miscompile: rendered as the host-toolchain diagnostic (`IPE-E0013`)
-    /// naming the release found, the one required, and the fix.
+    /// The compiler cargo would run for an emitted build is older than the
+    /// release the emitted manifests require, or it or its version could not
+    /// be resolved. An environment failure judged before cargo runs, not a
+    /// miscompile: rendered as the unsupported-toolchain diagnostic
+    /// (`IPE-E0014`) naming the release found, the one required, where the
+    /// compiler comes from, and the fix.
     ToolchainBelowFloor(toolchain::ToolchainFloorRefusal),
     /// `ipe health` found a critical prerequisite missing (no `rustc`/`cargo`,
     /// or an unresolvable runtime). This is a legitimate diagnostic verdict —
@@ -1311,7 +1312,7 @@ impl std::fmt::Display for CliError {
             // its rendering (see `toolchain::ToolchainMissing`'s `Display`).
             Self::ToolchainMissing(missing) => write!(f, "{missing}"),
             Self::ToolchainBelowFloor(refusal) => {
-                let d = Diagnostic::HostToolchainMissing {
+                let d = Diagnostic::HostToolchainUnsupported {
                     detail: refusal.detail(),
                 };
                 f.write_str(&render(&d, "", ""))
@@ -1701,7 +1702,7 @@ pub fn fmt_emitted_build_failed(
         // the two, or a dependency declaring a later `rust-version`.
         EmittedBuildCause::ToolchainBelowRustVersion => {
             let detail = String::from(text::cli_cargo_compile_failed_detail(code, what, &trimmed));
-            let d = Diagnostic::HostToolchainMissing {
+            let d = Diagnostic::HostToolchainUnsupported {
                 detail: format!(
                     "{detail}\nUpdate the toolchain, then try again:\n    rustup update stable"
                 ),

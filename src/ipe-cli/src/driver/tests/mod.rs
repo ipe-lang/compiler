@@ -302,7 +302,7 @@ fn emitted_build_failure_reports_unattributed_as_compiler_bug() {
 }
 
 /// cargo's own `rust-version` refusal is the host's toolchain, not a
-/// miscompile: a user-fault host-toolchain diagnostic, never the ICE.
+/// miscompile: a user-fault unsupported-toolchain diagnostic, never the ICE.
 #[test]
 fn emitted_build_refused_by_rust_version_is_a_host_toolchain_error() {
     let err = CliError::EmittedBuildFailed {
@@ -316,7 +316,7 @@ fn emitted_build_refused_by_rust_version_is_a_host_toolchain_error() {
     };
     assert_eq!(err.fault(), crate::screen::Fault::User);
     let rendered = err.to_string();
-    assert!(rendered.contains("IPE-E0013"), "{rendered}");
+    assert!(rendered.contains("IPE-E0014"), "{rendered}");
     assert!(rendered.contains("requires rustc 1.98.1"), "{rendered}");
     assert!(rendered.contains("rustup update stable"), "{rendered}");
     assert!(!rendered.contains("IPE-I0001"), "{rendered}");
@@ -324,13 +324,18 @@ fn emitted_build_refused_by_rust_version_is_a_host_toolchain_error() {
 }
 
 /// A toolchain judged below the pin before cargo runs renders the
-/// host-toolchain diagnostic naming the found and required releases.
+/// unsupported-toolchain diagnostic naming the found and required releases,
+/// never the missing-toolchain heading.
 #[test]
 fn a_toolchain_below_the_floor_is_a_host_toolchain_error() {
     let report =
         crate::toolchain::RustcVersion::parse(b"rustc 1.97.1 (x)\nhost: a-b-c\nrelease: 1.97.1\n")
             .map_err(crate::toolchain::RustcQueryRefusal::Parse);
-    let judged = crate::toolchain::judge_floor(report, crate::toolchain::PINNED_RELEASE);
+    let judged = crate::toolchain::judge_floor(
+        report,
+        &crate::toolchain::RustcSource::Path,
+        crate::toolchain::PINNED_RELEASE,
+    );
     let Err(refusal) = judged else {
         // The pin is above 1.97.1, so this branch is the failure.
         assert!(judged.is_err(), "1.97.1 must be below the pin");
@@ -341,7 +346,11 @@ fn a_toolchain_below_the_floor_is_a_host_toolchain_error() {
     assert!(err.renders_own_screen());
     let rendered = err.to_string();
     let required = format!("Rust {} or newer", crate::toolchain::PINNED_RELEASE);
-    assert!(rendered.contains("IPE-E0013"), "{rendered}");
+    assert!(rendered.contains("IPE-E0014"), "{rendered}");
+    assert!(
+        !rendered.to_lowercase().contains("toolchain missing"),
+        "{rendered}"
+    );
     assert!(rendered.contains("Rust 1.97.1"), "{rendered}");
     assert!(rendered.contains(&required), "{rendered}");
     assert!(rendered.contains("rustup update stable"), "{rendered}");

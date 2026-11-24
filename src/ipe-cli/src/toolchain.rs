@@ -28,6 +28,10 @@ use crate::remote_ingest::{
 use crate::style::TerminalSafe;
 use ipe_sandbox::host_tool::{self, HostTool};
 
+mod build_rustc;
+
+pub use build_rustc::{BuildRustc, RustcSource, RustcUnresolved};
+
 /// A `cargo` executable resolved on the `PATH`.
 ///
 /// Holding one is proof the toolchain-presence check passed; the wrapped path is
@@ -623,52 +627,140 @@ const _: () = assert!(
 pub struct ToolchainFloorRefusal {
     /// The release the emitted manifests require.
     pub required: RustRelease,
-    /// What the build's `rustc` reported instead.
+    /// What the build's compiler reported instead, and where it comes from.
     pub found: FloorReading,
 }
 
-/// What the build's `rustc` reported, when it does not meet the floor.
+/// What the build's compiler reported, when it does not meet the floor.
 #[derive(Debug, Clone)]
 pub enum FloorReading {
     /// A release below the floor.
-    Below(RustRelease),
+    Below(RustRelease, RustcSource),
     /// A `release` value that is not a Rust release number.
-    Unparsed(TerminalSafe),
+    Unparsed(TerminalSafe, RustcSource),
     /// No report: `rustc -vV` failed, or its report broke the grammar.
-    Unread(RustcQueryRefusal),
+    Unread(RustcQueryRefusal, RustcSource),
+    /// The compiler cargo would run cannot be resolved.
+    Unresolved(RustcUnresolved),
 }
 
 impl ToolchainFloorRefusal {
     /// The refusal's body: what was found, what is required, and the fix.
     ///
-    /// Shown inside the host-toolchain diagnostic (`IPE-E0013`).
+    /// Shown inside the unsupported-toolchain diagnostic (`IPE-E0014`).
     #[must_use]
     pub fn detail(&self) -> String {
         let required = self.required;
-        let found = match &self.found {
-            FloorReading::Below(release) => format!(
-                "The build would use Rust {release}, but Ipê's emitted crates need Rust {required} or newer."
+        let (found, source) = match &self.found {
+            FloorReading::Below(release, source) => (
+                format!(
+                    "The build would use Rust {release}, but Ipê's emitted crates need Rust {required} or newer."
+                ),
+                source,
             ),
-            FloorReading::Unparsed(release) => format!(
-                "The build's `rustc` reports release `{}`, which is not a Rust release number, \
-                 so Ipê cannot confirm it is Rust {required} or newer.",
-                release.as_str()
+            FloorReading::Unparsed(release, source) => (
+                format!(
+                    "The build's `rustc` reports release `{}`, which is not a Rust release number, \
+                     so Ipê cannot confirm it is Rust {required} or newer.",
+                    release.as_str()
+                ),
+                source,
             ),
-            FloorReading::Unread(why) => format!(
-                "Ipê could not read the version of the build's `rustc` (`rustc -vV` {}), \
-                 so it cannot confirm it is Rust {required} or newer.",
-                unread_phrase(why)
+            FloorReading::Unread(why, source) => (
+                format!(
+                    "Ipê could not read the version of the build's `rustc` (`rustc -vV` {}), \
+                     so it cannot confirm it is Rust {required} or newer.",
+                    unread_phrase(why)
+                ),
+                source,
             ),
+            FloorReading::Unresolved(why) => return unresolved_detail(why, required),
         };
-        format!(
-            "{found}\n\
-             Update the toolchain, then try again:\n    \
-             rustup update stable\n\
-             Or build with the pinned release:\n    \
-             rustup toolchain install {required}\n    \
-             RUSTUP_TOOLCHAIN={required} ipe <command>"
-        )
+        format!("{found}\n{}", source_remedy(source, required))
     }
+}
+
+/// A path for the refusal's prose, stripped of terminal controls.
+fn shown(path: &Path) -> TerminalSafe {
+    TerminalSafe::sanitize(&path.display().to_string())
+}
+
+/// Where the build's compiler comes from, and how to make it `required` or newer.
+fn source_remedy(source: &RustcSource, required: RustRelease) -> String {
+    let (names, setting, undo) = match source {
+        RustcSource::Path => {
+            return format!(
+                "Update the toolchain, then try again:\n    \
+                 rustup update stable\n\
+                 Or build with the pinned release:\n    \
+                 rustup toolchain install {required}\n    \
+                 RUSTUP_TOOLCHAIN={required} ipe <command>"
+            );
+        }
+        RustcSource::RustcVar(program) => (
+            format!(
+                "The build's compiler is `{}`, set by `RUSTC`.",
+                shown(program).as_str()
+            ),
+            "`RUSTC`",
+            "unset it",
+        ),
+        RustcSource::CargoBuildRustcVar(program) => (
+            format!(
+                "The build's compiler is `{}`, set by `CARGO_BUILD_RUSTC`.",
+                shown(program).as_str()
+            ),
+            "`CARGO_BUILD_RUSTC`",
+            "unset it",
+        ),
+        RustcSource::Config { file, program } => (
+            format!(
+                "The build's compiler is `{}`, set by `build.rustc` in {}.",
+                shown(program).as_str(),
+                shown(file).as_str()
+            ),
+            "`build.rustc`",
+            "remove it",
+        ),
+    };
+    format!(
+        "{names}\n\
+         Point {setting} at a Rust {required} or newer compiler, or {undo}, then try again."
+    )
+}
+
+/// The refusal's body when the compiler cargo would run cannot be resolved.
+fn unresolved_detail(why: &RustcUnresolved, required: RustRelease) -> String {
+    let cause = match why {
+        RustcUnresolved::Dir { dir, kind } => format!(
+            "Ipê could not resolve the build directory {} ({kind}).",
+            shown(dir).as_str()
+        ),
+        RustcUnresolved::NonUnicodeVar => {
+            String::from("`CARGO_BUILD_RUSTC` is not valid Unicode, so Cargo cannot use it.")
+        }
+        RustcUnresolved::ConfigUnreadable { file, kind } => format!(
+            "The Cargo configuration file {} cannot be read ({kind}).",
+            shown(file).as_str()
+        ),
+        RustcUnresolved::ConfigTooLarge { file } => format!(
+            "The Cargo configuration file {} is larger than Ipê reads.",
+            shown(file).as_str()
+        ),
+        RustcUnresolved::ConfigMalformed { file } => format!(
+            "The Cargo configuration file {} is not valid TOML.",
+            shown(file).as_str()
+        ),
+        RustcUnresolved::ConfigNotAPath { file } => format!(
+            "The Cargo configuration file {} sets `build.rustc` to something other than a path.",
+            shown(file).as_str()
+        ),
+    };
+    format!(
+        "{cause}\n\
+         Ipê cannot tell which compiler the build would use, so it cannot confirm it is \
+         Rust {required} or newer. Fix or remove that setting, then try again."
+    )
 }
 
 impl std::fmt::Display for ToolchainFloorRefusal {
@@ -697,45 +789,60 @@ fn unread_phrase(why: &RustcQueryRefusal) -> String {
 /// The [`ToolchainFloorRefusal`] naming the release found, or why none was.
 pub fn judge_floor(
     report: Result<RustcVersion, RustcQueryRefusal>,
+    source: &RustcSource,
     required: RustRelease,
 ) -> Result<(), ToolchainFloorRefusal> {
+    let source = source.clone();
     let found = match report {
-        Err(why) => FloorReading::Unread(why),
+        Err(why) => FloorReading::Unread(why, source),
         Ok(version) => match RustRelease::parse(version.release().as_bytes()) {
             Some(release) if release >= required => return Ok(()),
-            Some(release) => FloorReading::Below(release),
-            None => FloorReading::Unparsed(TerminalSafe::sanitize(version.release())),
+            Some(release) => FloorReading::Below(release, source),
+            None => FloorReading::Unparsed(TerminalSafe::sanitize(version.release()), source),
         },
     };
     Err(ToolchainFloorRefusal { required, found })
 }
 
-/// Refuse a build in `crate_dir` whose toolchain is older than the pin.
+/// Resolve the compiler the `cargo` command `build` would run, as a floor
+/// refusal when cargo could not resolve it either.
 ///
-/// `rustc -vV` runs in `crate_dir`, the directory cargo runs in, so rustup
-/// resolves the same toolchain for the query as for the build (a
-/// `rust-toolchain.toml` above it, an override, `RUSTUP_TOOLCHAIN`, or the
-/// default). The last directory admitted is remembered, so a watch session's
-/// rebuilds query once.
+/// # Errors
+/// [`FloorReading::Unresolved`] with the [`RustcUnresolved`] of
+/// [`BuildRustc::of`].
+pub fn resolve_build_rustc(build: &Command) -> Result<BuildRustc, ToolchainFloorRefusal> {
+    BuildRustc::of(build).map_err(|why| ToolchainFloorRefusal {
+        required: PINNED_RELEASE,
+        found: FloorReading::Unresolved(why),
+    })
+}
+
+/// Refuse a build whose compiler, `rustc`, is older than the pin.
+///
+/// `rustc -vV` runs as the build runs its compiler ([`BuildRustc::command`]):
+/// the same program, in the same directory, under the same environment
+/// overrides, so `rustup` resolves the same toolchain for the query as for
+/// the build (a `rust-toolchain.toml` above it, an override,
+/// `RUSTUP_TOOLCHAIN`, or the default). The last compiler admitted is
+/// remembered, so a watch session's rebuilds query once.
 ///
 /// # Errors
 /// The [`ToolchainFloorRefusal`] of [`judge_floor`].
-pub fn require_floor(crate_dir: &Path) -> Result<(), ToolchainFloorRefusal> {
-    static ADMITTED: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+pub fn require_floor(rustc: &BuildRustc) -> Result<(), ToolchainFloorRefusal> {
+    static ADMITTED: std::sync::Mutex<Option<BuildRustc>> = std::sync::Mutex::new(None);
     let remembered = ADMITTED
         .lock()
-        .is_ok_and(|admitted| admitted.as_deref() == Some(crate_dir));
+        .is_ok_and(|admitted| admitted.as_ref() == Some(rustc));
     if remembered {
         return Ok(());
     }
-    let mut rustc = Command::new("rustc");
-    rustc.current_dir(crate_dir);
     judge_floor(
-        RustcVersion::query(rustc, RUSTC_QUERY_LIMITS),
+        RustcVersion::query(rustc.command(), RUSTC_QUERY_LIMITS),
+        rustc.source(),
         PINNED_RELEASE,
     )?;
     if let Ok(mut admitted) = ADMITTED.lock() {
-        *admitted = Some(crate_dir.to_path_buf());
+        *admitted = Some(rustc.clone());
     }
     Ok(())
 }
@@ -851,6 +958,18 @@ impl StubRustc {
         std::fs::write(&script, format!("#!/bin/sh\n{body}\n"))?;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
         Ok(stub)
+    }
+
+    /// The directory holding the stub.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.0
+    }
+
+    /// The stub's own path.
+    #[must_use]
+    pub fn program(&self) -> PathBuf {
+        self.0.join("rustc")
     }
 
     /// A `PATH` that finds this stub first, then the process's own `PATH`.
@@ -1207,6 +1326,14 @@ mod tests {
         .map_err(RustcQueryRefusal::Parse)
     }
 
+    /// `report` judged as the compiler found on `PATH`.
+    fn judge_floor_path(
+        report: Result<RustcVersion, RustcQueryRefusal>,
+        required: RustRelease,
+    ) -> Result<(), ToolchainFloorRefusal> {
+        judge_floor(report, &RustcSource::Path, required)
+    }
+
     /// The release `text` parses to, or a test failure.
     #[allow(clippy::panic)] // an unparsed fixture release IS the failure
     fn release(text: &str) -> RustRelease {
@@ -1229,18 +1356,18 @@ mod tests {
     #[test]
     fn a_toolchain_one_minor_below_the_pin_is_refused() {
         let pin = release("1.98.1");
-        let refused = judge_floor(reporting("1.97.1"), pin);
+        let refused = judge_floor_path(reporting("1.97.1"), pin);
         assert!(
-            matches!(&refused, Err(ToolchainFloorRefusal { required, found: FloorReading::Below(found) })
+            matches!(&refused, Err(ToolchainFloorRefusal { required, found: FloorReading::Below(found, _) })
                 if *required == pin && *found == release("1.97.1")),
             "{refused:?}"
         );
-        let refused = judge_floor(reporting("1.98.0"), pin);
+        let refused = judge_floor_path(reporting("1.98.0"), pin);
         assert!(
             matches!(
                 &refused,
                 Err(ToolchainFloorRefusal {
-                    found: FloorReading::Below(_),
+                    found: FloorReading::Below(..),
                     ..
                 })
             ),
@@ -1259,7 +1386,7 @@ mod tests {
             "1.98.1-beta.3",
             "2.0.0",
         ] {
-            let judged = judge_floor(reporting(found), pin);
+            let judged = judge_floor_path(reporting(found), pin);
             assert!(judged.is_ok(), "{found}: {judged:?}");
         }
     }
@@ -1276,19 +1403,19 @@ mod tests {
             "99999999999.0.0",
             "1.98.1+local",
         ] {
-            let judged = judge_floor(reporting(found), pin);
+            let judged = judge_floor_path(reporting(found), pin);
             assert!(
                 matches!(
                     &judged,
                     Err(ToolchainFloorRefusal {
-                        found: FloorReading::Unparsed(_),
+                        found: FloorReading::Unparsed(..),
                         ..
                     })
                 ),
                 "{found}: {judged:?}"
             );
         }
-        let judged = judge_floor(
+        let judged = judge_floor_path(
             Err(RustcQueryRefusal::Parse(RustcVersionRefusal::NoBanner)),
             pin,
         );
@@ -1296,7 +1423,7 @@ mod tests {
             matches!(
                 &judged,
                 Err(ToolchainFloorRefusal {
-                    found: FloorReading::Unread(_),
+                    found: FloorReading::Unread(..),
                     ..
                 })
             ),
@@ -1306,7 +1433,7 @@ mod tests {
 
     #[test]
     fn the_refusal_names_found_required_and_remedy() {
-        let refused = judge_floor(reporting("1.97.1"), release("1.98.1"));
+        let refused = judge_floor_path(reporting("1.97.1"), release("1.98.1"));
         let detail = refused.err().map(|r| r.detail()).unwrap_or_default();
         for needle in [
             "Rust 1.97.1",
@@ -1325,7 +1452,7 @@ mod tests {
             "floor",
             "printf 'rustc 1.97.1 (x)\\nhost: a-b-c\\nrelease: 1.97.1\\n'",
         );
-        let judged = judge_floor(
+        let judged = judge_floor_path(
             RustcVersion::query(stubbed(&stub), RUSTC_QUERY_LIMITS),
             release("1.98.1"),
         );
@@ -1333,7 +1460,7 @@ mod tests {
             matches!(
                 &judged,
                 Err(ToolchainFloorRefusal {
-                    found: FloorReading::Below(_),
+                    found: FloorReading::Below(..),
                     ..
                 })
             ),

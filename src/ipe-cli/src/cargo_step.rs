@@ -546,9 +546,9 @@ impl CargoBuild<'_> {
     /// - [`CliError::OutputRefused`] if an emitted crate's directory
     ///   was replaced before or while cargo ran, or its `Cargo.lock` is a
     ///   symlink or reparse point.
-    /// - [`CliError::ToolchainBelowFloor`] if the toolchain cargo would use in
-    ///   the crate's directory is older than the pin, or its version cannot be
-    ///   read.
+    /// - [`CliError::ToolchainBelowFloor`] if the compiler the build command
+    ///   would run is older than the pin, or it or its version cannot be
+    ///   resolved.
     pub fn run(&self) -> Result<String, CliError> {
         self.run_within(CARGO_BUILD_WALL)
     }
@@ -559,12 +559,12 @@ impl CargoBuild<'_> {
             dir.verify()?;
         }
         let dir = self.dir();
-        crate::toolchain::require_floor(dir)?;
         let io_err = |source: std::io::Error| CliError::Io {
             path: dir.to_path_buf(),
             source,
         };
         let mut cmd = self.command();
+        crate::toolchain::require_floor(&crate::toolchain::resolve_build_rustc(&cmd)?)?;
         match self.krate.lock_policy() {
             LockPolicy::ReplayOrResolve(owned) => {
                 let _locked: Locked = establish_lock(&cmd, owned, self.output.verbosity())?;
@@ -726,8 +726,11 @@ impl WatchBuild<'_> {
     /// `spawn_cargo`, or the toolchain-floor refusal of
     /// [`crate::toolchain::require_floor`].
     pub fn spawn(&self) -> std::io::Result<(GroupedChild, CargoPipes)> {
-        crate::toolchain::require_floor(self.krate.path()).map_err(std::io::Error::other)?;
-        let mut child = spawn_cargo(self.command())?;
+        let cmd = self.command();
+        crate::toolchain::resolve_build_rustc(&cmd)
+            .and_then(|rustc| crate::toolchain::require_floor(&rustc))
+            .map_err(std::io::Error::other)?;
+        let mut child = spawn_cargo(cmd)?;
         let pipes = CargoPipes::take(&mut child, ARTIFACT_STREAM_CAP);
         Ok((child, pipes))
     }
@@ -2968,6 +2971,110 @@ mod tests {
             assert!(
                 matches!(&verdict, Err(CliError::Io { .. })),
                 "an unread stderr is an I/O failure, never a partial build diagnostic, got {verdict:?}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// A `rustc` reporting a release below the pin, made the build's
+        /// compiler by `base/.cargo/config.toml`, the configuration every
+        /// crate under `base` inherits.
+        ///
+        /// The process must not set `RUSTC` or `CARGO_BUILD_RUSTC`, which
+        /// cargo would prefer to the configuration.
+        fn configured_old_rustc(base: &Path) -> crate::toolchain::StubRustc {
+            for var in ["RUSTC", "CARGO_BUILD_RUSTC"] {
+                assert!(
+                    ipe_env::var_os(var).is_none(),
+                    "unset `{var}` to run this test: it overrides the stub compiler"
+                );
+            }
+            let rustc = crate::toolchain::StubRustc::new(
+                "floor-wiring",
+                "printf 'rustc 1.0.0 (x)\\nhost: a-b-c\\nrelease: 1.0.0\\n'",
+            )
+            .expect("write the stub rustc");
+            let config = base.join(".cargo");
+            std::fs::create_dir_all(&config).expect("create .cargo");
+            std::fs::write(
+                config.join("config.toml"),
+                format!(
+                    "[build]\nrustc = {:?}\n",
+                    rustc.program().display().to_string()
+                ),
+            )
+            .expect("write config.toml");
+            rustc
+        }
+
+        /// Whether `refusal` judged the configured stub, release 1.0.0.
+        fn refused_configured(refusal: &crate::toolchain::ToolchainFloorRefusal) -> bool {
+            use crate::toolchain::{FloorReading, RustcSource};
+            matches!(
+                &refusal.found,
+                FloorReading::Below(found, RustcSource::Config { .. })
+                    if found.to_string() == "1.0.0"
+            )
+        }
+
+        #[test]
+        fn a_build_whose_compiler_is_below_the_pin_is_refused_before_cargo_runs() {
+            let base = scratch("floor-build");
+            let _rustc = configured_old_rustc(&base);
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = OwnedDir::claim(&base.join("crate")).expect("claim crate");
+            let built = CargoBuild {
+                cargo: &cargo,
+                krate: CargoCrate::Emitted(&crate_dir),
+                posture: BuildPosture::Dev,
+                target: CargoTarget::Host,
+                target_dir: &TARGET,
+                output: CargoOutput::JsonStream(Verbosity::Quiet),
+                what: "the stub build",
+                runtime: None,
+            }
+            .run_within(LocalWall::of_secs::<30>());
+            assert!(
+                matches!(&built, Err(CliError::ToolchainBelowFloor(refusal)) if refused_configured(refusal)),
+                "{built:?}"
+            );
+            assert!(
+                invocations(&base).is_empty(),
+                "cargo must not run: {:?}",
+                invocations(&base)
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_watch_build_whose_compiler_is_below_the_pin_is_refused_before_cargo_runs() {
+            let base = scratch("floor-watch");
+            let _rustc = configured_old_rustc(&base);
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = base.join("crate");
+            std::fs::create_dir_all(&crate_dir).expect("crate dir");
+            let accel = crate::watch::BuildAccel::MachineDefault;
+            let watch = WatchBuild {
+                cargo: cargo.path(),
+                krate: crate::DevMarkedCrate::assume(&crate_dir),
+                target_dir: &TARGET,
+                accel: &accel,
+                verbosity: Verbosity::Quiet,
+            };
+            let spawned = watch.spawn();
+            let refusal = spawned.as_ref().err().and_then(|e| {
+                e.get_ref().and_then(|inner| {
+                    inner.downcast_ref::<crate::toolchain::ToolchainFloorRefusal>()
+                })
+            });
+            assert!(
+                refusal.is_some_and(refused_configured),
+                "{:?}",
+                spawned.as_ref().err()
+            );
+            assert!(
+                invocations(&base).is_empty(),
+                "cargo must not run: {:?}",
+                invocations(&base)
             );
             let _ = std::fs::remove_dir_all(&base);
         }
