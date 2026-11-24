@@ -1465,9 +1465,12 @@ struct ShownMember<'a> {
     comment: &'a str,
 }
 
-/// The plain rendering of a member: its heading line, then its doc comment, sanitised.
+/// The plain rendering of a member: its heading as one terminal-inert line (a module name comes
+/// from a file name), then its doc comment, sanitised.
 fn member_plain(shown: &ShownMember<'_>) -> crate::style::TerminalSafe {
-    let mut out = shown.heading.clone();
+    let mut out = crate::style::TerminalLine::sanitize(&shown.heading)
+        .as_str()
+        .to_owned();
     out.push('\n');
     if !shown.comment.is_empty() {
         out.push_str(shown.comment);
@@ -4139,20 +4142,25 @@ fn check(path: &Path) -> Result<(), CliError> {
         return Ok(());
     }
 
+    Err(CliError::DocCoverage(coverage_report(&gaps, exposed)))
+}
+
+/// The `--check` coverage report: one terminal-inert `Module.name` line per gap, since a module
+/// name comes from a file name.
+fn coverage_report(gaps: &[Undocumented], exposed: usize) -> crate::style::TerminalSafe {
     let mut report = format!(
         "{} of {} exposed binding(s) lack a doc-comment:\n",
         gaps.len(),
         exposed
     );
-    for gap in &gaps {
-        let _ = writeln!(report, "  {}.{}", gap.module, gap.name);
+    for gap in gaps {
+        let key = crate::style::TerminalLine::sanitize(&format!("{}.{}", gap.module, gap.name));
+        let _ = writeln!(report, "  {key}");
     }
     report.push_str(
         "add a `{-| … -}` doc-comment above each, or hide it from the module's exposing list",
     );
-    Err(CliError::DocCoverage(crate::style::TerminalSafe::sanitize(
-        &report,
-    )))
+    crate::style::TerminalSafe::sanitize(&report)
 }
 
 /// The stdlib doc-comment blocks known to miss their verdict, one
@@ -11418,6 +11426,53 @@ mod terminal_tests {
                 assert!(page.contains("Value doc pre"), "{page:?}");
             }
         }
+    }
+
+    /// A member's `--plain` heading is one inert line, whatever its module's name holds.
+    #[test]
+    fn member_plain_heading_is_one_inert_line() {
+        let module = hostile_module();
+        let member = module
+            .values
+            .first()
+            .map(|v| v.name.clone())
+            .unwrap_or_default();
+        let shown = shown_member(&module, &member, None);
+        let plain = member_plain(&shown);
+        assert!(!has_hazard(plain.as_str()), "{:?}", plain.as_str());
+        let heading = plain.as_str().lines().next().unwrap_or_default();
+        assert!(
+            heading.starts_with("Evil") && heading.contains(" : Int"),
+            "{:?}",
+            plain.as_str()
+        );
+        assert!(
+            plain
+                .as_str()
+                .lines()
+                .nth(1)
+                .is_some_and(|l| l.starts_with("Value doc")),
+            "{:?}",
+            plain.as_str()
+        );
+    }
+
+    /// The `--check` coverage report is one inert line per gap, whatever a module name holds.
+    #[test]
+    fn coverage_report_is_one_inert_line_per_gap() {
+        let gaps = [
+            Undocumented {
+                module: format!("Evil{HOSTILE}\nfake"),
+                name: "f".to_owned(),
+            },
+            Undocumented {
+                module: "Ok".to_owned(),
+                name: "g".to_owned(),
+            },
+        ];
+        let report = coverage_report(&gaps, 2);
+        assert!(!has_hazard(report.as_str()), "{:?}", report.as_str());
+        assert_eq!(report.as_str().lines().count(), 4, "{:?}", report.as_str());
     }
 
     /// The module `--plain` listing is one inert line per entry, whatever a name or a signature

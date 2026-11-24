@@ -43,6 +43,8 @@ pub enum TypeSearchError {
     UnparseableQuery { query: String, detail: String },
     /// The query parsed but no symbols matched.
     NoMatches { query: String },
+    /// The OS refused the compile thread the search runs on.
+    CompileThread(CliError),
 }
 
 impl TypeSearchError {
@@ -56,6 +58,7 @@ impl TypeSearchError {
             Self::NoMatches { query } => {
                 CliError::Usage(crate::text::msg::doc_type_no_match_hint(&query))
             }
+            Self::CompileThread(refused) => refused,
         }
     }
 }
@@ -306,7 +309,10 @@ pub fn normalize_signature(ty: &NormalizedType) -> NormalizedSignature {
 ///
 /// Returns [`TypeSearchError::UnparseableQuery`] when the string is not valid
 /// Ipê type syntax.
-pub fn parse_and_normalize_query(query: &str) -> Result<NormalizedSignature, TypeSearchError> {
+///
+/// The parse admits nesting up to the compiler's ceiling, a depth sized for the compile stack, so
+/// the one production caller is [`type_search`], which runs it there.
+fn parse_and_normalize_query(query: &str) -> Result<NormalizedSignature, TypeSearchError> {
     let (ann, interner) =
         parse_type_query(query).map_err(|d| TypeSearchError::UnparseableQuery {
             query: query.to_owned(),
@@ -507,8 +513,21 @@ fn same_result_subset_args(query: &NormalizedSignature, candidate: &NormalizedSi
 /// # Errors
 ///
 /// Returns [`TypeSearchError::UnparseableQuery`] when `query` is not valid Ipê
-/// type syntax, or [`TypeSearchError::NoMatches`] when no symbols match.
+/// type syntax, [`TypeSearchError::NoMatches`] when no symbols match, or
+/// [`TypeSearchError::CompileThread`] when the OS refuses the compile thread.
 pub fn type_search<'a>(
+    modules: &'a [ModuleDoc],
+    query: &str,
+    limit: usize,
+) -> Result<Vec<TypeMatch<'a>>, TypeSearchError> {
+    // The query parses, normalises, matches and drops as a tree as deep as the parser's
+    // ceiling, which is sized for the compile stack, never the caller's.
+    crate::threads::run_compile(|| ranked_matches(modules, query, limit))
+        .map_err(TypeSearchError::CompileThread)?
+}
+
+/// The body of [`type_search`], on the compile stack.
+fn ranked_matches<'a>(
     modules: &'a [ModuleDoc],
     query: &str,
     limit: usize,
@@ -794,6 +813,35 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(parsed[0]["signature"], signature);
         assert!(!json.contains('\u{202e}'), "U+202E reached the JSON raw");
+    }
+
+    /// A type query nested to the parser's ceiling parses, matches and drops off the caller's
+    /// stack: a caller on a 32 KiB stack, where the parse itself overflows, gets its answer.
+    #[test]
+    fn type_search_at_parser_ceiling_runs_off_the_callers_stack() {
+        let chain = |n: usize| format!("{}a", "a -> ".repeat(n));
+        let deepest = crate::threads::run_compile(|| {
+            (1..=usize::try_from(ipe_parse::MAX_DEPTH).unwrap_or(usize::MAX))
+                .rev()
+                .find(|&n| parse_and_normalize_query(&chain(n)).is_ok())
+        });
+        let Ok(Some(deepest)) = deepest else {
+            panic!("no arrow chain parses: {deepest:?}");
+        };
+        let query = chain(deepest);
+        let small = std::thread::Builder::new()
+            .stack_size(32 << 10)
+            .spawn(move || {
+                matches!(
+                    type_search(&[], &query, 20),
+                    Err(TypeSearchError::NoMatches { .. })
+                )
+            })
+            .map(std::thread::JoinHandle::join);
+        assert!(
+            matches!(small, Ok(Ok(true))),
+            "an at-ceiling query must parse and answer from a small caller stack"
+        );
     }
 
     /// A hostile module name, value name and signature reach the human listing as one inert
