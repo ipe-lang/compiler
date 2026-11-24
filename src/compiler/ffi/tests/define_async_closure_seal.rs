@@ -139,11 +139,19 @@ fn async_ffi_rs() -> String {
     )
 }
 
+/// The emitted program's crate root template, which owns its `fn main`.
+const TEMPLATE_MAIN_RS: &str = include_str!("../../backend/rust/templates/main.rs");
+
+/// The template `fn main`'s opening line.
+const TEMPLATE_MAIN_HEAD: &str = "fn main() {";
+/// The template `fn main`'s entry call, which drives the program's task.
+const TEMPLATE_ENTRY_CALL: &str = "block_on_entry(ipe_main)";
+
 /// The driver items every async seal app shares, ahead of its own `main`.
 ///
 /// `Entry` is the task `block_on_entry` drives, spelled through the runtime's
 /// own `IpeResult` so it names no crate-root task alias.
-const DRIVER_ITEMS: &str = r"use std::future::Future;
+const DRIVER_TYPES: &str = r"use std::future::Future;
 use std::pin::Pin;
 
 /// The app-side shape of an Ipê async function value.
@@ -151,22 +159,64 @@ type AsyncFn<R> = Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = R> + Send + 'st
 
 /// The entry task the runtime's own entry drives.
 type Entry = Pin<Box<dyn Future<Output = IpeResult<IpeError, ()>> + Send + 'static>>;
-
-/// The template's `fn main`: classifier first, then the runtime's own entry,
-/// both outcomes through the runtime's one exit funnel.
-fn run_entry(entry: impl FnOnce() -> Entry + Send + 'static) -> ! {
-    ipe_runtime::core::install_panic_classifier();
-    match block_on_entry(entry) {
-        IpeResult::Ok(()) => {
-            ipe_runtime::system::exit_process(ipe_runtime::system::ProcessStatus::SUCCESS)
-        }
-        IpeResult::Err(e) => {
-            ipe_runtime::core::eprint_task_error(&e.to_string());
-            ipe_runtime::system::exit_process(ipe_runtime::system::ProcessStatus::FAILURE)
-        }
-    }
-}
 ";
+
+/// The template's `fn main`, renamed `run_entry` and handed the driver's task.
+///
+/// The body is the template's own text, so the classifier, the entry, the
+/// error print and the exit funnel are exactly the shipped ones: a seal can
+/// never drift from the entry a real program runs. A template whose `fn main`
+/// no longer has one head line and one entry call fails the seal here.
+fn run_entry_item() -> String {
+    let body = TEMPLATE_MAIN_RS
+        .split_once(&format!("\n{TEMPLATE_MAIN_HEAD}\n"))
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("templates/main.rs holds a top-level `fn main() {` closed by `}`");
+    assert_eq!(
+        body.matches(TEMPLATE_ENTRY_CALL).count(),
+        1,
+        "the template `fn main` calls `{TEMPLATE_ENTRY_CALL}` exactly once:\n{body}"
+    );
+    format!(
+        "fn run_entry(entry: impl FnOnce() -> Entry + Send + 'static) {{\n{}\n}}\n",
+        body.replace(TEMPLATE_ENTRY_CALL, "block_on_entry(entry)")
+    )
+}
+
+/// The template's `fn main` steps the seal entry must carry, in order.
+const TEMPLATE_ENTRY_STEPS: [&str; 4] = [
+    "ipe_runtime::core::install_panic_classifier();",
+    "block_on_entry(entry)",
+    "ipe_runtime::core::eprint_task_error(",
+    "ipe_runtime::system::exit_process(ipe_runtime::system::ProcessStatus::FAILURE)",
+];
+
+/// Default gate: the seal entry is the template's `fn main`, step for step.
+///
+/// The derived `run_entry` installs the runtime's panic classifier before the
+/// runtime's own entry, and ends a failed task through the runtime's error print
+/// and exit funnel, so the seal runs what a shipped program runs.
+#[test]
+fn the_seal_entry_is_the_template_main() {
+    let item = run_entry_item();
+    let mut from = 0_usize;
+    for step in TEMPLATE_ENTRY_STEPS {
+        let at = item
+            .get(from..)
+            .and_then(|rest| rest.find(step))
+            .map(|i| i.saturating_add(from));
+        assert!(
+            at.is_some(),
+            "the seal entry must carry `{step}` after the steps before it:\n{item}"
+        );
+        from = at.map_or(from, |i| i.saturating_add(step.len()));
+    }
+    assert!(
+        !item.contains("ipe_main") && !item.contains("Runtime::new"),
+        "the seal entry drives the driver's task on the runtime's entry only:\n{item}"
+    );
+}
 
 /// Write the app crate for one async seal into a fresh `dir`.
 ///
@@ -174,7 +224,7 @@ fn run_entry(entry: impl FnOnce() -> Entry + Send + 'static) -> ! {
 /// executor of its own, so the adapters run on the runtime's.
 fn write_async_app(dir: &std::path::Path, name: &str, ffi_rs: &str, main_rs: &str) {
     let _ = std::fs::remove_dir_all(dir);
-    let main_rs = format!("{DRIVER_ITEMS}\n{main_rs}");
+    let main_rs = format!("{DRIVER_TYPES}\n{}\n{main_rs}", run_entry_item());
     e2e_support::ffi_app::FfiApp {
         name,
         runtime_features: &["async"],
@@ -339,6 +389,18 @@ fn async_closure_adapter_builds_and_runs() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The trip reached the runtime's panic classifier, never Rust's default report.
+///
+/// The classifier logs a `[error] <kind>` line for the unwind; without it Rust's
+/// default hook prints `panicked at` with the source location, the shape a
+/// shipped program never shows.
+fn assert_classified(mode: &str, stderr: &str) {
+    assert!(
+        stderr.contains("[error] ") && !stderr.contains("panicked at"),
+        "{mode}: the trip must be reported by the runtime's panic classifier.\nstderr: {stderr}"
+    );
+}
+
 /// Under `IPE_E2E=1`, a runtime trip in an async adapter's Ipê future ends typed.
 ///
 /// The app runs under the runtime's own entry. The trip is raised while the
@@ -404,6 +466,7 @@ fn async_closure_trip_ends_typed() {
             stderr.contains(trip_line),
             "{mode}: the trip's typed error `{trip_line}` must reach stderr.\nstderr: {stderr}"
         );
+        assert_classified(mode, &stderr);
     }
 
     for mode in ["result-poll", "result-build"] {
@@ -420,6 +483,7 @@ fn async_closure_trip_ends_typed() {
             stdout, "start\nresult returned the trip's typed error\n",
             "{mode}: the `Err` must be the trip's typed error.\nstderr: {stderr}"
         );
+        assert_classified(mode, &stderr);
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
