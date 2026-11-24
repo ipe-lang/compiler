@@ -20,9 +20,36 @@ use super::{CrateName, PinnedSet, pinned_set};
 /// The dependency tables a manifest (or one of its `[target.*]` tables) can carry.
 const DEP_TABLES: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
 
-/// The placeholder the dependency-model templates carry until the emitter
-/// substitutes the runtime's feature list.
-const RUNTIME_FEATURES_HOLE: &str = "__IPE_RUNTIME_FEATURES__";
+/// `text` with every `__UPPER_CASE__` emitter placeholder removed.
+///
+/// A template is TOML only once the emitter fills its placeholders (the
+/// runtime's feature list, say); an empty fill keeps every dependency it
+/// declares.
+fn without_placeholders(text: &str) -> String {
+    let is_body = |body: &str| {
+        !body.is_empty()
+            && body
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+    };
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("__") {
+        out.push_str(rest.get(..open).unwrap_or_default());
+        let after = rest.get(open.saturating_add(2)..).unwrap_or_default();
+        match after.find("__") {
+            Some(close) if after.get(..close).is_some_and(is_body) => {
+                rest = after.get(close.saturating_add(2)..).unwrap_or_default();
+            }
+            Some(_) | None => {
+                out.push_str("__");
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
 
 /// One registry dependency a manifest declares.
 #[derive(Debug, Clone)]
@@ -224,7 +251,7 @@ fn manifest_gaps(
 ) -> Result<Vec<String>, String> {
     let mut found = Vec::new();
     for (at, text) in emitted {
-        let text = text.replace(RUNTIME_FEATURES_HOLE, "");
+        let text = without_placeholders(text);
         for wanted in registry_deps(&manifest(&text, at)?, at)? {
             found.extend(gaps(set, provided, at, &wanted));
         }
@@ -559,4 +586,13 @@ fn a_manifest_const_is_found_and_a_test_const_is_not() {
     consts.visit_file(&syntax);
     let names: Vec<&str> = consts.found.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["A"]);
+}
+
+#[test]
+fn only_an_upper_case_placeholder_is_removed() {
+    assert_eq!(
+        without_placeholders("f = [__A_B1__] }\nx__y__ = 1\n__ = 2"),
+        "f = [] }\nx__y__ = 1\n__ = 2"
+    );
+    assert_eq!(without_placeholders("a ____ b"), "a ____ b");
 }
