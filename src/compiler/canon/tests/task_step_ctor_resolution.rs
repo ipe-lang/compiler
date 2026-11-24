@@ -5,6 +5,12 @@
 //! type's constructors overrides them. Two imports exposing a `Done`
 //! unqualified (`Ipe.Task.Step` and `Ipe.Parser.Step`) are ambiguous and fail
 //! closed with IPE-N0024.
+//!
+//! The same ladder holds for a kernel module's builtin union: `Ipe.Http`
+//! exposes `HttpMethod(Get, Post, ..)` and `Ipe.Html.Attributes` exposes
+//! `Method(Get, Post)`, so a bare `Get` under both explicit imports is IPE-N0024
+//! (in an expression and a pattern), while `A.Get` and `Http.Get` each resolve
+//! to their own module's constructor.
 
 use std::collections::BTreeMap;
 
@@ -22,6 +28,11 @@ const TASK_STUB: &str = "module Ipe.Task exposing (Step(..))\n\n\
 /// The `Step` declaration of `Ipe.Parser`, whose `Done` shares the name.
 const PARSER_STUB: &str = "module Ipe.Parser exposing (Step(..))\n\n\
                            type Step state a = Loop state | Done a\n";
+
+/// The `Method` declaration of `Ipe.Html.Attributes`, whose `Get` and `Post`
+/// share the names of the kernel `Ipe.Http`'s `HttpMethod` constructors.
+const ATTRIBUTES_STUB: &str = "module Ipe.Html.Attributes exposing (Method(..))\n\n\
+                               type Method = Get | Post\n";
 
 /// Canonicalise the stdlib `stubs` (as embedded stdlib modules) and then the
 /// user module `main` against their exports.
@@ -54,8 +65,8 @@ fn canonicalise_main(stubs: &[&str], main: &str) -> (DResult<Module>, Interner) 
 }
 
 /// The dot-joined home of the constructor `main`'s body names, if its body is a
-/// bare constructor reference.
-fn main_ctor_home(module: &Module, interner: &Interner) -> Option<String> {
+/// bare reference to the constructor `ctor`.
+fn main_ctor_home(module: &Module, ctor: &str, interner: &Interner) -> Option<String> {
     let body = module.defs.iter().find_map(|d| match d {
         Def::Untyped { name, body, .. } | Def::Typed { name, body, .. }
             if interner.resolve(name.value) == Some("main") =>
@@ -67,7 +78,7 @@ fn main_ctor_home(module: &Module, interner: &Interner) -> Option<String> {
     let Expr_::VarCtor { home, name, .. } = &body.value else {
         return None;
     };
-    if interner.resolve(*name) != Some("Done") {
+    if interner.resolve(*name) != Some(ctor) {
         return None;
     }
     let segments: Option<Vec<&str>> = home.iter().map(|s| interner.resolve(*s)).collect();
@@ -85,7 +96,7 @@ fn assert_done_resolves_to_task(main: &str) {
         return;
     };
     assert_eq!(
-        main_ctor_home(module, &interner).as_deref(),
+        main_ctor_home(module, "Done", &interner).as_deref(),
         Some("Ipe.Task"),
         "`Done` must be `Ipe.Task.Step`'s constructor, not the ambient `ChunkEvent.Done`"
     );
@@ -137,4 +148,87 @@ fn two_explicit_step_imports_are_refused_as_a_duplicate_type() {
         ),
         "two explicit `Step(..)` imports must fail closed at the import as a duplicate type, got {result:?}"
     );
+}
+
+/// Assert `result` is IPE-N0024 for `Get`, naming both modules.
+#[track_caller]
+fn assert_ambiguous_get(result: &DResult<Module>) {
+    assert!(
+        matches!(
+            result,
+            Err(Diagnostic::Name {
+                msg: NameError::AmbiguousImport { .. },
+                ..
+            })
+        ),
+        "a bare `Get` under two explicit imports must be IPE-N0024, got {result:?}"
+    );
+    let Err(Diagnostic::Name {
+        msg: NameError::AmbiguousImport { name, modules },
+        ..
+    }) = result
+    else {
+        return;
+    };
+    assert_eq!(&**name, "Get");
+    let rendered: Vec<&str> = modules.iter().map(AsRef::as_ref).collect();
+    assert_eq!(rendered, vec!["Ipe.Html.Attributes", "Ipe.Http"]);
+}
+
+/// The home of the `Get` that `main`'s body names, which must canonicalise.
+#[track_caller]
+fn main_get_home_of(main: &str) -> Option<String> {
+    let (result, interner) = canonicalise_main(&[ATTRIBUTES_STUB], main);
+    let Ok(module) = &result else {
+        assert!(result.is_ok(), "`{main}` must canonicalise, got {result:?}");
+        return None;
+    };
+    main_ctor_home(module, "Get", &interner)
+}
+
+#[test]
+fn a_bare_get_under_both_explicit_imports_is_ambiguous() {
+    let (result, _) = canonicalise_main(
+        &[ATTRIBUTES_STUB],
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\
+         import Ipe.Html.Attributes exposing (Method(..))\n\n\
+         main = Get\n",
+    );
+    assert_ambiguous_get(&result);
+}
+
+#[test]
+fn a_bare_get_pattern_under_both_explicit_imports_is_ambiguous() {
+    let (result, _) = canonicalise_main(
+        &[ATTRIBUTES_STUB],
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\
+         import Ipe.Html.Attributes exposing (Method(..))\n\n\
+         main m =\n    case m of\n        Get -> 0\n        _ -> 1\n",
+    );
+    assert_ambiguous_get(&result);
+}
+
+#[test]
+fn a_qualified_get_resolves_to_the_form_method() {
+    let home = main_get_home_of(
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\
+         import Ipe.Html.Attributes as A exposing (..)\n\n\
+         main = A.Get\n",
+    );
+    assert_eq!(home.as_deref(), Some("Ipe.Html.Attributes"));
+}
+
+#[test]
+fn a_qualified_http_get_resolves_to_the_http_method() {
+    let home = main_get_home_of(
+        "module Main exposing (main)\n\n\
+         import Ipe.Http as Http\n\
+         import Ipe.Html.Attributes exposing (Method(..))\n\n\
+         main = Http.Get\n",
+    );
+    assert!(home.is_some(), "`Http.Get` must resolve to a constructor");
+    assert_ne!(home.as_deref(), Some("Ipe.Html.Attributes"));
 }
