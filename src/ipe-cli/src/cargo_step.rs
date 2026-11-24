@@ -2742,7 +2742,10 @@ mod tests {
         #[test]
         fn a_lock_the_probe_rejects_is_seeded_afresh() {
             let base = scratch("probe-drifted");
-            let cargo = stub(&base, "case \"$*\" in *--locked*) exit 101;; esac\nexit 0");
+            let cargo = stub(
+                &base,
+                "case \"$*\" in update*--locked*) exit 101;; esac\nexit 0",
+            );
             let crate_dir = emitted_crate(&base, true);
             let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
             assert!(built.is_ok(), "{built:?}");
@@ -2759,7 +2762,7 @@ mod tests {
             let base = scratch("probe-signal");
             let cargo = stub(
                 &base,
-                "case \"$*\" in *--locked*) kill -9 $$;; esac\nexit 0",
+                "case \"$*\" in update*--locked*) kill -9 $$;; esac\nexit 0",
             );
             let crate_dir = emitted_crate(&base, true);
             let built = build(&cargo, CargoCrate::Emitted(&crate_dir));

@@ -521,12 +521,16 @@ impl PinnedSet {
 
     /// Judge `lock` under `posture`: every registry package must be one pin.
     ///
-    /// Path packages are the crate's own. The first package `posture` does
-    /// not admit, in lock order, is the verdict.
+    /// Path packages are the crate's own. A refused drift that breaks a pin
+    /// (moved, re-checksummed, re-sourced) outranks a refused addition
+    /// ([`LockDrift::Unpinned`]): a crate that moves a pin is usually itself
+    /// unpinned, and the move's remedy is the one that applies. Within a
+    /// rank, the first package in lock order is the verdict.
     ///
     /// # Errors
-    /// The first [`LockDrift`] `posture` refuses.
+    /// The first refused pin break, else the first refused addition.
     pub fn judge(&self, lock: &LockFile, posture: FfiPosture) -> Result<Agrees, LockDrift> {
+        let mut addition = None;
         for package in &lock.packages {
             let drift = match &package.origin {
                 Origin::Local => None,
@@ -539,13 +543,24 @@ impl PinnedSet {
                 }
             };
             if let Some(drift) = drift {
-                match posture.admits(&drift) {
-                    Admission::Admit => {}
-                    Admission::Refuse => return Err(drift),
+                match (posture.admits(&drift), &drift) {
+                    (Admission::Admit, _) => {}
+                    (Admission::Refuse, LockDrift::Unpinned { .. }) => {
+                        addition.get_or_insert(drift);
+                    }
+                    (
+                        Admission::Refuse,
+                        LockDrift::Moved { .. }
+                        | LockDrift::ChecksumDiffers { .. }
+                        | LockDrift::ForeignSource { .. }
+                        | LockDrift::Unparsable(_)
+                        | LockDrift::WrapperDiffers
+                        | LockDrift::SetUnreadable(_),
+                    ) => return Err(drift),
                 }
             }
         }
-        Ok(Agrees(()))
+        addition.map_or(Ok(Agrees(())), Err)
     }
 
     /// How the crates.io `package` of `lock`, recorded with `checksum`, disagrees with its pin.
