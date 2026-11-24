@@ -8,6 +8,7 @@ module Main exposing (main)
 
 import Ipe.Browser.Share as Share
 import Ipe.Char as Char
+import Ipe.Html as Html
 import Ipe.Html.Attributes as Attr
 import Ipe.Io as Io
 import Ipe.Result as Result exposing (Result(..))
@@ -30,7 +31,7 @@ verdict r =
 
 
 -- | Drive each surface's ONE dispatching seal on a raw string. `Attr.linkTarget`
--- (href) and `Ui.linkTarget` narrow through the anchor allowlist
+-- (href, form `action`) and `Ui.linkTarget` narrow through the anchor allowlist
 -- (http/https/mailto/tel); `Attr.imageSrc` (the media `src` fetch sink) narrows
 -- through its own tighter allowlist (http/https only). Each reads the raw string
 -- absolute-then-scheme-narrowed, else same-origin relative. The `verdict` fold
@@ -45,6 +46,12 @@ linkOf raw =
 
 imageOf raw =
     Attr.imageSrc raw
+
+
+-- | A form `action` takes the `LinkTarget` an `href` takes, so it shares the
+-- anchor allowlist: a script target never reaches the rendered `action`.
+actionOf raw =
+    Result.map (\target -> Html.render (Html.form [ Attr.action target ] [])) (Attr.linkTarget raw)
 
 
 shareOf raw =
@@ -85,6 +92,13 @@ main =
             , line "link_https" (verdict (linkOf "https://example.com"))
             , line "link_mailto" (verdict (linkOf "mailto:a@b.com"))
             , line "link_javascript" (verdict (linkOf "javascript:alert(1)"))
+
+            -- form `action` mirrors href: a same-origin path or a web URL
+            -- accepts; a script or `data:` scheme rejects.
+            , line "action_relative" (verdict (actionOf "/submit"))
+            , line "action_https" (verdict (actionOf "https://example.com/submit"))
+            , line "action_javascript" (verdict (actionOf "javascript:alert(1)"))
+            , line "action_data" (verdict (actionOf "data:text/html,<x>"))
 
             -- image `src` is a FETCH sink with its OWN narrower allowlist
             -- (http/https ONLY): a same-origin path accepts, but the mailto/tel

@@ -1,4 +1,4 @@
-//! REFUSAL SEAL for the typed URL sinks (`Ipe.Html.Attributes.href`,
+//! REFUSAL SEAL for the typed URL sinks (`Ipe.Html.Attributes.href` / `action`,
 //! `Ipe.Html.Attributes.src` / `imageSrc`, `Ipe.Ui.link`,
 //! `Ipe.Browser.Share.shareUrl`, the `<head>` `href` sinks
 //! `Ipe.Web.Head.canonical` / `Ipe.Web.Head.rss`) and the shared same-origin
@@ -77,6 +77,10 @@ fn url_scheme_seal_builds_and_runs() {
                     link_https=OK\n\
                     link_mailto=OK\n\
                     link_javascript=ERR\n\
+                    action_relative=OK\n\
+                    action_https=OK\n\
+                    action_javascript=ERR\n\
+                    action_data=ERR\n\
                     img_https=OK\n\
                     img_relative=OK\n\
                     img_mailto=ERR\n\

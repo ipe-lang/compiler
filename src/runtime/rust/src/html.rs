@@ -5519,6 +5519,46 @@ mod tests {
     }
 
     #[test]
+    fn javascript_action_is_neutralised() {
+        // A form submit navigates to `action` / `formaction`, so a script or
+        // `data:` target renders empty at the SSR sink and the patch sink.
+        for name in ["action", "formaction", "ACTION"] {
+            for target in [
+                "javascript:alert(1)",
+                "JaVaScRiPt:alert(1)",
+                " \tjavascript:alert(1)",
+                "java\tscript:alert(1)",
+                "vbscript:msgbox",
+                "data:text/html,<script>1</script>",
+                "data:image/png;base64,iVBOR",
+            ] {
+                let out = render_html(&bare(
+                    "form",
+                    vec![Attribute::Attr(name.into(), target.into())],
+                ));
+                assert!(
+                    out.contains(&format!("{name}=\"\"")),
+                    "{name}={target:?}: {out}"
+                );
+                assert_eq!(
+                    safe_patch_attr(name, target).map(|(_, v)| v),
+                    Some(""),
+                    "{name}={target:?}"
+                );
+            }
+        }
+        let out = render_html(&bare(
+            "form",
+            vec![Attribute::Attr("action".into(), "/submit".into())],
+        ));
+        assert!(out.contains("action=\"/submit\""), "{out}");
+        assert_eq!(
+            safe_patch_attr("action", "/submit").map(|(_, v)| v),
+            Some("/submit")
+        );
+    }
+
+    #[test]
     fn data_uri_src_policy() {
         // #3 — scriptable `data:text/html` neutralised; inert raster passes.
         let bad: Html<()> = Html::HElement(
