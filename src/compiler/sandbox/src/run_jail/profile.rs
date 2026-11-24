@@ -154,11 +154,11 @@ impl ListenGrant {
                 port: GrantPort::Source(web_default_port()?),
             },
             ServedPort::ServerLiteral(literal) => {
-                let port = ListenPort::from_program(literal.get()).ok_or(
+                let port = ListenPort::from_program(literal.get()).ok_or_else(|| {
                     ProfileError::ServedPortOutOfRange {
                         port: literal.get(),
-                    },
-                )?;
+                    }
+                })?;
                 Self {
                     key: ListenKey::Server,
                     port: GrantPort::Source(port),
@@ -814,8 +814,7 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
             "subprocess" => subprocess = Some(parse_bool(value)?),
             "env" => env_allowlist.push(value.to_owned()),
             "listen" => {
-                let grant = parse_profile_listen(value)
-                    .ok_or_else(|| malformed(&format!("malformed listen {value:?}")))?;
+                let grant = parse_profile_listen(value)?;
                 if listen.replace(grant).is_some() {
                     return Err(malformed("repeated `listen`"));
                 }
@@ -836,12 +835,21 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
 
 /// Parse an `ipe.profile` `listen` value: `none`, `web <port>`,
 /// `server <port>` or `server dynamic`.
-fn parse_profile_listen(value: &str) -> Option<Option<ListenGrant>> {
+///
+/// # Errors
+///
+/// [`ParseError::Malformed`] on any other value.
+fn parse_profile_listen(value: &str) -> Result<Option<ListenGrant>, ParseError> {
     if value == "none" {
-        return Some(None);
+        return Ok(None);
     }
-    let (key, port) = value.split_once(' ')?;
-    ListenGrant::parse_tokens(key, port).map(Some)
+    value
+        .split_once(' ')
+        .and_then(|(key, port)| ListenGrant::parse_tokens(key, port))
+        .map(Some)
+        .ok_or_else(|| ParseError::Malformed {
+            detail: format!("malformed listen {value:?}"),
+        })
 }
 
 /// Strictly parse a capfloor line into the *comparison floor*.

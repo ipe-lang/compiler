@@ -63,9 +63,10 @@ impl ServedPort {
     #[must_use]
     pub const fn join(self, other: Self) -> Self {
         match (self, other) {
-            (Self::Several, _) | (_, Self::Several) => Self::Several,
             (Self::WebDefault, Self::WebDefault) => Self::WebDefault,
-            (Self::WebDefault, Self::ServerLiteral(_) | Self::ServerDynamic)
+            (Self::Several, _)
+            | (_, Self::Several)
+            | (Self::WebDefault, Self::ServerLiteral(_) | Self::ServerDynamic)
             | (Self::ServerLiteral(_) | Self::ServerDynamic, Self::WebDefault) => Self::Several,
             (Self::ServerLiteral(a), Self::ServerLiteral(b)) => {
                 if a.0 == b.0 {

@@ -53,24 +53,22 @@ mod tests {
         Some(program_served_listener(&program))
     }
 
-    fn served_literal(n: i64) -> Option<ServedListener> {
-        Some(ServedListener::Serves(ServedPort::ServerLiteral(
-            SourcePortLiteral::new(n),
-        )))
+    fn served_literal(n: i64) -> ServedListener {
+        ServedListener::Serves(ServedPort::ServerLiteral(SourcePortLiteral::new(n)))
     }
 
     #[test]
     fn server_literal_port_folds_to_literal() {
         let served = served_of(
-            "module Lib exposing (serve)\nimport Ipe.Http.Server as Server\nserve =\n    Server.listen 8000 []\n",
+            "module Lib exposing (serve)\nimport Ipe.Server.Http as Server\nserve =\n    Server.listen 8000 []\n",
         );
-        assert_eq!(served, served_literal(8000));
+        assert_eq!(served, Some(served_literal(8000)));
     }
 
     #[test]
     fn computed_port_folds_to_dynamic() {
         let served = served_of(
-            "module Lib exposing (serve)\nimport Ipe.Http.Server as Server\nserve base =\n    Server.listen (base + 1) []\n",
+            "module Lib exposing (serve)\nimport Ipe.Server.Http as Server\nserve base =\n    Server.listen (base + 1) []\n",
         );
         assert_eq!(
             served,
@@ -81,7 +79,7 @@ mod tests {
     #[test]
     fn two_literals_fold_to_dynamic() {
         let served = served_of(
-            "module Lib exposing (a, b)\nimport Ipe.Http.Server as Server\na =\n    Server.listen 8000 []\nb =\n    Server.listen 9000 []\n",
+            "module Lib exposing (a, b)\nimport Ipe.Server.Http as Server\na =\n    Server.listen 8000 []\nb =\n    Server.listen 9000 []\n",
         );
         assert_eq!(
             served,
@@ -92,7 +90,7 @@ mod tests {
     #[test]
     fn eta_listen_folds_to_dynamic() {
         let served = served_of(
-            "module Lib exposing (start)\nimport Ipe.Http.Server as Server\nstart =\n    Server.listen\n",
+            "module Lib exposing (start)\nimport Ipe.Server.Http as Server\nstart =\n    Server.listen\n",
         );
         assert_eq!(
             served,
@@ -105,13 +103,13 @@ mod tests {
     #[test]
     fn unreached_listen_is_not_served() {
         let unreached = served_of(
-            "module Main exposing (main)\nimport Ipe.System as System\nimport Ipe.Http.Server as Server\n\nmain =\n    System.setenv \"HOME\" \"x\"\n\nserve =\n    Server.listen 8000 []\n",
+            "module Main exposing (main)\nimport Ipe.System as System\nimport Ipe.Server.Http as Server\n\nmain =\n    System.setenv \"HOME\" \"x\"\n\nserve =\n    Server.listen 8000 []\n",
         );
         assert_eq!(unreached, Some(ServedListener::NotServed));
         let reached = served_of(
-            "module Main exposing (main)\nimport Ipe.Http.Server as Server\n\nmain =\n    Server.listen 8000 []\n",
+            "module Main exposing (main)\nimport Ipe.Server.Http as Server\n\nmain =\n    Server.listen 8000 []\n",
         );
-        assert_eq!(reached, served_literal(8000));
+        assert_eq!(reached, Some(served_literal(8000)));
     }
 
     /// Lower a free-standing single-module program, or `None` if any pipeline

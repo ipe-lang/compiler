@@ -2629,28 +2629,7 @@ pub fn render_capabilities(
     use cli_args::OutputFormat::{Human, Json, Plain};
     let reach = frames.and_then(crate::frame_reach::FrameReport::reach);
     match format {
-        Plain => {
-            // The historical scriptable form: bare names, one per line. A pure
-            // program prints nothing, so `| wc -l` counts the capabilities.
-            let mut out = String::new();
-            for name in names {
-                out.push_str(name);
-                out.push('\n');
-            }
-            for origin in reach.map_or(&[][..], |reach| reach.origins()) {
-                let _ = writeln!(out, "frame:{origin}");
-            }
-            if let Some(report) = frames {
-                let _ = writeln!(out, "frame-program:{}", report.built().file());
-                for program in report.not_applicable() {
-                    let _ = writeln!(out, "frame-not-applicable:{}", program.file());
-                }
-            }
-            if let Some(token) = served_token(served) {
-                let _ = writeln!(out, "serves:{token}");
-            }
-            out
-        }
+        Plain => render_capabilities_plain(names, served, frames),
         Json => {
             // The shared machine envelope: a command may never hand-roll a bare
             // success object. The capability list rides under `payload`.
@@ -2660,13 +2639,11 @@ pub fn render_capabilities(
                     ("file", cli_args::json::string(program.file())),
                 ])
             };
+            let serves_json = served_token(served)
+                .map_or_else(|| "null".to_owned(), |t| cli_args::json::string(&t));
             let mut fields = vec![
                 ("capabilities", cli_args::json::string_array(names)),
-                (
-                    "serves",
-                    served_token(served)
-                        .map_or_else(|| "null".to_owned(), |t| cli_args::json::string(&t)),
-                ),
+                ("serves", serves_json),
             ];
             if let Some(reach) = reach {
                 let origins: Vec<&str> = reach.origins().iter().map(String::as_str).collect();
@@ -2725,9 +2702,7 @@ pub fn render_capabilities(
                     );
                 }
             }
-            if let Some(line) = served_line(served) {
-                let _ = writeln!(body, "{line}");
-            }
+            body.push_str(&served_line(served).map_or_else(String::new, |line| line + "\n"));
             let mut out = style::frame(&style::gutter(&body));
             if let Some(report) = frames {
                 out.push_str(&style::frame(&style::gutter(&frame_report_block(report))));
@@ -2735,6 +2710,37 @@ pub fn render_capabilities(
             out
         }
     }
+}
+
+/// The `--plain` form of [`render_capabilities`].
+fn render_capabilities_plain(
+    names: &[&str],
+    served: &ipe_ir::ServedListener,
+    frames: Option<&crate::frame_reach::FrameReport>,
+) -> String {
+    use std::fmt::Write as _;
+
+    // The historical scriptable form: bare names, one per line. A pure
+    // program prints nothing, so `| wc -l` counts the capabilities.
+    let mut out = String::new();
+    for name in names {
+        out.push_str(name);
+        out.push('\n');
+    }
+    let reach = frames.and_then(crate::frame_reach::FrameReport::reach);
+    for origin in reach.map_or(&[][..], |reach| reach.origins()) {
+        let _ = writeln!(out, "frame:{origin}");
+    }
+    if let Some(report) = frames {
+        let _ = writeln!(out, "frame-program:{}", report.built().file());
+        for program in report.not_applicable() {
+            let _ = writeln!(out, "frame-not-applicable:{}", program.file());
+        }
+    }
+    if let Some(token) = served_token(served) {
+        let _ = writeln!(out, "serves:{token}");
+    }
+    out
 }
 
 /// The machine token of the listener a program serves, `None` when it serves nothing.
@@ -2764,19 +2770,19 @@ fn served_line(served: &ipe_ir::ServedListener) -> Option<String> {
     let ServedListener::Serves(port) = served else {
         return None;
     };
-    let web = ListenKey::Web.operator_key().entry().name();
-    let server = ListenKey::Server.operator_key().entry().name();
+    let web_variable = ListenKey::Web.operator_key().entry().name();
+    let server_variable = ListenKey::Server.operator_key().entry().name();
     Some(match port {
         ServedPort::WebDefault => format!(
-            "It serves inbound connections on one port: {} unless `{web}` names another.",
+            "It serves inbound connections on one port: {} unless `{web_variable}` names another.",
             ipe_runtime_rust::env_registry::web::WEB_DEFAULT_PORT
         ),
         ServedPort::ServerLiteral(literal) => format!(
-            "It serves inbound connections on one port: {} unless `{server}` names another.",
+            "It serves inbound connections on one port: {} unless `{server_variable}` names another.",
             literal.get()
         ),
         ServedPort::ServerDynamic => format!(
-            "It serves inbound connections on one port, the one it computes unless `{server}` \
+            "It serves inbound connections on one port, the one it computes unless `{server_variable}` \
              names another."
         ),
         ServedPort::Several => "It reaches both a `Web` host and `Server.listen`, two \
@@ -4056,7 +4062,7 @@ pub fn served_on(
         });
     };
     match ipe_db::lower_program(db, source_root, entry_file) {
-        Ok(program) => Ok(ipe_lower::program_served_listener(&program)),
+        Ok(program) => Ok(ipe_lower::program_served_listener(program)),
         Err(err) => Err(attribute_entry_lowering_error(
             db,
             source_root,

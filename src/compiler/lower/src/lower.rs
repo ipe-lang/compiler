@@ -9822,6 +9822,17 @@ impl KernelUsage {
     }
 }
 
+/// Record one call or reified callee into `usage`, with the listener a serving
+/// kernel opens.
+///
+/// `args` is the saturated call's argument list, or `None` for a reified value.
+fn record_call_usage(callee: &Callee, args: Option<&[Expr]>, usage: &mut KernelUsage) {
+    record_callee_usage(callee, usage);
+    if let Callee::Kernel(k) = callee {
+        usage.record_served(*k, args);
+    }
+}
+
 /// Record one callee into `usage`: a kernel by its family record, a foreign
 /// wrapper by the `ffi` flag (plus `ffi_asserted` for an asserted shim).
 fn record_callee_usage(callee: &Callee, usage: &mut KernelUsage) {
@@ -10651,20 +10662,12 @@ fn scan_kernel_usage(expr: &Expr, usage: &mut KernelUsage) {
     }
     match expr {
         Expr::Call { callee, args, .. } => {
-            record_callee_usage(callee, usage);
-            if let Callee::Kernel(k) = callee {
-                usage.record_served(*k, Some(args));
-            }
+            record_call_usage(callee, Some(args), usage);
             for a in args {
                 scan_kernel_usage(a, usage);
             }
         }
-        Expr::FuncValue { callee, .. } => {
-            record_callee_usage(callee, usage);
-            if let Callee::Kernel(k) = callee {
-                usage.record_served(*k, None);
-            }
-        }
+        Expr::FuncValue { callee, .. } => record_call_usage(callee, None, usage),
         Expr::Apply { func, args } => {
             scan_kernel_usage(func, usage);
             for a in args {
