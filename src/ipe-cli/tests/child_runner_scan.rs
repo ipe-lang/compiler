@@ -145,16 +145,16 @@ const SITES: &[SiteRow] = &[
     ),
     (
         "cargo_step.rs",
-        "lock_dependencies_within",
-        "build.get_program()",
-        Runner::Local("LOCK_FETCH_LIMITS"),
+        "update_lock_offline_within",
+        "env.program()",
+        Runner::Local("LOCK_RESOLVE_LIMITS"),
         1,
     ),
     (
         "cargo_step.rs",
-        "lock_offline_within",
-        "cargo",
-        Runner::Local("LOCK_RESOLVE_LIMITS"),
+        "update_lock_online_within",
+        "env.program()",
+        Runner::Local("LOCK_FETCH_LIMITS"),
         1,
     ),
     (
@@ -3654,4 +3654,158 @@ fn a_child_removing_build_output_is_refused() {
                     let _ = usage_unexpected_argument(\"clean\", arg); }";
     let sites = removed_child_sites(admitted).expect("sample parses");
     assert!(sites.is_empty(), "{admitted}: {sites:?}");
+}
+
+/// The subcommand that resolves a lock afresh, which no `ipe` source may name.
+const FRESH_RESOLVE: &str = "generate-lockfile";
+
+/// The subcommand that narrows or probes a lock.
+const LOCK_UPDATE: &str = "update";
+
+/// The production fns of `cargo_step.rs` that alone may name [`LOCK_UPDATE`].
+///
+/// They are the derivation from the pinned set and the offline probe.
+const LOCK_UPDATE_OWNERS: &[&str] = &["narrow_to_workspace", "probe_lock_within"];
+
+/// Every production string literal equal to one wanted text, keyed by its enclosing fn.
+struct LiteralSites<'a> {
+    /// The literal text sought.
+    wanted: &'a str,
+    /// The enclosing fns, innermost last.
+    fns: Vec<String>,
+    /// Each site, as its enclosing fn (`<item>` outside one).
+    found: Vec<String>,
+}
+
+impl LiteralSites<'_> {
+    /// Record a site at the current fn.
+    fn record(&mut self) {
+        self.found.push(
+            self.fns
+                .last()
+                .map_or_else(|| "<item>".to_owned(), Clone::clone),
+        );
+    }
+
+    /// Whether `tokens` hold the wanted text as a string literal, at any depth.
+    fn tokens_hold(&self, tokens: TokenStream) -> bool {
+        tokens.into_iter().any(|tree| match tree {
+            TokenTree::Group(group) => self.tokens_hold(group.stream()),
+            TokenTree::Literal(lit) => syn::parse_str::<syn::LitStr>(&lit.to_string())
+                .is_ok_and(|text| text.value() == self.wanted),
+            TokenTree::Ident(_) | TokenTree::Punct(_) => false,
+        })
+    }
+}
+
+impl<'ast> Visit<'ast> for LiteralSites<'_> {
+    fn visit_item(&mut self, item: &'ast Item) {
+        if !item_attrs(item).is_some_and(is_test_only) {
+            visit::visit_item(self, item);
+        }
+    }
+
+    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+        self.fns.push(name_of(&item.sig.ident));
+        visit::visit_item_fn(self, item);
+        self.fns.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
+        if is_test_only(&item.attrs) {
+            return;
+        }
+        self.fns.push(name_of(&item.sig.ident));
+        visit::visit_impl_item_fn(self, item);
+        self.fns.pop();
+    }
+
+    fn visit_lit_str(&mut self, lit: &'ast syn::LitStr) {
+        if lit.value() == self.wanted {
+            self.record();
+        }
+    }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        if self.tokens_hold(mac.tokens.clone()) {
+            self.record();
+        }
+        visit::visit_macro(self, mac);
+    }
+}
+
+/// The production sites of the literal `wanted` in one parsed file, one fn name each.
+fn literal_sites_in(syntax: &syn::File, wanted: &str) -> Vec<String> {
+    if is_test_only(&syntax.attrs) {
+        return Vec::new();
+    }
+    let mut sites = LiteralSites {
+        wanted,
+        fns: Vec::new(),
+        found: Vec::new(),
+    };
+    sites.visit_file(syntax);
+    sites.found
+}
+
+/// The production sites of the literal `wanted` across the `ipe` crate's
+/// source, one `file: fn` line each.
+fn literal_sites(wanted: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let root = src_root();
+    let walked = walk(&root, crate_roots(&root)?)?;
+    if walked.reached.get("cargo_step.rs") != Some(&true) {
+        return Err("the walk must reach src/cargo_step.rs as production".into());
+    }
+    let mut found = Vec::new();
+    for (file, production) in &walked.reached {
+        if !production {
+            continue;
+        }
+        let syntax = syn::parse_file(&std::fs::read_to_string(root.join(file))?)?;
+        found.extend(
+            literal_sites_in(&syntax, wanted)
+                .into_iter()
+                .map(|within| format!("{file}: {within}")),
+        );
+    }
+    Ok(found)
+}
+
+#[test]
+fn no_source_resolves_a_lock_afresh_and_only_the_lock_owner_updates_one() {
+    let fresh = literal_sites(FRESH_RESOLVE).expect("source tree scannable");
+    assert!(
+        fresh.is_empty(),
+        "every lock derives from the pinned set; nothing names `{FRESH_RESOLVE}`:\n{}",
+        fresh.join("\n")
+    );
+    let updates = literal_sites(LOCK_UPDATE).expect("source tree scannable");
+    let owners: Vec<String> = LOCK_UPDATE_OWNERS
+        .iter()
+        .map(|owner| format!("cargo_step.rs: {owner}"))
+        .collect();
+    let strays: Vec<&String> = updates
+        .iter()
+        .filter(|site| !owners.contains(site))
+        .collect();
+    assert!(
+        strays.is_empty(),
+        "only {LOCK_UPDATE_OWNERS:?} in cargo_step.rs name `{LOCK_UPDATE}`:\n{strays:?}"
+    );
+    for owner in &owners {
+        assert!(
+            updates.contains(owner),
+            "{owner} names `{LOCK_UPDATE}`, or the scan reads the wrong tree: {updates:?}"
+        );
+    }
+}
+
+#[test]
+fn a_literal_in_a_fn_or_a_macro_is_found_and_test_code_is_not() {
+    let sample = "fn a() { c.args([\"generate-lockfile\"]); }\n\
+                  fn b() { let _ = format!(\"{}\", \"generate-lockfile\"); }\n\
+                  #[cfg(test)] fn t() { c.arg(\"generate-lockfile\"); }\n\
+                  #[cfg(test)] mod tests { fn u() { c.arg(\"generate-lockfile\"); } }";
+    let syntax = syn::parse_file(sample).expect("sample parses");
+    assert_eq!(literal_sites_in(&syntax, FRESH_RESOLVE), ["a", "b"]);
 }
