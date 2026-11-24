@@ -1584,7 +1584,7 @@ fn run_type_search(
                 let header = format!(
                     "{}Type-signature matches for `{}`{}\n\n",
                     p.bold,
-                    crate::style::TerminalSafe::sanitize(query),
+                    crate::style::TerminalLine::sanitize(query),
                     p.reset
                 );
                 crate::screen::Screen::new(crate::screen::Stream::Stdout)
@@ -2785,11 +2785,7 @@ fn list_modules(
             // namespace hierarchy is presented in the human listing, the
             // Markdown index, and the HTML nav (which can show pure-prefix
             // headers a plain, machine-readable list must not).
-            let mut out = String::new();
-            for name in &ordered {
-                let _ = writeln!(out, "{name}");
-            }
-            emit_machine(Stream::Stdout, &out);
+            emit_machine(Stream::Stdout, &module_list_plain(&ordered));
         }
         OutputFormat::Json => {
             let names: Vec<&str> = ordered.iter().map(|n| n.as_str()).collect();
@@ -2800,6 +2796,16 @@ fn list_modules(
             emit_machine(Stream::Stdout, &format!("{out}\n"));
         }
         OutputFormat::Human => {
+            // A project module name comes from a file name: each is shown as one inert line
+            // before the tree splits it, so none plants an escape or a line of its own.
+            let project_names: Vec<String> = project_names
+                .iter()
+                .map(|name| {
+                    crate::style::TerminalLine::sanitize(name)
+                        .as_str()
+                        .to_owned()
+                })
+                .collect();
             let mut body = String::new();
             let _ = writeln!(
                 body,
@@ -2865,6 +2871,16 @@ fn list_modules(
         }
     }
     Ok(())
+}
+
+/// The `--plain` module listing: one name per line, each a terminal-inert single line, since a
+/// project module name comes from a file name.
+fn module_list_plain(names: &[&String]) -> String {
+    let mut out = String::new();
+    for name in names {
+        let _ = writeln!(out, "{}", crate::style::TerminalLine::sanitize(name));
+    }
+    out
 }
 
 /// The sorted project module names `list` shows for `target`.
@@ -3045,53 +3061,61 @@ fn bump(count: &std::cell::Cell<usize>) {
     count.set(count.get().saturating_add(1));
 }
 
-/// Render a single [`ModuleDoc`] in human-readable guttered form.
+/// Write a single [`ModuleDoc`] to stdout as one doc page.
 fn render_module_human(module: &ModuleDoc, index: &AnchorIndex) {
-    use crate::style::GUTTER;
+    use crate::screen::{Screen, Stream};
+    let mut screen = Screen::new(Stream::Stdout);
+    let page = module_page(module, index, screen.doc_width(), screen.palette());
+    screen.doc(&page).emit();
+}
 
-    let md = module.comment.as_str();
-    let mut body = format!("{GUTTER}{}\n\n", module.name);
+/// One module's page, laid out by [`crate::doc_terminal::render`]: the module's doc comment,
+/// then each exposed type and value as a code line over its own doc comment.
+///
+/// Every doc comment is read as Markdown, the same as a member's page, so none reaches the
+/// terminal as raw source.
+fn module_page(
+    module: &ModuleDoc,
+    index: &AnchorIndex,
+    width: crate::doc_terminal::Width,
+    palette: &crate::style::Palette,
+) -> crate::doc_terminal::DocText {
+    use ipe_docs::markdown::Block;
+    use ipe_docs::markdown::parse::parse_blocks;
+
+    let comment = |md: &str| parse_blocks(&crate::doc_fence::fence_indented_code(md));
+    let mut blocks: Vec<Block> = Vec::new();
     if let Some(of) = stdlib_port_layer_of(&module.name) {
-        let _ = writeln!(
-            body,
-            "{GUTTER}{}\n",
-            crate::text::site_port_layer_banner(&of)
-        );
+        blocks.push(Block::Para(
+            crate::text::site_port_layer_banner(&of).to_string(),
+        ));
     }
-    if !md.is_empty() {
-        let _ = writeln!(body, "{GUTTER}{md}\n");
-    }
+    blocks.extend(comment(&module.comment));
     for union in &module.unions {
-        let _ = writeln!(
-            body,
-            "{GUTTER}  type {}{}",
+        blocks.push(Block::Code(format!(
+            "type {}{}",
             union.name,
             union_params(union.params)
-        );
-        if !union.comment.is_empty() {
-            let _ = writeln!(body, "{GUTTER}    {}", union.comment);
-        }
+        )));
+        blocks.extend(comment(&union.comment));
     }
     for value in &module.values {
-        let sig = {
-            let pieces = value.signature.pieces(index);
-            let mut s = String::new();
-            for p in &pieces {
-                match p {
-                    SigPiece::Text(t) | SigPiece::Link { text: t, .. } => s.push_str(t),
-                }
+        let mut signature = String::new();
+        for piece in value.signature.pieces(index) {
+            match piece {
+                SigPiece::Text(text) | SigPiece::Link { text, .. } => signature.push_str(&text),
             }
-            s
-        };
-        let _ = writeln!(body, "{GUTTER}  {} : {}", value.name, sig);
-        if !value.comment.is_empty() {
-            let _ = writeln!(body, "{GUTTER}    {}", value.comment);
         }
+        blocks.push(Block::Code(format!("{} : {signature}", value.name)));
+        blocks.extend(comment(&value.comment));
     }
-    // Doc comments and names are project source text: sanitise before framing.
-    crate::screen::Screen::new(crate::screen::Stream::Stdout)
-        .guttered(crate::style::TerminalSafe::sanitize(&body).as_str())
-        .emit();
+    crate::doc_terminal::render(
+        &crate::style::TerminalLine::sanitize(&module.name),
+        None,
+        &blocks,
+        width,
+        palette,
+    )
 }
 
 /// What an `ipe doc <Module>` query opens.
@@ -3166,6 +3190,23 @@ fn query_module(
     }
 }
 
+/// A module's `--plain` listing, flush-left, one entry per line: `type Name a` for a type and
+/// `name : signature` for a value. Names and signatures come from project source, so each line
+/// is terminal-inert and none can break into a second.
+fn module_plain(module: &ModuleDoc) -> String {
+    use crate::style::TerminalLine;
+    let mut out = String::new();
+    for union in &module.unions {
+        let line = format!("type {}{}", union.name, union_params(union.params));
+        let _ = writeln!(out, "{}", TerminalLine::sanitize(&line));
+    }
+    for value in &module.values {
+        let line = format!("{} : {}", value.name, value.signature.text());
+        let _ = writeln!(out, "{}", TerminalLine::sanitize(&line));
+    }
+    out
+}
+
 /// Render a resolved module's API per `format`.
 fn render_query_module(module: &ModuleDoc, format: OutputFormat) {
     // Build a single-module DocsJson for the anchor index (cross-reference
@@ -3179,15 +3220,7 @@ fn render_query_module(module: &ModuleDoc, format: OutputFormat) {
 
     match format {
         OutputFormat::Plain => {
-            // Flush-left: one entry per line, `name : signature`.
-            let mut out = String::new();
-            for union in &module.unions {
-                let _ = writeln!(out, "type {}{}", union.name, union_params(union.params));
-            }
-            for value in &module.values {
-                let _ = writeln!(out, "{} : {}", value.name, value.signature.text());
-            }
-            crate::screen::emit_machine(crate::screen::Stream::Stdout, &out);
+            crate::screen::emit_machine(crate::screen::Stream::Stdout, &module_plain(module));
         }
         OutputFormat::Json => {
             let mut out = String::new();
@@ -11335,6 +11368,77 @@ mod terminal_tests {
         for page in pages(shown.comment) {
             assert!(!has_hazard(&page), "{page:?}");
         }
+    }
+
+    /// A module whose name, type, value, signature and doc comments all carry `HOSTILE`, and
+    /// whose type comment fences an example under an info string.
+    fn hostile_module() -> ModuleDoc {
+        ModuleDoc {
+            name: format!("Evil{HOSTILE}\nfake"),
+            kind: ModuleKind::Local,
+            comment: format!("Module **doc** {HOSTILE}"),
+            unions: vec![UnionDoc {
+                name: format!("T{HOSTILE}\nfake"),
+                params: 1,
+                ctors: Vec::new(),
+                comment: format!("Type doc.\n\n```fence-info-word\nexample {HOSTILE}\n```\n"),
+            }],
+            values: vec![ValueDoc {
+                name: format!("f{HOSTILE}\nfake"),
+                signature: ValueSignature::Written(format!("Int{HOSTILE}\nfake")),
+                comment: format!("Value doc {HOSTILE}"),
+            }],
+        }
+    }
+
+    /// A module page reads every doc comment as Markdown through the one renderer: no hazard
+    /// survives, emphasis markers and a fence's info string are not printed raw.
+    #[test]
+    fn module_page_renders_doc_comments_inert() {
+        let module = hostile_module();
+        let docs = DocsJson {
+            version: DOCS_JSON_VERSION,
+            modules: vec![module.clone()],
+            disclosure: None,
+        };
+        let index = AnchorIndex::build(&docs);
+        for palette in [&Palette::PLAIN, &Palette::COLOR] {
+            for width in [Width::NO_WRAP, Width::DEFAULT] {
+                let page = unpainted(module_page(&module, &index, width, palette).as_str());
+                assert!(!has_hazard(&page), "{page:?}");
+                assert!(
+                    !page.contains("52;c") && !page.contains("http://x"),
+                    "{page:?}"
+                );
+                assert!(!page.contains("**"), "emphasis printed raw: {page:?}");
+                assert!(
+                    !page.contains("fence-info-word"),
+                    "fence info printed: {page:?}"
+                );
+                assert!(page.contains("Value doc pre"), "{page:?}");
+            }
+        }
+    }
+
+    /// The module `--plain` listing is one inert line per entry, whatever a name or a signature
+    /// holds.
+    #[test]
+    fn module_plain_is_one_inert_line_per_entry() {
+        let module = hostile_module();
+        let out = module_plain(&module);
+        assert_eq!(out.lines().count(), 2, "{out:?}");
+        assert!(!has_hazard(&out), "{out:?}");
+        assert!(out.starts_with("type T"), "{out:?}");
+    }
+
+    /// The `--plain` module list is one inert line per module, whatever a file name holds.
+    #[test]
+    fn module_list_plain_is_one_inert_line_per_name() {
+        let hostile = format!("Evil{HOSTILE}\nfake");
+        let names = [hostile, "Ipe.List".to_owned()];
+        let out = module_list_plain(&names.iter().collect::<Vec<&String>>());
+        assert_eq!(out.lines().count(), 2, "{out:?}");
+        assert!(!has_hazard(&out), "{out:?}");
     }
 
     #[test]

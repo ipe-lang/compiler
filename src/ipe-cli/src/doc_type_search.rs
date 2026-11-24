@@ -564,16 +564,17 @@ fn normalize_value_doc(value: &ValueDoc) -> Option<NormalizedSignature> {
 
 /// Render a list of type-search matches in human-readable form.
 ///
-/// Output format: `  symbol:Module.name — signature`
+/// Output format: `  symbol:Module.name — signature`, each field one terminal-inert line: a
+/// key and a signature come from project source.
 #[must_use]
 pub fn render_type_matches_human(hits: &[TypeMatch<'_>]) -> String {
+    use crate::style::TerminalLine;
     let mut out = String::new();
     for hit in hits {
-        let fq_key = format!("{}.{}", hit.module, hit.value.name);
-        let _ = std::fmt::Write::write_fmt(
-            &mut out,
-            format_args!("  symbol:{fq_key} — {}\n", hit.value.signature.text()),
-        );
+        let fq_key = TerminalLine::sanitize(&format!("{}.{}", hit.module, hit.value.name));
+        let signature = TerminalLine::sanitize(&hit.value.signature.text());
+        let _ =
+            std::fmt::Write::write_fmt(&mut out, format_args!("  symbol:{fq_key} — {signature}\n"));
     }
     out
 }
@@ -793,5 +794,30 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(parsed[0]["signature"], signature);
         assert!(!json.contains('\u{202e}'), "U+202E reached the JSON raw");
+    }
+
+    /// A hostile module name, value name and signature reach the human listing as one inert
+    /// line per match: no escape, control byte, bidi override, or planted line break.
+    #[test]
+    fn render_human_with_hostile_fields_is_inert() {
+        let hostile = "a\u{1b}]52;c;Zm9v\u{7}b\u{1b}[2J\u{9b}c\u{202e}d\re\nfake: line";
+        let value = ValueDoc {
+            name: hostile.to_owned(),
+            signature: crate::doc::ValueSignature::Written(hostile.to_owned()),
+            comment: String::new(),
+        };
+        let module = hostile.to_owned();
+        let hit = TypeMatch {
+            value: &value,
+            module: &module,
+            score: 0,
+        };
+        let out = render_type_matches_human(&[hit]);
+        assert_eq!(out.lines().count(), 1, "{out:?}");
+        assert!(
+            !out.chars().any(|c| c != '\n'
+                && (ipe_diagnostics::terminal::is_display_hazard(c) || c == '\u{1b}' || c == '\r')),
+            "{out:?}"
+        );
     }
 }

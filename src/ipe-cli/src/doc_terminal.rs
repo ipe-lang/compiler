@@ -9,6 +9,7 @@
 use std::fmt::Write as _;
 use std::io::IsTerminal;
 
+use ipe_diagnostics::nesting::{CompileStack, on_compile_stack};
 use ipe_diagnostics::{display_width, expand_tabs};
 use ipe_docs::markdown::parse::parse_spans;
 use ipe_docs::markdown::{Block, MAX_BLOCKQUOTE_DEPTH, Span};
@@ -100,6 +101,13 @@ const RULE_COLUMNS: usize = 40;
 /// The gap between two table columns.
 const COLUMN_GAP: &str = "  ";
 
+/// The widest aligned table, in columns, when lines are never wrapped.
+///
+/// Aligning pads every row to every column, so its work is the row count times the table's
+/// width; past this width a table falls back to one `header: value` line per cell, whose work is
+/// linear in the cells.
+const UNWRAPPED_TABLE_COLUMNS: u16 = Width::MAX;
+
 /// Lay out one doc page: a `title` line (with an optional dim `tag`), then `blocks`.
 ///
 /// Every text run is sanitised before it is measured or styled. Paragraphs, list items and the
@@ -122,7 +130,14 @@ pub fn render(
     let budget = width
         .columns()
         .map(|columns| usize::from(columns).saturating_sub(display_width(GUTTER, 0)));
-    let body = blocks_lines(blocks, budget, palette, 0);
+    // Highlighting parses each code block as Ipê source, so it runs on the stack the parser's
+    // nesting ceiling is sized for; a refused stack lays the page out unhighlighted.
+    let body = if palette.reset.is_empty() {
+        blocks_lines(blocks, budget, palette, None, 0)
+    } else {
+        on_compile_stack(|stack| blocks_lines(blocks, budget, palette, Some(stack), 0))
+            .unwrap_or_else(|_| blocks_lines(blocks, budget, palette, None, 0))
+    };
     if !body.is_empty() {
         out.push('\n');
         for line in body {
@@ -134,15 +149,18 @@ pub fn render(
 }
 
 /// The lines of `blocks` at `budget` columns, one blank line between two blocks.
+///
+/// Code is highlighted only with the proof of a `stack` sized for the parser.
 fn blocks_lines(
     blocks: &[Block],
     budget: Option<usize>,
     palette: &Palette,
+    stack: Option<&CompileStack>,
     depth: usize,
 ) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     for block in blocks {
-        let block_lines = block_lines(block, budget, palette, depth);
+        let block_lines = block_lines(block, budget, palette, stack, depth);
         if block_lines.is_empty() {
             continue;
         }
@@ -159,6 +177,7 @@ fn block_lines(
     block: &Block,
     budget: Option<usize>,
     palette: &Palette,
+    stack: Option<&CompileStack>,
     depth: usize,
 ) -> Vec<String> {
     match block {
@@ -167,7 +186,7 @@ fn block_lines(
             vec![format!("{}{text}{}", palette.bold, palette.reset)]
         }
         Block::Para(text) => wrap(&words(&parse_spans(text)), budget, "", "", palette),
-        Block::Code(body) => code_lines(body, palette),
+        Block::Code(body) => code_lines(body, palette, stack),
         Block::Bullet(items) => items
             .iter()
             .flat_map(|item| wrap(&words(&parse_spans(item)), budget, "- ", "  ", palette))
@@ -200,7 +219,7 @@ fn block_lines(
                 b.saturating_sub(display_width(QUOTE_BAR, 0))
                     .max(MIN_BUDGET)
             });
-            blocks_lines(inner, narrowed, palette, depth.saturating_add(1))
+            blocks_lines(inner, narrowed, palette, stack, depth.saturating_add(1))
                 .into_iter()
                 .map(|line| format!("{}{QUOTE_BAR}{}{line}", palette.dim, palette.reset))
                 .collect()
@@ -441,15 +460,14 @@ fn place(
 }
 
 /// The lines of a code block: sanitised, tabs expanded, indented by [`GUTTER`], highlighted
-/// when the palette paints.
-fn code_lines(body: &str, palette: &Palette) -> Vec<String> {
+/// when the palette paints and a parser-sized `stack` is proven.
+fn code_lines(body: &str, palette: &Palette, stack: Option<&CompileStack>) -> Vec<String> {
     let safe = TerminalSafe::sanitize(body);
     let expanded: Vec<String> = safe.as_str().lines().map(expand_tabs).collect();
     let source = expanded.join("\n");
-    let painted = if palette.reset.is_empty() {
-        source
-    } else {
-        highlight(&source, palette)
+    let painted = match stack {
+        Some(stack) if !palette.reset.is_empty() => highlight(&source, palette, stack),
+        _ => source,
     };
     painted
         .lines()
@@ -464,7 +482,9 @@ fn code_lines(body: &str, palette: &Palette) -> Vec<String> {
 }
 
 /// `source` painted by its syntax tokens, or unchanged when it does not parse as a module.
-fn highlight(source: &str, palette: &Palette) -> String {
+///
+/// The parse admits nesting up to the compiler's ceiling, so it runs only on a [`CompileStack`].
+fn highlight(source: &str, palette: &Palette, _stack: &CompileStack) -> String {
     let mut interner = ipe_intern::Interner::default();
     let Ok(syntax) = ipe_parse::parse_module(source, &mut interner) else {
         return source.to_owned();
@@ -540,7 +560,7 @@ fn table_lines(
     }
     let gaps = display_width(COLUMN_GAP, 0).saturating_mul(columns.saturating_sub(1));
     let total = widths.iter().fold(gaps, |sum, w| sum.saturating_add(*w));
-    if budget.is_some_and(|b| total > b) {
+    if total > budget.unwrap_or_else(|| usize::from(UNWRAPPED_TABLE_COLUMNS)) {
         return table_fallback(&head, &body, palette);
     }
     let row_line = |row: &[TerminalLine], open: &str, close: &str| {
@@ -703,6 +723,56 @@ mod tests {
         let out = page(&quoted, Width::DEFAULT);
         assert!(out.contains('x'));
         assert!(out.lines().count() < quoted.len());
+    }
+
+    /// A coloured page parses its code at the parser's nesting ceiling off the caller's stack: a
+    /// caller on a 32 KiB stack, where the parse itself overflows, lays every at-ceiling shape
+    /// out highlighted.
+    #[test]
+    fn highlight_at_parser_ceiling_runs_off_the_callers_stack() {
+        let shapes = nesting_shapes::shapes();
+        let small = std::thread::Builder::new()
+            .stack_size(32 << 10)
+            .spawn(move || {
+                shapes
+                    .iter()
+                    .map(|&(name, shape, deepest, _)| {
+                        let page = render(
+                            &TerminalLine::sanitize(name),
+                            None,
+                            &[Block::Code(shape(deepest).src)],
+                            Width::NO_WRAP,
+                            &Palette::COLOR,
+                        );
+                        page.as_str().contains(Palette::COLOR.orange)
+                    })
+                    .collect::<Vec<bool>>()
+            })
+            .map(std::thread::JoinHandle::join);
+        assert!(
+            matches!(small, Ok(Ok(painted)) if painted.iter().all(|&p| p)),
+            "an at-ceiling code block must lay out, highlighted, from a small caller stack"
+        );
+    }
+
+    /// Aligning a table pads each row to every column, so its work is rows times columns even
+    /// when trailing padding is trimmed; with no wrap budget, a table past the widest aligned
+    /// width falls back to one line per cell.
+    #[test]
+    fn unwrapped_table_work_is_linear() {
+        let n = 4_000;
+        let header = format!("|{}", " h |".repeat(n));
+        let rule = format!("|{}", "---|".repeat(n));
+        let rows = "| x |\n".repeat(n);
+        let markdown = format!("{header}\n{rule}\n{rows}");
+        let out = page(&markdown, Width::NO_WRAP);
+        assert!(
+            out.len() < markdown.len().saturating_mul(4),
+            "{} bytes from {} bytes of table",
+            out.len(),
+            markdown.len()
+        );
+        assert!(out.contains("h: x"), "the wide table falls back");
     }
 
     #[test]
