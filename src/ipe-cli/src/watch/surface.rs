@@ -325,6 +325,7 @@ impl<R: TerminalRestore> TerminalLease<R> {
     }
 
     /// Whether a child owns the terminal.
+    #[cfg(all(test, unix))]
     pub const fn is_held(&self) -> bool {
         self.owner.get().is_some()
     }
