@@ -3,8 +3,10 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use super::RegularFile;
 use super::{
-    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal, RegularFile,
+    ByteCap, EntryCap, EntryName, FileId, FileKind, HeldDir, HintedKind, OpenRefusal,
     is_one_spelled_name, may_open_as,
 };
 

@@ -3141,9 +3141,11 @@ mod relay {
 }
 
 /// How many reads or writes one pump of a pipe makes at most.
+#[cfg(unix)]
 const PUMP_ROUNDS: u32 = 16;
 
 /// The most bytes one read takes from a pipe.
+#[cfg(unix)]
 const PUMP_CHUNK: usize = 16 * 1024;
 
 /// The pause after the first pump that moved nothing; it doubles up to [`POLL_INTERVAL`].
