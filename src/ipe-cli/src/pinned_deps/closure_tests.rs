@@ -385,7 +385,11 @@ fn emitted_manifests() -> Result<Vec<(String, String)>, String> {
             .and_then(|name| name.to_str())
             .unwrap_or_default()
             .to_owned();
-        if name.starts_with("Cargo") && name.ends_with(".toml") {
+        if name.starts_with("Cargo")
+            && Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("toml"))
+        {
             found.push((format!("templates/{name}"), read(&path)?));
         }
     }
