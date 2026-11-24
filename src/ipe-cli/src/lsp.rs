@@ -132,6 +132,7 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::TestFailed { .. }
         | CliError::UpgradeNoPrebuilt { .. }
         | CliError::ToolchainMissing(_)
+        | CliError::ToolchainBelowFloor(_)
         | CliError::HealthCritical
         | CliError::LintGateFailed
         | CliError::EjectUnsupported { .. }

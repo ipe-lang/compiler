@@ -94,6 +94,22 @@ const RUNTIME_CLIPPY_TOML: &str = include_str!("../../../../../src/runtime/rust/
 /// The repository toolchain pin, the SSOT of every emitted `rust-version`.
 const RUST_TOOLCHAIN_TOML: &str = include_str!("../../../../../rust-toolchain.toml");
 
+/// The release every emitted manifest's `rust-version` declares: the
+/// `rust-toolchain.toml` channel, read at compile time.
+///
+/// The driver judges the toolchain a build would use against this same text
+/// before cargo runs, so the floor it refuses below is the one cargo enforces.
+/// Empty only if the toolchain file names no channel, which the manifest
+/// assertion below turns into a build failure.
+pub const RUST_VERSION_FLOOR: &str = match quoted_value(RUST_TOOLCHAIN_TOML.as_bytes(), CHANNEL_KEY)
+{
+    Some(pin) => match core::str::from_utf8(pin) {
+        Ok(pin) => pin,
+        Err(_) => "",
+    },
+    None => "",
+};
+
 /// The runtime crate's manifest, the one a dependency-model emit bundles.
 const RUNTIME_CARGO_TOML: &str = include_str!("../../../../../src/runtime/rust/Cargo.toml");
 

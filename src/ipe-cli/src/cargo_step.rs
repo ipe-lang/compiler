@@ -546,6 +546,9 @@ impl CargoBuild<'_> {
     /// - [`CliError::OutputRefused`] if an emitted crate's directory
     ///   was replaced before or while cargo ran, or its `Cargo.lock` is a
     ///   symlink or reparse point.
+    /// - [`CliError::ToolchainBelowFloor`] if the toolchain cargo would use in
+    ///   the crate's directory is older than the pin, or its version cannot be
+    ///   read.
     pub fn run(&self) -> Result<String, CliError> {
         self.run_within(CARGO_BUILD_WALL)
     }
@@ -556,6 +559,7 @@ impl CargoBuild<'_> {
             dir.verify()?;
         }
         let dir = self.dir();
+        crate::toolchain::require_floor(dir)?;
         let io_err = |source: std::io::Error| CliError::Io {
             path: dir.to_path_buf(),
             source,
@@ -718,9 +722,11 @@ impl WatchBuild<'_> {
     /// The caller holds the rebuild to [`CARGO_BUILD_WALL`].
     ///
     /// # Errors
-    /// The spawn error when cargo cannot be started, or the refusal of
-    /// `spawn_cargo`.
+    /// The spawn error when cargo cannot be started, the refusal of
+    /// `spawn_cargo`, or the toolchain-floor refusal of
+    /// [`crate::toolchain::require_floor`].
     pub fn spawn(&self) -> std::io::Result<(GroupedChild, CargoPipes)> {
+        crate::toolchain::require_floor(self.krate.path()).map_err(std::io::Error::other)?;
         let mut child = spawn_cargo(self.command())?;
         let pipes = CargoPipes::take(&mut child, ARTIFACT_STREAM_CAP);
         Ok((child, pipes))

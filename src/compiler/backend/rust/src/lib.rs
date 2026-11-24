@@ -60,6 +60,7 @@ mod layout_sweep;
 mod naming;
 mod preamble;
 mod project;
+pub use project::RUST_VERSION_FLOOR;
 mod record_template;
 mod render;
 mod route_grammar;

@@ -2052,12 +2052,7 @@ pub enum ReadMiss {
 pub fn read_miss(err: &CliError) -> ReadMiss {
     use crate::io_bounded::SourceRefusal;
     match err {
-        CliError::Io { source, .. } => match source.kind() {
-            io::ErrorKind::NotFound => ReadMiss::Absent,
-            io::ErrorKind::InvalidData => ReadMiss::Unread(Unread::NotUtf8),
-            // `io::ErrorKind` is non-exhaustive: every other kind is a failed read.
-            _ => ReadMiss::Unread(Unread::Io),
-        },
+        CliError::Io { source, .. } => io_read_miss(source.kind()),
         CliError::SourceRefused { reason, .. } => ReadMiss::Unread(match reason {
             SourceRefusal::Symlink => Unread::Link,
             SourceRefusal::NotRegularFile => Unread::NotRegular,
@@ -2117,6 +2112,7 @@ pub fn read_miss(err: &CliError) -> ReadMiss {
         | CliError::TestFailed { .. }
         | CliError::UpgradeNoPrebuilt { .. }
         | CliError::ToolchainMissing(..)
+        | CliError::ToolchainBelowFloor(..)
         | CliError::HealthCritical
         | CliError::LintGateFailed
         | CliError::EjectUnsupported { .. }
@@ -2152,6 +2148,16 @@ pub fn read_miss(err: &CliError) -> ReadMiss {
         | CliError::WasiRunFeatureDisabled
         | CliError::WasiRunFailed { .. }
         | CliError::WasiRunExited { .. } => ReadMiss::Unread(Unread::Io),
+    }
+}
+
+/// Classify a capped read that failed with an I/O error of `kind`.
+const fn io_read_miss(kind: io::ErrorKind) -> ReadMiss {
+    match kind {
+        io::ErrorKind::NotFound => ReadMiss::Absent,
+        io::ErrorKind::InvalidData => ReadMiss::Unread(Unread::NotUtf8),
+        // `io::ErrorKind` is non-exhaustive: every other kind is a failed read.
+        _ => ReadMiss::Unread(Unread::Io),
     }
 }
 
