@@ -512,3 +512,61 @@ fn every_compiled_stdlib_module_lowers_as_its_own_entry() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+/// The listener the `Main` entry of a scratch package serves.
+fn served_listener(
+    tag: &str,
+    files: &[(&str, &str)],
+) -> Result<ipe_ir::ServedListener, Box<dyn Error>> {
+    let dir = scratch_package(tag, files)?;
+    let package = PackageSourceSet::read(&dir.join("package.ipe"))?;
+    let served = ipe::PackageFrontEnd::cold(package).infer_served(&["Main".to_owned()])?;
+    let _ = fs::remove_dir_all(&dir);
+    Ok(served)
+}
+
+/// The web template serves on the web default port.
+#[test]
+fn web_template_discloses_served_default_port() -> Result<(), Box<dyn Error>> {
+    let served = served_listener(
+        "served_web",
+        &[("Main.ipe", include_str!("../templates/Main.ipe"))],
+    )?;
+    assert_eq!(
+        served,
+        ipe_ir::ServedListener::NotServed.with(ipe_ir::ServedPort::WebDefault)
+    );
+    Ok(())
+}
+
+/// The server template serves on the literal port its `Server.listen` names.
+#[test]
+fn server_template_discloses_served_port_8000() -> Result<(), Box<dyn Error>> {
+    let served = served_listener(
+        "served_server",
+        &[("Main.ipe", include_str!("../templates/Main.server.ipe"))],
+    )?;
+    assert_eq!(
+        served,
+        ipe_ir::ServedListener::NotServed.with(ipe_ir::ServedPort::ServerLiteral(
+            ipe_ir::SourcePortLiteral::new(8000)
+        ))
+    );
+    Ok(())
+}
+
+/// A program that only makes outbound HTTP requests reaches the network but
+/// serves nothing.
+#[test]
+fn http_client_program_is_not_served() -> Result<(), Box<dyn Error>> {
+    let files = [(
+        "Main.ipe",
+        include_str!("fixtures/capabilities/uses_http_and_clock.ipe"),
+    )];
+    assert!(shared_capabilities("client_caps", &files)?.contains(&Capability::Network));
+    assert_eq!(
+        served_listener("client_served", &files)?,
+        ipe_ir::ServedListener::NotServed
+    );
+    Ok(())
+}

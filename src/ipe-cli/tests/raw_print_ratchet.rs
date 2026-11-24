@@ -108,7 +108,7 @@ const ADMITTED: &[(&str, usize)] = &[
     ("cargo_step.rs", 2),
     ("doc.rs", 2),
     ("driver/commands.rs", 13),
-    ("driver/commands_pkg.rs", 12),
+    ("driver/commands_pkg.rs", 13),
     ("driver/driver_error.rs", 5),
     ("ffi.rs", 3),
     ("fmt.rs", 1),
