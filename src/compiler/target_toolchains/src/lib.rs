@@ -372,8 +372,8 @@ const fn table_is_consistent() -> bool {
         ) || !same_str(triple.as_str(), spelling)
             || !is_underscored_cc_env(triple.as_str(), row.cc_env)
             || !candidates_fit(row.cc_candidates, triple.arch())
-            || family_mask(row.same_arch_packages) != Some(EVERY_FAMILY)
-            || verified_mask(row.verified) != Some(EVERY_FAMILY)
+            || !matches!(family_mask(row.same_arch_packages), Some(EVERY_FAMILY))
+            || !matches!(verified_mask(row.verified), Some(EVERY_FAMILY))
         {
             return false;
         }
