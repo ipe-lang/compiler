@@ -27,78 +27,9 @@
 
 use ipe_diagnostics::{DResult, Diagnostic};
 
-/// Target triples the static path supports — a closed set.
-///
-/// Parse, don't validate: the CLI parses `--target` into this enum and
-/// refuses anything else, so an unverifiable triple can never reach cargo
-/// and violate the SEAL. Growing the set (Windows `+crt-static`, wasm) means
-/// adding a variant alongside a CI lane that proves it end-to-end.
-///
-/// Toolchain requirements per variant:
-/// - [`Self::X8664LinuxMusl`]: `musl-tools` (apt) + `x86_64-unknown-linux-musl`
-///   rustup target. Verified in CI on `ubuntu-latest`.
-/// - [`Self::Aarch64LinuxMusl`]: `gcc-aarch64-linux-gnu` + `musl-cross` (or
-///   `aarch64-linux-musl-gcc` from `musl.cc`) + `aarch64-unknown-linux-musl`
-///   rustup target + `qemu-user-static` for cross-run verification.
-///   CI: `ubuntu-24.04-arm` (native runner) or `ubuntu-latest` with the cross
-///   toolchain installed. See `.github/workflows/static.yml` `linux-static-arm64`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum StaticTriple {
-    /// `x86_64-unknown-linux-musl` — fully static ELF, zero runtime deps.
-    /// The default when `--static` is given without `--target`.
-    #[default]
-    X8664LinuxMusl,
-    /// `aarch64-unknown-linux-musl` — fully static `AArch64` ELF, zero runtime
-    /// deps. Requires the `aarch64-unknown-linux-musl` rustup target and a
-    /// musl-capable `AArch64` C linker (`aarch64-linux-musl-gcc` or equivalent).
-    Aarch64LinuxMusl,
-}
-
-impl StaticTriple {
-    /// The rustc target-triple spelling.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::X8664LinuxMusl => "x86_64-unknown-linux-musl",
-            Self::Aarch64LinuxMusl => "aarch64-unknown-linux-musl",
-        }
-    }
-
-    /// Parse a rustc triple into the supported set. `None` means the triple
-    /// is not (yet) a supported static target — the CLI turns that into a
-    /// typed refusal listing [`Self::SUPPORTED`].
-    #[must_use]
-    pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "x86_64-unknown-linux-musl" => Some(Self::X8664LinuxMusl),
-            "aarch64-unknown-linux-musl" => Some(Self::Aarch64LinuxMusl),
-            _ => None,
-        }
-    }
-
-    /// Every supported triple, for refusal messages.
-    pub const SUPPORTED: &'static [&'static str] =
-        &["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"];
-
-    /// C-compiler executable names the toolchain preflight probes on `PATH`
-    /// for this triple, most-specific first.
-    ///
-    /// A C-carrying static build (the default: the emitted graph pulls the
-    /// `zstd`/`ring` C units) needs a compiler that targets *this* triple. The
-    /// names are architecture-specific: an `x86_64` host's
-    /// `x86_64-linux-musl-gcc` cannot compile for aarch64, so probing it for an
-    /// aarch64 plan would spuriously pass. aarch64 also accepts the
-    /// widely-packaged GNU cross-compiler (`aarch64-linux-gnu-gcc`) because the
-    /// bundled `rust-lld` self-contained link path supplies the musl startup
-    /// objects — only the C units, not the final link, need the cross toolchain.
-    #[must_use]
-    pub const fn cc_candidates(self) -> &'static [&'static str] {
-        match self {
-            Self::X8664LinuxMusl => &["x86_64-linux-musl-gcc", "musl-gcc"],
-            Self::Aarch64LinuxMusl => &["aarch64-linux-musl-gcc", "aarch64-linux-gnu-gcc"],
-        }
-    }
-}
+/// The supported static triples and the host toolchain each needs live in the
+/// one table every reader shares.
+pub use ipe_target_toolchains::{StaticTriple, TargetLinker};
 
 /// The allocator linked into a static artifact.
 ///
@@ -210,25 +141,21 @@ pub const CARGO_CONFIG_MARKER: &str =
 ///
 /// `+crt-static` produces the fully-static (static-pie) executable. No
 /// `target-dir` key is ever written (the shared-target pin is the user's
-/// concern), and no linker is pinned: the default driver links the verified
-/// dep set (including the `zstd`/`ring` C units) when a musl-capable C
-/// compiler is present — presence the CLI preflight has already checked.
+/// concern). The linker follows the triple's [`TargetLinker`]: the host C
+/// driver needs no pin, while `rust-lld` links self-contained against the musl
+/// startup objects rustup ships with the target.
 #[must_use]
 pub fn cargo_config(plan: &StaticPlan) -> String {
-    // AArch64 links through the bundled `rust-lld` with a self-contained musl
-    // startup, so a static AArch64 build needs only a C cross-compiler for the
-    // C deps (zstd/ring) — no scarce `aarch64-linux-musl-gcc`. Native
-    // x86_64-musl keeps the default linker.
-    let cross_link = match plan.triple {
-        StaticTriple::Aarch64LinuxMusl => {
+    let link = match plan.triple.linker() {
+        TargetLinker::HostCc => "",
+        TargetLinker::RustLld => {
             ", \"-C\", \"linker=rust-lld\", \"-C\", \"link-self-contained=yes\""
         }
-        StaticTriple::X8664LinuxMusl => "",
     };
     format!(
         "{CARGO_CONFIG_MARKER}\n\
          [target.{triple}]\n\
-         rustflags = [\"-C\", \"target-feature=+crt-static\"{cross_link}]\n",
+         rustflags = [\"-C\", \"target-feature=+crt-static\"{link}]\n",
         triple = plan.triple.as_str()
     )
 }
@@ -312,8 +239,8 @@ pub fn staticize_manifest(base: &str, allocator: StaticAllocator) -> DResult<Str
 #[cfg(test)]
 mod tests {
     use super::{
-        CARGO_CONFIG_MARKER, CProfile, StaticAllocator, StaticPlan, StaticTriple, cargo_config,
-        staticize_manifest,
+        CARGO_CONFIG_MARKER, CProfile, StaticAllocator, StaticPlan, StaticTriple, TargetLinker,
+        cargo_config, staticize_manifest,
     };
     use ipe_diagnostics::DResult;
 
@@ -459,33 +386,21 @@ mod tests {
     }
 
     #[test]
-    fn triple_parse_is_closed() {
-        assert_eq!(
-            StaticTriple::parse("x86_64-unknown-linux-musl"),
-            Some(StaticTriple::X8664LinuxMusl)
-        );
-        assert_eq!(
-            StaticTriple::parse("aarch64-unknown-linux-musl"),
-            Some(StaticTriple::Aarch64LinuxMusl)
-        );
-        assert_eq!(StaticTriple::parse("x86_64-unknown-linux-gnu"), None);
-        assert_eq!(StaticTriple::parse("aarch64-unknown-linux-gnu"), None);
-        assert_eq!(StaticTriple::parse(""), None);
-    }
-
-    #[test]
-    fn cc_candidates_are_triple_specific() {
-        // x86_64 probes its own musl compilers and must NOT list an aarch64
-        // name; aarch64 must NOT list the x86_64 name — a host carrying only
-        // the wrong-arch compiler must not spuriously pass the preflight.
-        let x64 = StaticTriple::X8664LinuxMusl.cc_candidates();
-        let arm = StaticTriple::Aarch64LinuxMusl.cc_candidates();
-        assert!(x64.contains(&"x86_64-linux-musl-gcc"));
-        assert!(x64.contains(&"musl-gcc"));
-        assert!(!x64.iter().any(|c| c.contains("aarch64")));
-        assert!(arm.contains(&"aarch64-linux-musl-gcc"));
-        assert!(arm.contains(&"aarch64-linux-gnu-gcc"));
-        assert!(!arm.iter().any(|c| c.starts_with("x86_64")));
+    fn every_triple_config_follows_its_linker() {
+        for triple in StaticTriple::ALL {
+            let cfg = cargo_config(&StaticPlan {
+                triple,
+                c_profile: CProfile::CFree,
+            });
+            assert!(cfg.contains(&format!("[target.{}]", triple.as_str())));
+            let pins_lld = cfg.contains("linker=rust-lld");
+            assert_eq!(
+                pins_lld,
+                triple.linker() == TargetLinker::RustLld,
+                "{triple:?}"
+            );
+            assert_eq!(cfg.contains("link-self-contained=yes"), pins_lld);
+        }
     }
 
     #[test]
@@ -520,7 +435,7 @@ mod tests {
         );
         assert!(
             cfg.contains("linker=rust-lld"),
-            "aarch64 pins rust-lld self-contained (portable, no scarce musl-cross-gcc)"
+            "aarch64 links through rust-lld self-contained"
         );
     }
 }

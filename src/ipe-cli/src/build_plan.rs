@@ -311,7 +311,7 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
 /// not a cryptic cargo error minutes later.
 ///
 /// The probed compiler names come from the plan's triple
-/// ([`StaticTriple::cc_candidates`]) so an aarch64 static build does not probe
+/// ([`StaticTriple::toolchain`]) so an aarch64 static build does not probe
 /// `x86_64`-only compiler names (which would spuriously pass on an `x86_64` host).
 /// Under a C-free plan the C-compiler check is skipped — there is no C unit to
 /// compile.
@@ -324,14 +324,13 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
 /// [`Refusal::TargetNotInstalled`] / [`Refusal::MuslCCompilerMissing`].
 pub fn preflight(plan: &StaticPlan) -> Result<(), Refusal> {
     let installed = rustup_installed_targets();
-    let cc_present = ipe_env::var_os(format!("CC_{}", plan.triple.as_str().replace('-', "_")))
-        .is_some()
+    let toolchain = plan.triple.toolchain();
+    let cc_present = ipe_env::var_os(toolchain.cc_env).is_some()
         || ipe_env::var_os("TARGET_CC").is_some()
-        || plan
-            .triple
-            .cc_candidates()
+        || toolchain
+            .cc_candidates
             .iter()
-            .any(|name| binary_on_path(name));
+            .any(|candidate| binary_on_path(candidate.name()));
     preflight_with(plan, installed.as_deref(), cc_present)
 }
 

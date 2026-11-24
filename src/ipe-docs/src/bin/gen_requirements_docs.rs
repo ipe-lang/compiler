@@ -13,6 +13,11 @@
 //! - `src/runtime/rust/src/db.rs` — the `SQLITE_VERSION_FLOOR` /
 //!   `POSTGRES_VERSION_FLOOR` constants (each an `EngineVersion::new(major,
 //!   minor)`).
+//! - `install.sh` — the `c-toolchain` row of each family in
+//!   `PREREQ_FAMILIES`, the host C toolchain command the installer prints.
+//!
+//! The **Target toolchains** section is rendered from the
+//! `ipe_target_toolchains` table itself, the one the build reads.
 //!
 //! The `db` feature (`sqlx` + `tokio`) is not pulled into this crate to read
 //! those two integers: it would be a heavy, needless dependency for a
@@ -37,6 +42,8 @@
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+use ipe_target_toolchains::{CrossArchAdvice, PackageFamily, StaticTriple, Verified};
 
 fn main() -> ExitCode {
     match run() {
@@ -69,6 +76,28 @@ pub struct RequirementsFacts {
     pub sqlite_floor: (u32, u32),
     /// `(major, minor)` — `POSTGRES_VERSION_FLOOR`.
     pub postgres_floor: (u32, u32),
+    /// The host C toolchain row per installer family, in `PREREQ_FAMILIES`
+    /// order.
+    pub host_c_toolchain: Vec<HostCToolchainRow>,
+}
+
+/// One installer family's host C toolchain advice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostCToolchainRow {
+    /// The family as the docs name it.
+    pub host: &'static str,
+    /// The command the installer prints, or its note when nothing is to be
+    /// installed.
+    pub advice: HostAdvice,
+}
+
+/// What the installer prints for a family's C toolchain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostAdvice {
+    /// A command to run.
+    Command(String),
+    /// A note that the toolchain ships with the system.
+    Note(String),
 }
 
 /// Read and strictly parse every source this doc depends on.
@@ -89,12 +118,82 @@ fn gather_facts(repo_root: &Path) -> Result<RequirementsFacts, String> {
     let sqlite_floor = parse_engine_floor(&db_rs_src, "SQLITE_VERSION_FLOOR")?;
     let postgres_floor = parse_engine_floor(&db_rs_src, "POSTGRES_VERSION_FLOOR")?;
 
+    let install_sh_path = repo_root.join("install.sh");
+    let install_sh_src = std::fs::read_to_string(&install_sh_path)
+        .map_err(|e| format!("cannot read {}: {e}", install_sh_path.display()))?;
+    let host_c_toolchain = parse_host_c_toolchain(&install_sh_src)?;
+
     Ok(RequirementsFacts {
         rust_channel,
         edition,
         sqlite_floor,
         postgres_floor,
+        host_c_toolchain,
     })
+}
+
+/// The docs name of an installer family, or `None` for a family this page
+/// does not know.
+fn installer_family_label(family: &str) -> Option<&'static str> {
+    let known = |listed: PackageFamily| Some(listed.label());
+    match family {
+        "debian" => known(PackageFamily::Debian),
+        "fedora" => known(PackageFamily::Fedora),
+        "arch" => known(PackageFamily::Arch),
+        "alpine" => known(PackageFamily::Alpine),
+        "suse" => Some("openSUSE"),
+        "macos" => Some("macOS"),
+        "freebsd" => Some("FreeBSD"),
+        _ => None,
+    }
+}
+
+/// Strictly parse every `PREREQ_FAMILIES` family's `c-toolchain` row out of
+/// `install.sh`.
+///
+/// Fails — never defaults — when the family list is missing, a family is
+/// unknown, or a family has no row or more than one. A row whose text begins
+/// with `sudo` or `xcode-select` is a command; any other row is a note.
+fn parse_host_c_toolchain(src: &str) -> Result<Vec<HostCToolchainRow>, String> {
+    const FAMILIES: &str = "PREREQ_FAMILIES='";
+    let families = src
+        .lines()
+        .find_map(|line| line.strip_prefix(FAMILIES))
+        .and_then(|rest| rest.strip_suffix('\''))
+        .ok_or_else(|| format!("cannot find a `{FAMILIES}...'` line in install.sh"))?;
+    let mut rows = Vec::new();
+    for family in families.split(' ') {
+        let host = installer_family_label(family)
+            .ok_or_else(|| format!("install.sh names the unknown family `{family}`"))?;
+        let prefix = format!("c-toolchain:{family}) PREREQ_CMD='");
+        let mut found = src
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix(prefix.as_str()))
+            .map(|rest| rest.strip_suffix("' ;;"));
+        let text = match (found.next(), found.next()) {
+            (Some(Some(text)), None) if !text.is_empty() && !text.contains(['`', '|', '\'']) => {
+                text
+            }
+            (None, _) => return Err(format!("install.sh has no `c-toolchain:{family}` row")),
+            (Some(_), None) => {
+                return Err(format!(
+                    "install.sh's `c-toolchain:{family}` row is not one plain quoted value"
+                ));
+            }
+            (Some(_), Some(_)) => {
+                return Err(format!(
+                    "install.sh has more than one `c-toolchain:{family}` row"
+                ));
+            }
+        };
+        let advice = if text.starts_with("sudo ") || text.starts_with("xcode-select ") {
+            HostAdvice::Command(text.to_owned())
+        } else {
+            HostAdvice::Note(text.to_owned())
+        };
+        rows.push(HostCToolchainRow { host, advice });
+    }
+    Ok(rows)
 }
 
 /// Strictly parse the `channel = "..."` key out of a `rust-toolchain.toml`
@@ -207,7 +306,104 @@ pub fn render_requirements_docs(facts: &RequirementsFacts) -> String {
     );
     out.push('\n');
 
+    render_target_toolchains(&mut out, &facts.host_c_toolchain);
+
     out
+}
+
+/// Render the **Target toolchains** section from the target toolchain table
+/// and the installer's host C toolchain rows.
+fn render_target_toolchains(out: &mut String, host_c_toolchain: &[HostCToolchainRow]) {
+    out.push_str(
+        "## Target toolchains
+
+",
+    );
+    out.push_str(
+        "A static build (`--static`) produces a fully static Linux binary for one of the targets below. Each target needs its Rust standard library and a C compiler that targets musl, because the default dependency graph compiles C code. Every build, static or not, also needs the host's own C toolchain.
+
+",
+    );
+
+    out.push_str(
+        "### Host C toolchain
+
+",
+    );
+    out.push_str(
+        "| Host | Install |
+",
+    );
+    out.push_str(
+        "|------|---------|
+",
+    );
+    for row in host_c_toolchain {
+        match &row.advice {
+            HostAdvice::Command(command) => {
+                let _ = writeln!(out, "| {} | `{command}` |", row.host);
+            }
+            HostAdvice::Note(note) => {
+                let _ = writeln!(out, "| {} | {note} |", row.host);
+            }
+        }
+    }
+    out.push('\n');
+
+    for triple in StaticTriple::ALL {
+        let row = triple.toolchain();
+        let target = triple.as_str();
+        let arch = triple.arch().as_str();
+        let _ = writeln!(
+            out,
+            "### `{target}`
+"
+        );
+        let _ = writeln!(
+            out,
+            "Rust standard library: `rustup target add {target}`.
+"
+        );
+        let candidates: Vec<String> = row
+            .cc_candidates
+            .iter()
+            .map(|candidate| format!("`{}`", candidate.name()))
+            .collect();
+        let _ = writeln!(
+            out,
+            "C compiler on an `{arch}` host — `ipe` looks for {} on `PATH`:
+",
+            candidates.join(", then ")
+        );
+        out.push_str(
+            "| Host | Install | Verified by |
+",
+        );
+        out.push_str(
+            "|------|---------|-------------|
+",
+        );
+        for family in PackageFamily::ALL {
+            let command = row.install_command(family).unwrap_or("");
+            let verified = match row.verified_by(family) {
+                Some(Verified::CiJob(job)) => format!("CI job `{job}`"),
+                Some(Verified::PackageIndex) => "the distribution's package index".to_owned(),
+                None => String::new(),
+            };
+            let _ = writeln!(out, "| {} | `{command}` | {verified} |", family.label());
+        }
+        out.push('\n');
+        match row.cross_arch {
+            CrossArchAdvice::SetCcEnv => {
+                let _ = writeln!(
+                    out,
+                    "On a host of another architecture no distribution package ships a musl cross compiler: set `{}` to the path of an `{arch}` musl C compiler.
+",
+                    row.cc_env
+                );
+            }
+        }
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -262,7 +458,74 @@ mod tests {
             edition: "2024".to_owned(),
             sqlite_floor: (3, 35),
             postgres_floor: (9, 5),
+            host_c_toolchain: vec![
+                HostCToolchainRow {
+                    host: "Debian, Ubuntu",
+                    advice: HostAdvice::Command("sudo apt install build-essential".to_owned()),
+                },
+                HostCToolchainRow {
+                    host: "FreeBSD",
+                    advice: HostAdvice::Note("cc ships in the FreeBSD base system".to_owned()),
+                },
+            ],
         }
+    }
+
+    const INSTALL_SH: &str = "PREREQ_FAMILIES='debian freebsd'\n\
+        prereq_command() {\n\
+            case \"$1:$2\" in\n\
+            c-toolchain:debian) PREREQ_CMD='sudo apt install build-essential' ;;\n\
+            c-toolchain:freebsd) PREREQ_CMD='cc ships in the FreeBSD base system' ;;\n\
+            esac\n\
+        }\n";
+
+    #[test]
+    fn host_c_toolchain_parses_every_family_in_order() {
+        assert_eq!(
+            parse_host_c_toolchain(INSTALL_SH),
+            Ok(sample_facts().host_c_toolchain)
+        );
+    }
+
+    #[test]
+    fn host_c_toolchain_fails_closed() {
+        let refused = [
+            INSTALL_SH.replace("PREREQ_FAMILIES='debian freebsd'", "PREREQ_FAMILIES=debian"),
+            INSTALL_SH.replace("debian freebsd", "debian beos"),
+            INSTALL_SH.replace("c-toolchain:freebsd", "fetcher:freebsd"),
+            INSTALL_SH.replace(
+                "c-toolchain:freebsd) PREREQ_CMD='cc ships in the FreeBSD base system' ;;",
+                "c-toolchain:freebsd) PREREQ_CMD='' ;;",
+            ),
+            INSTALL_SH.replace("build-essential' ;;", "build-essential`x` ;;"),
+            format!("{INSTALL_SH}c-toolchain:debian) PREREQ_CMD='sudo apt install gcc' ;;\n"),
+        ];
+        for src in refused {
+            assert!(parse_host_c_toolchain(&src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn target_toolchains_render_every_triple_from_the_table() {
+        let out = render_requirements_docs(&sample_facts());
+        assert!(out.contains("## Target toolchains"));
+        assert!(out.contains("| Debian, Ubuntu | `sudo apt install build-essential` |"));
+        assert!(out.contains("| FreeBSD | cc ships in the FreeBSD base system |"));
+        for triple in StaticTriple::ALL {
+            let row = triple.toolchain();
+            assert!(out.contains(&format!("### `{}`", triple.as_str())));
+            assert!(out.contains(&format!("`rustup target add {}`", triple.as_str())));
+            assert!(out.contains(&format!("`{}`", row.cc_env)));
+            for family in PackageFamily::ALL {
+                let command = row.install_command(family).unwrap_or("absent");
+                assert!(
+                    out.contains(&format!("`{command}`")),
+                    "{triple:?} {family:?}"
+                );
+            }
+        }
+        assert!(out.contains("CI job `linux-static-arm64`"));
+        assert!(!out.contains("-linux-gnu-gcc"));
     }
 
     /// Resolve the workspace root (two levels up from this crate's manifest).
