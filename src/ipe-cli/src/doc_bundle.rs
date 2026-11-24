@@ -301,7 +301,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Module,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -311,7 +311,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Symbol,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -326,7 +326,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Diagnostic,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -336,7 +336,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Cli,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -449,7 +449,7 @@ impl DocBundle {
             &mut self.maps,
             kind,
             key,
-            title,
+            TerminalLine::from(title),
             TerminalSafe::sanitize(body),
             None,
         )
@@ -633,7 +633,14 @@ pub(crate) fn ingest_embedded_dir(
             body,
             order,
         } = parse_markdown_file(slug, raw, &source_label)?;
-        insert_entry(maps, kind, key, title, TerminalSafe::sanitize(&body), order)?;
+        insert_entry(
+            maps,
+            kind,
+            key,
+            TerminalLine::sanitize(&title),
+            TerminalSafe::sanitize(&body),
+            order,
+        )?;
     }
     Ok(())
 }
@@ -711,7 +718,14 @@ fn ingest_held_dir_additive(
         if maps.get(&kind).is_some_and(|m| m.contains_key(&key)) {
             continue;
         }
-        insert_entry(maps, kind, key, title, TerminalSafe::sanitize(&body), order)?;
+        insert_entry(
+            maps,
+            kind,
+            key,
+            TerminalLine::sanitize(&title),
+            TerminalSafe::sanitize(&body),
+            order,
+        )?;
     }
     Ok(())
 }
@@ -898,7 +912,7 @@ fn ingest_embedded_assets(
             maps,
             kind,
             key.to_owned(),
-            title.to_owned(),
+            TerminalLine::sanitize(title),
             TerminalSafe::sanitize(body),
             None,
         )?;
@@ -911,7 +925,7 @@ fn insert_entry(
     maps: &mut BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
     kind: DocKind,
     key: String,
-    title: String,
+    title: TerminalLine,
     body: TerminalSafe,
     order: Option<i64>,
 ) -> Result<(), BundleError> {
@@ -928,7 +942,7 @@ fn insert_entry(
         DocEntry {
             kind,
             key,
-            title: TerminalLine::sanitize(&title),
+            title,
             body,
             order,
         },
@@ -1163,7 +1177,7 @@ mod tests {
             &mut maps,
             DocKind::Guide,
             crate::agents_guide::GUIDE_KEY.to_owned(),
-            "A page".to_owned(),
+            TerminalLine::sanitize("A page"),
             TerminalSafe::sanitize("# A page\n"),
             None,
         )

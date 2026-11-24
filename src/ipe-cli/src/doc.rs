@@ -1032,7 +1032,7 @@ fn render_hit(hit: Hit<'_>, format: OutputFormat) {
                 OutputFormat::Json => emit_machine(Stream::Stdout, &render_doc_entry_json(entry)),
                 OutputFormat::Human => show_doc_page(
                     &crate::style::TerminalLine::sanitize(&entry.source_key),
-                    Some(entry_kind_label(entry.kind)),
+                    Some(entry_kind_label(&entry.kind)),
                     &entry.text,
                 ),
             }
@@ -1681,7 +1681,7 @@ fn render_doc_entry_json(entry: &ipe_docs::Entry) -> String {
 }
 
 /// The label a human page tags a content-index entry's kind with.
-const fn entry_kind_label(kind: ipe_docs::EntryKind) -> &'static str {
+const fn entry_kind_label(kind: &ipe_docs::EntryKind) -> &'static str {
     match kind {
         ipe_docs::EntryKind::Symbol => "symbol",
         ipe_docs::EntryKind::Module => "module",

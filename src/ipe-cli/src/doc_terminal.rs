@@ -17,8 +17,8 @@ use crate::style::{GUTTER, Palette, TerminalLine, TerminalSafe};
 
 /// The column budget a doc page wraps at.
 ///
-/// Either a terminal width inside [`Width::MIN`]`..=`[`Width::MAX`] or no wrapping at all, so a
-/// wrap loop never runs against a zero or absurd width.
+/// Either a terminal width inside [`Width::MIN`] to [`Width::MAX`] columns or no wrapping at all,
+/// so a wrap loop never runs against a zero or absurd width.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Width(Option<u16>);
 
@@ -29,7 +29,7 @@ impl Width {
     pub const MAX: u16 = 200;
     /// Lines are never wrapped: the output is not a terminal, or its size is unknown.
     pub const NO_WRAP: Self = Self(None);
-    /// The width used when a terminal reports a size outside [`Self::MIN`]`..=`[`Self::MAX`].
+    /// The width used when a terminal reports a size outside [`Self::MIN`] to [`Self::MAX`].
     pub const DEFAULT: Self = Self(Some(80));
 
     /// The width for a terminal reporting `columns`.
@@ -287,7 +287,7 @@ fn words(spans: &[Span]) -> Vec<Token> {
     for span in spans {
         match span {
             Span::Plain(text) | Span::Italic(text) => {
-                feed(text, Style::Plain, &mut word, &mut tokens)
+                feed(text, Style::Plain, &mut word, &mut tokens);
             }
             Span::Bold(text) => feed(text, Style::Bold, &mut word, &mut tokens),
             Span::Code(text) => feed(text, Style::Code, &mut word, &mut tokens),
