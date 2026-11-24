@@ -232,3 +232,70 @@ fn a_qualified_http_get_resolves_to_the_http_method() {
     assert!(home.is_some(), "`Http.Get` must resolve to a constructor");
     assert_ne!(home.as_deref(), Some("Ipe.Html.Attributes"));
 }
+
+/// The home of the `Get` that `main`'s body names under the kernel imports alone.
+#[track_caller]
+fn kernel_get_home_of(main: &str) -> Option<String> {
+    let (result, interner) = canonicalise_main(&[], main);
+    let Ok(module) = &result else {
+        assert!(result.is_ok(), "`{main}` must canonicalise, got {result:?}");
+        return None;
+    };
+    main_ctor_home(module, "Get", &interner)
+}
+
+#[test]
+fn an_open_kernel_import_binds_its_builtin_union_constructors() {
+    let open = kernel_get_home_of(
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (..)\n\n\
+         main = Get\n",
+    );
+    let explicit = kernel_get_home_of(
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\n\
+         main = Get\n",
+    );
+    assert!(
+        open.is_some(),
+        "`exposing (..)` must bind `HttpMethod`'s `Get`"
+    );
+    assert_eq!(
+        open, explicit,
+        "`(..)` must deliver what `HttpMethod(..)` does"
+    );
+}
+
+#[test]
+fn a_bare_get_under_both_open_imports_is_ambiguous() {
+    let (result, _) = canonicalise_main(
+        &[ATTRIBUTES_STUB],
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (..)\n\
+         import Ipe.Html.Attributes exposing (..)\n\n\
+         main = Get\n",
+    );
+    assert_ambiguous_get(&result);
+}
+
+#[test]
+fn a_local_get_outranks_an_open_kernel_import() {
+    let (result, interner) = canonicalise_main(
+        &[],
+        "module Main exposing (main)\n\n\
+         import Ipe.Http exposing (..)\n\n\
+         type Verb = Get\n\n\
+         main = Get\n",
+    );
+    let Ok(module) = &result else {
+        assert!(
+            result.is_ok(),
+            "a local `Get` must canonicalise, got {result:?}"
+        );
+        return;
+    };
+    assert_eq!(
+        main_ctor_home(module, "Get", &interner).as_deref(),
+        Some("Main")
+    );
+}
