@@ -71,6 +71,7 @@ pub mod owner_trust;
 pub mod pack;
 pub mod package_manifest;
 pub mod package_name;
+pub mod pinned_deps;
 pub mod pkg;
 pub mod program_name;
 pub mod progress;

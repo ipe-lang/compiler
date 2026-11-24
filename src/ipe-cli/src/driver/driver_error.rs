@@ -422,6 +422,11 @@ pub enum CliError {
     /// Nothing was built: the wrapper builds only from the verified compiler
     /// workspace this binary was compiled from.
     WrapperSourceRefused(Box<crate::wrapper_source::WrapperSourceRefusal>),
+    /// A crate's `Cargo.lock` disagrees with the dependency set this `ipe` was tested with.
+    ///
+    /// Nothing was built: every lock is derived from the pinned set, and one
+    /// that moves, adds, or re-sources a pinned package is refused.
+    LockDrift(Box<crate::pinned_deps::LockRefusal>),
     /// `ipe upgrade --agents` wrote nothing to the project's `AGENTS.md`.
     ///
     /// [`fmt::Display`] names the reason, then its remedy.
@@ -902,6 +907,7 @@ impl CliError {
             Self::GroupRequired { .. } => "group-required",
             Self::NoRunForm { .. } => "no-run-form",
             Self::WrapperSourceRefused(_) => "wrapper-source-refused",
+            Self::LockDrift(_) => "lock-drift",
             Self::AgentsGuideRefused(_) => "agents-guide-refused",
             Self::VerifyFailed { .. } => "verify-failed",
             Self::TestFailed { .. } => "test-failed",
@@ -973,6 +979,7 @@ impl CliError {
             | Self::BundledManifest { .. }
             | Self::TestRunnerStale { .. } => Internal,
             Self::FfiPrep(refusal) => ffi_prep_fault(refusal),
+            Self::LockDrift(refusal) => refusal.fault(),
             Self::Usage(_)
             | Self::ProjectRefused(_)
             | Self::DependencyNotCompiled { .. }
@@ -1282,6 +1289,7 @@ impl std::fmt::Display for CliError {
                 &refusal.root.display(),
                 &refusal.defect,
             )),
+            Self::LockDrift(refusal) => std::fmt::Display::fmt(&**refusal, f),
             Self::AgentsGuideRefused(refusal) => f.write_str(&refusal.message()),
             Self::VerifyFailed { stage, report } => {
                 writeln!(f, "{}", text::cli_verify_failed(stage))?;

@@ -2834,6 +2834,74 @@ cargo metadata emitted unparseable JSON: {detail}
 
 cargo metadata reported no target_directory
 
+## cli-lock-drift
+
+{lock} disagrees with the dependency set this `ipe` was tested with: {drift}
+
+## lock-drift-unpinned
+
+it locks {name} {version}, a crate outside the tested set
+
+## lock-drift-moved-by-project
+
+{project} asks for {name} {locked}, but ipe pins {name} {pinned} — relax {project}'s `{name}` requirement to one compatible with {name} {pinned}, for example `{name} = "{pinned}"`
+
+## lock-drift-moved-by-crate
+
+{requester} {version} asks for {name} {locked}, but ipe pins {name} {pinned} — relax {requester}'s `{name}` requirement to one compatible with {name} {pinned}: depend on a {requester} release whose `{name}` requirement {pinned} satisfies
+
+## lock-drift-moved-unrequested
+
+it locks {name} {locked}, but ipe pins {name} {pinned} — relax the requirement that asks for {name} {locked} to one compatible with {name} {pinned}
+
+## lock-drift-checksum
+
+it locks {name} {version} with a checksum other than the tested one
+
+## lock-drift-foreign-source
+
+it takes {name} from {source}, a source other than crates.io
+
+## lock-drift-unparsable
+
+it is not a lock ipe reads: {reason}
+
+## lock-drift-wrapper-differs
+
+the workspace lock differs from the one this `ipe` was built with — rebuild `ipe` from this checkout, or restore its `Cargo.lock`
+
+## lock-drift-set-unreadable
+
+the dependency set embedded in this `ipe` cannot be read: {reason}
+
+## lock-parse-not-utf8
+
+the lock is not UTF-8
+
+## lock-parse-not-toml
+
+the lock is not valid TOML
+
+## lock-parse-format-version
+
+the lock is not format version {expected}
+
+## lock-parse-unknown-key
+
+the lock holds the unknown key `{key}`
+
+## lock-parse-malformed
+
+the lock's `{field}` holds a value of the wrong shape
+
+## pinned-set-foreign-source
+
+{name} comes from {source}, a source other than crates.io
+
+## pinned-set-missing-checksum
+
+{name} {version} records no checksum
+
 ## explain-moved
 
 `ipe explain` has moved: use `ipe doc <key>` instead

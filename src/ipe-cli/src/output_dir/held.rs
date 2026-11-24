@@ -2112,6 +2112,7 @@ pub fn read_miss(err: &CliError) -> ReadMiss {
         | CliError::GroupRequired { .. }
         | CliError::NoRunForm { .. }
         | CliError::WrapperSourceRefused(..)
+        | CliError::LockDrift(..)
         | CliError::AgentsGuideRefused(..)
         | CliError::VerifyFailed { .. }
         | CliError::TestFailed { .. }

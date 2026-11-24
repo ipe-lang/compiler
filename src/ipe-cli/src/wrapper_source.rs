@@ -9,7 +9,9 @@
 //! held handle, and the tree must parse as the workspace that declares the
 //! wrapper: a `[workspace]` table whose `members` name [`WRAPPER_MEMBER`], a
 //! committed `Cargo.lock` beside it, and a member manifest whose package is
-//! [`WRAPPER_PACKAGE`]. An `ipe` running away from that source refuses a
+//! [`WRAPPER_PACKAGE`]. The committed lock's bytes are read once through the
+//! held handle and kept, so the bytes a release judges are the bytes it read.
+//! An `ipe` running away from that source refuses a
 //! native-bearing release with [`crate::CliError::WrapperSourceRefused`].
 
 use std::ffi::OsStr;
@@ -17,6 +19,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use crate::io_bounded::{MANIFEST_CAP, prove_regular, read_proven};
+use crate::pinned_deps::LOCK_CAP;
 use crate::proven_dir::{EntryName, ProvenDir, ProvenDirError};
 use crate::text;
 
@@ -33,6 +36,7 @@ pub const WRAPPER_MEMBER: &str = "src/ipe-wrapper";
 #[derive(Debug)]
 pub struct WrapperSource {
     root: PathBuf,
+    lock: String,
 }
 
 /// Why a candidate wrapper source was refused.
@@ -42,7 +46,8 @@ pub enum WrapperSourceDefect {
     NoBuildRoot,
     /// A directory or file on the way is absent or not proven owner-trusted.
     Unproven(ProvenDirError),
-    /// A manifest could not be read within [`MANIFEST_CAP`] as UTF-8.
+    /// A manifest could not be read within [`MANIFEST_CAP`] as UTF-8, or the
+    /// committed lock within [`LOCK_CAP`].
     Unreadable(PathBuf),
     /// A manifest is not valid TOML.
     Unparsable(PathBuf),
@@ -111,9 +116,7 @@ impl WrapperSource {
         if !declared {
             return Err(refuse(WrapperSourceDefect::MemberUndeclared));
         }
-        let lock = entry(&held, "Cargo.lock").map_err(refuse)?;
-        held.open_file(&lock)
-            .map_err(|e| refuse(WrapperSourceDefect::Unproven(e)))?;
+        let lock = read_lock(&held).map_err(refuse)?;
 
         let member = ProvenDir::open(&root.join(WRAPPER_MEMBER))
             .map_err(|e| refuse(WrapperSourceDefect::Unproven(e)))?;
@@ -129,16 +132,32 @@ impl WrapperSource {
         }
         Ok(Self {
             root: root.to_path_buf(),
+            lock,
         })
     }
 
-    /// A source over `root` that skips every check, for the build-command unit
-    /// tests only.
+    /// A source over `root` committing the embedded pinned lock, that skips
+    /// every check, for the build-command unit tests only.
     #[cfg(test)]
     pub(crate) fn unverified_for_test(root: &Path) -> Self {
+        let seed = crate::pinned_deps::pinned_set().map_or(&[][..], |set| set.seed_bytes());
+        Self::unverified_with_lock(root, &String::from_utf8_lossy(seed))
+    }
+
+    /// A source over `root` committing `lock`, that skips every check, for
+    /// the build-command unit tests only.
+    #[cfg(test)]
+    pub(crate) fn unverified_with_lock(root: &Path, lock: &str) -> Self {
         Self {
             root: root.to_path_buf(),
+            lock: lock.to_owned(),
         }
+    }
+
+    /// The committed `Cargo.lock`'s bytes, as read through the held root.
+    #[must_use]
+    pub fn lock_bytes(&self) -> &[u8] {
+        self.lock.as_bytes()
     }
 
     /// The verified workspace root: the directory `cargo` builds the wrapper in.
@@ -156,6 +175,18 @@ fn entry(dir: &ProvenDir, name: &'static str) -> Result<EntryName, WrapperSource
             source: std::io::ErrorKind::InvalidInput.into(),
         })
     })
+}
+
+/// Read the committed `Cargo.lock` inside `dir` from the held handle.
+fn read_lock(dir: &ProvenDir) -> Result<String, WrapperSourceDefect> {
+    let name = entry(dir, "Cargo.lock")?;
+    let path = dir.path_of(&name);
+    let file = dir
+        .open_file(&name)
+        .map_err(WrapperSourceDefect::Unproven)?;
+    prove_regular(file, &path)
+        .and_then(|file| read_proven(file, &path, LOCK_CAP))
+        .map_err(|_| WrapperSourceDefect::Unreadable(path))
 }
 
 /// Read and parse the `Cargo.toml` inside `dir` from the held handle.
