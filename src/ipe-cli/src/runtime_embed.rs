@@ -753,13 +753,30 @@ pub fn stamped_version(role: BundleRole, digest: RuntimeDigest) -> String {
     format!("{COMPILER_VERSION}+ipe.{}.{}", role.token(), digest.hex())
 }
 
-/// Prepare the runtime manifest for bundling: set `package.version` to `version`
-/// and remove every `dev-dependencies` table, `target.*` ones included.
+/// The `[lints.rust]` raises a bundled runtime manifest keeps.
+///
+/// `unsafe_code` cannot start firing on code that already holds it when the
+/// user's toolchain changes; every other raise can.
+const BUNDLE_KEPT_RUST_RAISES: &[&str] = &["unsafe_code"];
+
+/// The levels a bundled `[lints.rust]` entry keeps: the ones that never fail a build.
+const BUILD_SAFE_LEVELS: &[&str] = &["allow", "warn"];
+
+/// Prepare the runtime manifest for bundling: set `package.version` to `version`,
+/// remove every `dev-dependencies` table, `target.*` ones included, and drop
+/// every `[lints.rust]` raise not in [`BUNDLE_KEPT_RUST_RAISES`].
 ///
 /// Dev dependencies are never built for a non-root crate, and they may name
 /// workspace-relative paths that do not resolve outside the workspace. The
 /// manifest is parsed once as TOML, so a key that merely mentions
 /// `dev-dependencies` is kept.
+///
+/// The bundle is a path dependency of the user's crate, whose lints cargo does
+/// not cap, built by whatever toolchain the user has: a rustc lint raised above
+/// `warn` (the in-repo `deprecated_in_future = "deny"`, say) would turn a newer
+/// toolchain's new warning into that user's build failure. The in-repo manifest
+/// keeps every raise, so the pinned gates stay strict; the bundle is only ever
+/// less strict, in lint levels alone, which change no compiled code.
 ///
 /// # Errors
 /// [`BundleFault::Manifest`] when the manifest does not parse.
@@ -783,7 +800,45 @@ fn prepare_bundled_manifest(manifest: &str, version: &str) -> Result<String, Bun
             }
         }
     }
+    drop_toolchain_sensitive_raises(&mut doc);
     Ok(doc.to_string())
+}
+
+/// Remove every `[lints.rust]` entry of `doc` raised above `warn`, or of an
+/// unreadable level, except the [`BUNDLE_KEPT_RUST_RAISES`].
+///
+/// A removed entry falls back to rustc's own default level.
+fn drop_toolchain_sensitive_raises(doc: &mut toml_edit::DocumentMut) {
+    let Some(rust) = doc
+        .get_mut("lints")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .and_then(|lints| lints.get_mut("rust"))
+        .and_then(toml_edit::Item::as_table_like_mut)
+    else {
+        return;
+    };
+    let raised: Vec<String> = rust
+        .iter()
+        .filter(|(lint, item)| {
+            !BUNDLE_KEPT_RUST_RAISES.contains(lint) && !lint_level_is_build_safe(item)
+        })
+        .map(|(lint, _)| lint.to_owned())
+        .collect();
+    for lint in raised {
+        rust.remove(&lint);
+    }
+}
+
+/// Whether a `[lints.<tool>]` entry sets `allow` or `warn`.
+///
+/// Either form: `lint = "level"` or `lint = { level = "level", ... }`.
+fn lint_level_is_build_safe(item: &toml_edit::Item) -> bool {
+    let level = item.as_str().or_else(|| {
+        item.as_table_like()
+            .and_then(|entry| entry.get("level"))
+            .and_then(toml_edit::Item::as_str)
+    });
+    level.is_some_and(|level| BUILD_SAFE_LEVELS.contains(&level))
 }
 
 /// The embedded runtime crate, the shared base both roles stamp.
@@ -1409,6 +1464,88 @@ mod tests {
                 .and_then(toml::Value::as_str),
             Some("1.2.3+ipe.out.x")
         ));
+    }
+
+    /// Every `[lints.rust]` raise of `manifest`, rendered `lint = level`, sorted.
+    fn rust_raises(manifest: &str) -> Vec<String> {
+        let table: toml::Table = manifest.parse().expect("the manifest parses");
+        let mut raised: Vec<String> = table
+            .get("lints")
+            .and_then(|lints| lints.get("rust"))
+            .and_then(toml::Value::as_table)
+            .into_iter()
+            .flatten()
+            .filter_map(|(lint, value)| {
+                let level = value
+                    .as_str()
+                    .or_else(|| value.get("level").and_then(toml::Value::as_str));
+                (!matches!(level, Some("allow" | "warn"))).then(|| format!("{lint} = {level:?}"))
+            })
+            .collect();
+        raised.sort();
+        raised
+    }
+
+    /// The shipped bundle raises no rustc lint but `unsafe_code`, while the
+    /// in-repo manifest it comes from denies the deprecation lints.
+    #[test]
+    fn the_bundled_manifest_raises_no_toolchain_sensitive_lint() {
+        let raw = RUNTIME_CRATE
+            .get_file(MANIFEST)
+            .and_then(|file| file.contents_utf8())
+            .expect("the embedded runtime manifest is UTF-8");
+        let raw_raises = rust_raises(raw);
+        for lint in ["deprecated", "deprecated_in_future", "unsafe_code"] {
+            assert!(
+                raw_raises.contains(&format!("{lint} = Some(\"deny\")")),
+                "precondition: the in-repo runtime manifest denies `{lint}`: {raw_raises:?}"
+            );
+        }
+        for role in [BundleRole::Out, BundleRole::Scratch] {
+            let bundle = bundled_runtime(role).expect("bundle");
+            let manifest = bundle
+                .files()
+                .get(Path::new(MANIFEST))
+                .expect("the bundle carries a Cargo.toml");
+            assert_eq!(
+                rust_raises(manifest),
+                vec!["unsafe_code = Some(\"deny\")".to_owned()],
+                "{}: the bundled runtime is a path dependency whose lints cargo does \
+                 not cap; a rustc raise there fails a newer toolchain's user build",
+                role.token()
+            );
+        }
+    }
+
+    /// Every raised rustc lint but `unsafe_code` is dropped, in either entry
+    /// form and at any raised or unreadable level; `allow`/`warn` entries and
+    /// other tools' tables stay.
+    #[test]
+    fn a_raised_rust_lint_is_dropped_from_the_bundle() {
+        let fixture = "[package]\nname = \"r\"\nversion = \"0.0.0\"\n\n\
+            [lints.rust]\nunsafe_code = \"deny\"\ndeprecated = \"deny\"\n\
+            deprecated_in_future = { level = \"forbid\", priority = 1 }\n\
+            unexpected_cfgs = { level = \"warn\", check-cfg = [] }\n\
+            unused = \"allow\"\nodd = 3\n\n\
+            [lints.clippy]\nunwrap_used = \"deny\"\n";
+        let out = prepare_bundled_manifest(fixture, "1.0.0").expect("prepares");
+        assert_eq!(
+            rust_raises(&out),
+            vec!["unsafe_code = Some(\"deny\")".to_owned()]
+        );
+        let table: toml::Table = out.parse().expect("parses");
+        let rust = table
+            .get("lints")
+            .and_then(|lints| lints.get("rust"))
+            .and_then(toml::Value::as_table)
+            .expect("the rust table stays");
+        let mut kept: Vec<&str> = rust.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["unexpected_cfgs", "unsafe_code", "unused"]);
+        assert!(out.contains("unwrap_used = \"deny\""));
+        let dotted = "[package]\nname = \"r\"\n\n[lints]\nrust.deprecated = \"deny\"\n";
+        let out = prepare_bundled_manifest(dotted, "1.0.0").expect("prepares");
+        assert!(rust_raises(&out).is_empty(), "{out}");
     }
 
     #[test]

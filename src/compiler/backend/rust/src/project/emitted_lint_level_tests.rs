@@ -4,8 +4,8 @@
 //! sees: at `warn` it only prints, while an emitted `deny`/`forbid` would turn
 //! that user's build red. A `clippy::` lint never fires in a plain build, so a
 //! clippy raise is outside the rule. The runtime manifest a dependency-model
-//! emit bundles keeps `unsafe_code = "deny"`, the one raise a toolchain change
-//! cannot fire on code that already holds it. The other direction holds too:
+//! emit bundles is held to the same rule where it is bundled
+//! (`ipe-cli`'s `runtime_embed`). The other direction holds too:
 //! the workspace lint policy refuses, on the pinned toolchain, every std item
 //! deprecated now or scheduled for deprecation, and every emitted manifest
 //! declares `rust-version` equal to the pin.
@@ -14,7 +14,7 @@
 
 use super::{
     CARGO_DEP_TOML, CARGO_TOML, CARGO_WASM_DEP_TOML, EMITTED_MANIFESTS, GOLDEN as MAIN_RS,
-    RUNTIME_CARGO_TOML, RUNTIME_CONFIG_RS, RUNTIME_MOD_RS, RUST_TOOLCHAIN_TOML, WASM_CARGO_TOML,
+    RUNTIME_CONFIG_RS, RUNTIME_MOD_RS, RUST_TOOLCHAIN_TOML, WASM_CARGO_TOML,
     async_runtime_cargo_toml, compression_cargo_toml, config_cargo_toml, crypto_cargo_toml,
     crypto_core_heavy_cargo_toml, csv_cargo_toml, db_cargo_toml, dev_posture_cargo_toml,
     email_cargo_toml, every_manifest_declares_the_pin, http_client_cargo_toml, jwt_cargo_toml,
@@ -28,9 +28,6 @@ use std::path::{Path, PathBuf};
 
 /// The lint levels a manifest may set: the ones that never fail a build.
 const BUILD_SAFE_LEVELS: &[&str] = &["allow", "warn"];
-
-/// The `[lints.rust]` raises the bundled runtime manifest may keep.
-const RUNTIME_MANIFEST_RAISES: &[&str] = &["unsafe_code"];
 
 /// The lints the workspace denies against deprecated std items.
 ///
@@ -165,27 +162,6 @@ fn emitted_manifests_raise_no_lint_level() {
         "an emitted manifest raises a lint a newer toolchain can fire on, failing \
          the user's build; keep it at `warn`:\n{}",
         drift.join("\n")
-    );
-}
-
-/// The bundled runtime manifest raises no rustc lint beyond the named exception.
-///
-/// Its `[lints.rust]` table travels with a dependency-model bundle, and a path
-/// dependency's lints are not capped.
-#[test]
-fn bundled_runtime_manifest_raises_no_toolchain_sensitive_lint() {
-    let raised = raised_lints(RUNTIME_CARGO_TOML, RUNTIME_MANIFEST_RAISES);
-    assert!(raised.is_ok(), "the runtime manifest parses: {raised:?}");
-    let Ok((raised, read)) = raised else { return };
-    assert!(
-        read > 0,
-        "precondition: the runtime manifest declares lints"
-    );
-    let rust_raises: Vec<&String> = raised.iter().filter(|r| r.starts_with("rust.")).collect();
-    assert!(
-        rust_raises.is_empty(),
-        "the bundled runtime manifest raises a rustc lint a newer toolchain can \
-         fire on in a user's dependency-model build:\n{rust_raises:?}"
     );
 }
 
@@ -400,6 +376,7 @@ fn workspace_denies_every_deprecation_lint() {
         ("Cargo.toml", &["workspace", "lints", "rust"][..]),
         ("tools/ipe-ffi-inspector/Cargo.toml", &["lints", "rust"][..]),
         ("tools/ipe-index/Cargo.toml", &["lints", "rust"][..]),
+        ("src/runtime/rust/Cargo.toml", &["lints", "rust"][..]),
     ] {
         let text = std::fs::read_to_string(repo.join(rel)).expect("manifest reads");
         let doc: toml::Table = text.parse().expect("manifest parses");
