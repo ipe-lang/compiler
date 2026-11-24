@@ -728,6 +728,20 @@ checks:
       Cargo.lock superseded so their dead weight does not evict the caches CI
       reads. A red is a failed delete; the caches it would remove age out.
 
+  # ── Toolchain emit — the channels users build emitted projects with ──────
+  - context: stable-toolchain-emit
+    disposition: nightly-gate
+    producer: toolchain-emit.yml
+    guards: SEAL
+  - context: beta-toolchain-emit
+    disposition: informational
+    producer: toolchain-emit.yml
+    owner: ci
+    note: >-
+      Early warning one Rust release ahead: the default app built on the beta
+      channel with warnings denied. A red is a deprecation, lint or API change
+      the next stable brings; fix it before `stable-toolchain-emit` reddens.
+
   # ── Registry publish smoke — informational (advisory live push-path proof) ──
   - context: "publish → admit clean + reject bad → cleanup"
     disposition: informational

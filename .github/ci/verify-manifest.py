@@ -2276,6 +2276,7 @@ INLINE_DECIDERS: dict[tuple[str, str], str] = {
     ("playground.yml", "build"): "Build ipe-wasm (wasm32-unknown-unknown)",
     ("playground.yml", "playground-jail-run"): "Run jail-runner tests (unit + sandbox security proofs)",
     ("static.yml", "linux-cfree-gate"): "C-free refusal gates",
+    ("toolchain-emit.yml", "toolchain-emit"): "Emit and build the default app on ${{ matrix.channel }}, warnings denied",
     ("trust-root-diff.yml", "trust-root-diff"): "Judge the PR against the trusted CODEOWNERS",
 }
 @dataclasses.dataclass(frozen=True)

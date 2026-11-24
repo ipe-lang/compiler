@@ -203,6 +203,13 @@ PRODUCERS: tuple[Producer, ...] = (
             }
         ),
     ),
+    Producer(
+        workflow="toolchain-emit.yml",
+        events=("schedule", "workflow_dispatch"),
+        recovery="workflow_dispatch",
+        gates=frozenset({"stable-toolchain-emit"}),
+        non_blocking=frozenset({"beta-toolchain-emit"}),
+    ),
 )
 
 
