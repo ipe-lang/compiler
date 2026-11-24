@@ -1993,6 +1993,8 @@ messages! {
     lock_drift_moved_internal(name, locked, pinned) = "lock-drift-moved-internal";
     /// A crates.io crate locked without a checksum.
     lock_drift_unchecksummed(name, version) = "lock-drift-unchecksummed";
+    /// ipe's own emitted graph locked a crates.io crate without a checksum.
+    lock_drift_unchecksummed_internal(name, version) = "lock-drift-unchecksummed-internal";
     /// A pinned version locked with another checksum.
     lock_drift_checksum(name, version) = "lock-drift-checksum";
     /// A lock takes a crate from a source other than crates.io.

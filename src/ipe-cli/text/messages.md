@@ -2862,6 +2862,10 @@ ipe's own dependency graph locks {name} {locked}, but ipe pins {name} {pinned}: 
 
 it locks {name} {version} from crates.io without a checksum, so its bytes cannot be verified — delete the lock entry and let cargo record it again
 
+## lock-drift-unchecksummed-internal
+
+ipe's own dependency graph locks {name} {version} from crates.io without a checksum: this `ipe` derived a lock whose bytes its tested set cannot verify
+
 ## lock-drift-checksum
 
 it locks {name} {version} with a checksum other than the tested one

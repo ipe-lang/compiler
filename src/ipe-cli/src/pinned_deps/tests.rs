@@ -412,3 +412,69 @@ fn an_unpinned_crate_without_a_checksum_is_refused_under_every_posture() {
         assert!(refusal.to_string().contains("without a checksum"));
     }
 }
+
+#[test]
+fn a_root_named_like_a_registry_crate_is_still_the_root() {
+    let Some(set) = set() else {
+        assert!(set().is_some(), "the small set parses");
+        return;
+    };
+    let runtime = crate::runtime_embed::RUNTIME_PACKAGE;
+    // The root `http` shares its name with the registry `http` hyper needs;
+    // only a path dependency makes a Local package a forcer.
+    let text = format!(
+        "version = 4\n\n{}{}{}{}{}{}",
+        local("http", &format!("\"{runtime}\", \"serde_json\"")),
+        registry("http", "1.1.0", SUM_A, ""),
+        registry("hyper", "1.0.0", SUM_A, "\"http 1.1.0\""),
+        local(runtime, "\"serde_json\""),
+        registry("serde_json", "1.0.100", SUM_A, ""),
+        registry("serde_with", "3.0.0", SUM_A, "\"serde_json\""),
+    );
+    let verdict = set.judge_text(&text, FfiPosture::FfiBearing);
+    assert!(
+        matches!(
+            &verdict,
+            Err(LockDrift::Moved { requested_by: Some(by), .. })
+                if matches!(&**by, Requester::Crate { name, version }
+                    if name.as_str() == "serde_with" && version.to_string() == "3.0.0")
+        ),
+        "the registry crate that forced the move is named, not the same-named root: {verdict:?}"
+    );
+}
+
+#[test]
+fn a_checksum_less_crate_in_ipes_own_graph_is_worded_as_ipes() {
+    let Some(set) = set() else {
+        assert!(set().is_some(), "the small set parses");
+        return;
+    };
+    let text = lock(
+        "\"extra\"",
+        "[[package]]\nname = \"extra\"\nversion = \"2.0.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    );
+    for posture in [FfiPosture::FfiFree, FfiPosture::FfiBearing] {
+        let verdict = set.judge_text(&text, posture);
+        assert!(verdict.is_err(), "refused under {posture:?}");
+        let Err(drift) = verdict else { return };
+        let refusal = LockRefusal {
+            lock: "Cargo.lock".into(),
+            posture,
+            drift,
+        };
+        let shown = refusal.to_string();
+        match refusal.fault() {
+            crate::screen::Fault::Internal => assert!(
+                shown.contains("ipe's own dependency graph")
+                    && shown.contains("extra 2.0.0")
+                    && !shown.contains("delete the lock entry"),
+                "an internal refusal names no user remedy: {shown}"
+            ),
+            crate::screen::Fault::User => assert!(
+                shown.contains("delete the lock entry"),
+                "a user refusal names the user's remedy: {shown}"
+            ),
+        }
+    }
+}

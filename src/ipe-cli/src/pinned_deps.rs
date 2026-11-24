@@ -455,6 +455,11 @@ impl fmt::Display for LockRefusal {
                 &lock,
                 &text::lock_drift_moved_internal(name, locked, pinned),
             )),
+            (crate::screen::Fault::Internal, LockDrift::Unchecksummed { name, version }) => f
+                .write_str(&text::cli_lock_drift(
+                    &lock,
+                    &text::lock_drift_unchecksummed_internal(name, version),
+                )),
             (
                 crate::screen::Fault::Internal | crate::screen::Fault::User,
                 LockDrift::Unpinned { .. }
@@ -686,18 +691,27 @@ impl PinnedSet {
 
     /// The claim `dependent` of `lock` has to have forced a move, or `None`
     /// for the bundled runtime, which is never the one to relax.
+    ///
+    /// A path crate forces only when another path package depends on it: a
+    /// registry dependency that shares its name is a different package, so a
+    /// root named like a registry crate stays the root.
     fn role(&self, lock: &LockFile, dependent: &LockedPackage) -> Option<RequesterRole> {
         match &dependent.origin {
             Origin::Local if dependent.name.as_str() == crate::runtime_embed::RUNTIME_PACKAGE => {
                 None
             }
             Origin::Local => Some(
-                if lock.packages.iter().any(|package| {
-                    package
-                        .dependencies
-                        .iter()
-                        .any(|dep| dep.name == dependent.name)
-                }) {
+                if lock
+                    .packages
+                    .iter()
+                    .filter(|package| matches!(package.origin, Origin::Local))
+                    .any(|package| {
+                        package
+                            .dependencies
+                            .iter()
+                            .any(|dep| dep.name == dependent.name)
+                    })
+                {
                     RequesterRole::Forcer
                 } else {
                     RequesterRole::Root
@@ -718,9 +732,9 @@ impl PinnedSet {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RequesterRole {
     /// A user crate outside the set: a registry or foreign package that is
-    /// not exactly a pin, or a path crate the project depends on.
+    /// not exactly a pin, or a path crate another path package depends on.
     Forcer,
-    /// The project's own root package, which no package depends on.
+    /// The project's own root package, which no path package depends on.
     Root,
     /// An exact pin, which accepts the pinned version too.
     Pinned,
