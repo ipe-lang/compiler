@@ -372,12 +372,16 @@ fn capped_text(stderr: &mut ScratchFile) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::process::{Command, Stdio};
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
+    use super::await_canary;
     use super::{
-        CanaryExit, ProcCap, RunJailDefect, SCOPE_SCRIPT, Scope, TEETH_SCRIPT, await_canary,
-        canary_profile, classify, decide,
+        CanaryExit, ProcCap, RunJailDefect, SCOPE_SCRIPT, Scope, TEETH_SCRIPT, canary_profile,
+        classify, decide,
     };
 
     /// No canary runs under `timeout`: its firing exits nonzero like a refused

@@ -1720,6 +1720,7 @@ mod tests {
     }
 
     /// Every bwrap mount op before the payload separator, as `(op, target)` in argv order.
+    #[cfg(unix)]
     fn mount_targets(argv: &[String]) -> Vec<(String, String)> {
         let mut ops = Vec::new();
         let mut rest = argv.iter();
