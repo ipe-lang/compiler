@@ -198,11 +198,12 @@ fn manifest(text: &str, at: &str) -> Result<toml::Table, String> {
 
 /// Whether `cargo deny` judges the dependencies of the `[target.<key>]` table.
 ///
-/// The deny graph (`deny.toml [graph]`, no target filter) drops an edge whose
-/// `cfg` expression names no predicate and is false — `cfg(any())` — so a pin
-/// spelled there is locked but never judged for advisories, licences, bans or
-/// sources. Any predicate-free `cfg` counts as unjudged (fail closed); a pin
-/// that must never compile uses a contradiction such as
+/// The deny graph (`deny.toml [graph]`, no target filter — `deny_graph_gaps`
+/// refuses one) drops an edge whose `cfg` expression names no predicate and is
+/// false — `cfg(any())` — so a pin spelled there is locked but never judged for
+/// advisories, licences, bans or sources. Every predicate-free `cfg` is refused,
+/// the true ones too (fail closed); `true` and `false` are literals, never
+/// predicates. A pin that must never compile uses a contradiction such as
 /// `cfg(all(unix, not(unix)))`, whose predicates keep the edge in the graph.
 fn deny_judges_target(key: &str) -> bool {
     let Some(expr) = key
@@ -213,7 +214,39 @@ fn deny_judges_target(key: &str) -> bool {
         return true;
     };
     expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .any(|word| !word.is_empty() && !matches!(word, "any" | "all" | "not"))
+        .any(|word| !word.is_empty() && !matches!(word, "any" | "all" | "not" | "true" | "false"))
+}
+
+/// The `deny.toml [graph]` keys that leave every edge of a contradiction `cfg`
+/// in the judged graph: the feature selection only. `targets` makes krates
+/// evaluate each `cfg` per target (dropping the contradiction), and `exclude`,
+/// `exclude-dev`, `exclude-unpublished` or any key cargo-deny adds later can
+/// remove a pin's edge, so every other key is refused.
+const DENY_GRAPH_KEYS: &[&str] = &["all-features", "no-default-features", "features"];
+
+/// The top-level `deny.toml` keys that name the judged graph outside `[graph]`
+/// (the pre-`[graph]` spelling of the target filter and the exclusions).
+const DENY_LEGACY_GRAPH_KEYS: &[&str] = &["targets", "exclude", "exclude-dev"];
+
+/// Each way the `deny.toml` `deny` (named `at`) would let cargo-deny drop the
+/// edge of a pin `deny_judges_target` accepts.
+fn deny_graph_gaps(deny: &toml::Table, at: &str) -> Vec<String> {
+    let mut found: Vec<String> = DENY_LEGACY_GRAPH_KEYS
+        .iter()
+        .filter(|key| deny.contains_key(**key))
+        .map(|key| format!("{at}: top-level `{key}` changes the judged graph's edges"))
+        .collect();
+    match deny.get("graph") {
+        None => {}
+        Some(toml::Value::Table(graph)) => found.extend(
+            graph
+                .keys()
+                .filter(|key| !DENY_GRAPH_KEYS.contains(&key.as_str()))
+                .map(|key| format!("{at}: `[graph] {key}` changes the judged graph's edges")),
+        ),
+        Some(_) => found.push(format!("{at}: `graph` is not a table")),
+    }
+    found
 }
 
 /// `manifest` without the `[target.*]` tables `cargo deny` never judges.
@@ -471,6 +504,16 @@ fn the_embedded_set_holds_the_emitter_closure() {
     let set = pinned_set();
     assert!(set.is_ok(), "the workspace lock is a pinned set: {set:?}");
     let Ok(set) = set else { return };
+    let deny = read(&repo_root().join("deny.toml")).and_then(|text| manifest(&text, "deny.toml"));
+    assert!(deny.is_ok(), "{deny:?}");
+    let Ok(deny) = deny else { return };
+    let unjudged = deny_graph_gaps(&deny, "deny.toml");
+    assert!(
+        unjudged.is_empty(),
+        "the emitter-closure pins are judged only while deny.toml's graph keeps every \
+         contradiction-cfg edge:\n{}",
+        unjudged.join("\n")
+    );
     let members = member_manifests();
     assert!(members.is_ok(), "{members:?}");
     let emitted = emitted_manifests();
@@ -537,17 +580,26 @@ fn a_provisioned_dependency_has_no_gap() {
 }
 
 #[test]
-fn a_pin_the_deny_graph_drops_provisions_nothing() {
+fn a_pin_under_a_predicate_free_cfg_provisions_nothing() {
     let emitted = "[dependencies]\nitoa = \"1\"\n";
-    for dropped in ["cfg(any())", "cfg(not(any()))", "cfg ( all ( ) )"] {
-        let member = format!("[target.'{dropped}'.dependencies]\nitoa = \"1\"\n");
+    // `cfg(any())` is the edge the deny graph drops; the others it keeps
+    // (`not(any())` is true) or cargo rejects, and are refused all the same.
+    for predicate_free in [
+        "cfg(any())",
+        "cfg(not(any()))",
+        "cfg ( all ( ) )",
+        "cfg(false)",
+        "cfg(true)",
+        "cfg(all(true, not(false)))",
+    ] {
+        let member = format!("[target.'{predicate_free}'.dependencies]\nitoa = \"1\"\n");
         let found = gaps_of(&member, emitted);
         assert!(
             found.len() == 1
                 && found
                     .iter()
                     .all(|gap| gap.contains("no workspace member declares itoa")),
-            "{dropped}: {found:?}"
+            "{predicate_free}: {found:?}"
         );
     }
     for judged in [
@@ -557,6 +609,45 @@ fn a_pin_the_deny_graph_drops_provisions_nothing() {
     ] {
         let member = format!("[target.'{judged}'.dependencies]\nitoa = \"1\"\n");
         assert_eq!(gaps_of(&member, emitted), Vec::<String>::new(), "{judged}");
+    }
+}
+
+#[test]
+fn a_deny_graph_that_can_drop_a_pin_edge_is_refused() {
+    let gaps_in =
+        |text: &str| manifest(text, "deny.toml").map(|deny| deny_graph_gaps(&deny, "deny.toml"));
+    for kept in [
+        "",
+        "[graph]\n",
+        "[graph]\nall-features = false\nno-default-features = false\nfeatures = [\"full\"]\n",
+    ] {
+        assert_eq!(gaps_in(kept), Ok(Vec::new()), "{kept:?}");
+    }
+    for (refused, key) in [
+        (
+            "[graph]\ntargets = [\"x86_64-unknown-linux-gnu\"]\n",
+            "targets",
+        ),
+        ("[graph]\ntargets = []\n", "targets"),
+        ("[graph]\nexclude-dev = true\n", "exclude-dev"),
+        ("[graph]\nexclude = [\"dlmalloc\"]\n", "exclude"),
+        (
+            "[graph]\nexclude-unpublished = true\n",
+            "exclude-unpublished",
+        ),
+        (
+            "targets = [{ triple = \"x86_64-unknown-linux-gnu\" }]\n",
+            "targets",
+        ),
+        ("graph = 1\n", "graph"),
+    ] {
+        let found = gaps_in(refused);
+        assert!(
+            found
+                .as_ref()
+                .is_ok_and(|found| found.len() == 1 && found.iter().all(|gap| gap.contains(key))),
+            "{refused:?}: {found:?}"
+        );
     }
 }
 
