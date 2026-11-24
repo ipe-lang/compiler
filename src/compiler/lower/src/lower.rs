@@ -32,11 +32,12 @@ use ipe_ir::once_closure::{CaptureScope, ClosureKind};
 use ipe_ir::{
     AppSurface, ArgumentErasure, Arm, BinOp, BoundSet, CallPin, Callee, Capability, EnumDef,
     EnumPayloadTable, Expr, Func, FuncId, IrType, KernelFn, Match, ModPath, Module, OnFormKind,
-    Pat, Program, RowParam, RuntimeModule, SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain,
-    UserPin, Variant, fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds,
-    ir_type_is_serde, is_dispatch_free, is_irrefutable,
+    Pat, Program, RowParam, RuntimeModule, ServedListener, ServedListenerKind, ServedPort,
+    SharedAlts, SliceOwnership, TypeDef, UiCtor, UiPlain, UserPin, Variant,
+    fun_value_arc_promotable, ir_type_has_effect_carrier, ir_type_holds, ir_type_is_serde,
+    is_dispatch_free, is_irrefutable,
 };
-use ipe_kernels::{FnSlotCarrier, RuntimeBounds};
+use ipe_kernels::{FnSlotCarrier, RuntimeBounds, SourcePortLiteral};
 use ipe_types::{
     EmittedHeads, RowTail, SignatureWildcards, SolvedTypes, Ty, TyBounds, ty_is_ground,
 };
@@ -9670,6 +9671,9 @@ struct KernelUsage {
     /// whereas the `uses_*` family flags saturate early. The lowerer's flag scan
     /// leaves this `false` and keeps its early-exit; the capability scan sets it.
     collect_caps: bool,
+    /// The inbound listener the reached serving kernels open, folded on the
+    /// same visit as [`Self::caps`] and only while collecting capabilities.
+    served: ServedListener,
 }
 
 impl KernelUsage {
@@ -9714,6 +9718,27 @@ impl KernelUsage {
             && self.debug
             && self.ffi
             && self.async_runtime
+    }
+
+    /// Fold the listener one serving kernel opens into [`Self::served`].
+    ///
+    /// `args` is the saturated call's argument list, or `None` for a reified
+    /// kernel value (an eta or partial use), whose port is never a literal.
+    /// Runs only while collecting capabilities, so the flag scan's early exit
+    /// never skips a serving kernel.
+    fn record_served(&mut self, k: KernelFn, args: Option<&[Expr]>) {
+        if !self.collect_caps {
+            return;
+        }
+        let port = match k.def().serves {
+            None => return,
+            Some(ServedListenerKind::WebHost) => ServedPort::WebDefault,
+            Some(ServedListenerKind::ServerPortArg) => match args.and_then(<[Expr]>::first) {
+                Some(Expr::Int(n)) => ServedPort::ServerLiteral(SourcePortLiteral::new(*n)),
+                _ => ServedPort::ServerDynamic,
+            },
+        };
+        self.served = self.served.with(port);
     }
 
     /// OR in the family flags for one kernel callee, and record its capability
@@ -10627,11 +10652,19 @@ fn scan_kernel_usage(expr: &Expr, usage: &mut KernelUsage) {
     match expr {
         Expr::Call { callee, args, .. } => {
             record_callee_usage(callee, usage);
+            if let Callee::Kernel(k) = callee {
+                usage.record_served(*k, Some(args));
+            }
             for a in args {
                 scan_kernel_usage(a, usage);
             }
         }
-        Expr::FuncValue { callee, .. } => record_callee_usage(callee, usage),
+        Expr::FuncValue { callee, .. } => {
+            record_callee_usage(callee, usage);
+            if let Callee::Kernel(k) = callee {
+                usage.record_served(*k, None);
+            }
+        }
         Expr::Apply { func, args } => {
             scan_kernel_usage(func, usage);
             for a in args {
@@ -10897,6 +10930,27 @@ fn body_capabilities<'a>(bodies: impl Iterator<Item = &'a Expr>) -> BTreeSet<Cap
         usage.caps.insert(Capability::FfiRaw);
     }
     usage.caps
+}
+
+/// The inbound listener a lowered program opens: the join over every serving
+/// kernel its held functions reach.
+///
+/// Scans the same bodies as [`program_capabilities_scan`], so the fact covers
+/// exactly the functions the emitted binary keeps.
+#[must_use]
+pub fn program_served_scan(program: &Program) -> ServedListener {
+    let mut usage = KernelUsage {
+        collect_caps: true,
+        ..KernelUsage::default()
+    };
+    for body in program
+        .modules
+        .iter()
+        .flat_map(|m| m.funcs.iter().map(|f| &f.body))
+    {
+        scan_kernel_usage(body, &mut usage);
+    }
+    usage.served
 }
 
 /// What a set of root modules reaches in a lowered program.

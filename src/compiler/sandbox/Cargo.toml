@@ -26,16 +26,17 @@ serde = { version = "1", features = ["derive"] }
 getrandom = { version = "0.3", features = ["std"] }
 # Jujutsu's configuration is TOML; the same major the CLI and FFI crates parse with.
 toml = "0.8"
+# The runtime descriptor floor every jail spawn and exec goes through (the
+# child inherits stdio and only the sealed descriptors its argv names, which
+# stay close-on-exec in this process), and on every target the one listen-port
+# grammar and operator port keys a served listener grant parses through.
+ipe-runtime-rust = { path = "../../runtime/rust", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # The private-scratch exclusive `O_NOFOLLOW` open, and the effective uid/gid the
 # private-scratch and jail-dir ownership checks compare against, obtained
 # without `unsafe`.
 rustix = { version = "1.1", features = ["fs", "process"] }
-# The runtime descriptor floor every jail spawn and exec goes through: the child
-# inherits stdio and only the sealed descriptors its argv names, which stay
-# close-on-exec in this process.
-ipe-runtime-rust = { path = "../../runtime/rust", default-features = false }
 
 # The Windows run-jail arm builds its confinement primitives through the Win32
 # kernel API (Job Object, AppContainer lowbox token, capability SIDs, ACLs,

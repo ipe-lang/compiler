@@ -6,7 +6,9 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
-use ipe_kernels::Capability;
+use ipe_kernels::{Capability, ServedListener, ServedPort};
+use ipe_runtime_rust::env_grammar::ListenPort;
+use ipe_runtime_rust::env_registry::{self, PortKey};
 
 // ── the database axis (a run-jail input, resolved from package.ipe) ──────────
 
@@ -37,6 +39,15 @@ pub enum ProfileError {
     /// *tighten* the jail past what the program needs (a false-deny), and
     /// guessing an axis could under-isolate — so this refuses.
     UnknownDatabaseDriver,
+    /// The program passes `Server.listen` a literal port outside `1..=65535`,
+    /// which the runtime refuses at start; no listener grant names it.
+    ServedPortOutOfRange {
+        /// The literal the program wrote.
+        port: i64,
+    },
+    /// The program reaches both a web application host and `Server.listen`, so
+    /// no single listener grant describes it.
+    SeveralListeners,
 }
 
 impl std::fmt::Display for ProfileError {
@@ -48,8 +59,185 @@ impl std::fmt::Display for ProfileError {
                  resolved to a concrete axis (network or filesystem); refusing to build a jail \
                  that might over- or under-isolate it"
             ),
+            Self::ServedPortOutOfRange { port } => write!(
+                f,
+                "the program passes `Server.listen` the port {port}, outside `1..=65535`; pass a \
+                 port in `1..=65535` to `Server.listen`"
+            ),
+            Self::SeveralListeners => write!(
+                f,
+                "the program reaches both a `Web` application host and `Server.listen`, so it \
+                 would open two listeners; a program serves on one listener, so keep one of them"
+            ),
         }
     }
+}
+
+// ── the served listener (an inbound grant, read from the lowered program) ───
+
+/// Which operator variable names a served listener's port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenKey {
+    /// An `Ipe.Web` application host.
+    Web,
+    /// An `Ipe.Http.Server` app (`Server.listen`).
+    Server,
+}
+
+impl ListenKey {
+    /// The operator variable that relocates this listener's port.
+    #[must_use]
+    pub const fn operator_key(self) -> PortKey {
+        match self {
+            Self::Web => env_registry::web::WEB_PORT,
+            Self::Server => env_registry::listen::SERVER_PORT,
+        }
+    }
+
+    /// The wire token both grammars spell this key with.
+    const fn token(self) -> &'static str {
+        match self {
+            Self::Web => "web",
+            Self::Server => "server",
+        }
+    }
+
+    /// The key a wire token spells, or `None` for any other text.
+    fn parse(token: &str) -> Option<Self> {
+        match token {
+            "web" => Some(Self::Web),
+            "server" => Some(Self::Server),
+            _ => None,
+        }
+    }
+}
+
+/// The port a served listener grant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrantPort {
+    /// The port the program states (a literal, or the web default).
+    Source(ListenPort),
+    /// A port the program computes: only the operator variable names it.
+    Operator,
+}
+
+/// The one inbound listener a served program is granted.
+///
+/// Built only by [`Self::from_served`] (from the lowered program's fact) and by
+/// the two wire parsers, each through the runtime's own port grammar, so a
+/// grant can never name a port the runtime would refuse. It records the source
+/// fact, never an operator-resolved port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub struct ListenGrant {
+    key: ListenKey,
+    port: GrantPort,
+}
+
+impl ListenGrant {
+    /// Parse the lowered program's served fact into its listener grant.
+    ///
+    /// `Ok(None)` when the program serves nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ProfileError::ServedPortOutOfRange`] for a `Server.listen` literal
+    /// outside `1..=65535`; [`ProfileError::SeveralListeners`] when a web host
+    /// and `Server.listen` are both reached.
+    pub fn from_served(served: &ServedListener) -> Result<Option<Self>, ProfileError> {
+        let ServedListener::Serves(port) = served else {
+            return Ok(None);
+        };
+        let grant = match port {
+            ServedPort::WebDefault => Self {
+                key: ListenKey::Web,
+                port: GrantPort::Source(web_default_port()?),
+            },
+            ServedPort::ServerLiteral(literal) => {
+                let port = ListenPort::from_program(literal.get()).ok_or(
+                    ProfileError::ServedPortOutOfRange {
+                        port: literal.get(),
+                    },
+                )?;
+                Self {
+                    key: ListenKey::Server,
+                    port: GrantPort::Source(port),
+                }
+            }
+            ServedPort::ServerDynamic => Self {
+                key: ListenKey::Server,
+                port: GrantPort::Operator,
+            },
+            ServedPort::Several => return Err(ProfileError::SeveralListeners),
+        };
+        Ok(Some(grant))
+    }
+
+    /// Which operator variable names this listener's port.
+    #[must_use]
+    pub const fn key(self) -> ListenKey {
+        self.key
+    }
+
+    /// The port this grant names.
+    #[must_use]
+    pub const fn port(self) -> GrantPort {
+        self.port
+    }
+
+    /// The key and port as two wire tokens: `web 8000`, `server dynamic`.
+    fn tokens(self) -> (&'static str, String) {
+        let port = match self.port {
+            GrantPort::Source(port) => port.get().to_string(),
+            GrantPort::Operator => "dynamic".to_owned(),
+        };
+        (self.key.token(), port)
+    }
+
+    /// Parse a key token and a port token: a port in `1..=65535`, or `dynamic`
+    /// for a server key only.
+    fn parse_tokens(key: &str, port: &str) -> Option<Self> {
+        let key = ListenKey::parse(key)?;
+        let port = match (key, port) {
+            (ListenKey::Server, "dynamic") => GrantPort::Operator,
+            (_, digits) => GrantPort::Source(ListenPort::parse(digits)?),
+        };
+        Some(Self { key, port })
+    }
+
+    /// The capfloor value form: `web:8000`, `server:dynamic`.
+    fn floor_value(self) -> String {
+        let (key, port) = self.tokens();
+        format!("{key}:{port}")
+    }
+
+    /// Parse the capfloor value form.
+    fn parse_floor_value(value: &str) -> Option<Self> {
+        let (key, port) = value.split_once(':')?;
+        Self::parse_tokens(key, port)
+    }
+}
+
+impl From<ListenGrant> for String {
+    fn from(grant: ListenGrant) -> Self {
+        grant.floor_value()
+    }
+}
+
+impl TryFrom<String> for ListenGrant {
+    type Error = ParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse_floor_value(&value).ok_or_else(|| ParseError::Malformed {
+            detail: format!("malformed listen grant {value:?}"),
+        })
+    }
+}
+
+/// The web host's default port, parsed through the runtime's port grammar.
+fn web_default_port() -> Result<ListenPort, ProfileError> {
+    let port = i64::from(env_registry::web::WEB_DEFAULT_PORT);
+    ListenPort::from_program(port).ok_or(ProfileError::ServedPortOutOfRange { port })
 }
 
 impl std::error::Error for ProfileError {}
@@ -309,6 +497,9 @@ pub struct SandboxProfile {
     pub subprocess: bool,
     /// The resource caps.
     pub limits: RunResourceLimits,
+    /// The one inbound listener the program serves on, or `None` for a program
+    /// that serves nothing. An inbound grant only: it never grants egress.
+    pub listen: Option<ListenGrant>,
 }
 
 impl SandboxProfile {
@@ -323,6 +514,7 @@ impl SandboxProfile {
             env_allowlist: Vec::new(),
             subprocess: false,
             limits: RunResourceLimits::default(),
+            listen: None,
         }
     }
 
@@ -359,7 +551,10 @@ impl SandboxProfile {
             .env_allowlist
             .iter()
             .all(|v| floor.env_allowlist.contains(v));
-        network_ok && subprocess_ok && fs_ok && env_ok
+        // A served listener must be exactly the floor's: a profile cannot add a
+        // listener the binary was not built with, nor move it to another key or port.
+        let listen_ok = self.listen.is_none_or(|grant| floor.listen == Some(grant));
+        network_ok && subprocess_ok && fs_ok && env_ok && listen_ok
     }
 
     /// Whether `self` isolates *at least* as much as `floor` on every axis.
@@ -394,6 +589,15 @@ impl SandboxProfile {
         for name in &self.env_allowlist {
             let _ = writeln!(s, "env {name}");
         }
+        match self.listen {
+            None => {
+                let _ = writeln!(s, "listen none");
+            }
+            Some(grant) => {
+                let (key, port) = grant.tokens();
+                let _ = writeln!(s, "listen {key} {port}");
+            }
+        }
         s
     }
 
@@ -404,6 +608,7 @@ impl SandboxProfile {
     /// swap *which* env vars it grants below what the binary was built for.
     ///
     /// Format: `ipe-capfloor 1 net=<b> fs=<isolated|rw> sub=<b> env=<names>
+    /// listen=<none|web:<port>|server:<port>|server:dynamic>
     /// intent=<release|development>` where `<names>` is the sorted, comma-joined
     /// set of granted env names (empty when none) and `intent` names the build
     /// pipeline that embedded the floor ([`FloorIntent`]). The names are bound by identity, so the floor compares env by the
@@ -421,10 +626,12 @@ impl SandboxProfile {
         names.sort_unstable();
         names.dedup();
         format!(
-            "ipe-capfloor 1 net={} fs={fs} sub={} env={} intent={}",
+            "ipe-capfloor 1 net={} fs={fs} sub={} env={} listen={} intent={}",
             self.network,
             self.subprocess,
             names.join(","),
+            self.listen
+                .map_or_else(|| "none".to_owned(), ListenGrant::floor_value),
             intent.token()
         )
     }
@@ -586,6 +793,7 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
     let mut filesystem: Option<FilesystemScope> = None;
     let mut subprocess: Option<bool> = None;
     let mut env_allowlist: Vec<String> = Vec::new();
+    let mut listen: Option<Option<ListenGrant>> = None;
 
     for line in lines {
         if line.trim().is_empty() {
@@ -605,6 +813,13 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
             }
             "subprocess" => subprocess = Some(parse_bool(value)?),
             "env" => env_allowlist.push(value.to_owned()),
+            "listen" => {
+                let grant = parse_profile_listen(value)
+                    .ok_or_else(|| malformed(&format!("malformed listen {value:?}")))?;
+                if listen.replace(grant).is_some() {
+                    return Err(malformed("repeated `listen`"));
+                }
+            }
             other => return Err(malformed(&format!("unknown key {other:?}"))),
         }
     }
@@ -615,7 +830,18 @@ pub fn parse_profile(text: &str) -> Result<SandboxProfile, ParseError> {
         subprocess: subprocess.ok_or_else(|| malformed("missing `subprocess`"))?,
         env_allowlist,
         limits: RunResourceLimits::default(),
+        listen: listen.ok_or_else(|| malformed("missing `listen`"))?,
     })
+}
+
+/// Parse an `ipe.profile` `listen` value: `none`, `web <port>`,
+/// `server <port>` or `server dynamic`.
+fn parse_profile_listen(value: &str) -> Option<Option<ListenGrant>> {
+    if value == "none" {
+        return Some(None);
+    }
+    let (key, port) = value.split_once(' ')?;
+    ListenGrant::parse_tokens(key, port).map(Some)
 }
 
 /// Strictly parse a capfloor line into the *comparison floor*.
@@ -647,6 +873,7 @@ pub fn parse_capfloor(line: &str) -> Result<CapFloor, ParseError> {
     let mut subprocess = false;
     let mut env_allowlist: Vec<String> = Vec::new();
     let mut intent: Option<FloorIntent> = None;
+    let mut listen: Option<Option<ListenGrant>> = None;
     for field in parts {
         let (k, v) = field
             .split_once('=')
@@ -663,6 +890,18 @@ pub fn parse_capfloor(line: &str) -> Result<CapFloor, ParseError> {
             "sub" => subprocess = v == "true",
             "env" => {
                 env_allowlist = parse_capfloor_env_names(v)?;
+            }
+            "listen" => {
+                let grant = match v {
+                    "none" => None,
+                    value => Some(
+                        ListenGrant::parse_floor_value(value)
+                            .ok_or_else(|| malformed(format!("malformed listen {value:?}")))?,
+                    ),
+                };
+                if listen.replace(grant).is_some() {
+                    return Err(malformed("repeated listen field".to_owned()));
+                }
             }
             "intent" => {
                 let parsed = match v {
@@ -684,6 +923,7 @@ pub fn parse_capfloor(line: &str) -> Result<CapFloor, ParseError> {
             subprocess,
             env_allowlist,
             limits: RunResourceLimits::default(),
+            listen: listen.flatten(),
         },
         intent: intent.unwrap_or(FloorIntent::Development),
     })
@@ -912,6 +1152,9 @@ pub fn scan_capfloor(bytes: &[u8]) -> Option<CapFloor> {
         }
         let occurrence: BTreeSet<&str> = f.env_allowlist.iter().map(String::as_str).collect();
         env_names.retain(|n| occurrence.contains(n));
+        if merged.listen != f.listen {
+            merged.listen = None;
+        }
     }
     merged.env_allowlist = env_names.into_iter().map(str::to_owned).collect();
     Some(CapFloor {
@@ -1056,5 +1299,197 @@ mod limit_mapping_tests {
             ..RunResourceLimits::default()
         };
         assert_eq!(fits.job_memory_limit_bytes(), 1024);
+    }
+}
+
+#[cfg(test)]
+mod listen_tests {
+    use super::{
+        FloorIntent, GrantPort, ListenGrant, ListenKey, ProfileError, SandboxProfile,
+        parse_capfloor, parse_profile, scan_capfloor,
+    };
+    use ipe_kernels::{ServedListener, ServedPort, SourcePortLiteral};
+
+    fn served(port: ServedPort) -> ServedListener {
+        ServedListener::NotServed.with(port)
+    }
+
+    fn grant(port: ServedPort) -> Option<ListenGrant> {
+        ListenGrant::from_served(&served(port)).ok().flatten()
+    }
+
+    fn literal(port: i64) -> ServedPort {
+        ServedPort::ServerLiteral(SourcePortLiteral::new(port))
+    }
+
+    fn with_listen(listen: Option<ListenGrant>) -> SandboxProfile {
+        SandboxProfile {
+            listen,
+            ..SandboxProfile::maximally_isolated()
+        }
+    }
+
+    const BASE: &str = "ipe-profile 1\nnetwork false\nfilesystem isolated\nsubprocess false\n";
+
+    #[test]
+    fn listen_line_round_trips_and_refuses_duplicates_missing_and_garbage() {
+        for listen in [
+            None,
+            grant(ServedPort::WebDefault),
+            grant(literal(8000)),
+            grant(ServedPort::ServerDynamic),
+        ] {
+            let profile = with_listen(listen);
+            assert_eq!(parse_profile(&profile.to_profile_string()), Ok(profile));
+        }
+        assert!(parse_profile(BASE).is_err(), "a missing `listen` refuses");
+        for line in [
+            "listen none\nlisten none\n",
+            "listen web 8000\nlisten server 8000\n",
+            "listen web dynamic\n",
+            "listen server 0\n",
+            "listen server 65536\n",
+            "listen server +80\n",
+            "listen server\n",
+            "listen tcp 80\n",
+            "listen server 80 81\n",
+        ] {
+            assert!(
+                parse_profile(&format!("{BASE}{line}")).is_err(),
+                "{line:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn capfloor_listen_none_refuses_a_served_profile() {
+        let line = with_listen(None).to_capfloor_line(FloorIntent::Release);
+        assert!(line.contains(" listen=none "), "{line}");
+        let parsed = parse_capfloor(&line);
+        assert!(parsed.is_ok(), "the written floor must parse: {line}");
+        let Ok(floor) = parsed else { return };
+        assert!(!with_listen(grant(literal(8000))).satisfies_capfloor(&floor.axes));
+        assert!(with_listen(None).satisfies_capfloor(&floor.axes));
+        let served_floor = with_listen(grant(literal(8000)));
+        assert!(with_listen(grant(literal(8000))).satisfies_capfloor(&served_floor));
+        assert!(!with_listen(grant(literal(8001))).satisfies_capfloor(&served_floor));
+        assert!(!with_listen(grant(ServedPort::ServerDynamic)).satisfies_capfloor(&served_floor));
+        assert!(!with_listen(grant(ServedPort::WebDefault)).satisfies_capfloor(&served_floor));
+    }
+
+    #[test]
+    fn capfloor_without_listen_field_parses_as_none() {
+        let parsed = parse_capfloor("ipe-capfloor 1 net=false fs=isolated sub=false env=");
+        assert!(parsed.is_ok(), "a floor without `listen=` must parse");
+        let Ok(floor) = parsed else { return };
+        assert_eq!(floor.axes.listen, None);
+        for bad in [
+            "listen=web:0",
+            "listen=web:dynamic",
+            "listen=server",
+            "listen=tcp:80",
+            "listen=none listen=none",
+        ] {
+            assert!(
+                parse_capfloor(&format!("ipe-capfloor 1 net=false {bad}")).is_err(),
+                "{bad:?} must refuse"
+            );
+        }
+    }
+
+    #[test]
+    fn capfloor_scan_intersects_different_grants_to_none() {
+        let line = |listen| with_listen(listen).to_capfloor_line(FloorIntent::Release);
+        let same = format!(
+            "{}\n{}\n",
+            line(grant(literal(8000))),
+            line(grant(literal(8000)))
+        );
+        assert_eq!(
+            scan_capfloor(same.as_bytes()).map(|f| f.axes.listen),
+            Some(grant(literal(8000)))
+        );
+        let differ = format!(
+            "{}\n{}\n",
+            line(grant(literal(8000))),
+            line(grant(ServedPort::WebDefault))
+        );
+        assert_eq!(
+            scan_capfloor(differ.as_bytes()).map(|f| f.axes.listen),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn listen_port_bounds_are_the_runtimes() {
+        for (port, accepted) in [(0, false), (1, true), (65_535, true), (65_536, false)] {
+            assert_eq!(grant(literal(port)).is_some(), accepted, "{port}");
+            assert_eq!(
+                parse_profile(&format!("{BASE}listen server {port}\n")).is_ok(),
+                accepted,
+                "{port}"
+            );
+            assert_eq!(
+                parse_capfloor(&format!("ipe-capfloor 1 listen=server:{port}")).is_ok(),
+                accepted,
+                "{port}"
+            );
+        }
+    }
+
+    #[test]
+    fn served_fact_never_sets_network() {
+        for port in [
+            ServedPort::WebDefault,
+            literal(8000),
+            ServedPort::ServerDynamic,
+        ] {
+            let profile = with_listen(grant(port));
+            assert!(profile.listen.is_some());
+            assert!(!profile.network);
+            assert!(
+                profile
+                    .to_capfloor_line(FloorIntent::Release)
+                    .contains("net=false")
+            );
+        }
+    }
+
+    #[test]
+    fn an_out_of_range_served_port_refuses_and_an_in_range_one_clears() {
+        assert_eq!(
+            ListenGrant::from_served(&served(literal(70_000))),
+            Err(ProfileError::ServedPortOutOfRange { port: 70_000 })
+        );
+        assert_eq!(
+            ListenGrant::from_served(&served(literal(0))),
+            Err(ProfileError::ServedPortOutOfRange { port: 0 })
+        );
+        let cleared = grant(literal(8000));
+        assert!(cleared.is_some(), "port 8000 must clear");
+        let Some(cleared) = cleared else { return };
+        assert_eq!(cleared.key(), ListenKey::Server);
+        assert!(matches!(cleared.port(), GrantPort::Source(p) if p.get() == 8000));
+        assert!(matches!(
+            grant(ServedPort::ServerDynamic).map(ListenGrant::port),
+            Some(GrantPort::Operator)
+        ));
+        assert!(matches!(
+            grant(ServedPort::WebDefault).map(ListenGrant::port),
+            Some(GrantPort::Source(p)) if p.get() == 8000
+        ));
+        assert_eq!(
+            ListenGrant::from_served(&ServedListener::NotServed),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn several_listeners_refuse() {
+        let both = served(ServedPort::WebDefault).with(literal(8000));
+        assert_eq!(
+            ListenGrant::from_served(&both),
+            Err(ProfileError::SeveralListeners)
+        );
     }
 }
