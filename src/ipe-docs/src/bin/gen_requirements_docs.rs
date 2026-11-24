@@ -151,20 +151,38 @@ fn installer_family_label(family: &str) -> Option<&'static str> {
 /// Strictly parse every `PREREQ_FAMILIES` family's `c-toolchain` row out of
 /// `install.sh`.
 ///
-/// Fails — never defaults — when the family list is missing, a family is
-/// unknown, or a family has no row or more than one. A row whose text begins
-/// with `sudo` or `xcode-select` is a command; any other row is a note.
+/// Fails — never defaults — when the family list is missing or assigned more
+/// than once, a family is unknown or listed twice, or a family has no row or
+/// more than one. A row whose text begins with `sudo` or `xcode-select` is a
+/// command; any other row is a note.
 fn parse_host_c_toolchain(src: &str) -> Result<Vec<HostCToolchainRow>, String> {
-    const FAMILIES: &str = "PREREQ_FAMILIES='";
-    let families = src
+    const FAMILIES: &str = "PREREQ_FAMILIES=";
+    let mut assigned = src
         .lines()
-        .find_map(|line| line.strip_prefix(FAMILIES))
-        .and_then(|rest| rest.strip_suffix('\''))
-        .ok_or_else(|| format!("cannot find a `{FAMILIES}...'` line in install.sh"))?;
+        .filter_map(|line| line.trim_start().strip_prefix(FAMILIES));
+    let families = match (assigned.next(), assigned.next()) {
+        (Some(value), None) => value
+            .strip_prefix('\'')
+            .and_then(|rest| rest.strip_suffix('\''))
+            .ok_or_else(|| format!("install.sh's `{FAMILIES}` is not one quoted value"))?,
+        (None, _) => {
+            return Err(format!(
+                "cannot find a `{FAMILIES}'...'` line in install.sh"
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(format!("install.sh assigns `{FAMILIES}` more than once"));
+        }
+    };
     let mut rows = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
     for family in families.split(' ') {
         let host = installer_family_label(family)
             .ok_or_else(|| format!("install.sh names the unknown family `{family}`"))?;
+        if seen.contains(&family) {
+            return Err(format!("install.sh lists the family `{family}` twice"));
+        }
+        seen.push(family);
         let prefix = format!("c-toolchain:{family}) PREREQ_CMD='");
         let mut found = src
             .lines()
@@ -507,6 +525,9 @@ mod tests {
             ),
             INSTALL_SH.replace("build-essential' ;;", "build-essential`x` ;;"),
             format!("{INSTALL_SH}c-toolchain:debian) PREREQ_CMD='sudo apt install gcc' ;;\n"),
+            format!("{INSTALL_SH}PREREQ_FAMILIES='debian'\n"),
+            format!("{INSTALL_SH}  PREREQ_FAMILIES='debian'\n"),
+            INSTALL_SH.replace("debian freebsd", "debian freebsd debian"),
         ];
         for src in refused {
             assert!(parse_host_c_toolchain(&src).is_err(), "{src}");
@@ -553,6 +574,26 @@ mod tests {
         ));
     }
 
+    /// Whether a workflow body sets `name: value` on a line of its own; a
+    /// comment naming the pair does not set it.
+    fn sets_env(job_body: &str, name: &str, value: &str) -> bool {
+        let pair = format!("{name}: {value}");
+        job_body.lines().any(|line| line.trim() == pair)
+    }
+
+    #[test]
+    fn a_commented_variable_is_not_set() {
+        let set = "      env:\n        CC_x: musl-gcc\n";
+        assert!(sets_env(set, "CC_x", "musl-gcc"));
+        assert!(!sets_env("      # CC_x: musl-gcc\n", "CC_x", "musl-gcc"));
+        assert!(!sets_env(
+            "        CC_x: musl-gcc-old\n",
+            "CC_x",
+            "musl-gcc"
+        ));
+        assert!(!sets_env("        XCC_x: musl-gcc\n", "CC_x", "musl-gcc"));
+    }
+
     /// Each CI job the table cites exists in `static.yml`, installs the
     /// Debian package the row names, and sets the variable the row advises.
     #[test]
@@ -587,7 +628,7 @@ mod tests {
                 );
                 if let Some(value) = row.cc_env_value_after(install.compiler) {
                     assert!(
-                        job_body.contains(&format!("{}: {value}\n", row.cc_env)),
+                        sets_env(&job_body, row.cc_env, value),
                         "`{job}` does not set `{}={value}`",
                         row.cc_env
                     );

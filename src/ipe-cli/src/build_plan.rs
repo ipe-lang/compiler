@@ -327,35 +327,68 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
 /// [`Refusal::TargetNotInstalled`] / [`Refusal::MuslCCompilerMissing`].
 pub fn preflight(plan: &StaticPlan) -> Result<(), Refusal> {
     let installed = rustup_installed_targets();
+    let path = ipe_env::var_os("PATH");
     let cc_present = c_compiler_reachable(
         plan.triple,
         CpuArch::HOST,
-        |name| ipe_env::var_os(name).is_some(),
-        |candidate| host_tool::resolve(HostTool::CCompiler(candidate)).is_ok(),
+        |name| ipe_env::var_os(name),
+        path.iter().flat_map(std::env::split_paths),
+        |dir, candidate| {
+            host_tool::resolve_in_dirs(
+                std::slice::from_ref(dir),
+                HostTool::CCompiler(candidate),
+                ipe_path_core::HOST,
+            )
+            .is_ok()
+        },
     );
     preflight_with(plan, installed.as_deref(), cc_present)
 }
 
 /// Whether cc-rs reaches a C compiler for `triple` on a host of architecture
-/// `host`: a `CC` variable names one, or a compiler cc-rs looks for unaided,
-/// and that targets the triple's architecture, is on `PATH`.
+/// `host`, given the environment `env` and the `PATH` entries `path_dirs`, in
+/// order, where `holds(dir, candidate)` says `dir` holds `candidate` as an
+/// executable file.
 ///
-/// A name on `PATH` that cc-rs does not look for under the triple (`musl-gcc`
-/// for aarch64), or that targets the host's architecture when it is not the
-/// triple's, is not a compiler for the build.
-fn c_compiler_reachable(
+/// cc-rs takes the first of `CC_<triple>` (dashes), `CC_<triple>`
+/// (underscores), `TARGET_CC` and `CC` that is set. A blank value names no
+/// compiler and falls through to the `PATH` search; only the underscored
+/// variable and `TARGET_CC` are admitted, so the dashed spelling and a plain
+/// `CC` (often a glibc `gcc`) refuse. With no variable naming one, a set
+/// `CROSS_COMPILE` replaces the names cc-rs looks for, so it refuses too.
+/// Otherwise the first `PATH` entry holding any name cc-rs looks for unaided
+/// decides, in cc-rs's order within the entry, and the name it lands on must
+/// target the triple's architecture: a later entry's fitting compiler is never
+/// the one cc-rs runs.
+fn c_compiler_reachable<D>(
     triple: StaticTriple,
     host: Option<CpuArch>,
-    env_set: impl Fn(&str) -> bool,
-    on_path: impl Fn(CcCandidate) -> bool,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    path_dirs: impl IntoIterator<Item = D>,
+    holds: impl Fn(&D, CcCandidate) -> bool,
 ) -> bool {
     let row = triple.toolchain();
-    env_set(row.cc_env)
-        || env_set("TARGET_CC")
-        || row
-            .cc_candidates
-            .iter()
-            .any(|candidate| row.found_unaided(*candidate, host) && on_path(*candidate))
+    let dashed = format!("CC_{}", triple.as_str());
+    let named = [dashed.as_str(), row.cc_env, "TARGET_CC", "CC"]
+        .into_iter()
+        .find_map(|name| env(name).map(|value| (name, value)));
+    if let Some((name, value)) = named
+        && !value.to_string_lossy().trim().is_empty()
+    {
+        return name == row.cc_env || name == "TARGET_CC";
+    }
+    if env("CROSS_COMPILE").is_some() {
+        return false;
+    }
+    path_dirs
+        .into_iter()
+        .find_map(|dir| {
+            row.cc_rs_unaided
+                .iter()
+                .copied()
+                .find(|candidate| holds(&dir, *candidate))
+        })
+        .is_some_and(|picked| row.found_unaided(picked, host))
 }
 
 /// [`preflight`]'s pure core.
@@ -625,46 +658,110 @@ mod tests {
         assert!(preflight_with(&plan, None, false).is_err());
     }
 
+    /// No variable set; `PATH` is `dirs`, each the candidates it holds.
+    fn reachable(triple: StaticTriple, host: Option<CpuArch>, dirs: &[&[CcCandidate]]) -> bool {
+        with_env(triple, host, &[], dirs)
+    }
+
+    /// `vars` set; `PATH` is `dirs`, each the candidates it holds.
+    fn with_env(
+        triple: StaticTriple,
+        host: Option<CpuArch>,
+        vars: &[(&str, &str)],
+        dirs: &[&[CcCandidate]],
+    ) -> bool {
+        c_compiler_reachable(
+            triple,
+            host,
+            |name| {
+                vars.iter()
+                    .find(|(set, _)| *set == name)
+                    .map(|(_, value)| (*value).into())
+            },
+            dirs.iter().copied(),
+            |dir: &&[CcCandidate], candidate| dir.contains(&candidate),
+        )
+    }
+
     #[test]
     fn a_compiler_cc_rs_does_not_use_is_not_reachable() {
-        let no_env = |_: &str| false;
-        let only = |listed: CcCandidate| move |candidate: CcCandidate| candidate == listed;
         let (x86, arm) = (Some(CpuArch::X8664), Some(CpuArch::Aarch64));
+        let (x64, a64) = (StaticTriple::X8664LinuxMusl, StaticTriple::Aarch64LinuxMusl);
         // cc-rs never looks for `musl-gcc` under aarch64, on any host.
         for host in [x86, arm] {
-            assert!(!c_compiler_reachable(
-                StaticTriple::Aarch64LinuxMusl,
-                host,
-                no_env,
-                only(CcCandidate::MuslGcc)
-            ));
+            assert!(!reachable(a64, host, &[&[CcCandidate::MuslGcc]]));
         }
         // An aarch64 host's `musl-gcc` targets aarch64, not x86_64.
-        assert!(!c_compiler_reachable(
-            StaticTriple::X8664LinuxMusl,
-            arm,
-            no_env,
-            only(CcCandidate::MuslGcc)
-        ));
-        assert!(c_compiler_reachable(
-            StaticTriple::X8664LinuxMusl,
-            x86,
-            no_env,
-            only(CcCandidate::MuslGcc)
-        ));
-        assert!(c_compiler_reachable(
-            StaticTriple::Aarch64LinuxMusl,
-            x86,
-            no_env,
-            only(CcCandidate::Aarch64LinuxMuslGcc)
-        ));
+        assert!(!reachable(x64, arm, &[&[CcCandidate::MuslGcc]]));
+        assert!(!reachable(x64, None, &[&[CcCandidate::MuslGcc]]));
+        assert!(reachable(x64, x86, &[&[CcCandidate::MuslGcc]]));
+        assert!(reachable(a64, x86, &[&[CcCandidate::Aarch64LinuxMuslGcc]]));
         // The documented remedy for aarch64: set the triple's variable.
-        assert!(c_compiler_reachable(
-            StaticTriple::Aarch64LinuxMusl,
+        assert!(with_env(
+            a64,
             arm,
-            |name| name == "CC_aarch64_unknown_linux_musl",
-            |_| false
+            &[("CC_aarch64_unknown_linux_musl", "musl-gcc")],
+            &[]
         ));
+        assert!(with_env(
+            x64,
+            arm,
+            &[("TARGET_CC", "x86_64-linux-musl-gcc")],
+            &[]
+        ));
+    }
+
+    /// cc-rs takes the first `PATH` entry holding any name it looks for, so a
+    /// fitting compiler in a later entry never runs.
+    #[test]
+    fn the_first_path_entry_cc_rs_searches_decides() {
+        let arm = Some(CpuArch::Aarch64);
+        let x64 = StaticTriple::X8664LinuxMusl;
+        let native: &[CcCandidate] = &[CcCandidate::MuslGcc];
+        let cross: &[CcCandidate] = &[CcCandidate::X8664LinuxMuslGcc];
+        assert!(!reachable(x64, arm, &[native, cross]));
+        assert!(reachable(x64, arm, &[cross, native]));
+        assert!(reachable(x64, arm, &[&[], cross]));
+        // Within one entry cc-rs tries `x86_64-linux-musl-gcc` first.
+        assert!(reachable(
+            x64,
+            arm,
+            &[&[CcCandidate::MuslGcc, CcCandidate::X8664LinuxMuslGcc]]
+        ));
+    }
+
+    /// The variable cc-rs reads first decides; a blank one names no compiler.
+    #[test]
+    fn the_variable_cc_rs_reads_first_decides() {
+        let x86 = Some(CpuArch::X8664);
+        let x64 = StaticTriple::X8664LinuxMusl;
+        let musl: &[&[CcCandidate]] = &[&[CcCandidate::MuslGcc]];
+        let under = "CC_x86_64_unknown_linux_musl";
+        assert!(!with_env(x64, x86, &[(under, "  ")], &[]));
+        assert!(with_env(x64, x86, &[(under, " ")], musl));
+        assert!(!with_env(x64, x86, &[("TARGET_CC", "")], &[]));
+        assert!(!with_env(
+            x64,
+            x86,
+            &[("CC_x86_64-unknown-linux-musl", ""), (under, "musl-gcc")],
+            &[]
+        ));
+        // A plain `CC` or the dashed spelling preempts the `PATH` search.
+        assert!(!with_env(x64, x86, &[("CC", "gcc")], musl));
+        assert!(!with_env(
+            x64,
+            x86,
+            &[("CC_x86_64-unknown-linux-musl", "musl-gcc")],
+            musl
+        ));
+        assert!(with_env(
+            x64,
+            x86,
+            &[(under, "musl-gcc"), ("CC", "gcc")],
+            &[]
+        ));
+        // `CROSS_COMPILE` replaces the names cc-rs searches for.
+        assert!(!with_env(x64, x86, &[("CROSS_COMPILE", "")], musl));
     }
 
     #[test]
