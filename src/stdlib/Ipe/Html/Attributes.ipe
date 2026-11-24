@@ -6,6 +6,10 @@
 -- `Kernel.kernel` aliases (`html_named_attr_` / `html_bool_named_attr_` /
 -- `html_no_attr_`). The attribute VALUE is escaped at the native render sink
 -- (`escape_attr`), so no escaping happens here; the fixed keys are literals.
+--
+-- Form attributes: `method` takes a `Method` (`Get` or `Post`), the only two
+-- methods an HTML form submits with, and `action` takes the same `LinkTarget`
+-- an `href` takes, so a form posts only to a target `linkTarget` accepted.
 
 
 module Ipe.Html.Attributes exposing
@@ -15,6 +19,7 @@ module Ipe.Html.Attributes exposing
     , LinkTarget, linkTarget
     , MediaTarget, imageSrc
     , type_, for_, style, title, autocomplete
+    , Method(..), method, action
     , checked, disabled, readonly, required, multiple, selected, autofocus
     , tabindex, rows
     , Role(..), role
@@ -229,6 +234,51 @@ title =
 autocomplete : String -> Attribute msg
 autocomplete =
     attribute "autocomplete"
+
+
+-- ── Form attributes ──────────────────────────────────────────────────────────
+-- | The HTTP method an HTML form submits with. A browser sends a form only as
+-- `GET` or `POST`, so any other method has no `Method` value to build.
+type Method
+    = Get
+    | Post
+
+
+-- | `method m` — the form's `method` attribute, rendered as `method="get"` or
+-- `method="post"`.
+--
+-- ```ipe
+-- [ method Post ]
+-- ```
+method : Method -> Attribute msg
+method m =
+    attribute "method" (methodText m)
+
+
+-- | `methodText m` — the lowercase wire spelling of a `Method`. The `case` is
+-- exhaustive over both arms — no wildcard.
+methodText : Method -> String
+methodText m =
+    case m of
+        Get ->
+            "get"
+
+        Post ->
+            "post"
+
+
+-- | `action target` — the form's `action` attribute over a safe `LinkTarget`
+-- (build one with `linkTarget`), the URL a submit navigates to. A bare `String`
+-- is a type error, so a `javascript:` or `data:` action cannot be written.
+--
+-- ```ipe
+-- import Ipe.Html as Html
+--
+-- Result.map (\target -> Html.form [ method Post, action target ] []) (linkTarget "/signup")
+-- ```
+action : LinkTarget -> Attribute msg
+action target =
+    attribute "action" (renderTarget target)
 
 
 -- ── Bool fixed-key attributes ────────────────────────────────────────────────
