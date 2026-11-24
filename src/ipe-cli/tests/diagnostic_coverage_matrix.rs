@@ -75,6 +75,13 @@ const ALLOWLIST: &[(&str, &str, &str)] = &[
         "IPE-I0203",
         "ICE: golden anchor missing requires compiler-internal corruption",
     ),
+    // ── IPE-E#### (environment) ─────────────────────────────────────────────
+    (
+        "refusal-tested",
+        "IPE-E0013",
+        "no producer yet: the host-toolchain resolver that raises it lands with its \
+         release-build refusal tests in the C-toolchain resolver slice (bead 88vk)",
+    ),
     // ── IPE-L#### (lowering / not-yet-supported) ────────────────────────────
     (
         "refusal-tested",

@@ -73,6 +73,7 @@ _EMIT = (
     "src/compiler/lower/**",
     "src/compiler/ir/**",
     "src/compiler/kernels/**",
+    "src/compiler/target_toolchains/**",
     "src/stdlib/**",
 ) + _RUNTIME
 SCOPES: dict[str, tuple[str, ...]] = {

@@ -26,7 +26,7 @@ use std::fmt;
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4410, SandboxError};
 
 pub use covers::{JailMounts, bind_exposing, path_covers};
-pub use host_tool::{HostTool, ToolPath, ToolRefusal};
+pub use host_tool::{HostTool, ToolPath, ToolRefusal, UserProgramRefusal};
 pub use mounts::{CanonicalPath, HomeMasks, JailPathError, MaskedDir};
 pub use vcs_config::{
     ConfigFault, ConfigLimits, ConfigRefusal, ConfigRoots, ConfigSetting, Grants, Home, MAX_LINKS,
@@ -1677,7 +1677,8 @@ mod tests {
     const COMMAND_BUILD_SITES: [(&str, usize); 3] = [
         // `JailArgv::command`, consumed only by `JailLaunch::new`.
         ("run_jail/mod.rs", 1),
-        // `ToolPath::command`, the closed host-tool set.
+        // `ToolPath::command`: the closed host-tool set, or a user-named program
+        // admitted from an absolute path only.
         ("host_tool.rs", 1),
         // The FreeBSD `mount`/`umount`/`rctl` calls, each through `run_host_tool`.
         ("build_jail.rs", 6),

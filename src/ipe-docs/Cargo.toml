@@ -28,6 +28,7 @@ path = "src/bin/gen_site.rs"
 ipe_annotate    = { path = "../compiler/annotate" }
 ipe_diagnostics = { path = "../compiler/diagnostics" }
 ipe_intern      = { path = "../compiler/intern" }
+ipe_target_toolchains = { path = "../compiler/target_toolchains" }
 ipe_kernels   = { path = "../compiler/kernels" }
 ipe_syntax    = { path = "../compiler/syntax" }
 ipe_parse     = { path = "../compiler/parse" }

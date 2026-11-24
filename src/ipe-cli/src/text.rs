@@ -812,7 +812,7 @@ messages! {
     /// The rustup target is not installed.
     target_not_installed(triple) = "target-not-installed";
     /// No musl-capable C compiler for the triple.
-    musl_c_compiler_missing(triple, triple_env) = "musl-c-compiler-missing";
+    musl_c_compiler_missing(triple, cc_env) = "musl-c-compiler-missing";
     /// `mimalloc` with `--cfree`.
     mimalloc_requires_c(allocator) = "mimalloc-requires-c";
     /// The libc allocator with `--cfree`.

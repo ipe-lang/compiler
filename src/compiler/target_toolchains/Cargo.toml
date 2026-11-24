@@ -1,0 +1,9 @@
+[package]
+name = "ipe_target_toolchains"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+description = "The static release targets and the host toolchain each one needs: the one table the build, `ipe health`, the docs and CI read"
+
+[lints]
+workspace = true
