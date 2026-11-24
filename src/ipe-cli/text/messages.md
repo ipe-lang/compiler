@@ -687,10 +687,12 @@ declared capabilities do not match the program's inferred set
 ## cli-capability-mismatch-missing
 
   used but not declared: {list}
+    add {list} to `capabilities.declares` in package.ipe
 
 ## cli-capability-mismatch-extra
 
   declared but not used: {list}
+    remove {list} from `capabilities.declares` in package.ipe
 
 ## cli-hash-mismatch
 

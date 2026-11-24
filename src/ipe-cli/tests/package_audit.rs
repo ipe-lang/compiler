@@ -318,6 +318,123 @@ fn an_overdeclared_capability_rejects() {
     );
 }
 
+/// A program that only serves inbound on its own listener — no egress kernel.
+const SERVED_MAIN: &str = "module Main exposing (main)\n\
+                           \n\
+                           import Ipe.Server.Http as Server\n\
+                           import Ipe.Task\n\
+                           \n\
+                           \n\
+                           handle : Server.Request -> Task Error Server.Response\n\
+                           handle _req =\n\
+                           \x20   Task.succeed (Server.text \"Hello, world!\")\n\
+                           \n\
+                           \n\
+                           main =\n\
+                           \x20   Server.listen 8000\n\
+                           \x20       [ Server.get \"/\" handle\n\
+                           \x20       ]\n";
+
+/// A `package.ipe` named `name` whose `capabilities.declares` list is `declares`.
+fn manifest_declaring(name: &str, declares: &str) -> String {
+    format!(
+        "module Package exposing (package)\n\n\npackage =\n\
+         \x20   {{ name = \"{name}\"\n\
+         \x20   , version = \"0.1.0\"\n\
+         \x20   , capabilities = {{ declares = [ {declares} ] }}\n\
+         \x20   }}\n"
+    )
+}
+
+/// A served package still declaring `Network` is refused, naming the remove line;
+/// applying that remedy clears the audit.
+#[test]
+fn a_served_package_declaring_network_is_refused_and_removing_it_clears() {
+    let pkg = temp_pkg("served-stale-net");
+    write_package(
+        &pkg,
+        &manifest_declaring("served-pkg", "Network"),
+        SERVED_MAIN,
+    );
+    let index = empty_index("served-stale-net");
+
+    let (ok, _stdout, stderr) = run_audit(&pkg, &index);
+    assert!(
+        !ok,
+        "a stale `network` claim on a served package must reject"
+    );
+    assert!(
+        stderr.contains("declared but NOT used") && stderr.contains("network"),
+        "the diagnostic names the unused `network` claim; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("remove `Network` from `capabilities.declares` in package.ipe"),
+        "the diagnostic names the remedy; got:\n{stderr}"
+    );
+
+    // Apply the remedy: drop `Network` from `declares`.
+    std::fs::write(
+        pkg.join("package.ipe"),
+        manifest_declaring("served-pkg", ""),
+    )
+    .expect("rewrite package.ipe");
+    let (ok, stdout, stderr) = run_audit(&pkg, &index);
+    assert!(
+        ok,
+        "the remedy clears the audit; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// A served package declaring nothing passes: serving needs no `network`.
+#[test]
+fn a_served_package_declaring_nothing_passes() {
+    let pkg = temp_pkg("served-no-net");
+    write_package(
+        &pkg,
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"served-pkg\", version = \"0.1.0\" }\n",
+        SERVED_MAIN,
+    );
+    let index = empty_index("served-no-net");
+
+    let (ok, stdout, stderr) = run_audit(&pkg, &index);
+    assert!(
+        ok,
+        "a served package needs no capability; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// A client package that makes an outbound request still needs `network`; the
+/// named remedy clears the refusal.
+#[test]
+fn a_client_package_still_needs_network() {
+    let pkg = temp_pkg("client-net");
+    write_package(
+        &pkg,
+        "module Package exposing (package)\n\n\npackage =\n    { name = \"client-pkg\", version = \"0.1.0\" }\n",
+        NETWORK_MAIN,
+    );
+    let index = empty_index("client-net");
+
+    let (ok, _stdout, stderr) = run_audit(&pkg, &index);
+    assert!(!ok, "an outbound request with nothing declared must reject");
+    assert!(
+        stderr.contains("add `Network` to `capabilities.declares` in package.ipe"),
+        "the diagnostic names the remedy; got:\n{stderr}"
+    );
+
+    // Apply the remedy: add `Network` to `declares`.
+    std::fs::write(
+        pkg.join("package.ipe"),
+        manifest_declaring("client-pkg", "Network"),
+    )
+    .expect("rewrite package.ipe");
+    let (ok, stdout, stderr) = run_audit(&pkg, &index);
+    assert!(
+        ok,
+        "the remedy clears the audit; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn an_unimported_sibling_capability_rejects() {
     // The whole-package hole: `Main` is pure and never imports `Extra`, but the

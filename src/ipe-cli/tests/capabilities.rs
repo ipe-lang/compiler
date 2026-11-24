@@ -2270,3 +2270,88 @@ fn a_frame_list_without_a_web_leaf_is_refused_at_build() -> TestResult {
     }
     Ok(())
 }
+
+/// A program that only serves inbound on its own listener — no egress kernel.
+const SERVED_ONLY: &str = r#"module Main exposing (main)
+
+import Ipe.Server.Http as Server
+import Ipe.Task
+
+
+handle : Server.Request -> Task Error Server.Response
+handle _req =
+    Task.succeed (Server.text "Hello, world!")
+
+
+main =
+    Server.listen 8000
+        [ Server.get "/" handle
+        ]
+"#;
+
+/// A served program declaring a stale `network` is refused with the remove
+/// line; dropping `network` from the declared set clears the verification.
+#[test]
+fn verify_refuses_stale_network_on_a_served_program_and_the_remedy_clears_it() -> TestResult {
+    let dir = write_single("served-stale-net", SERVED_ONLY)?;
+    let stale = verify(&dir, &BTreeSet::from([Capability::Network]));
+    let remedied = verify(&dir, &BTreeSet::new());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(
+        stale.is_err(),
+        "a stale `network` claim must be refused: {stale:?}"
+    );
+    let Err(err) = stale else {
+        return Ok(());
+    };
+    assert!(
+        matches!(
+            &err,
+            ipe::CliError::CapabilityMismatch { missing, extra }
+                if missing.is_empty() && extra.as_slice() == ["network"]
+        ),
+        "only `network` is over-declared: {err:?}"
+    );
+    let shown = err.to_string();
+    assert!(
+        shown.contains("remove `Network` from `capabilities.declares` in package.ipe"),
+        "the refusal names its remedy: {shown}"
+    );
+    assert!(
+        remedied.is_ok(),
+        "the remedy clears the verification: {remedied:?}"
+    );
+    Ok(())
+}
+
+/// Every capability's remedy spelling parses back as that capability.
+///
+/// A remedy applied literally to `package.ipe` must declare exactly what it
+/// names, for every axis including each browser port.
+#[test]
+fn every_capability_manifest_spelling_parses_back_to_itself() -> TestResult {
+    let dir = crate::support::scratch_root().join(format!(
+        "ipe-cap-spelling-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    e2e_support::scratch::fresh(&dir);
+    create_project_dir(&dir)?;
+    let manifest_path = dir.join("package.ipe");
+    for cap in Capability::ALL {
+        let text = format!(
+            "module Package exposing (package)\n\n\npackage =\n    {{ name = \"cappkg\", version = \"0.1.0\", capabilities = {{ declares = [ {} ] }} }}\n",
+            cap.manifest_spelling()
+        );
+        let parsed = ipe::package_manifest::parse_package_manifest_source(&text, &manifest_path)
+            .map(|(manifest, _)| manifest.capabilities);
+        assert!(
+            matches!(&parsed, Ok(set) if *set == BTreeSet::from([*cap])),
+            "{cap:?} spelled `{}` parses to {parsed:?}",
+            cap.manifest_spelling()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(())
+}

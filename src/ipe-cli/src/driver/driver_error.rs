@@ -1158,14 +1158,14 @@ impl std::fmt::Display for CliError {
                     write!(
                         f,
                         "\n{}",
-                        text::cli_capability_mismatch_missing(&missing.join(", "))
+                        text::cli_capability_mismatch_missing(&manifest_spellings(missing))
                     )?;
                 }
                 if !extra.is_empty() {
                     write!(
                         f,
                         "\n{}",
-                        text::cli_capability_mismatch_extra(&extra.join(", "))
+                        text::cli_capability_mismatch_extra(&manifest_spellings(extra))
                     )?;
                 }
                 Ok(())
@@ -1509,6 +1509,24 @@ pub fn fmt_io_error(
         // renders as a short human phrase (e.g. "permission denied").
         f.write_str(&text::cli_io_other(&path, &source.kind()))
     }
+}
+
+/// The `package.ipe` spellings of capability wire names, each backticked.
+///
+/// The token a capability-mismatch remedy tells the author to add or remove; a
+/// name outside the vocabulary is shown as given.
+fn manifest_spellings(wires: &[&str]) -> String {
+    wires
+        .iter()
+        .map(|wire| {
+            let spelled = wire.parse::<ipe_ir::Capability>().map_or_else(
+                |_| (*wire).to_owned(),
+                ipe_ir::Capability::manifest_spelling,
+            );
+            format!("`{spelled}`")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Render the runtime-install error family (`RuntimeDirInvalid`,
@@ -2080,6 +2098,33 @@ mod tests {
             "capability-mismatch"
         );
         assert_eq!(CliError::HealthCritical.machine_kind(), "health-critical");
+    }
+
+    /// A capability mismatch names the manifest token to add for each missing
+    /// capability and the one to remove for each extra.
+    #[test]
+    fn capability_mismatch_names_both_remedies() {
+        let shown = CliError::CapabilityMismatch {
+            missing: vec!["clock", "js-port:clipboard"],
+            extra: vec!["network"],
+        }
+        .to_string();
+        assert!(
+            shown.contains(
+                "add `Clock`, `JsPort Clipboard` to `capabilities.declares` in package.ipe"
+            ),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("remove `Network` from `capabilities.declares` in package.ipe"),
+            "{shown}"
+        );
+        let only_extra = CliError::CapabilityMismatch {
+            missing: vec![],
+            extra: vec!["network"],
+        }
+        .to_string();
+        assert!(!only_extra.contains("add "), "{only_extra}");
     }
 
     /// A scratch failure renders only the error kind: neither the temp root

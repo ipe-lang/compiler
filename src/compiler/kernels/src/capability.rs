@@ -934,6 +934,29 @@ impl Capability {
             },
         }
     }
+
+    /// The spelling a `package.ipe` author writes in `capabilities.declares`.
+    ///
+    /// The `Ipe.Package` constructor (`Network`, `NativeFfi`, `JsPort Clipboard`),
+    /// so a refusal's remedy names exactly the token to add or remove.
+    #[must_use]
+    pub fn manifest_spelling(self) -> String {
+        let bare = match self {
+            Self::Network => "Network",
+            Self::Filesystem => "Filesystem",
+            Self::Database => "Database",
+            Self::Env => "Env",
+            Self::Subprocess => "Subprocess",
+            Self::Clock => "Clock",
+            Self::Random => "Random",
+            Self::NativeFfi => "NativeFfi",
+            Self::FfiRaw => "FfiRaw",
+            Self::Unsafe => "Unsafe",
+            Self::CustomElement => "CustomElement",
+            Self::JsPort(axis) => return format!("JsPort {}", axis.ctor_name()),
+        };
+        bare.to_owned()
+    }
 }
 
 /// Parse a capability from its wire name, the inverse of [`Capability::as_str`].

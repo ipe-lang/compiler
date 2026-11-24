@@ -1365,23 +1365,45 @@ fn capability_consistency(
         "the declared `[capabilities]` set does not match the package's inferred effects \
          — the declared set must be exactly the truth the user consents to.",
     );
-    let missing: Vec<&'static str> = inferred.difference(&declared).map(|c| c.as_str()).collect();
-    let extra: Vec<&'static str> = declared.difference(inferred).map(|c| c.as_str()).collect();
+    let missing: Vec<Capability> = inferred.difference(&declared).copied().collect();
+    let extra: Vec<Capability> = declared.difference(inferred).copied().collect();
     if !missing.is_empty() {
         let _ = write!(
             message,
             "\n  used but NOT declared (a hidden effect): {}",
-            missing.join(", ")
+            wire_names(&missing)
         );
+        for cap in &missing {
+            let _ = write!(
+                message,
+                "\n    add `{}` to `capabilities.declares` in package.ipe",
+                cap.manifest_spelling()
+            );
+        }
     }
     if !extra.is_empty() {
         let _ = write!(
             message,
             "\n  declared but NOT used (an over-broad claim): {}",
-            extra.join(", ")
+            wire_names(&extra)
         );
+        for cap in &extra {
+            let _ = write!(
+                message,
+                "\n    remove `{}` from `capabilities.declares` in package.ipe",
+                cap.manifest_spelling()
+            );
+        }
     }
     Err(reject(Check::Capability, message))
+}
+
+/// The wire names of `caps`, comma-separated in the order given.
+fn wire_names(caps: &[Capability]) -> String {
+    caps.iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Infer the capability set of exactly the assembled `sources` and reconcile it with `manifest`.
