@@ -574,6 +574,46 @@ const GROUP_OTHER_BITS: u32 = 0o077;
 /// # Errors
 /// The [`ScratchRefusal`] naming the first violated condition.
 pub const fn base_verdict(entry: EntryFacts, who: Identity) -> Result<(), ScratchRefusal> {
+    ancestor_verdict(entry, who, GroupWritePosture::OwnGroup)
+}
+
+/// Which owner-and-group pair a trust verdict lets write an entry besides its owner.
+///
+/// The group-write exception is the only rule the two postures split: a
+/// development run keeps the owner's own entry with the effective group, a
+/// release run also requires that group to be a user-private one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupWritePosture {
+    /// The effective user's own entry with the effective group may be group-writable.
+    OwnGroup,
+    /// As [`GroupWritePosture::OwnGroup`], and the effective gid must equal the effective uid.
+    PrivateGroup,
+}
+
+impl GroupWritePosture {
+    /// Whether this posture lets `entry`'s group write it on behalf of `who`.
+    #[must_use]
+    pub const fn grants_group_write(self, entry: EntryFacts, who: Identity) -> bool {
+        let own_group = entry.owner == who.euid && entry.group == who.egid;
+        match self {
+            Self::OwnGroup => own_group,
+            Self::PrivateGroup => own_group && who.egid == who.euid,
+        }
+    }
+}
+
+/// Whether `entry` may be a strict ancestor of a trusted directory under `posture`.
+///
+/// A directory owned by the effective user or root, writable by others only
+/// when sticky, and group-writable only when sticky or granted by `posture`.
+///
+/// # Errors
+/// The [`ScratchRefusal`] naming the first violated condition.
+pub const fn ancestor_verdict(
+    entry: EntryFacts,
+    who: Identity,
+    posture: GroupWritePosture,
+) -> Result<(), ScratchRefusal> {
     if !matches!(entry.kind, EntryKind::Directory) {
         return Err(ScratchRefusal::NotADirectory);
     }
@@ -584,11 +624,264 @@ pub const fn base_verdict(entry: EntryFacts, who: Identity) -> Result<(), Scratc
     if entry.mode & OTHER_WRITE != 0 && !sticky {
         return Err(ScratchRefusal::WritableByOthers);
     }
-    let own_private_group = entry.owner == who.euid && entry.group == who.egid;
-    if entry.mode & GROUP_WRITE != 0 && !sticky && !own_private_group {
+    if entry.mode & GROUP_WRITE != 0 && !sticky && !posture.grants_group_write(entry, who) {
         return Err(ScratchRefusal::WritableByOthers);
     }
     Ok(())
+}
+
+/// Whether `entry` may hold a file only the effective user or root can name.
+///
+/// The ancestor rule without the sticky allowance: in a sticky shared
+/// directory another user can still create an absent name.
+///
+/// # Errors
+/// The [`ScratchRefusal`] naming the first violated condition.
+pub const fn holding_verdict(
+    entry: EntryFacts,
+    who: Identity,
+    posture: GroupWritePosture,
+) -> Result<(), ScratchRefusal> {
+    if !matches!(entry.kind, EntryKind::Directory) {
+        return Err(ScratchRefusal::NotADirectory);
+    }
+    if entry.owner != who.euid && entry.owner != ROOT_UID {
+        return Err(ScratchRefusal::ForeignOwner);
+    }
+    if entry.mode & OTHER_WRITE != 0 {
+        return Err(ScratchRefusal::WritableByOthers);
+    }
+    if entry.mode & GROUP_WRITE != 0 && !posture.grants_group_write(entry, who) {
+        return Err(ScratchRefusal::WritableByOthers);
+    }
+    Ok(())
+}
+
+/// Whether `entry` is an existing file only the effective user or root can rewrite.
+///
+/// A regular file (never a link), owned by the effective user or root, never
+/// writable by others, and group-writable only when `posture` grants it.
+///
+/// # Errors
+/// The [`ScratchRefusal`] naming the first violated condition.
+pub const fn file_verdict(
+    entry: EntryFacts,
+    who: Identity,
+    posture: GroupWritePosture,
+) -> Result<(), ScratchRefusal> {
+    if !matches!(entry.kind, EntryKind::File) {
+        return Err(ScratchRefusal::NotARegularFile);
+    }
+    if entry.owner != who.euid && entry.owner != ROOT_UID {
+        return Err(ScratchRefusal::ForeignOwner);
+    }
+    if entry.mode & OTHER_WRITE != 0 {
+        return Err(ScratchRefusal::WritableByOthers);
+    }
+    if entry.mode & GROUP_WRITE != 0 && !posture.grants_group_write(entry, who) {
+        return Err(ScratchRefusal::WritableByOthers);
+    }
+    Ok(())
+}
+
+/// The most directories a trusted-chain walk visits before it refuses.
+pub const TRUSTED_CHAIN_MAX_COMPONENTS: usize = 256;
+
+/// The most roots one jail attestation carries.
+pub const JAIL_ATTESTATION_MAX_ROOTS: usize = 4;
+
+/// The device and inode that name one directory across a bind mount.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirId {
+    /// The device number.
+    pub dev: u64,
+    /// The inode number.
+    pub ino: u64,
+}
+
+/// What a trusted-chain walk reads about one directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChainEntry {
+    /// The verdict facts, read without following a final link.
+    pub facts: EntryFacts,
+    /// The directory's identity.
+    pub id: DirId,
+}
+
+/// The directories a launcher proved trusted with real ids before it remapped them.
+///
+/// Inside a user namespace root and every unmapped user read as the overflow
+/// id, so ownership above a bind root cannot be judged there; the launcher
+/// judges the chain on the host and names each root that passed. A value
+/// that does not parse attests nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct JailAttestation(Vec<DirId>);
+
+impl JailAttestation {
+    /// The attestation that names no root: every chain is judged to `/`.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Read `text`, a comma-separated list of `dev:ino` decimal pairs.
+    ///
+    /// Any malformed pair, an empty list, or more than
+    /// [`JAIL_ATTESTATION_MAX_ROOTS`] pairs attests nothing.
+    #[must_use]
+    pub fn parse(text: &str) -> Self {
+        let mut roots = Vec::new();
+        for pair in text.split(',') {
+            if roots.len() == JAIL_ATTESTATION_MAX_ROOTS {
+                return Self::none();
+            }
+            let Some(id) = parse_dir_id(pair) else {
+                return Self::none();
+            };
+            roots.push(id);
+        }
+        Self(roots)
+    }
+
+    /// Whether `id` names an attested root.
+    #[must_use]
+    pub fn covers(&self, id: DirId) -> bool {
+        self.0.contains(&id)
+    }
+}
+
+/// One `dev:ino` pair of plain decimal digits, or `None`.
+fn parse_dir_id(pair: &str) -> Option<DirId> {
+    let (dev, ino) = pair.split_once(':')?;
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if !digits(dev) || !digits(ino) {
+        return None;
+    }
+    Some(DirId {
+        dev: dev.parse().ok()?,
+        ino: ino.parse().ok()?,
+    })
+}
+
+/// Which element of a trusted chain a verdict judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainRole {
+    /// The directory that holds the file.
+    Holding,
+    /// A directory above the holding one.
+    Ancestor,
+}
+
+/// Why a directory chain cannot be trusted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainRefusal {
+    /// The holding directory does not exist.
+    HoldingDirMissing,
+    /// A directory on the chain could not be read.
+    Unreadable {
+        /// The directory that could not be read.
+        dir: PathBuf,
+    },
+    /// The chain is deeper than [`TRUSTED_CHAIN_MAX_COMPONENTS`].
+    TooDeep,
+    /// A directory on the chain failed its verdict.
+    Untrusted {
+        /// Which element failed.
+        role: ChainRole,
+        /// The directory that failed.
+        dir: PathBuf,
+        /// The first violated condition.
+        cause: ScratchRefusal,
+    },
+}
+
+/// Judge `canonical_dir` and every ancestor up to the filesystem root, or to an attested root.
+///
+/// `canonical_dir` holds the file and takes [`holding_verdict`]; every
+/// ancestor takes [`ancestor_verdict`]. The walk stops after a directory
+/// whose identity `attested` covers and which passed its own verdict.
+/// `facts_of` reads one directory without following a final link.
+///
+/// # Errors
+/// The [`ChainRefusal`] of the first directory that fails, or of a walk past
+/// [`TRUSTED_CHAIN_MAX_COMPONENTS`].
+pub fn judge_chain<F>(
+    canonical_dir: &Path,
+    who: Identity,
+    posture: GroupWritePosture,
+    attested: &JailAttestation,
+    mut facts_of: F,
+) -> Result<(), ChainRefusal>
+where
+    F: FnMut(&Path) -> io::Result<ChainEntry>,
+{
+    for (depth, dir) in canonical_dir.ancestors().enumerate() {
+        if depth >= TRUSTED_CHAIN_MAX_COMPONENTS {
+            return Err(ChainRefusal::TooDeep);
+        }
+        let role = if depth == 0 {
+            ChainRole::Holding
+        } else {
+            ChainRole::Ancestor
+        };
+        let entry = match facts_of(dir) {
+            Ok(entry) => entry,
+            Err(e) if depth == 0 && e.kind() == io::ErrorKind::NotFound => {
+                return Err(ChainRefusal::HoldingDirMissing);
+            }
+            Err(_) => {
+                return Err(ChainRefusal::Unreadable {
+                    dir: dir.to_path_buf(),
+                });
+            }
+        };
+        let verdict = match role {
+            ChainRole::Holding => holding_verdict(entry.facts, who, posture),
+            ChainRole::Ancestor => ancestor_verdict(entry.facts, who, posture),
+        };
+        verdict.map_err(|cause| ChainRefusal::Untrusted {
+            role,
+            dir: dir.to_path_buf(),
+            cause,
+        })?;
+        if attested.covers(entry.id) {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// The trusted-chain facts of `path`, read without following a final link.
+///
+/// # Errors
+/// The lookup error.
+#[cfg(unix)]
+pub fn chain_entry(path: &Path) -> io::Result<ChainEntry> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok(ChainEntry {
+        facts: platform::facts(&meta),
+        id: DirId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        },
+    })
+}
+
+/// The verdict facts of `path`, read without following a final link.
+///
+/// # Errors
+/// The lookup error.
+#[cfg(unix)]
+pub fn entry_facts(path: &Path) -> io::Result<EntryFacts> {
+    std::fs::symlink_metadata(path).map(|meta| platform::facts(&meta))
+}
+
+/// The effective uid and gid of this process.
+#[cfg(unix)]
+#[must_use]
+pub fn current_identity() -> Identity {
+    platform::identity()
 }
 
 /// Whether `entry` is a private scratch entry of the expected `kind`.
@@ -1727,6 +2020,385 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The overflow uid and gid a user namespace shows for every unmapped id.
+    const OVERFLOW: u32 = 65_534;
+
+    /// A user whose primary group is shared: gid 100 (`users`) under uid 1000.
+    const SHARED_GROUP_USER: Identity = Identity {
+        euid: 1000,
+        egid: 100,
+    };
+
+    const fn file(owner: u32, group: u32, mode: u32) -> EntryFacts {
+        EntryFacts {
+            kind: EntryKind::File,
+            owner,
+            group,
+            mode,
+        }
+    }
+
+    /// A chain of injected directory facts keyed by path, each with a distinct inode.
+    struct Chain(Vec<(PathBuf, ChainEntry)>);
+
+    impl Chain {
+        fn of(entries: &[(&str, EntryFacts)]) -> Self {
+            Self(
+                entries
+                    .iter()
+                    .zip(1_u64..)
+                    .map(|((path, facts), ino)| {
+                        (
+                            PathBuf::from(path),
+                            ChainEntry {
+                                facts: *facts,
+                                id: DirId { dev: 7, ino },
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        }
+
+        fn id_of(&self, path: &str) -> Option<DirId> {
+            self.0
+                .iter()
+                .find(|(p, _)| p == Path::new(path))
+                .map(|(_, entry)| entry.id)
+        }
+
+        fn judge(
+            &self,
+            dir: &str,
+            who: Identity,
+            posture: GroupWritePosture,
+            attested: &JailAttestation,
+        ) -> Result<(), ChainRefusal> {
+            judge_chain(Path::new(dir), who, posture, attested, |p| {
+                self.0
+                    .iter()
+                    .find(|(known, _)| known == p)
+                    .map(|(_, entry)| *entry)
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
+            })
+        }
+    }
+
+    /// A g+w ancestor whose group is not the effective group is shared with that group.
+    #[test]
+    fn a_group_writable_ancestor_of_another_group_is_refused() {
+        let chain = Chain::of(&[
+            ("/srv/app/data", dir(1000, 1000, 0o700)),
+            ("/srv/app", dir(1000, 4242, 0o775)),
+            ("/srv", dir(0, 0, 0o755)),
+            ("/", dir(0, 0, 0o755)),
+        ]);
+        for posture in [GroupWritePosture::OwnGroup, GroupWritePosture::PrivateGroup] {
+            assert_eq!(
+                chain.judge("/srv/app/data", ME, posture, &JailAttestation::none()),
+                Err(ChainRefusal::Untrusted {
+                    role: ChainRole::Ancestor,
+                    dir: PathBuf::from("/srv/app"),
+                    cause: ScratchRefusal::WritableByOthers,
+                })
+            );
+        }
+    }
+
+    /// A private chain to `/` is trusted under both postures.
+    #[test]
+    fn a_private_chain_is_trusted() {
+        let chain = Chain::of(&[
+            ("/home/me/app", dir(1000, 1000, 0o700)),
+            ("/home/me", dir(1000, 1000, 0o755)),
+            ("/home", dir(0, 0, 0o755)),
+            ("/", dir(0, 0, 0o755)),
+        ]);
+        for posture in [GroupWritePosture::OwnGroup, GroupWritePosture::PrivateGroup] {
+            assert_eq!(
+                chain.judge("/home/me/app", ME, posture, &JailAttestation::none()),
+                Ok(())
+            );
+        }
+    }
+
+    /// A sticky world-writable directory may be an ancestor but never the holding directory.
+    #[test]
+    fn a_sticky_directory_is_trusted_only_as_an_ancestor() {
+        let chain = Chain::of(&[
+            ("/tmp/app", dir(1000, 1000, 0o700)),
+            ("/tmp", dir(0, 0, 0o1777)),
+            ("/", dir(0, 0, 0o755)),
+        ]);
+        let none = JailAttestation::none();
+        assert_eq!(
+            chain.judge("/tmp/app", ME, GroupWritePosture::PrivateGroup, &none),
+            Ok(())
+        );
+        assert_eq!(
+            chain.judge("/tmp", ME, GroupWritePosture::PrivateGroup, &none),
+            Err(ChainRefusal::Untrusted {
+                role: ChainRole::Holding,
+                dir: PathBuf::from("/tmp"),
+                cause: ScratchRefusal::WritableByOthers,
+            })
+        );
+    }
+
+    /// An absent holding directory and an unreadable ancestor are refusals, never a pass.
+    #[test]
+    fn a_missing_holding_dir_or_unreadable_ancestor_is_refused() {
+        let chain = Chain::of(&[("/", dir(0, 0, 0o755))]);
+        let none = JailAttestation::none();
+        assert_eq!(
+            chain.judge("/gone", ME, GroupWritePosture::OwnGroup, &none),
+            Err(ChainRefusal::HoldingDirMissing)
+        );
+        let chain = Chain::of(&[("/a/b", dir(1000, 1000, 0o700)), ("/", dir(0, 0, 0o755))]);
+        assert_eq!(
+            chain.judge("/a/b", ME, GroupWritePosture::OwnGroup, &none),
+            Err(ChainRefusal::Unreadable {
+                dir: PathBuf::from("/a"),
+            })
+        );
+    }
+
+    /// A chain deeper than the component ceiling is refused before it is read past it.
+    #[test]
+    fn a_chain_past_the_component_ceiling_is_refused() {
+        let deep: PathBuf = std::iter::once("/")
+            .chain(std::iter::repeat_n("d", TRUSTED_CHAIN_MAX_COMPONENTS))
+            .collect();
+        let mut reads = 0_usize;
+        let verdict = judge_chain(
+            &deep,
+            ME,
+            GroupWritePosture::OwnGroup,
+            &JailAttestation::none(),
+            |_| {
+                reads += 1;
+                Ok(ChainEntry {
+                    facts: dir(1000, 1000, 0o700),
+                    id: DirId { dev: 1, ino: 1 },
+                })
+            },
+        );
+        assert_eq!(verdict, Err(ChainRefusal::TooDeep));
+        assert_eq!(reads, TRUSTED_CHAIN_MAX_COMPONENTS);
+    }
+
+    /// An attested root that passes its own verdict ends the walk above it.
+    #[test]
+    fn a_jail_attested_root_cuts_the_chain() {
+        let chain = Chain::of(&[
+            ("/work/tree", dir(1000, 1000, 0o755)),
+            ("/work", dir(OVERFLOW, OVERFLOW, 0o755)),
+            ("/", dir(OVERFLOW, OVERFLOW, 0o755)),
+        ]);
+        let Some(root) = chain.id_of("/work/tree") else {
+            assert!(
+                chain.id_of("/work/tree").is_some(),
+                "fixture names its root"
+            );
+            return;
+        };
+        let attested = JailAttestation::parse(&format!("{}:{}", root.dev, root.ino));
+        assert!(attested.covers(root), "{attested:?}");
+        assert_eq!(
+            chain.judge("/work/tree", ME, GroupWritePosture::PrivateGroup, &attested),
+            Ok(())
+        );
+        let below = Chain::of(&[
+            ("/work/tree/db", dir(1000, 1000, 0o777)),
+            ("/work/tree", dir(1000, 1000, 0o755)),
+        ]);
+        assert_eq!(
+            below.judge(
+                "/work/tree/db",
+                ME,
+                GroupWritePosture::PrivateGroup,
+                &attested
+            ),
+            Err(ChainRefusal::Untrusted {
+                role: ChainRole::Holding,
+                dir: PathBuf::from("/work/tree/db"),
+                cause: ScratchRefusal::WritableByOthers,
+            }),
+            "the attestation never relaxes a directory below the root"
+        );
+    }
+
+    /// Without an attestation the overflow owner of a remapped ancestor is foreign.
+    #[test]
+    fn an_unattested_overflow_owned_ancestor_is_refused() {
+        let chain = Chain::of(&[
+            ("/work/tree", dir(1000, 1000, 0o755)),
+            ("/work", dir(OVERFLOW, OVERFLOW, 0o755)),
+            ("/", dir(OVERFLOW, OVERFLOW, 0o755)),
+        ]);
+        assert_eq!(
+            chain.judge(
+                "/work/tree",
+                ME,
+                GroupWritePosture::PrivateGroup,
+                &JailAttestation::none()
+            ),
+            Err(ChainRefusal::Untrusted {
+                role: ChainRole::Ancestor,
+                dir: PathBuf::from("/work"),
+                cause: ScratchRefusal::ForeignOwner,
+            })
+        );
+    }
+
+    /// An attested root that fails its own verdict does not cut the walk.
+    #[test]
+    fn an_attested_root_that_fails_its_verdict_is_refused() {
+        let chain = Chain::of(&[
+            ("/work/tree", dir(1000, 1000, 0o777)),
+            ("/", dir(0, 0, 0o755)),
+        ]);
+        let Some(root) = chain.id_of("/work/tree") else {
+            assert!(
+                chain.id_of("/work/tree").is_some(),
+                "fixture names its root"
+            );
+            return;
+        };
+        let attested = JailAttestation::parse(&format!("{}:{}", root.dev, root.ino));
+        assert!(matches!(
+            chain.judge("/work/tree", ME, GroupWritePosture::OwnGroup, &attested),
+            Err(ChainRefusal::Untrusted {
+                role: ChainRole::Holding,
+                ..
+            })
+        ));
+    }
+
+    /// Every malformed or oversized attestation attests nothing.
+    #[test]
+    fn a_malformed_attestation_attests_nothing() {
+        let id = DirId { dev: 7, ino: 9 };
+        assert!(JailAttestation::parse("7:9").covers(id));
+        assert!(JailAttestation::parse("1:2,7:9").covers(id));
+        for malformed in [
+            "",
+            "7",
+            "7:",
+            ":9",
+            "7:9,",
+            "7:9,x:1",
+            "+7:9",
+            "7:-9",
+            " 7:9",
+            "7:9:1",
+            "99999999999999999999:9",
+            "1:1,2:2,3:3,4:4,7:9",
+        ] {
+            assert_eq!(
+                JailAttestation::parse(malformed),
+                JailAttestation::none(),
+                "{malformed:?}"
+            );
+        }
+        assert!(!JailAttestation::none().covers(id));
+    }
+
+    /// The release posture grants group write only to a user-private group, gid equal to uid.
+    #[test]
+    fn own_private_group_requires_a_gid_equal_to_the_uid() {
+        let own_group_dir = dir(1000, 100, 0o770);
+        assert_eq!(
+            ancestor_verdict(
+                own_group_dir,
+                SHARED_GROUP_USER,
+                GroupWritePosture::OwnGroup
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            ancestor_verdict(
+                own_group_dir,
+                SHARED_GROUP_USER,
+                GroupWritePosture::PrivateGroup
+            ),
+            Err(ScratchRefusal::WritableByOthers)
+        );
+        assert_eq!(
+            holding_verdict(
+                own_group_dir,
+                SHARED_GROUP_USER,
+                GroupWritePosture::PrivateGroup
+            ),
+            Err(ScratchRefusal::WritableByOthers)
+        );
+        let private_group_dir = dir(1000, 1000, 0o770);
+        for posture in [GroupWritePosture::OwnGroup, GroupWritePosture::PrivateGroup] {
+            assert_eq!(ancestor_verdict(private_group_dir, ME, posture), Ok(()));
+            assert_eq!(holding_verdict(private_group_dir, ME, posture), Ok(()));
+        }
+        assert_eq!(
+            base_verdict(own_group_dir, SHARED_GROUP_USER),
+            Ok(()),
+            "the scratch verdict keeps the own-group rule"
+        );
+    }
+
+    /// The holding verdict refuses a sticky shared directory the ancestor verdict accepts.
+    #[test]
+    fn holding_verdict_refuses_a_sticky_shared_directory() {
+        let sticky = dir(0, 0, 0o1777);
+        for posture in [GroupWritePosture::OwnGroup, GroupWritePosture::PrivateGroup] {
+            assert_eq!(ancestor_verdict(sticky, ME, posture), Ok(()));
+            assert_eq!(
+                holding_verdict(sticky, ME, posture),
+                Err(ScratchRefusal::WritableByOthers)
+            );
+        }
+        assert_eq!(
+            holding_verdict(dir(1001, 1001, 0o700), ME, GroupWritePosture::OwnGroup),
+            Err(ScratchRefusal::ForeignOwner)
+        );
+    }
+
+    /// An existing database file is the user's or root's, and only they can rewrite it.
+    #[test]
+    fn file_verdict_refuses_a_file_another_user_can_write() {
+        let own = GroupWritePosture::OwnGroup;
+        let release = GroupWritePosture::PrivateGroup;
+        assert_eq!(file_verdict(file(1000, 1000, 0o644), ME, release), Ok(()));
+        assert_eq!(file_verdict(file(0, 0, 0o644), ME, release), Ok(()));
+        assert_eq!(
+            file_verdict(file(1000, 1000, 0o666), ME, own),
+            Err(ScratchRefusal::WritableByOthers)
+        );
+        assert_eq!(
+            file_verdict(file(1001, 1001, 0o600), ME, own),
+            Err(ScratchRefusal::ForeignOwner)
+        );
+        assert_eq!(
+            file_verdict(file(1000, 4242, 0o664), ME, own),
+            Err(ScratchRefusal::WritableByOthers)
+        );
+        assert_eq!(file_verdict(file(1000, 1000, 0o664), ME, release), Ok(()));
+        assert_eq!(
+            file_verdict(file(1000, 100, 0o664), SHARED_GROUP_USER, release),
+            Err(ScratchRefusal::WritableByOthers)
+        );
+        assert_eq!(
+            file_verdict(dir(1000, 1000, 0o600), ME, own),
+            Err(ScratchRefusal::NotARegularFile)
+        );
+        let link = EntryFacts {
+            kind: EntryKind::Other,
+            ..file(1000, 1000, 0o600)
+        };
+        assert_eq!(
+            file_verdict(link, ME, own),
+            Err(ScratchRefusal::NotARegularFile)
+        );
     }
 
     #[test]

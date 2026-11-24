@@ -23,7 +23,6 @@
 //! sink keeps serving. No `unwrap`/`expect`/indexing in any reachable path.
 
 use sqlx::SqlitePool;
-use sqlx::sqlite::SqliteConnectOptions;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
@@ -114,7 +113,8 @@ pub async fn enable_from_env() {
     let pool = match open_spill_pool(&path).await {
         Ok(p) => p,
         Err(e) => {
-            crate::system::emit_runtime_log("spill", &format!("open {path}: {e}"));
+            let shown = crate::error::shown_path(&path);
+            crate::system::emit_runtime_log("spill", &format!("open {shown}: {e}"));
             return;
         }
     };
@@ -144,18 +144,22 @@ pub async fn enable_from_env() {
 
 /// Write one entry to the spill (the unit of work the batcher repeats). Mapping
 /// to the hub schema lives here so it's directly testable without the channel.
+/// The most connections the spill writer's pool holds: the batcher and the pruner.
+const SPILL_MAX_CONNECTIONS: u32 = 4;
+
 /// Open (creating it when absent) the spill file at `path` in WAL mode.
 ///
-/// Every connection carries [`crate::system::SQLITE_BUSY_TIMEOUT`] from its connect
-/// options. WAL is the only journal mode that lets the console child read while
-/// this process writes without each blocking the other; the console reader opens
-/// read-write to attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`).
-async fn open_spill_pool(path: &str) -> Result<SqlitePool, sqlx::Error> {
-    let options = SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(true)
-        .busy_timeout(crate::system::SQLITE_BUSY_TIMEOUT);
-    let pool = SqlitePool::connect_with(options).await?;
+/// `path` is a literal file name, opened through [`crate::db::VettedPool`], so
+/// the file is proven trusted before it opens. Every connection carries
+/// [`crate::system::SQLITE_BUSY_TIMEOUT`] from its connect options. WAL is the
+/// only journal mode that lets the console child read while this process writes
+/// without each blocking the other; the console reader opens read-write to
+/// attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`).
+async fn open_spill_pool(path: &str) -> Result<SqlitePool, crate::db::DbConnectError> {
+    let url = crate::db::DbUrl::sqlite_path(path, crate::db::FileMode::CreateIfMissing)?;
+    let pool = crate::db::VettedPool::<sqlx::Sqlite>::connect(&url, SPILL_MAX_CONNECTIONS)
+        .await?
+        .into_pool();
     let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await;
     crate::db::own_pool(crate::db::PoolRole::TelemetrySpill, &pool);
     Ok(pool)
@@ -300,7 +304,7 @@ mod tests {
     /// it is trivial). Cross-process visibility is a standard SQLite guarantee.
     #[tokio::test]
     async fn write_entry_maps_to_hub_schema() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("spill-we-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -383,7 +387,7 @@ mod tests {
     /// The spill pool registers itself, so a served app's stop closes it last.
     #[tokio::test]
     async fn the_spill_pool_registers_itself_for_the_stop() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("spill-owned-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -403,7 +407,7 @@ mod tests {
     /// busy timeout.
     #[tokio::test]
     async fn the_spill_pool_carries_the_declared_busy_timeout() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("spill-busy-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();

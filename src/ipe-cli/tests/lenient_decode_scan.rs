@@ -135,7 +135,8 @@ const DENIED_PATHS: &[&str] = &[
 /// failure, a process exit outside its funnel, environment and temp-root
 /// reads, panicking thread starts, a task started outside the task funnel, an
 /// app listener served outside its Host admission, a random draw outside
-/// `entropy::fill_entropy`), which this scan does not own.
+/// `entropy::fill_entropy`, a SQLite file named outside its trusted-path
+/// proof), which this scan does not own.
 const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "core::option::Option::unwrap_unchecked",
     "core::result::Result::unwrap_unchecked",
@@ -174,6 +175,7 @@ const OTHER_RULE_DENIED_PATHS: &[&str] = &[
     "getrandom::getrandom",
     "uuid::Timestamp::now",
     "rand_core::OsRng",
+    "sqlx_sqlite::SqliteConnectOptions::filename",
 ];
 
 /// The most alias hops a path is followed through before it counts as

@@ -1582,6 +1582,9 @@ impl StoreOpenError {
                 // Without the relay the deny-private policy refuses the dial,
                 // and its cause (no private socket directory) is environmental.
                 DbConnectError::RelayUnavailable => true,
+                // A store file other local users could reach is refused, never
+                // replaced by memory.
+                DbConnectError::UntrustedLocation(_) => true,
                 DbConnectError::Unreachable(_) | DbConnectError::VersionUnreadable(_) => false,
             },
             Self::Schema(_) => false,
@@ -1647,7 +1650,7 @@ impl<Model, Msg> SqliteStore<Model, Msg> {
         ttl: Duration,
         schema_tag: [u8; 32],
     ) -> Result<Self, StoreOpenError> {
-        let url = crate::db::DbUrl::parse(&format!("sqlite:{path}?mode=rwc"))
+        let url = crate::db::DbUrl::sqlite_path(path, crate::db::FileMode::CreateIfMissing)
             .map_err(StoreOpenError::Connect)?;
         let pool =
             crate::db::VettedPool::<sqlx::Sqlite>::connect(&url, SESSION_STORE_MAX_CONNECTIONS)
@@ -2767,8 +2770,8 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::expect_used)] // test: the temp store opens
     async fn sqlite_displaced_handle_never_overwrites_the_installed_one() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_displaced_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_displaced_{}.db", std::process::id()));
         let p = path.to_str().expect("a UTF-8 temp path");
         let _ = std::fs::remove_file(p);
         {
@@ -3019,6 +3022,9 @@ mod tests {
         }
         let policy = [
             StoreOpenError::Connect(DbConnectError::RelayUnavailable),
+            StoreOpenError::Connect(DbConnectError::UntrustedLocation(
+                crate::db::DbPathRefusal::FinalIsSymlink,
+            )),
             StoreOpenError::Connect(DbConnectError::HostRefused(SsrfRefusal::LocalSocket)),
             StoreOpenError::Connect(DbConnectError::InvalidUrl),
             StoreOpenError::Connect(DbConnectError::MisplacedUserinfo),
@@ -3104,8 +3110,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn a_sqlite_session_store_registers_its_pool_for_the_stop() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_owned_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_owned_{}.db", std::process::id()));
         let p = path.to_str().expect("the temp path is UTF-8");
         let _ = std::fs::remove_file(p);
         let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
@@ -3126,8 +3132,7 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_checkpoint_survives_restart() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_p5_{}.db", std::process::id()));
+        let path = crate::db::test_db_root().join(format!("ipetest_p5_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -3158,8 +3163,7 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_rejects_a_row_written_by_a_different_schema_tag() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_h24_{}.db", std::process::id()));
+        let path = crate::db::test_db_root().join(format!("ipetest_h24_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -3186,8 +3190,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_accepts_a_row_written_by_the_same_schema_tag() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_h24ok_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_h24ok_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -3353,8 +3357,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_web_sessions_excludes_cold_rows() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_webs_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_webs_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
@@ -3396,8 +3400,8 @@ mod tests {
     #[tokio::test]
     async fn sqlite_store_new_format_round_trips_model_through_json() {
         use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_json_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_json_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         let model: i32 = 42;
@@ -3446,8 +3450,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_garbage_row_is_rejected_not_crashed() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_garbage_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_garbage_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
@@ -3634,8 +3638,8 @@ mod tests {
     #[cfg(all(feature = "web", unix))]
     #[tokio::test]
     async fn file_store_never_writes_through_planted_symlinks() {
-        let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_links_{}", std::process::id()));
+        let dir =
+            crate::db::test_db_root().join(format!("ipetest_file_links_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
         let victim = dir.join("victim.txt");
@@ -3667,8 +3671,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn checkpoint_carries_no_style_nonce() {
-        let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_nonce_{}", std::process::id()));
+        let dir =
+            crate::db::test_db_root().join(format!("ipetest_file_nonce_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
         let map = dir.join("sessions.json");
@@ -3736,8 +3740,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_leaves_no_temp_file_behind() {
-        let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_notmp_{}", std::process::id()));
+        let dir =
+            crate::db::test_db_root().join(format!("ipetest_file_notmp_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
         let entries = |d: &std::path::Path| {
@@ -3796,7 +3800,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_write_map_names_the_failing_step() {
-        let dir = crate::scratch_core::test_temp_root()
+        let dir = crate::db::test_db_root()
             .join(format!("ipetest_file_persisterr_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
@@ -3862,8 +3866,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_set_on_a_blocked_map_is_refused_then_diverges() {
-        let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_refused_{}", std::process::id()));
+        let dir =
+            crate::db::test_db_root().join(format!("ipetest_file_refused_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
         let map = dir.join("sessions.json");
@@ -3933,8 +3937,8 @@ mod tests {
         assert!(!streak.failing());
         assert_eq!(streak.transition("file", None), None);
 
-        let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_streak_{}", std::process::id()));
+        let dir =
+            crate::db::test_db_root().join(format!("ipetest_file_streak_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
         let map = dir.join("sessions.json");
@@ -3961,8 +3965,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_checkpoint_survives_restart() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_{}.json", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_file_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -3988,8 +3992,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_rejects_a_row_written_by_a_different_schema_tag() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_fileh24_{}.json", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_fileh24_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -4013,7 +4017,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_starts_empty_on_a_corrupt_map() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("ipetest_filecorrupt_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         std::fs::write(p, b"{ this is not valid json").unwrap();
@@ -4231,7 +4235,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_carries_the_credential_section() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("ipetest_credsection_{}.json", std::process::id()));
         let Some(p) = path.to_str() else {
             return;
@@ -4294,8 +4298,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn choose_store_honours_file_and_memory_without_error() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_choose_{}.json", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_choose_{}.json", std::process::id()));
         let p = path.to_string_lossy().into_owned();
         let _ = std::fs::remove_file(&p);
         assert!(
@@ -4324,8 +4328,8 @@ mod tests {
     #[tokio::test]
     async fn file_store_map_is_owner_only_0600() {
         use std::os::unix::fs::PermissionsExt as _;
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_perms_{}.json", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_perms_{}.json", std::process::id()));
         let p = path.to_string_lossy().into_owned();
         let _ = std::fs::remove_file(&p);
         let s: FileStore<i32, ()> = FileStore::new(&p, Duration::from_secs(60), TEST_TAG);
@@ -4473,8 +4477,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_reconstructs_across_an_additive_model_change() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_addfile_{}.json", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_addfile_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -4539,7 +4543,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_retyped_field_falls_back_to_reinit() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("ipetest_addretype_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
@@ -4582,7 +4586,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_removed_field_falls_back_to_reinit() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("ipetest_addremove_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
@@ -4618,8 +4622,8 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_reconstructing_unchanged_schema_restores_verbatim() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_addsame_{}.json", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_addsame_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -4674,7 +4678,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn file_store_reconstructing_corrupt_body_falls_back_to_reinit() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("ipetest_addcorrupt_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
@@ -4706,8 +4710,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_store_reconstructs_across_an_additive_model_change() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_addsql_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_addsql_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         {
@@ -5044,7 +5048,7 @@ mod tests {
     #[cfg(feature = "web")]
     #[tokio::test]
     async fn set_then_rejoin_is_live_file() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::db::test_db_root()
             .join(format!("ipetest_claimfile_{}.json", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
@@ -5068,8 +5072,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn set_then_rejoin_is_live_sqlite() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_claimsql_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_claimsql_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         let _ = std::fs::remove_file(p);
         let s: SqliteStore<i32, ()> = SqliteStore::new(p, Duration::from_secs(60), TEST_TAG)
@@ -5160,8 +5164,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_set_on_a_closed_pool_is_refused_for_a_fresh_handle() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_refused_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_refused_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5192,8 +5196,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_set_on_a_closed_pool_diverges_a_held_handle() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_diverged_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_diverged_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5224,8 +5228,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_diverged_entry_is_evictable_again_after_a_landed_checkpoint() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_healed_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_healed_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5264,8 +5268,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_delete_that_does_not_land_is_pending_and_tombstones_the_sid() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_pending_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_pending_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5299,8 +5303,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_cold_read_during_an_in_flight_delete_misses() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_inflight_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_inflight_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5354,8 +5358,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn tombstone_retry_removes_the_row_on_the_next_sweep() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_retried_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_retried_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5428,8 +5432,8 @@ mod tests {
     #[cfg(feature = "db")]
     #[tokio::test]
     async fn sqlite_cold_row_past_ttl_is_a_miss_without_a_sweep() {
-        let path = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_ttlread_{}.db", std::process::id()));
+        let path =
+            crate::db::test_db_root().join(format!("ipetest_ttlread_{}.db", std::process::id()));
         let p = path.to_str().unwrap();
         remove_sqlite(p);
         let bounded = tokio::time::timeout(Duration::from_secs(30), async {
@@ -5468,8 +5472,8 @@ mod tests {
     async fn file_store_cold_row_past_ttl_is_a_miss_without_a_sweep() {
         const STALE: &str = "abcdefabcdefabcdefabcdefabcdef01";
         const RECENT: &str = "fedcbafedcbafedcbafedcbafedcba02";
-        let dir = crate::scratch_core::test_temp_root()
-            .join(format!("ipetest_file_ttlread_{}", std::process::id()));
+        let dir =
+            crate::db::test_db_root().join(format!("ipetest_file_ttlread_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");
         let map = dir.join("sessions.json");
@@ -5519,7 +5523,7 @@ mod tests {
             ))
         ));
 
-        let dir = crate::scratch_core::test_temp_root()
+        let dir = crate::db::test_db_root()
             .join(format!("ipetest_encode_refused_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(std::fs::create_dir_all(&dir).is_ok(), "make scratch dir");

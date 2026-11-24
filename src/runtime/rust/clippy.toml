@@ -94,6 +94,7 @@ disallowed-methods = [
     { path = "axum::serve::serve", reason = "serve an app listener through server::serve_app (Host admission)", allow-invalid = true },
     { path = "getrandom::getrandom", reason = "draw entropy through `entropy::fill_entropy`, the runtime's one source" },
     { path = "uuid::Timestamp::now", reason = "panics on an unreadable clock; build ids through `uuid_kernel`'s checked clock", allow-invalid = true },
+    { path = "sqlx_sqlite::SqliteConnectOptions::filename", reason = "a SQLite file is named only from a proven trusted path; open it through `db::VettedPool` (`db::TrustedDbPath`)", allow-invalid = true },
 ]
 
 disallowed-types = [

@@ -17411,7 +17411,7 @@ mod route_entry_cmd_tests {
     #[allow(clippy::expect_used)] // test: the temp store opens and the page stores its session
     fn eviction_keeps_a_session_with_a_cmd_in_flight() {
         run(false, || async {
-            let path = crate::scratch_core::test_temp_root()
+            let path = crate::db::test_db_root()
                 .join(format!("ipetest_inflight_evict_{}.db", std::process::id()));
             let p = path.to_str().expect("a UTF-8 temp path").to_owned();
             let _ = std::fs::remove_file(p.as_str());
@@ -17549,7 +17549,7 @@ mod route_entry_cmd_tests {
     #[allow(clippy::expect_used)] // test: the temp store opens and the page stores its session
     fn driver_continues_on_a_diverged_checkpoint_and_the_session_is_not_evicted() {
         run(false, || async {
-            let path = crate::scratch_core::test_temp_root()
+            let path = crate::db::test_db_root()
                 .join(format!("ipetest_diverged_turn_{}.db", std::process::id()));
             let p = path.to_str().expect("a UTF-8 temp path").to_owned();
             for suffix in ["", "-wal", "-shm"] {

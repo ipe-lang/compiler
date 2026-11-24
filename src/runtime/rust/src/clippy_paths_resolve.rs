@@ -127,6 +127,15 @@ const _URL: () = {
     let _ = ::url::Url::query_pairs;
 };
 
+#[cfg(feature = "db")]
+const _SQLX_SQLITE: () = {
+    #[expect(clippy::disallowed_methods)]
+    let _: fn(
+        ::sqlx::sqlite::SqliteConnectOptions,
+        &str,
+    ) -> ::sqlx::sqlite::SqliteConnectOptions = ::sqlx::sqlite::SqliteConnectOptions::filename;
+};
+
 #[cfg(feature = "web-core")]
 const _SERDE_URLENCODED: () = {
     #[expect(clippy::disallowed_methods)]
