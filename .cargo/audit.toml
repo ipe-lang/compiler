@@ -1,6 +1,9 @@
-# cargo-audit configuration — the documented, justified advisory ignore-list
-# (the same id set as deny.toml [advisories].ignore; verify-manifest.py check
-# 29 refuses a difference either way).
+# cargo-audit configuration — the documented, justified advisory ignore-list.
+# cargo-audit judges every package a lockfile records, unactivated optional
+# packages included; cargo-deny judges the activated graph. So this list is
+# deny.toml [advisories].ignore plus the lockfile-only ids
+# verify-manifest.py's `AUDIT_LOCKFILE_ONLY_IGNORES` names with their package;
+# check 29 refuses any other difference.
 
 [advisories]
 ignore = [
@@ -20,8 +23,10 @@ ignore = [
     # v4 lockfiles record all optional packages of every dep in the graph, even
     # unactivated ones. No code in this repo activates rust_decimal's "rkyv"
     # feature, and no rkyv archive is ever deserialized — the OOB path is
-    # unreachable. Fix would require rust_decimal >= 0.8 (a semver-breaking
-    # jump); accepted until that line is available and rust_decimal updates.
+    # unreachable, and cargo-deny's activated graph never meets it (a
+    # lockfile-only id, absent from deny.toml). Fix would require
+    # rkyv >= 0.8.17 through rust_decimal (a semver-breaking jump); accepted
+    # until rust_decimal updates.
     "RUSTSEC-2026-0235",
     # RUSTSEC-2026-0459 — bundled SQLite before 3.54.0 can return uninitialized
     # page-cache memory when a database is opened with a sibling `-wal` file of
