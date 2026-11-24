@@ -3664,8 +3664,12 @@ const LOCK_UPDATE: &str = "update";
 
 /// The production fns of `cargo_step.rs` that alone may name [`LOCK_UPDATE`].
 ///
-/// They are the derivation from the pinned set and the offline probe.
-const LOCK_UPDATE_OWNERS: &[&str] = &["narrow_to_workspace", "probe_lock_within"];
+/// They are the offline and online derivations from the pinned set and the offline probe.
+const LOCK_UPDATE_OWNERS: &[&str] = &[
+    "update_lock_offline_within",
+    "update_lock_online_within",
+    "probe_lock_within",
+];
 
 /// Every production string literal equal to one wanted text, keyed by its enclosing fn.
 struct LiteralSites<'a> {

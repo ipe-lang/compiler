@@ -1156,6 +1156,14 @@ impl LockEnv<'_> {
             Self::Bare(cargo) => cargo.as_os_str(),
         }
     }
+
+    /// Give `update` the build's environment; a bare `cargo` adds none.
+    fn forward_into(self, update: &mut Command) {
+        match self {
+            Self::Build(build) => forward_build_env(build, update),
+            Self::Bare(_) => {}
+        }
+    }
 }
 
 /// Narrow the lock in `dir` to its crate with `cargo update --workspace --offline`.
@@ -1175,8 +1183,11 @@ fn update_lock_offline_within(
     dir: &Path,
     ceiling: LocalCeiling,
 ) -> Result<Captured, CliError> {
-    let mut update = narrow_to_workspace(env, dir);
-    update.arg("--offline");
+    let mut update = Command::new(env.program());
+    update
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(dir);
+    env.forward_into(&mut update);
     run_local(update, ceiling, LocalSource::LockResolve).map_err(|e| local_run_error(dir, e))
 }
 
@@ -1195,19 +1206,10 @@ fn update_lock_online_within(
     dir: &Path,
     ceiling: LocalCeiling,
 ) -> Result<Captured, CliError> {
-    let update = narrow_to_workspace(env, dir);
-    run_local(update, ceiling, LocalSource::LockFetch).map_err(|e| local_run_error(dir, e))
-}
-
-/// A `cargo update --workspace` in `dir` with `env`'s environment.
-fn narrow_to_workspace(env: LockEnv<'_>, dir: &Path) -> Command {
     let mut update = Command::new(env.program());
     update.args(["update", "--workspace"]).current_dir(dir);
-    match env {
-        LockEnv::Build(build) => forward_build_env(build, &mut update),
-        LockEnv::Bare(_) => {}
-    }
-    update
+    env.forward_into(&mut update);
+    run_local(update, ceiling, LocalSource::LockFetch).map_err(|e| local_run_error(dir, e))
 }
 
 /// How an offline lock derivation that ran within its ceilings ended.
