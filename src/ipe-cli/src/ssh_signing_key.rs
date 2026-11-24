@@ -1009,6 +1009,7 @@ mod tests {
         plant_on_register: Option<&'static str>,
         calls: usize,
         seen_key: Option<String>,
+        #[cfg(unix)] // only a unix build stages and reads the private key's mode
         staged_private_mode: Option<u32>,
         dir: PathBuf,
     }
@@ -1020,6 +1021,7 @@ mod tests {
                 plant_on_register: None,
                 calls: 0,
                 seen_key: None,
+                #[cfg(unix)]
                 staged_private_mode: None,
                 dir: dir.to_path_buf(),
             }

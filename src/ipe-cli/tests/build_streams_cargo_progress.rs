@@ -11,6 +11,7 @@
 //!
 //! Unix-only: it relies on a shell fake `cargo` and `PATH` scrubbing to
 //! guarantee the fake is the one resolved.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::Path;
@@ -30,7 +31,6 @@ const PROGRESS_MARKER: &str = "Compiling ipe-app v0.0.0 (fake-cargo-progress-mar
 /// invocation, prints a progress line to stderr and exits 0; for a `metadata`
 /// invocation, prints a minimal valid JSON so any metadata probe on the path
 /// does not spawn-fail before the build is reached.
-#[cfg(unix)]
 fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     // The `build` arm writes the marker to stderr (fd 2), exactly where a real
@@ -52,7 +52,6 @@ fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// `ipe dev build <dir>` must relay the emitted crate's `cargo build` stderr to
 /// its own stderr — the progress the user watches while cargo compiles.
-#[cfg(unix)]
 #[test]
 fn build_streams_the_emitted_cargo_progress() {
     assert_relays_cargo_progress("build");
@@ -63,7 +62,6 @@ fn build_streams_the_emitted_cargo_progress() {
 /// produces no `ipe-app` binary, so the exec step fails afterwards — but the
 /// progress line must already have been streamed before that, which is all this
 /// asserts.
-#[cfg(unix)]
 #[test]
 fn run_streams_the_emitted_cargo_progress() {
     assert_relays_cargo_progress("run");
@@ -71,7 +69,6 @@ fn run_streams_the_emitted_cargo_progress() {
 
 /// Spawn `ipe dev <subcommand> <dir>` with a fake progress-printing `cargo` on the
 /// `PATH` and assert the fake's stderr marker is relayed to `ipe`'s stderr.
-#[cfg(unix)]
 fn assert_relays_cargo_progress(subcommand: &str) {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
 

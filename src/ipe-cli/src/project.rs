@@ -3646,6 +3646,7 @@ import String
     // ── Module discovery refusals ─────────────────────────────────────────────
 
     /// An empty source root unique to this test process.
+    #[cfg(unix)] // every caller is a FIFO/unreadable-dir module-discovery test
     #[allow(clippy::expect_used)] // test fixture: an unwritable temp dir IS the failure
     fn walk_root(name: &str) -> PathBuf {
         let root =
@@ -4164,6 +4165,7 @@ import String
     }
 
     /// The tree refusal `result` carries, from a snapshot or from `hash_tree`.
+    #[cfg(unix)] // its only caller is a unix-only symlink/FIFO/oversize test
     fn snapshot_limit<T>(
         result: &Result<T, CliError>,
     ) -> Option<crate::remote_ingest::IngestLimit> {
@@ -4174,6 +4176,7 @@ import String
     }
 
     /// The tree refusal a `hash_tree` result carries.
+    #[cfg(unix)] // its only caller is a unix-only symlink/FIFO/oversize test
     fn hash_limit<T>(
         result: &Result<T, crate::cache::TreeHashError>,
     ) -> Option<crate::remote_ingest::IngestLimit> {

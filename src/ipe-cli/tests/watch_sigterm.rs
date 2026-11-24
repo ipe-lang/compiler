@@ -12,6 +12,9 @@
 //! 3. `IPE_E2E=1`: a SECOND SIGTERM during the teardown ends the process —
 //!    by the signal, unless the teardown already finished cleanly — and the
 //!    supervised child is gone either way.
+//!
+//! Unix-only: every scenario signals via `kill(1)`/`SIGTERM`.
+#![cfg(unix)]
 
 #[cfg(target_os = "linux")]
 use std::io::{Read, Write};
@@ -429,7 +432,6 @@ fn watch_shuts_down_the_supervised_child_on_sigterm_to_only_the_ipe_process() ->
 /// `WatchHandle::stop()` shuts it down. Against an unconditional-install
 /// build, the watch loop tears itself down on the signal and assertion (b)
 /// fails.
-#[cfg(unix)]
 #[test]
 fn spawn_never_installs_a_sigterm_forwarder() -> Result<(), BoxError> {
     use std::sync::Arc;

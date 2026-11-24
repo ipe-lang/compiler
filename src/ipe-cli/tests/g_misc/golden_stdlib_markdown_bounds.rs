@@ -11,6 +11,7 @@
 //! Linearity is judged on the child's CPU time, which the host's load does not
 //! inflate, never on its wall time.
 
+#[cfg(unix)] // every user is a unix-only shell-script CPU/deadline test
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;

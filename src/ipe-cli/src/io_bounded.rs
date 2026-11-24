@@ -730,6 +730,7 @@ mod tests {
     }
 
     /// One plain entry name.
+    #[cfg(unix)] // every caller is a symlink/FIFO no-follow test
     #[allow(clippy::expect_used)] // test fixture: every literal here is one plain name
     fn entry(name: &str) -> EntryName {
         EntryName::new(std::ffi::OsStr::new(name)).expect("one plain entry name")

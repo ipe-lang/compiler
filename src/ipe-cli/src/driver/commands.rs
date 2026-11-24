@@ -2774,7 +2774,7 @@ enum WasmOptSkip {
 /// either tool ran; [`CliError::Io`]
 /// on a filesystem or spawn failure; as [`crate::bundle_www::publish_www`]
 /// when the finished `www/` is published into the directory `into` claims.
-#[cfg(test)]
+#[cfg(all(test, unix))] // every caller lives in `held_crate_tests`, unix-only
 fn bundle_wasm_pkg(
     crate_dir: &OwnedDir,
     wasm_path: &Path,

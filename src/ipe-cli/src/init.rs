@@ -2816,6 +2816,7 @@ mod tests {
     }
 
     /// The names in `dir`, sorted; an absent directory lists nothing.
+    #[cfg(unix)] // every caller is a symlink/fifo placement test
     fn names_in(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .map(|entries| {
@@ -2835,6 +2836,7 @@ mod tests {
     }
 
     /// Every placement policy; the asking ones only when a terminal is attached.
+    #[cfg(unix)] // its only caller is a unix-only symlink placement test
     fn every_policy(tty: Option<&Interactive>) -> Vec<(Existing<'_>, Missing<'_>)> {
         let mut policies = vec![
             (Existing::Force, Missing::Write),

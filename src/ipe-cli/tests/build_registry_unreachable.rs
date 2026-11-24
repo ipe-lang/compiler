@@ -7,6 +7,9 @@
 //! reach crates.io (host-resolution failure + source-load failure). Ipê must
 //! classify this as an environment error and render IPE-E0001 with a "check
 //! your connection" message, never IPE-I0001 with "please report this bug".
+//!
+//! Unix-only: the fake `cargo` is a `#!/bin/sh` script.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::Path;
@@ -14,7 +17,6 @@ use std::path::Path;
 /// Write an executable fake `cargo` at `dir/cargo` that exits non-zero with
 /// the DNS/registry-error patterns cargo emits when offline or when the
 /// registry is unreachable.
-#[cfg(unix)]
 fn write_offline_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     // The stderr lines mirror what cargo actually emits on a DNS failure:
@@ -37,7 +39,6 @@ fn write_offline_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// Registry-unreachable classification gate. Unix-only: relies on a shell fake
 /// `cargo` and PATH scrubbing to guarantee the fake is the one resolved.
-#[cfg(unix)]
 #[test]
 #[allow(clippy::panic)] // a refused precondition is the test failure
 fn build_registry_unreachable_renders_ipe_e0001_not_ice() {

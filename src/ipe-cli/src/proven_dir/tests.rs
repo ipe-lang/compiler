@@ -1,9 +1,11 @@
 use std::ffi::OsStr;
+#[cfg(unix)] // only `scratch`, unix-only below, returns a `PathBuf`
 use std::path::PathBuf;
 
 use super::*;
 
 /// A fresh, empty scratch directory unique to `name`, this process and this thread.
+#[cfg(unix)] // every caller lives in the unix-only `mod unix` below
 fn scratch(name: &str) -> PathBuf {
     let base = ipe_test_temp::temp_root()
         .canonicalize()
@@ -19,6 +21,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The entry name `text`, which the test knows to be one plain component.
+#[cfg(unix)] // every caller lives in the unix-only `mod unix` below
 fn name(text: &str) -> EntryName {
     EntryName::new(OsStr::new(text)).expect("a plain component")
 }

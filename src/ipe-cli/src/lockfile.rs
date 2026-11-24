@@ -793,9 +793,11 @@ impl RawLocked {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)] // its only user is a unix-only symlink refusal test
+    use super::JudgedLock;
     use super::{
-        HeldDir, JudgedLock, LOCKFILE_NAME, LocalSource, LockKey, LockRefusal, LockedDep,
-        LockedOrigin, Lockfile, MAX_LOCAL_SOURCE_LEN, TextLine,
+        HeldDir, LOCKFILE_NAME, LocalSource, LockKey, LockRefusal, LockedDep, LockedOrigin,
+        Lockfile, MAX_LOCAL_SOURCE_LEN, TextLine,
     };
     use crate::CliError;
     use crate::index::{EscapeSource, PinnedRev, RemotePath, Sha256Hex, SourceUrl};

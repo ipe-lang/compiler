@@ -114,6 +114,7 @@ mod tests {
     use super::*;
 
     /// A parsed home over `path`.
+    #[cfg(not(windows))] // every caller is a unix-style absolute-home test
     fn parsed(path: &str) -> HomeDir {
         HomeDir::try_parse(Some(path.into())).expect("an absolute test home")
     }

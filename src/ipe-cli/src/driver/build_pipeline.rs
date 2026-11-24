@@ -2832,7 +2832,7 @@ impl EmittedCrate {
 
     /// A witness over an already-written directory, for unit tests that
     /// stage a crate by hand.
-    #[cfg(test)]
+    #[cfg(all(test, unix))] // every caller lives in `commands::held_crate_tests`, unix-only
     #[must_use]
     pub(crate) const fn assume_written(
         dir: OwnedDir,
@@ -4970,6 +4970,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)] // its only caller needs `chmod` to build an unreadable sibling
     fn collected_modules(collected: &CollectedSources) -> Vec<Vec<String>> {
         collected.sources.keys().cloned().collect()
     }

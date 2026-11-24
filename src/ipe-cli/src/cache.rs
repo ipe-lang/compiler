@@ -1663,6 +1663,7 @@ mod tests {
         CacheSite::Explicit(dir.to_path_buf())
     }
 
+    #[cfg(unix)] // every caller is a unix-only cache-identity test
     fn explicit_root(dir: &Path) -> CacheRoot {
         CacheRoot::Explicit(dir.to_path_buf())
     }
@@ -2790,6 +2791,7 @@ mod tests {
     // The lowered-IR cache tier
     // -----------------------------------------------------------------
 
+    #[cfg(unix)] // every caller is a unix-only cache-identity test
     #[allow(clippy::too_many_lines)] // exhaustive `Module` literal (every `uses_*` flag)
     fn sample_ir_program(i: &mut Interner) -> ipe_diagnostics::DResult<Program> {
         use ipe_ir::{

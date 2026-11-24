@@ -4061,8 +4061,11 @@ fn rel_to_native(rel: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bundle_www::{MAX_ASSET_BYTES, MAX_INDEX_HTML_BYTES};
+    #[cfg(unix)] // its only user is a unix-only oversized-asset test
+    use crate::bundle_www::MAX_ASSET_BYTES;
+    use crate::bundle_www::MAX_INDEX_HTML_BYTES;
     use crate::output_dir::test_links::{staging_leftovers, tree_snapshot};
+    #[cfg(unix)] // every user is a unix-only symlink/fifo asset-swap test
     use ipe_fs_open::FileKind;
     use ipe_runtime_rust::encoding::{FrameOriginEntries, ServerOrigins};
 

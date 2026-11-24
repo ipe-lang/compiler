@@ -28,6 +28,7 @@ use e2e_support::wait_for;
 type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// The supervisor's listener relocation var `ipe dev watch` places its child with.
+#[cfg(target_os = "linux")]
 const RELOCATION_ENV: &str = ipe_runtime_rust::LISTEN_PORT_RELOCATION_ENV;
 
 /// A minimal `Ipe.Http.Server` fixture, parameterised on the response body
@@ -142,6 +143,7 @@ impl EventSink {
             .count()
     }
 
+    #[cfg(target_os = "linux")]
     fn count_restarted(&self) -> usize {
         self.0
             .lock()
@@ -221,6 +223,7 @@ fn start_watch_bluegreen(
 /// neither `web_app` nor `server_listen`, so under blue-green the proxy must NOT
 /// engage (no bind on `opts.port`) and watch takes the direct-restart path. The
 /// `marker` in the printed line lets a test observe that it is running.
+#[cfg(target_os = "linux")]
 fn worker_fixture(marker: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -248,6 +251,7 @@ fn worker_fixture(marker: &str) -> String {
 /// Try to bind `port` on loopback: `true` means the port is FREE (nothing — no
 /// proxy — is holding it). Used to prove the proxy did NOT engage for a
 /// non-HTTP shape under blue-green.
+#[cfg(target_os = "linux")]
 fn port_is_free(port: u16) -> bool {
     std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
 }

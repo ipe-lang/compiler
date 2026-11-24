@@ -4131,11 +4131,15 @@ mod tests {
     use super::{
         ALL_BUDGETS, Budget, BudgetPairing, ByteBudget, CHILD_STDERR_MAX_BYTES, CappedReadError,
         CaptureOutcome, Captured, ChildStderr, EntryBudget, FetchBudget, GITHUB_API, Git,
-        IngestLimit, IngestRefusal, IngestSource, InheritedInput, InheritedRole, LocalRefusal,
-        LocalSource, LocalWall, MAX_REMOTE_BYTES, MAX_REMOTE_ENTRIES, MAX_WALL_SECS, Mode,
-        PACKAGE_SOURCE, PackageName, RefsCeiling, RunError, Staging, Stream, TOOL_QUERY_LIMITS,
-        Transfer, TreeCeiling, Usage, WallBudget, capture, curl_limit_args, curl_refusal, measure,
-        read_capped, run_core, run_inherited, run_local_fed,
+        IngestLimit, IngestRefusal, IngestSource, LocalRefusal, LocalSource, MAX_REMOTE_BYTES,
+        MAX_REMOTE_ENTRIES, MAX_WALL_SECS, Mode, PACKAGE_SOURCE, PackageName, RefsCeiling,
+        RunError, Staging, Transfer, TreeCeiling, Usage, WallBudget, capture, curl_limit_args,
+        measure, read_capped, run_core,
+    };
+    #[cfg(unix)] // every caller below is a unix-shell child/transfer test
+    use super::{
+        InheritedInput, InheritedRole, LocalWall, Stream, TOOL_QUERY_LIMITS, curl_refusal,
+        run_inherited, run_local_fed,
     };
     use std::io::Read;
     use std::process::Command;
@@ -4648,6 +4652,7 @@ mod tests {
     }
 
     /// `sh -c <script>`, the portable way to make a child write a known number of bytes.
+    #[cfg(unix)] // every caller is a unix-shell child/transfer test
     fn sh(script: &str) -> Command {
         let mut command = Command::new("sh");
         command.args(["-c", script]);

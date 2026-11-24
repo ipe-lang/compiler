@@ -12,6 +12,9 @@
 //! only cargo invocation is the emitted-crate compile — which fails. A `build`
 //! that never runs cargo, or runs it and drops the failure, would exit 0 here
 //! and fail this test.
+//!
+//! Unix-only: the fake `cargo` is a `#!/bin/sh` script.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::Path;
@@ -20,7 +23,6 @@ use std::path::Path;
 /// error to stderr and exits 1 for a `build` invocation, and prints a minimal
 /// valid `cargo metadata` JSON for a `metadata` invocation (so any metadata
 /// probe on the path does not itself spawn-fail before the build is reached).
-#[cfg(unix)]
 fn write_failing_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
     use std::os::unix::fs::PermissionsExt as _;
     let script = "#!/bin/sh\n\
@@ -38,7 +40,6 @@ fn write_failing_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
 
 /// The failing-cargo propagation gate. Unix-only: it relies on a shell fake
 /// `cargo` and on `PATH` scrubbing to guarantee the fake is the one resolved.
-#[cfg(unix)]
 #[test]
 #[allow(clippy::panic)] // a refused precondition is the test failure
 fn build_propagates_a_failed_emitted_cargo_build() {

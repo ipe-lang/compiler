@@ -35,6 +35,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// A minimal `Web.tea` whose view carries a hoistable `Ui.padding` style value
 /// and a marker text so an HTTP read can confirm the app is up. `padding` is the
 /// dominant appearance edit and hoists to a `LiteralTable` default under the flag.
+#[cfg(target_os = "linux")]
 fn web_fixture(padding: u32, extra_text: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -70,6 +71,7 @@ fn web_fixture(padding: u32, extra_text: &str) -> String {
 /// (`Font.weight : Int`) — a direct `Int` style value read back through the
 /// `parse::<i64>().unwrap_or(<literal>)` path. A marker text confirms the app is
 /// up. The weight hoists into the per-view `LiteralTable` default under the flag.
+#[cfg(target_os = "linux")]
 fn web_fixture_weight(weight: u32, extra_text: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -109,6 +111,7 @@ fn web_fixture_weight(weight: u32, extra_text: &str) -> String {
 /// literal carries `<duration>ms …`; that literal hoists into the per-view
 /// `LiteralTable`, so a `duration` edit changes only a `LiteralTable` slot and
 /// hot-swaps without a rebuild. A marker text confirms the app is up.
+#[cfg(target_os = "linux")]
 fn web_fixture_animation(duration: u32, extra_text: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -155,6 +158,7 @@ fn web_fixture_animation(duration: u32, extra_text: &str) -> String {
 /// A `Web.tea` whose view carries a hoistable **attribute value** (`Ui.name`)
 /// and a **static text** node whose content is `text` — both widened
 /// appearance-literal kinds (Step 5). A marker text confirms the app is up.
+#[cfg(target_os = "linux")]
 fn web_fixture_attr_text(name: &str, text: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -192,6 +196,7 @@ fn web_fixture_attr_text(name: &str, text: &str) -> String {
 /// literal, so it hoists into the per-view `LiteralTable`; `src` is a typed
 /// `ImageValue` (a data URI via `Ui.imageData`) since `Ui.image` no longer
 /// accepts a raw string.
+#[cfg(target_os = "linux")]
 fn web_fixture_image(description: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -232,6 +237,7 @@ fn web_fixture_image(description: &str) -> String {
 /// (re-sanitize-on-read). Its sanitized result is rendered into a `data-css`
 /// attribute so an HTTP read confirms the served CSS value. A marker text
 /// confirms the app is up.
+#[cfg(target_os = "linux")]
 fn web_fixture_css(value: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -272,6 +278,7 @@ fn web_fixture_css(value: &str) -> String {
 /// element or text — changes only that one slot's value and hot-swaps with no
 /// recompile. `text` is the first paragraph's text; `extra_child` is spliced
 /// after it (empty, or a full `<p>` element) so a test can add a static child.
+#[cfg(target_os = "linux")]
 fn web_fixture_static_html(text: &str, extra_child: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -313,6 +320,7 @@ fn web_fixture_static_html(text: &str, extra_child: &str) -> String {
 /// single-slot change the classifier routes to `AppearanceOnly` — a zero-compile
 /// hot-swap. This is the `Ipe.Ui` analogue of `web_fixture_static_html`; the
 /// `Ui.node` element kernel is what the `Ui.el` / `Ui.column` wrappers lower to.
+#[cfg(target_os = "linux")]
 fn web_fixture_static_ui(text: &str, extra_child: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -349,6 +357,7 @@ fn web_fixture_static_ui(text: &str, extra_child: &str) -> String {
 /// (`SafeCssValue` on each axis) is a pure function of the String, so a hoisted
 /// slot read neutralises identically to the baked literal. A marker text confirms
 /// the app is up.
+#[cfg(target_os = "linux")]
 fn web_fixture_grid(cols: &str, rows: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -390,6 +399,7 @@ fn web_fixture_grid(cols: &str, rows: &str) -> String {
 /// enough to survive heavy contention (matched to the warm-rebuild budget used in
 /// `watch_integration.rs`) while proving no cargo build ran — any rebuild would
 /// fire `Restarted` and the test catches that separately.
+#[cfg(target_os = "linux")]
 const E2E_HOT_SWAP_BUDGET: Duration = Duration::from_secs(90);
 
 fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
@@ -406,6 +416,7 @@ fn fresh_dirs(tag: &str) -> Result<(PathBuf, PathBuf), BoxError> {
     Ok((ipe_dir, out_dir))
 }
 
+#[cfg(target_os = "linux")]
 fn write_main(ipe_dir: &Path, source: &str) -> Result<(), BoxError> {
     let src_dir = ipe_dir.join("src");
     std::fs::create_dir_all(&src_dir)
@@ -419,6 +430,7 @@ fn write_main(ipe_dir: &Path, source: &str) -> Result<(), BoxError> {
         .map_err(|e| -> BoxError { format!("write Main.ipe: {e}").into() })
 }
 
+#[cfg(target_os = "linux")]
 fn http_get_body(port: u16) -> Option<String> {
     // Retry a few times with a short pause: a freshly hot-swapped server may
     // accept the connection but return a partial body before the SSR finishes.
@@ -455,6 +467,7 @@ fn http_get_body(port: u16) -> Option<String> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn wait_for_serving(port: u16, timeout: Duration) -> bool {
     wait_for(timeout, || {
         http_get_body(port).is_some_and(|b| b.contains("marker"))
@@ -472,6 +485,7 @@ impl EventSink {
             .push(event);
     }
 
+    #[cfg(target_os = "linux")]
     fn count_hot_swapped(&self) -> usize {
         self.0
             .lock()
@@ -481,6 +495,7 @@ impl EventSink {
             .count()
     }
 
+    #[cfg(target_os = "linux")]
     fn count_restarted(&self) -> usize {
         self.0
             .lock()
@@ -1467,6 +1482,7 @@ fn static_ui_subtree_structural_edit_hot_swaps_without_rebuild() -> Result<(), B
 /// `IPE_WATCH_HOT_APPEARANCE` flag the compiler inlines each wrapper body and
 /// hoists the whole tree as a `UiTemplate`, proving wrapper calls are transparent
 /// to the template partition pass.
+#[cfg(target_os = "linux")]
 fn web_fixture_static_ui_wrappers(text: &str, extra_child: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -1603,6 +1619,7 @@ fn static_ui_subtree_wrapper_hot_swaps_without_rebuild() -> Result<(), BoxError>
 /// hole fill, so editing the static sibling's text changes ONLY the baked template
 /// string — a structural hot-swap with no recompile, while the `{count}` hole
 /// stays compiled.
+#[cfg(target_os = "linux")]
 fn web_fixture_value_hole(label: &str, extra_child: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -1715,6 +1732,7 @@ fn value_hole_static_sibling_hot_swaps_without_rebuild() -> Result<(), BoxError>
 /// A `Web.tea` whose view maps a lambda over `model.items` — under the flag the
 /// `List.map` becomes a template list hole whose per-item fills read the
 /// lambda's parameter `entry`.
+#[cfg(target_os = "linux")]
 fn web_fixture_list_hole(label: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -1783,6 +1801,7 @@ fn list_hole_item_binder_matches_its_reads() -> Result<(), BoxError> {
 /// the arm compiles to `apply_transition_hot("<baked datum>", model)`, so editing
 /// the `step` literal changes ONLY the baked datum json — a transition hot-swap
 /// with no recompile. A marker text confirms the app is up.
+#[cfg(target_os = "linux")]
 fn web_fixture_counter(step: u32, extra_text: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -1910,6 +1929,7 @@ fn update_arm_step_edit_hot_swaps_without_rebuild() -> Result<(), BoxError> {
 /// `const IPE_WEB_MSG_SET` descriptor of the variant surface, which the watch
 /// classifier diffs across emits. `keep_decrement` drops `Decrement` (a
 /// NON-additive removal) when false.
+#[cfg(target_os = "linux")]
 fn web_fixture_msg_variants(keep_decrement: bool) -> String {
     let decrement_variant = if keep_decrement { " | Decrement" } else { "" };
     let decrement_arm = if keep_decrement {
@@ -1957,6 +1977,7 @@ fn web_fixture_msg_variants(keep_decrement: bool) -> String {
 /// needed. The `subscriptions` entry compiles to `sub_every_hot(<baked datum>)`
 /// under the hot flag; editing only the interval literal changes only the baked
 /// datum json, so the classifier routes it to a sub patch (no recompile).
+#[cfg(target_os = "linux")]
 fn web_fixture_ticker(interval: u32, extra_text: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -2142,6 +2163,7 @@ fn subscriptions_interval_edit_hot_swaps_without_rebuild() -> Result<(), BoxErro
 /// over the arm's OWN compiled effect table (the `Cmd.perform` stays compiled,
 /// wrapped in a lazy `move` thunk; only the wiring id is data). A marker text
 /// confirms the app is up.
+#[cfg(target_os = "linux")]
 fn web_fixture_cmd_perform() -> String {
     "module Main exposing (main)\n\n\
      import Ipe.Tea.Web as Web\n\
@@ -2225,6 +2247,7 @@ fn cmd_perform_arm_composes_and_serves() -> Result<(), BoxError> {
 
 /// A `Web.tea` over a `String` model field whose `update` is `update_body`; its
 /// `Fetch` arm performs `Task.succeed label` for a `label` bound from the model.
+#[cfg(target_os = "linux")]
 fn web_fixture_cmd_perform_label(update_body: &str) -> String {
     format!(
         "module Main exposing (main)\n\n\
@@ -2259,6 +2282,7 @@ fn web_fixture_cmd_perform_label(update_body: &str) -> String {
 
 /// The `Cmd.perform` arm sits inside a source lambda in `update`, reading a
 /// `let` binding of the enclosing body.
+#[cfg(target_os = "linux")]
 const NESTED_LAMBDA_UPDATE: &str = "    let\n        \
         label =\n            \
             model.name\n\n        \
@@ -2274,6 +2298,7 @@ const NESTED_LAMBDA_UPDATE: &str = "    let\n        \
 
 /// The `Cmd.perform` arm reads `label`, which the body reads again after the
 /// `case`.
+#[cfg(target_os = "linux")]
 const READ_AFTER_MATCH_UPDATE: &str = "    let\n        \
         label =\n            \
             model.name\n\n        \
@@ -2290,6 +2315,7 @@ const READ_AFTER_MATCH_UPDATE: &str = "    let\n        \
         next\n";
 
 /// Cold-build `source` under the hot flag and wait until it serves its marker.
+#[cfg(target_os = "linux")]
 fn assert_serves_hot(tag: &str, port: u16, source: &str, what: &str) -> Result<(), BoxError> {
     let (ipe_dir, out_dir) = fresh_dirs(tag)?;
     write_main(&ipe_dir, source)?;
