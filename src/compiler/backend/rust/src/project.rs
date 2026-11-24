@@ -91,6 +91,117 @@ const RUNTIME_CONFIG_RS: &str = include_str!("../templates/ipe_runtime/config.rs
 /// the two cannot drift.
 const RUNTIME_CLIPPY_TOML: &str = include_str!("../../../../../src/runtime/rust/clippy.toml");
 
+/// The repository toolchain pin, the SSOT of every emitted `rust-version`.
+const RUST_TOOLCHAIN_TOML: &str = include_str!("../../../../../rust-toolchain.toml");
+
+/// The runtime crate's manifest, the one a dependency-model emit bundles.
+const RUNTIME_CARGO_TOML: &str = include_str!("../../../../../src/runtime/rust/Cargo.toml");
+
+/// The key line that opens the pinned toolchain's `channel` value.
+const CHANNEL_KEY: &[u8] = b"\nchannel = \"";
+
+/// The key line that opens a manifest's `rust-version` value.
+const RUST_VERSION_KEY: &[u8] = b"\nrust-version = \"";
+
+/// Every manifest an emit writes or bundles, each declaring `rust-version`.
+const EMITTED_MANIFESTS: &[&[u8]] = &[
+    CARGO_TOML.as_bytes(),
+    CARGO_DEP_TOML.as_bytes(),
+    CARGO_WASM_DEP_TOML.as_bytes(),
+    WASM_CARGO_TOML.as_bytes(),
+    RUNTIME_CARGO_TOML.as_bytes(),
+];
+
+// Every emitted manifest, and the runtime manifest a dependency-model emit
+// bundles, declares `rust-version` equal to the pinned toolchain: the one
+// toolchain CI builds emitted projects with is the floor a user's cargo
+// enforces, and a drift breaks this crate's build.
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if an emitted manifest's `rust-version` drifts from `rust-toolchain.toml` [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    every_manifest_declares_the_pin(RUST_TOOLCHAIN_TOML.as_bytes(), EMITTED_MANIFESTS),
+    "every emitted manifest's `rust-version` must equal the `rust-toolchain.toml` channel"
+);
+
+/// Whether every manifest in `manifests` declares the pinned `rust-version`.
+///
+/// The pin is the `toolchain` file's `channel`; the answer is `false` when the
+/// toolchain names no channel or a manifest no `rust-version`.
+const fn every_manifest_declares_the_pin(toolchain: &[u8], manifests: &[&[u8]]) -> bool {
+    let Some(pin) = quoted_value(toolchain, CHANNEL_KEY) else {
+        return false;
+    };
+    if pin.is_empty() {
+        return false;
+    }
+    let mut rest = manifests;
+    while let Some((manifest, tail)) = rest.split_first() {
+        let Some(declared) = quoted_value(manifest, RUST_VERSION_KEY) else {
+            return false;
+        };
+        if !bytes_eq(declared, pin) {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+/// The bytes between the first `key` in `text` and the next `"` on its line.
+const fn quoted_value<'a>(text: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    let mut at = text;
+    loop {
+        if let Some((head, value)) = at.split_at_checked(key.len())
+            && bytes_eq(head, key)
+        {
+            return until_quote(value);
+        }
+        let Some((_, tail)) = at.split_first() else {
+            return None;
+        };
+        at = tail;
+    }
+}
+
+/// The bytes of `text` before its first `"`.
+///
+/// `None` when a newline or the end comes first.
+const fn until_quote(text: &[u8]) -> Option<&[u8]> {
+    let mut len = 0usize;
+    let mut at = text;
+    while let Some((byte, tail)) = at.split_first() {
+        match *byte {
+            b'"' => {
+                return match text.split_at_checked(len) {
+                    Some((value, _)) => Some(value),
+                    None => None,
+                };
+            }
+            b'\n' => return None,
+            _ => {}
+        }
+        len = len.saturating_add(1);
+        at = tail;
+    }
+    None
+}
+
+/// Byte-wise equality of two slices.
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let (mut a, mut b) = (a, b);
+    while let (Some((x, a_tail)), Some((y, b_tail))) = (a.split_first(), b.split_first()) {
+        if *x != *y {
+            return false;
+        }
+        a = a_tail;
+        b = b_tail;
+    }
+    true
+}
+
 /// Insert [`RUNTIME_CLIPPY_TOML`] at the project root of a vendored-runtime emit.
 ///
 /// # Errors
@@ -114,6 +225,7 @@ pub const WASM_CARGO_TOML: &str = r#"[package]
 name = "ipe-app"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.98.1"
 # The crate root is `src/main.rs` (shared layout with the binary targets);
 # without this cargo would ALSO infer a `[[bin]]` from that path.
 autobins = false
@@ -6808,6 +6920,9 @@ mod tests {
 
 #[cfg(test)]
 mod vendored_feature_tests;
+
+#[cfg(test)]
+mod emitted_lint_level_tests;
 
 #[cfg(test)]
 mod wasm_shell_tests {
