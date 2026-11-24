@@ -312,7 +312,7 @@ fn write_async_app(root: &Path, name: &str, main_rs: &str) -> PkgInfo {
         wrapper_dir.join("src").join("lib.rs"),
         "use std::future::Future;\n\
          use std::pin::Pin;\n\
-         pub async fn greet(name: String) -> String { format!(\"hello {name}\") }\n\
+         pub async fn greet(name: String) -> String { let mut s = String::from(\"hello \"); s.push_str(&name); s }\n\
          pub fn drive(fut: Pin<Box<dyn Future<Output = String> + Send>>) -> String {\n    \
          drop(fut);\n    String::from(\"driven\")\n}\n",
     )

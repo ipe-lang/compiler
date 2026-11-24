@@ -215,6 +215,7 @@ fn tree_findings() -> Vec<(String, Vec<Finding>)> {
         .collect()
 }
 
+#[allow(clippy::expect_used)] // a missing fixture IS the failure
 fn fixture(name: &str) -> Vec<Finding> {
     let path = e2e_support::manifest_dir!().join(FIXTURES).join(name);
     let text = std::fs::read_to_string(&path).expect("read the crate-scope-scan fixture");
