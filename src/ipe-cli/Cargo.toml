@@ -52,6 +52,7 @@ test-fixtures = []
 [dependencies]
 ipe_stdlib = { path = "../stdlib" }
 ipe_docs = { path = "../ipe-docs" }
+ipe_annotate = { path = "../compiler/annotate" }
 ipe_fmt = { path = "../ipe-fmt" }
 ipe_kernels = { path = "../compiler/kernels" }
 ipe_intern = { path = "../compiler/intern" }

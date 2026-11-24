@@ -35,7 +35,9 @@ pub use diagnostic::{
     TypeDeclDefect, TypeError, TypeSizeOrigin, WidgetFileRefusal, WidgetPathEscape,
     WidgetUnreadable, WildcardDependence,
 };
-pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
+pub use render::{
+    DOC_HINT_CMD, display_width, expand_tabs, plain_message, render, render_json, render_ty,
+};
 pub use span::{Located, Span};
 
 #[cfg(test)]

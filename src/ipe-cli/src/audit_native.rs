@@ -1434,18 +1434,23 @@ fn emit_probe_and_build_argv(
     let target_dir = scratch.join("target");
     let cargo = absolute_cargo()?;
 
-    // Resolve the dependency graph to a `Cargo.lock` in the emitted crate BEFORE
-    // the jailed build runs. The jail binds the emitted crate read-only, so a
-    // build that had to write the lock in-place would fail on the read-only mount.
-    // Generating the lock here (outside the jail, from the toolchain's pre-fetched
-    // registry cache) lets the jailed build run `--locked --offline`: it reads the
-    // resolved graph and writes nothing but its own scratch-local target dir. A
-    // lock-generation failure is not itself a jail verdict; the jailed `--locked`
-    // build surfaces any residual resolution gap as a build failure, fail-closed.
-    // A resolve that crosses its time or output ceiling fails the audit.
-    let (crate::cargo_step::LockOutcome::Resolved
-    | crate::cargo_step::LockOutcome::Unresolved { .. }) =
-        crate::cargo_step::lock_offline(&cargo, &manifest_path)?;
+    // Derive the emitted crate's `Cargo.lock` from the pinned set BEFORE the
+    // jailed build runs. The jail binds the emitted crate read-only, so a build
+    // that had to write the lock in-place would fail on the read-only mount.
+    // Deriving it here (outside the jail, from the toolchain's pre-fetched
+    // registry cache) lets the jailed build run `--locked --offline`: it reads
+    // the derived graph and writes nothing but its own scratch-local target dir.
+    // An update that fails is not itself a jail verdict; the jailed `--locked`
+    // build surfaces any residual gap as a build failure, fail-closed. A lock
+    // that moves a pinned package, or a step that crosses its time or output
+    // ceiling, fails the audit.
+    match crate::cargo_step::lock_offline(&cargo, emitted_dir)? {
+        crate::cargo_step::LockOutcome::Seeded
+        | crate::cargo_step::LockOutcome::Unresolved { .. } => {}
+        crate::cargo_step::LockOutcome::Drift(refusal) => {
+            return Err(CliError::LockDrift(Box::new(refusal)));
+        }
+    }
 
     Ok(vec![
         cargo.into_os_string(),
