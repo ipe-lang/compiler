@@ -10,8 +10,10 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
+use crate::emit_ui_plan::UiDelegate;
 use crate::rust_str_lit;
 use ipe_diagnostics::Diagnostic;
+use ipe_ir::KernelFn;
 
 /// One runtime-crate cargo feature an item's gate names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -249,10 +251,87 @@ pub fn check_items(
         })
 }
 
+/// The emit path a serving kernel takes to the runtime entry that binds its listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServeEntry {
+    /// The standard kernel-call path to this runtime function.
+    KernelFn(&'static str),
+    /// A sibling shape emitter, which names the served runtime entry itself.
+    Delegate(UiDelegate),
+}
+
+/// The emit path of a serving kernel, or `None` for a kernel that serves nothing.
+///
+/// The arm list ends in a wildcard, but no serving kernel can hide behind it:
+/// a new serving kernel must join [`ipe_kernels::SERVING_KERNELS`] (that
+/// crate's own build-time check), and the assertion below then fails the build
+/// until this function names it.
+pub(crate) const fn serve_entry(k: KernelFn) -> Option<ServeEntry> {
+    match k {
+        KernelFn::ServerListen => Some(ServeEntry::KernelFn(k.def().runtime_fn)),
+        KernelFn::WebApp | KernelFn::WebAppRouted | KernelFn::WebAppWith => {
+            Some(ServeEntry::Delegate(UiDelegate::Web))
+        }
+        _ => None,
+    }
+}
+
+/// Whether every kernel of `serving` has a [`serve_entry`].
+const fn every_serving_kernel_has_an_entry(serving: &[KernelFn]) -> bool {
+    let mut rest = serving;
+    while let [kernel, tail @ ..] = rest {
+        if serve_entry(*kernel).is_none() {
+            return false;
+        }
+        rest = tail;
+    }
+    true
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a serving kernel has no emit path in `serve_entry`, so the kernel's listener fact and the backend could disagree [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(every_serving_kernel_has_an_entry(
+    &ipe_kernels::SERVING_KERNELS
+));
+
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeItem, UnselectedRuntimeItem, check_items};
+    use super::{
+        RuntimeItem, ServeEntry, UnselectedRuntimeItem, check_items,
+        every_serving_kernel_has_an_entry, serve_entry,
+    };
+    use crate::emit_ui_plan::UiDelegate;
+    use ipe_ir::KernelFn;
     use std::collections::BTreeSet;
+
+    /// Each serving kernel's emit path is the one its emitter takes; a kernel
+    /// that serves nothing has none, and a list naming one fails the check.
+    #[test]
+    fn every_serving_kernel_names_its_emit_path() {
+        assert_eq!(
+            serve_entry(KernelFn::ServerListen),
+            Some(ServeEntry::KernelFn("server_listen"))
+        );
+        for web in [
+            KernelFn::WebApp,
+            KernelFn::WebAppRouted,
+            KernelFn::WebAppWith,
+        ] {
+            assert_eq!(
+                serve_entry(web),
+                Some(ServeEntry::Delegate(UiDelegate::Web))
+            );
+        }
+        assert_eq!(serve_entry(KernelFn::WebEmbed), None);
+        assert_eq!(serve_entry(KernelFn::WebRenderStatic), None);
+        assert!(every_serving_kernel_has_an_entry(
+            &ipe_kernels::SERVING_KERNELS
+        ));
+        assert!(!every_serving_kernel_has_an_entry(&[
+            KernelFn::ServerListen,
+            KernelFn::WebEmbed
+        ]));
+    }
 
     /// The features `ipe init tui` under `ipe dev watch` selects.
     const TUI_WATCH: [&str; 6] = [

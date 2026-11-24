@@ -2037,10 +2037,16 @@ pub const fn ui_call_shape(k: KernelFn) -> Option<UiEmitPlan> {
         KernelFn::PubSubPublish | KernelFn::PubSubPublishNoEcho => native(N::PubSubPublish),
 
         // ── Shape-router delegations ──────────────────────────────────────
-        KernelFn::WebApp
-        | KernelFn::WebAppRouted
-        | KernelFn::WebEmbed
-        | KernelFn::WebAppWith
+        // A served web host routes where its serve entry says, so the emitter
+        // and the serving-kernel check read one fact. One without a delegate
+        // entry gets no plan (the partition tests below then fail).
+        KernelFn::WebApp | KernelFn::WebAppRouted | KernelFn::WebAppWith => {
+            match crate::runtime_items::serve_entry(k) {
+                Some(crate::runtime_items::ServeEntry::Delegate(to)) => delegate(to),
+                Some(crate::runtime_items::ServeEntry::KernelFn(_)) | None => return None,
+            }
+        }
+        KernelFn::WebEmbed
         | KernelFn::WebRoute
         | KernelFn::WebPageLink
         | KernelFn::WebRenderStatic => delegate(UiDelegate::Web),

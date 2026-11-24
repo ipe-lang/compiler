@@ -246,7 +246,7 @@ fn capabilities_json_is_a_stable_object() {
     assert_eq!(
         r.stdout.trim(),
         "{\"schema\":\"ipe.cli.capabilities/1\",\"status\":\"ok\",\
-         \"command\":\"capabilities\",\"payload\":{\"capabilities\":[\"network\",\"clock\"]}}"
+         \"command\":\"capabilities\",\"payload\":{\"capabilities\":[\"network\",\"clock\"],\"serves\":null}}"
     );
 }
 

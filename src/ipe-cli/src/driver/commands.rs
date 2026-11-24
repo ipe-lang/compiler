@@ -5502,6 +5502,7 @@ mod held_crate_tests {
         crate::run_sandbox::ResolvedCapabilities {
             inferred: native.clone(),
             declared: native,
+            served: ipe_ir::ServedListener::NotServed,
         }
     }
 
@@ -5666,6 +5667,7 @@ mod held_crate_tests {
             resolved: crate::run_sandbox::ResolvedCapabilities {
                 inferred: std::collections::BTreeSet::new(),
                 declared: std::collections::BTreeSet::new(),
+                served: ipe_ir::ServedListener::NotServed,
             },
         };
         assert!(!run_sandbox::is_native_bearing(
