@@ -5537,7 +5537,7 @@ mod tests {
                     vec![Attribute::Attr(name.into(), target.into())],
                 ));
                 assert!(
-                    out.contains(&format!("{name}=\"\"")),
+                    out.contains(&format!("{}=\"\"", name.to_ascii_lowercase())),
                     "{name}={target:?}: {out}"
                 );
                 assert_eq!(
