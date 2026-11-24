@@ -40,14 +40,14 @@ A static build (`--static`) produces a fully static Linux binary for one of the 
 
 Rust standard library: `rustup target add x86_64-unknown-linux-musl`.
 
-C compiler on an `x86_64` host — `ipe` looks for `x86_64-linux-musl-gcc`, then `musl-gcc` on `PATH`:
+C compiler on an `x86_64` host — the build looks for `x86_64-linux-musl-gcc`, then `musl-gcc` on `PATH`, and any other compiler is named through `CC_x86_64_unknown_linux_musl`:
 
 | Host | Install | Verified by |
 |------|---------|-------------|
 | Debian, Ubuntu | `sudo apt install musl-tools` | CI job `linux-static-x64` |
 | Fedora, RHEL, Rocky | `sudo dnf install musl-gcc` | the distribution's package index |
 | Arch | `sudo pacman -S --needed musl` | the distribution's package index |
-| Alpine | `sudo apk add build-base` | the distribution's package index |
+| Alpine | `sudo apk add build-base`, then set `CC_x86_64_unknown_linux_musl=cc` | the distribution's package index |
 
 On a host of another architecture no distribution package ships a musl cross compiler: set `CC_x86_64_unknown_linux_musl` to the path of an `x86_64` musl C compiler.
 
@@ -55,14 +55,14 @@ On a host of another architecture no distribution package ships a musl cross com
 
 Rust standard library: `rustup target add aarch64-unknown-linux-musl`.
 
-C compiler on an `aarch64` host — `ipe` looks for `aarch64-linux-musl-gcc`, then `musl-gcc` on `PATH`:
+C compiler on an `aarch64` host — the build looks for `aarch64-linux-musl-gcc` on `PATH`, and any other compiler is named through `CC_aarch64_unknown_linux_musl`:
 
 | Host | Install | Verified by |
 |------|---------|-------------|
-| Debian, Ubuntu | `sudo apt install musl-tools` | CI job `linux-static-arm64` |
-| Fedora, RHEL, Rocky | `sudo dnf install musl-gcc` | the distribution's package index |
-| Arch | `sudo pacman -S --needed musl` | the distribution's package index |
-| Alpine | `sudo apk add build-base` | the distribution's package index |
+| Debian, Ubuntu | `sudo apt install musl-tools`, then set `CC_aarch64_unknown_linux_musl=musl-gcc` | CI job `linux-static-arm64` |
+| Fedora, RHEL, Rocky | `sudo dnf install musl-gcc`, then set `CC_aarch64_unknown_linux_musl=musl-gcc` | the distribution's package index |
+| Arch | `sudo pacman -S --needed musl`, then set `CC_aarch64_unknown_linux_musl=musl-gcc` | the distribution's package index |
+| Alpine | `sudo apk add build-base`, then set `CC_aarch64_unknown_linux_musl=cc` | the distribution's package index |
 
 On a host of another architecture no distribution package ships a musl cross compiler: set `CC_aarch64_unknown_linux_musl` to the path of an `aarch64` musl C compiler.
 

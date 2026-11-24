@@ -12,7 +12,10 @@
 
 use std::fmt;
 
-use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
+use ipe_backend_rust::static_build::{
+    CProfile, CcCandidate, CpuArch, StaticAllocator, StaticPlan, StaticTriple,
+};
+use ipe_sandbox::host_tool::{self, HostTool};
 
 use crate::delivery::TargetTriple;
 use crate::remote_ingest::{LocalCeiling, LocalSource, TOOL_QUERY_LIMITS, run_local};
@@ -181,7 +184,7 @@ pub enum Refusal {
     TargetNotInstalled { triple: &'static str },
     /// The dependency graph carries C compile units (`zstd`, `ring`) and no
     /// musl-capable C compiler is reachable.
-    MuslCCompilerMissing { triple: &'static str },
+    MuslCCompilerMissing { triple: StaticTriple },
     /// A C-requiring allocator was requested alongside `--cfree`. `mimalloc`
     /// vendors and links C; `system` is the target libc's C malloc — neither
     /// can exist in a C-free artifact.
@@ -213,7 +216,7 @@ impl fmt::Display for Refusal {
             Self::WebviewStatic => text::msg::webview_static(),
             Self::TargetNotInstalled { triple } => text::target_not_installed(triple),
             Self::MuslCCompilerMissing { triple } => {
-                text::musl_c_compiler_missing(triple, &triple.replace('-', "_"))
+                text::musl_c_compiler_missing(&triple.as_str(), &triple.toolchain().cc_env)
             }
             Self::AllocatorRequiresC {
                 got: got @ AllocatorChoice::Mimalloc,
@@ -324,14 +327,35 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
 /// [`Refusal::TargetNotInstalled`] / [`Refusal::MuslCCompilerMissing`].
 pub fn preflight(plan: &StaticPlan) -> Result<(), Refusal> {
     let installed = rustup_installed_targets();
-    let toolchain = plan.triple.toolchain();
-    let cc_present = ipe_env::var_os(toolchain.cc_env).is_some()
-        || ipe_env::var_os("TARGET_CC").is_some()
-        || toolchain
+    let cc_present = c_compiler_reachable(
+        plan.triple,
+        CpuArch::HOST,
+        |name| ipe_env::var_os(name).is_some(),
+        |candidate| host_tool::resolve(HostTool::CCompiler(candidate)).is_ok(),
+    );
+    preflight_with(plan, installed.as_deref(), cc_present)
+}
+
+/// Whether cc-rs reaches a C compiler for `triple` on a host of architecture
+/// `host`: a `CC` variable names one, or a compiler cc-rs looks for unaided,
+/// and that targets the triple's architecture, is on `PATH`.
+///
+/// A name on `PATH` that cc-rs does not look for under the triple (`musl-gcc`
+/// for aarch64), or that targets the host's architecture when it is not the
+/// triple's, is not a compiler for the build.
+fn c_compiler_reachable(
+    triple: StaticTriple,
+    host: Option<CpuArch>,
+    env_set: impl Fn(&str) -> bool,
+    on_path: impl Fn(CcCandidate) -> bool,
+) -> bool {
+    let row = triple.toolchain();
+    env_set(row.cc_env)
+        || env_set("TARGET_CC")
+        || row
             .cc_candidates
             .iter()
-            .any(|candidate| binary_on_path(candidate.name()));
-    preflight_with(plan, installed.as_deref(), cc_present)
+            .any(|candidate| row.found_unaided(*candidate, host) && on_path(*candidate))
 }
 
 /// [`preflight`]'s pure core.
@@ -357,7 +381,7 @@ pub fn preflight_with(
     }
     if !plan.is_c_free() && !c_cc_present {
         return Err(Refusal::MuslCCompilerMissing {
-            triple: plan.triple.as_str(),
+            triple: plan.triple,
         });
     }
     Ok(())
@@ -386,18 +410,15 @@ fn installed_targets_of(rustup: &std::ffi::OsStr, ceiling: LocalCeiling) -> Opti
     Some(text.lines().map(str::to_owned).collect())
 }
 
-/// Whether an executable named `name` exists on `PATH`.
-fn binary_on_path(name: &str) -> bool {
-    ipe_env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocatorChoice, Refusal, StaticRequestLayer, parse_bool, preflight_with, resolve,
+        AllocatorChoice, Refusal, StaticRequestLayer, c_compiler_reachable, parse_bool,
+        preflight_with, resolve,
     };
-    use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
+    use ipe_backend_rust::static_build::{
+        CProfile, CcCandidate, CpuArch, StaticAllocator, StaticPlan, StaticTriple,
+    };
 
     /// A [`StaticPlan`] carrying a C-requiring allocator (the common test
     /// shape). C-free plans are built directly with [`CProfile::CFree`].
@@ -602,6 +623,57 @@ mod tests {
         // rustup absent → fail-soft on the target check, cc still gated.
         assert!(preflight_with(&plan, None, true).is_ok());
         assert!(preflight_with(&plan, None, false).is_err());
+    }
+
+    #[test]
+    fn a_compiler_cc_rs_does_not_use_is_not_reachable() {
+        let no_env = |_: &str| false;
+        let only = |listed: CcCandidate| move |candidate: CcCandidate| candidate == listed;
+        let (x86, arm) = (Some(CpuArch::X8664), Some(CpuArch::Aarch64));
+        // cc-rs never looks for `musl-gcc` under aarch64, on any host.
+        for host in [x86, arm] {
+            assert!(!c_compiler_reachable(
+                StaticTriple::Aarch64LinuxMusl,
+                host,
+                no_env,
+                only(CcCandidate::MuslGcc)
+            ));
+        }
+        // An aarch64 host's `musl-gcc` targets aarch64, not x86_64.
+        assert!(!c_compiler_reachable(
+            StaticTriple::X8664LinuxMusl,
+            arm,
+            no_env,
+            only(CcCandidate::MuslGcc)
+        ));
+        assert!(c_compiler_reachable(
+            StaticTriple::X8664LinuxMusl,
+            x86,
+            no_env,
+            only(CcCandidate::MuslGcc)
+        ));
+        assert!(c_compiler_reachable(
+            StaticTriple::Aarch64LinuxMusl,
+            x86,
+            no_env,
+            only(CcCandidate::Aarch64LinuxMuslGcc)
+        ));
+        // The documented remedy for aarch64: set the triple's variable.
+        assert!(c_compiler_reachable(
+            StaticTriple::Aarch64LinuxMusl,
+            arm,
+            |name| name == "CC_aarch64_unknown_linux_musl",
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn the_missing_compiler_refusal_names_the_table_variable() {
+        for triple in StaticTriple::ALL {
+            let shown = Refusal::MuslCCompilerMissing { triple }.to_string();
+            assert!(shown.contains(triple.toolchain().cc_env), "{shown}");
+            assert!(shown.contains(triple.as_str()), "{shown}");
+        }
     }
 
     #[test]

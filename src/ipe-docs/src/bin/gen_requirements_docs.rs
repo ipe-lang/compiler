@@ -364,16 +364,17 @@ fn render_target_toolchains(out: &mut String, host_c_toolchain: &[HostCToolchain
             "Rust standard library: `rustup target add {target}`.
 "
         );
-        let candidates: Vec<String> = row
-            .cc_candidates
+        let unaided: Vec<String> = row
+            .cc_rs_unaided
             .iter()
             .map(|candidate| format!("`{}`", candidate.name()))
             .collect();
         let _ = writeln!(
             out,
-            "C compiler on an `{arch}` host — `ipe` looks for {} on `PATH`:
+            "C compiler on an `{arch}` host — the build looks for {} on `PATH`, and any other compiler is named through `{}`:
 ",
-            candidates.join(", then ")
+            unaided.join(", then "),
+            row.cc_env
         );
         out.push_str(
             "| Host | Install | Verified by |
@@ -384,13 +385,20 @@ fn render_target_toolchains(out: &mut String, host_c_toolchain: &[HostCToolchain
 ",
         );
         for family in PackageFamily::ALL {
-            let command = row.install_command(family).unwrap_or("");
+            let install = row
+                .same_arch_install(family)
+                .map_or_else(String::new, |install| {
+                    row.cc_env_value_after(install.compiler).map_or_else(
+                        || format!("`{}`", install.command),
+                        |value| format!("`{}`, then set `{}={value}`", install.command, row.cc_env),
+                    )
+                });
             let verified = match row.verified_by(family) {
                 Some(Verified::CiJob(job)) => format!("CI job `{job}`"),
                 Some(Verified::PackageIndex) => "the distribution's package index".to_owned(),
                 None => String::new(),
             };
-            let _ = writeln!(out, "| {} | `{command}` | {verified} |", family.label());
+            let _ = writeln!(out, "| {} | {install} | {verified} |", family.label());
         }
         out.push('\n');
         match row.cross_arch {
@@ -526,6 +534,72 @@ mod tests {
         }
         assert!(out.contains("CI job `linux-static-arm64`"));
         assert!(!out.contains("-linux-gnu-gcc"));
+    }
+
+    /// cc-rs looks for `aarch64-linux-musl-gcc` under aarch64, never the
+    /// `musl-gcc` the Debian package ships, so the row names the variable.
+    #[test]
+    fn an_install_cc_rs_cannot_find_renders_its_cc_env_value() {
+        let out = render_requirements_docs(&sample_facts());
+        assert!(out.contains(
+            "| Debian, Ubuntu | `sudo apt install musl-tools`, then set \
+             `CC_aarch64_unknown_linux_musl=musl-gcc` | CI job `linux-static-arm64` |"
+        ));
+        assert!(out.contains(
+            "| Debian, Ubuntu | `sudo apt install musl-tools` | CI job `linux-static-x64` |"
+        ));
+        assert!(out.contains(
+            "| Alpine | `sudo apk add build-base`, then set `CC_x86_64_unknown_linux_musl=cc` |"
+        ));
+    }
+
+    /// Each CI job the table cites exists in `static.yml`, installs the
+    /// Debian package the row names, and sets the variable the row advises.
+    #[test]
+    fn every_cited_ci_job_runs_the_row_it_verifies() {
+        let path = workspace_path(".github/workflows/static.yml");
+        let workflow = std::fs::read_to_string(&path).expect("static.yml");
+        for triple in StaticTriple::ALL {
+            let row = triple.toolchain();
+            for family in PackageFamily::ALL {
+                let Some(Verified::CiJob(job)) = row.verified_by(family) else {
+                    continue;
+                };
+                let header = format!("  {job}:");
+                let job_body: String = workflow
+                    .lines()
+                    .skip_while(|line| *line != header)
+                    .skip(1)
+                    .take_while(|line| {
+                        line.is_empty() || line.starts_with("   ") || line.starts_with("  #")
+                    })
+                    .flat_map(|line| [line, "\n"])
+                    .collect();
+                assert!(!job_body.is_empty(), "static.yml has no job `{job}`");
+                let install = row.same_arch_install(family).expect("install row");
+                let package = install.command.rsplit(' ').next().expect("a package word");
+                assert!(
+                    job_body
+                        .lines()
+                        .any(|line| line.trim_start().starts_with("packages:")
+                            && line.split_whitespace().any(|word| word == package)),
+                    "`{job}` does not install `{package}`"
+                );
+                if let Some(value) = row.cc_env_value_after(install.compiler) {
+                    assert!(
+                        job_body.contains(&format!("{}: {value}\n", row.cc_env)),
+                        "`{job}` does not set `{}={value}`",
+                        row.cc_env
+                    );
+                } else {
+                    assert!(
+                        !job_body.contains(row.cc_env),
+                        "`{job}` sets `{}` the row says is not needed",
+                        row.cc_env
+                    );
+                }
+            }
+        }
     }
 
     /// Resolve the workspace root (two levels up from this crate's manifest).

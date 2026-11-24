@@ -411,7 +411,7 @@ the target {triple} is not installed — run: rustup target add {triple}
 
 ## musl-c-compiler-missing
 
-no musl-capable C compiler found for {triple} (the emitted project's zstd/ring dependencies compile C). Install one (Debian/Ubuntu: apt install musl-tools) or set CC_{triple_env}
+no musl-capable C compiler found for {triple} (the emitted project's zstd/ring dependencies compile C). Install one as the Target toolchains section of the requirements reference lists for your host, or set {cc_env} to the path of a musl C compiler for {triple}
 
 ## mimalloc-requires-c
 

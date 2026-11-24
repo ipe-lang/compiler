@@ -29,7 +29,7 @@ use ipe_diagnostics::{DResult, Diagnostic};
 
 /// The supported static triples and the host toolchain each needs live in the
 /// one table every reader shares.
-pub use ipe_target_toolchains::{StaticTriple, TargetLinker};
+pub use ipe_target_toolchains::{CcCandidate, CpuArch, StaticTriple, TargetLinker};
 
 /// The allocator linked into a static artifact.
 ///
