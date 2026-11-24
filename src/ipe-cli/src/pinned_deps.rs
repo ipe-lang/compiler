@@ -773,6 +773,9 @@ fn parse_dependency(value: &toml::Value) -> Result<DepRef, LockParseError> {
 }
 
 #[cfg(test)]
+mod closure_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         Admission, FfiPosture, LockDrift, LockField, LockParseError, LockRefusal, PinnedSet,
@@ -783,7 +786,7 @@ mod tests {
     const SUM_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     /// A small pinned set: `serde_json` 1.0.140 and `itoa` 1.0.15, plus a path member.
-    const SET: &[u8] = b"version = 4\n\n\
+    pub(super) const SET: &[u8] = b"version = 4\n\n\
         [[package]]\nname = \"member\"\nversion = \"0.1.0\"\ndependencies = [\"serde_json\"]\n\n\
         [[package]]\nname = \"itoa\"\nversion = \"1.0.15\"\n\
         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\
@@ -816,8 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn the_embedded_set_parses_and_holds_every_emitted_crate() {
-        use ipe_backend_rust::crate_specs as specs;
+    fn the_embedded_set_parses_within_the_lock_cap() {
         let set = pinned_set();
         assert!(set.is_ok(), "the workspace lock is a pinned set: {set:?}");
         let Ok(set) = set else { return };
@@ -825,51 +827,6 @@ mod tests {
         assert!(
             u64::try_from(SEED.len()).is_ok_and(|len| len <= super::LOCK_CAP.get()),
             "the seed fits the lock read cap"
-        );
-        let emitted = [
-            specs::TOKIO,
-            specs::SQLX.spec,
-            specs::AXUM.spec,
-            specs::TOWER_HTTP.spec,
-            specs::TOWER,
-            specs::ASYNC_TRAIT,
-            specs::CROSSTERM,
-            specs::UNICODE_WIDTH,
-            specs::WRY,
-            specs::TAO,
-            specs::GTK,
-            specs::TOKIO_TUNGSTENITE.spec,
-            specs::TOKIO_RUSTLS.spec,
-            specs::RUSTLS.spec,
-            specs::WEBPKI_ROOTS.spec,
-            specs::LETTRE.spec,
-            specs::ICU_CASEMAP,
-            specs::ICU_LOCALE_CORE,
-            specs::REQWEST.spec,
-            specs::TOML,
-            specs::SERDE_SAPHYR.spec,
-            specs::FLATE2,
-            specs::ZSTD,
-            specs::CSV,
-            specs::SHA1,
-            specs::MD5,
-            specs::AES_GCM,
-            specs::CHACHA20POLY1305,
-            specs::PBKDF2,
-            specs::JSONWEBTOKEN,
-            specs::URL,
-            specs::RSA.spec,
-            specs::FUTURES_UTIL,
-            specs::SERDE_JSON.spec,
-        ];
-        let missing: Vec<&str> = emitted
-            .iter()
-            .map(|spec| spec.name)
-            .filter(|name| !set.holds(name))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "every crate the emitter names is pinned: {missing:?}"
         );
     }
 
