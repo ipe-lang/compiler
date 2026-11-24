@@ -217,8 +217,10 @@ fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
 /// `LimitExceeded` refusal; a malformed or mismatched location, or one whose
 /// TLS mode does not verify a remote server, is `InvalidInput`, a dial policy
 /// refusal `PermissionDenied`, and a missing
-/// relay `Unavailable`; an untrusted SQLite location is `PermissionDenied`
-/// (a malformed `file:` name `InvalidInput`). `context` prefixes the message.
+/// relay `Unavailable`; an untrusted SQLite location is `AccessDenied`, a
+/// missing directory or non-file `CannotOpen`, both carrying their
+/// `DbFailure` (a malformed `file:` name `InvalidInput`). `context` prefixes
+/// the message.
 pub(crate) fn connect_refusal<E: crate::FromIpeError>(
     context: &str,
     engine: DbEngine,
@@ -4056,21 +4058,26 @@ impl DbPathRefusal {
     /// The Ipê error for this refusal, carrying `message`.
     ///
     /// A malformed name is the caller's input error; a missing worker is
-    /// unavailable; every location an attacker could reach is permission denied.
+    /// unavailable; a missing directory or a non-file is the driver's own
+    /// `CannotOpen`; every location an attacker could reach is `AccessDenied`.
     fn error_with(&self, message: String) -> IpeError {
         match self {
             Self::FileUriName | Self::NoFileName => IpeError::invalid_input(message),
             Self::ProofUnavailable => IpeError::unavailable(message),
-            Self::HoldingDirMissing
-            | Self::ChainUnreadable { .. }
+            // Nothing openable is there: the failure the driver itself reports
+            // for a missing directory or a non-file, so `Db.open`'s
+            // classification does not hinge on which check saw it first.
+            Self::HoldingDirMissing | Self::FinalNotRegular => {
+                IpeError::database(IpeDbFailure::CannotOpen, message)
+            }
+            Self::ChainUnreadable { .. }
             | Self::ChainTooDeep
             | Self::Untrusted { .. }
             | Self::FinalIsSymlink
-            | Self::FinalNotRegular
             | Self::FinalUnreadable
             | Self::FinalUntrusted { .. }
             | Self::SiblingIsSymlink { .. }
-            | Self::OutsideProfile => IpeError::permission_denied().with_message(message),
+            | Self::OutsideProfile => IpeError::database(IpeDbFailure::AccessDenied, message),
         }
     }
 }
@@ -12913,7 +12920,8 @@ mod tests {
             }
         }
 
-        /// `Db.open` on a directory fails as `CannotOpen`.
+        /// `Db.open` on a directory fails as `CannotOpen`, refused before the
+        /// driver sees it, with the message naming the non-file.
         #[tokio::test]
         async fn open_on_a_directory_is_cannot_open() {
             let dir = scratch_path("dir_db");
@@ -12923,7 +12931,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             assert!(
                 matches!(&failure, Some(IpeError::Error(IpeErrorKind::NotFound, info))
-                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))),
+                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))
+                        && info.message.contains("other than a regular file")),
                 "{failure:?}"
             );
         }
@@ -18446,7 +18455,7 @@ mod trusted_db_path_tests {
             assert!(proven.is_ok(), "{proven:?}");
             return;
         };
-        let real = std::fs::canonicalize(&real).map_or(real, |canonical| canonical);
+        let real = std::fs::canonicalize(&real).unwrap_or(real);
         assert_eq!(proven.as_path(), real.join("app.db"));
     }
 
@@ -18461,8 +18470,7 @@ mod trusted_db_path_tests {
             assert!(proven.is_ok(), "{proven:?}");
             return;
         };
-        let root =
-            std::fs::canonicalize(dir.path()).map_or_else(|_| dir.path().to_path_buf(), |c| c);
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
         assert_eq!(proven.as_path(), root.join("app.db"));
     }
 
@@ -18532,6 +18540,54 @@ mod trusted_db_path_tests {
             let _ = std::os::unix::fs::symlink(dir.path().join("elsewhere"), &named);
             let refused = TrustedDbPath::prove(&file);
             assert_eq!(refused, Err(DbPathRefusal::SiblingIsSymlink { sibling }));
+        }
+    }
+
+    /// Every refused location reaches Ipê classified like the driver's own
+    /// open failures: an attacker-reachable location is `AccessDenied`, a
+    /// missing directory or non-file `CannotOpen`.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::panic)] // a fixture location that is not refused cannot be classified
+    fn a_refused_location_carries_its_db_failure() {
+        use super::{IpeDbFailure, IpeError, IpeErrorDetails, IpeErrorKind, IpeMaybe};
+        let dir = private_dir("trusted-db-failure");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let untrusted = TrustedDbPath::prove(&shared.join("app.db"));
+        let missing = TrustedDbPath::prove(&dir.path().join("absent").join("app.db"));
+        let (Err(untrusted), Err(missing)) = (untrusted, missing) else {
+            panic!("both locations must refuse");
+        };
+        let classified = |refusal: &DbPathRefusal| {
+            let IpeError::Error(kind, info) = refusal.error_with(String::new());
+            Some((kind, info.details))
+        };
+        let denied = Some((
+            IpeErrorKind::PermissionDenied,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::AccessDenied)),
+        ));
+        let cannot_open = Some((
+            IpeErrorKind::NotFound,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen)),
+        ));
+        for refusal in [
+            untrusted,
+            DbPathRefusal::ChainTooDeep,
+            DbPathRefusal::FinalIsSymlink,
+            DbPathRefusal::FinalUnreadable,
+            DbPathRefusal::FinalUntrusted {
+                cause: ScratchRefusal::WritableByOthers,
+            },
+            DbPathRefusal::SiblingIsSymlink {
+                sibling: SqliteSibling::Wal,
+            },
+            DbPathRefusal::OutsideProfile,
+        ] {
+            assert_eq!(classified(&refusal), denied, "{refusal:?}");
+        }
+        for refusal in [missing, DbPathRefusal::FinalNotRegular] {
+            assert_eq!(classified(&refusal), cannot_open, "{refusal:?}");
         }
     }
 

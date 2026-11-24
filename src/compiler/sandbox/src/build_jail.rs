@@ -1203,7 +1203,8 @@ pub fn macos_scrubbed_env(
     }
     // Only the profile's declared env names re-enter, and only when the host
     // actually sets them (granted-but-unset ⇒ simply absent, never a placeholder).
-    for name in &profile.env_allowlist {
+    // A launcher-owned name never re-enters: this arm attests no root.
+    for name in crate::host_env::reexported_names(profile) {
         if let Some(value) = host_env(name) {
             env.push((OsString::from(name), value));
         }
@@ -4458,6 +4459,26 @@ mod tests {
             !by_name.contains_key("SECRET"),
             "a non-allowlisted host var must be dropped even when the host sets it"
         );
+    }
+
+    /// The macOS and FreeBSD arms attest no root, so a granted launcher-owned
+    /// name never carries a host value into the jail, in any letter case.
+    #[test]
+    fn scrubbed_env_never_re_exports_a_launcher_owned_name() {
+        let owned = crate::scratch::JAIL_TRUSTED_ROOTS_VAR;
+        let lower = owned.to_ascii_lowercase();
+        let lookup = |_: &str| Some(OsString::from("1:1"));
+        let profile = SandboxProfile {
+            env_allowlist: vec![owned.to_owned(), lower, "ALLOWED".to_owned()],
+            ..SandboxProfile::maximally_isolated()
+        };
+        let env = macos_scrubbed_env(&profile, Path::new("/s"), &lookup);
+        assert!(
+            env.iter()
+                .all(|(name, _)| !crate::host_env::is_launcher_owned(&name.to_string_lossy())),
+            "{env:?}"
+        );
+        assert!(env.iter().any(|(name, _)| name == "ALLOWED"), "{env:?}");
     }
 
     // ── the Windows exit-code mapping (pure — runs on any host) ───────────────

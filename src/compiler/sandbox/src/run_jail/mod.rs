@@ -684,10 +684,7 @@ fn jail_argv_unproven<'fd>(
         argv.push("LANG".into());
         argv.push(lang);
     }
-    for name in &profile.env_allowlist {
-        if name == JAIL_TRUSTED_ROOTS_VAR {
-            continue;
-        }
+    for name in crate::host_env::reexported_names(profile) {
         if let Some(value) = host_env(name) {
             argv.push("--setenv".into());
             argv.push(name.into());
@@ -696,16 +693,13 @@ fn jail_argv_unproven<'fd>(
     }
     // The bind roots the host proved trusted with real ids, set last so no
     // host or allowlisted value can stand in for the launcher's own proof.
-    match host_attested_roots(mounts).render() {
-        Some(roots) => {
-            argv.push("--setenv".into());
-            argv.push(JAIL_TRUSTED_ROOTS_VAR.into());
-            argv.push(roots.into());
-        }
-        None => {
-            argv.push("--unsetenv".into());
-            argv.push(JAIL_TRUSTED_ROOTS_VAR.into());
-        }
+    if let Some(roots) = host_attested_roots(mounts).render() {
+        argv.push("--setenv".into());
+        argv.push(JAIL_TRUSTED_ROOTS_VAR.into());
+        argv.push(roots.into());
+    } else {
+        argv.push("--unsetenv".into());
+        argv.push(JAIL_TRUSTED_ROOTS_VAR.into());
     }
 
     // Materialise the app inside the jail from the inherited sealed descriptor,
