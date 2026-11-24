@@ -82,6 +82,21 @@ fn guide_agents_plain_is_asset_bytes() -> io::Result<()> {
     Ok(())
 }
 
+/// A page's fence info string is markup, never text: `ipe doc IPE-T0018` lays out its
+/// `ipe ipe:error` example as code and prints neither the language nor the marker.
+#[test]
+fn fence_info_never_printed() {
+    let (ok, stdout, stderr) = run(&["doc", "IPE-T0018"]);
+    assert!(ok, "doc IPE-T0018 must succeed: {stderr}");
+    assert!(stdout.contains("IPE-T0018"), "the page opens: {stdout}");
+    assert!(!stdout.contains("ipe:error"), "fence info leaked: {stdout}");
+    assert!(!stdout.contains("```"), "fence marker leaked: {stdout}");
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "NO_COLOR page carries an escape: {stdout}"
+    );
+}
+
 #[test]
 fn generate_writes_docs_json_and_markdown() -> io::Result<()> {
     let pkg = documented_package("generate")?;

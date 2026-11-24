@@ -1024,17 +1024,17 @@ fn render_hit(hit: Hit<'_>, format: OutputFormat) {
     match hit {
         Hit::Bundled(entry) => render_bundle_entry(entry, format),
         Hit::Indexed(entry) => {
-            use crate::screen::{Screen, Stream, emit_machine};
+            use crate::screen::{Stream, emit_machine};
             match format {
                 OutputFormat::Plain => {
-                    emit_machine(Stream::Stdout, &render_doc_entry_plain(entry));
+                    emit_machine(Stream::Stdout, render_doc_entry_plain(entry).as_str());
                 }
                 OutputFormat::Json => emit_machine(Stream::Stdout, &render_doc_entry_json(entry)),
-                OutputFormat::Human => {
-                    let mut screen = Screen::new(Stream::Stdout);
-                    let body = render_doc_entry_human(entry, screen.palette());
-                    screen.styled(&body).emit();
-                }
+                OutputFormat::Human => show_doc_page(
+                    &crate::style::TerminalLine::sanitize(&entry.source_key),
+                    Some(entry_kind_label(entry.kind)),
+                    &entry.text,
+                ),
             }
         }
     }
@@ -1430,7 +1430,58 @@ fn render_member(
     written: Option<&WrittenSignatures>,
     format: OutputFormat,
 ) {
-    use crate::screen::{Screen, Stream, Tone, emit_machine};
+    use crate::screen::{Stream, emit_machine};
+    let shown = shown_member(module, member, written);
+    match format {
+        OutputFormat::Plain => emit_machine(Stream::Stdout, member_plain(&shown).as_str()),
+        OutputFormat::Json => {
+            let mut out = member_json(
+                &shown.key,
+                &module.name,
+                member,
+                &shown.signature,
+                shown.comment,
+            );
+            out.push('\n');
+            emit_machine(Stream::Stdout, &out);
+        }
+        OutputFormat::Human => show_doc_page(
+            &crate::style::TerminalLine::sanitize(&shown.heading),
+            None,
+            shown.comment,
+        ),
+    }
+}
+
+/// One member as every format shows it: its key, signature, heading line and doc comment.
+struct ShownMember<'a> {
+    /// `Module.member`.
+    key: String,
+    /// The signature the member is shown with.
+    signature: String,
+    /// The first line a human or plain rendering opens with.
+    heading: String,
+    /// The member's doc comment, empty when it has none.
+    comment: &'a str,
+}
+
+/// The plain rendering of a member: its heading line, then its doc comment, sanitised.
+fn member_plain(shown: &ShownMember<'_>) -> crate::style::TerminalSafe {
+    let mut out = shown.heading.clone();
+    out.push('\n');
+    if !shown.comment.is_empty() {
+        out.push_str(shown.comment);
+        out.push('\n');
+    }
+    crate::style::TerminalSafe::sanitize(&out)
+}
+
+/// What [`render_member`] shows for `member` of `module`.
+fn shown_member<'a>(
+    module: &'a ModuleDoc,
+    member: &str,
+    written: Option<&WrittenSignatures>,
+) -> ShownMember<'a> {
     let key = format!("{}.{member}", module.name);
     let value = module.values.iter().find(|v| v.name == member);
     let union = module.unions.iter().find(|u| u.name == member);
@@ -1452,30 +1503,35 @@ fn render_member(
         }
         (None, None) => (String::new(), key.clone(), ""),
     };
-    match format {
-        OutputFormat::Plain => {
-            let mut out = heading;
-            out.push('\n');
-            if !comment.is_empty() {
-                out.push_str(comment);
-                out.push('\n');
-            }
-            emit_machine(Stream::Stdout, &out);
-        }
-        OutputFormat::Json => {
-            let mut out = member_json(&key, &module.name, member, &signature, comment);
-            out.push('\n');
-            emit_machine(Stream::Stdout, &out);
-        }
-        OutputFormat::Human => {
-            let mut screen = Screen::new(Stream::Stdout);
-            screen.line(Tone::Success, &heading);
-            if !comment.is_empty() {
-                screen.blank().line(Tone::Text, comment);
-            }
-            screen.emit();
-        }
+    ShownMember {
+        key,
+        signature,
+        heading,
+        comment,
     }
+}
+
+/// Write one doc page to stdout: `markdown` laid out by [`crate::doc_terminal::render`] under a
+/// `title` line, at the width of the terminal stdout writes to.
+fn show_doc_page(title: &crate::style::TerminalLine, tag: Option<&str>, markdown: &str) {
+    use crate::screen::{Screen, Stream};
+    let mut screen = Screen::new(Stream::Stdout);
+    let page = doc_page(title, tag, markdown, screen.doc_width(), screen.palette());
+    screen.doc(&page).emit();
+}
+
+/// One doc page: `markdown` parsed (a doc comment's indented example read as code) and laid out
+/// under `title` at `width`.
+fn doc_page(
+    title: &crate::style::TerminalLine,
+    tag: Option<&str>,
+    markdown: &str,
+    width: crate::doc_terminal::Width,
+    palette: &crate::style::Palette,
+) -> crate::doc_terminal::DocText {
+    let normalised = crate::doc_fence::fence_indented_code(markdown);
+    let blocks = ipe_docs::markdown::parse::parse_blocks(&normalised);
+    crate::doc_terminal::render(title, tag, &blocks, width, palette)
 }
 
 /// The one `--json` shape of a member entry, whichever route found it:
@@ -1550,7 +1606,7 @@ fn run_type_search(
 
 /// Render a [`crate::doc_bundle::DocEntry`] per the requested output format.
 fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat) {
-    use crate::screen::{Screen, Stream, emit_machine};
+    use crate::screen::{Stream, emit_machine};
     match format {
         OutputFormat::Plain => {
             let mut out = entry.body.as_str().to_owned();
@@ -1563,45 +1619,26 @@ fn render_bundle_entry(entry: &crate::doc_bundle::DocEntry, format: OutputFormat
             let out = entry_json(
                 entry.kind.prefix(),
                 &entry.key,
-                &entry.title,
+                entry.title.as_str(),
                 entry.body.as_str(),
             );
             emit_machine(Stream::Stdout, &out);
         }
-        OutputFormat::Human => {
-            let mut screen = Screen::new(Stream::Stdout);
-            let p = screen.palette();
-            let mut out = String::new();
-            let _ = writeln!(
-                out,
-                "{}{}{}  {}[{}]{}",
-                p.bold,
-                crate::style::TerminalSafe::sanitize(&entry.key),
-                p.reset,
-                p.dim,
-                entry.kind,
-                p.reset
-            );
-            let body = entry.body.as_str();
-            if !body.is_empty() {
-                out.push('\n');
-                out.push_str(body);
-                if !body.ends_with('\n') {
-                    out.push('\n');
-                }
-            }
-            screen.styled(&out).emit();
-        }
+        OutputFormat::Human => show_doc_page(
+            &crate::style::TerminalLine::sanitize(&entry.key),
+            Some(entry.kind.prefix()),
+            entry.body.as_str(),
+        ),
     }
 }
 
-/// Plain (terse) rendering of a documentation entry: signature + example.
-fn render_doc_entry_plain(entry: &ipe_docs::Entry) -> String {
+/// Plain (terse) rendering of a documentation entry: its Markdown text, sanitised.
+fn render_doc_entry_plain(entry: &ipe_docs::Entry) -> crate::style::TerminalSafe {
     let mut out = entry.text.clone();
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out
+    crate::style::TerminalSafe::sanitize(&out)
 }
 
 /// The one `--json` shape of a non-member entry, whichever route found it:
@@ -1643,30 +1680,16 @@ fn render_doc_entry_json(entry: &ipe_docs::Entry) -> String {
     entry_json(kind, &entry.source_key, &title, &entry.text)
 }
 
-/// Human (rich) rendering of a documentation entry with ANSI colour.
-fn render_doc_entry_human(entry: &ipe_docs::Entry, p: &crate::style::Palette) -> String {
-    let kind_label = match entry.kind {
+/// The label a human page tags a content-index entry's kind with.
+const fn entry_kind_label(kind: ipe_docs::EntryKind) -> &'static str {
+    match kind {
         ipe_docs::EntryKind::Symbol => "symbol",
         ipe_docs::EntryKind::Module => "module",
         ipe_docs::EntryKind::Diagnostic => "diagnostic",
         ipe_docs::EntryKind::Construct => "construct",
         ipe_docs::EntryKind::Command => "command",
         ipe_docs::EntryKind::EnvVar => "env-var",
-    };
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "{}{}{}  {}[{}]{}",
-        p.bold, entry.source_key, p.reset, p.dim, kind_label, p.reset
-    );
-    if !entry.text.is_empty() {
-        out.push('\n');
-        out.push_str(&entry.text);
-        if !entry.text.ends_with('\n') {
-            out.push('\n');
-        }
     }
-    out
 }
 
 /// Run `ipe doc` for the parsed [`DocMode`].
@@ -3853,7 +3876,7 @@ fn build_site_search_script(
         entries.push(SearchEntry {
             kind: e.kind.prefix(),
             key: e.key.clone(),
-            title: e.title.clone(),
+            title: e.title.as_str().to_owned(),
             href: entry_href(e.kind, &e.key, href_base),
         });
     }
@@ -6230,7 +6253,7 @@ fn render_diagnostic_index(bundle: &crate::doc_bundle::DocBundle, search_script:
             html::escape(&href),
             html::escape(&entry.key),
             html::escape(&href),
-            html::escape(&entry.title),
+            html::escape(entry.title.as_str()),
         );
     }
     body.push_str("</ul>\n");
@@ -6278,7 +6301,7 @@ fn render_cli_index(bundle: &crate::doc_bundle::DocBundle, search_script: &str) 
         let summary = if entry.title.is_empty() {
             first_sentence(entry.body.as_str())
         } else {
-            entry.title.clone()
+            entry.title.as_str().to_owned()
         };
         let _ = write!(
             body,
@@ -6344,7 +6367,7 @@ fn render_curated_kind_indexes(
                 body,
                 "<li><a href=\"{}\" class=\"entry-title\">{}</a>",
                 html::escape(&href),
-                html::escape(&entry.title)
+                html::escape(entry.title.as_str())
             );
             if !summary.is_empty() {
                 let _ = write!(
@@ -6390,8 +6413,8 @@ fn render_entry_page(
 ) -> String {
     let header = render_header(nav_section_for(kind), "../", search_script);
     let mut body = String::new();
-    let _ = writeln!(body, "<h1>{}</h1>", html::escape(&entry.title));
-    if entry.key != entry.title {
+    let _ = writeln!(body, "<h1>{}</h1>", html::escape(entry.title.as_str()));
+    if entry.key != entry.title.as_str() {
         let _ = writeln!(
             body,
             "<p class=\"entry-code\"><code>{}</code></p>",
@@ -6412,7 +6435,7 @@ fn render_entry_page(
         // through the shared token-classifier highlighter (no second lexer).
         body.push_str(&ipe_docs::render::markdown_to_html(entry.body.as_str()));
     }
-    html_page(&entry.title, "../style.css", &header, &body)
+    html_page(entry.title.as_str(), "../style.css", &header, &body)
 }
 
 /// Emit a `<kind>/<key>.html` page for every non-module bundle entry, keyed by
@@ -6495,7 +6518,7 @@ fn render_html_index(
                 body,
                 "<li><a href=\"{}\" class=\"entry-title\">{}</a>",
                 html::escape(&href),
-                html::escape(&entry.title)
+                html::escape(entry.title.as_str())
             );
             if !summary.is_empty() {
                 let _ = write!(
@@ -7544,7 +7567,7 @@ mod tests {
         let entry = |kind, key: &str| DocEntry {
             kind,
             key: key.to_owned(),
-            title: key.to_owned(),
+            title: crate::style::TerminalLine::sanitize(key),
             body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
@@ -9162,7 +9185,9 @@ serve app
         let entry = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Cli,
             key: command.to_owned(),
-            title: crate::help::command_summary(command).unwrap().to_owned(),
+            title: crate::style::TerminalLine::sanitize(
+                crate::help::command_summary(command).unwrap(),
+            ),
             body: crate::style::TerminalSafe::sanitize(&markdown),
             order: None,
         };
@@ -10062,21 +10087,21 @@ serve app
         let first = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "first".to_owned(),
-            title: "First Guide".to_owned(),
+            title: crate::style::TerminalLine::sanitize("First Guide"),
             body: crate::style::TerminalSafe::sanitize(""),
             order: Some(0),
         };
         let second = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "second".to_owned(),
-            title: "Second Guide".to_owned(),
+            title: crate::style::TerminalLine::sanitize("Second Guide"),
             body: crate::style::TerminalSafe::sanitize(""),
             order: Some(1),
         };
         let unordered = crate::doc_bundle::DocEntry {
             kind: crate::doc_bundle::DocKind::Guide,
             key: "zz-alpha".to_owned(),
-            title: "Alpha".to_owned(),
+            title: crate::style::TerminalLine::sanitize("Alpha"),
             body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
@@ -11218,5 +11243,109 @@ total =
             ),
             "`agents` opens the guide, got {only:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_tests {
+    use super::*;
+    use crate::doc_terminal::Width;
+    use crate::style::{Palette, TerminalLine};
+
+    /// Every hazard a hostile page plants: OSC 52, OSC 8, CSI, a C1 CSI, a bidi override, a bare
+    /// carriage return.
+    const HOSTILE: &str = "pre \u{1b}]52;c;Zm9v\u{7} \u{1b}]8;;http://x\u{1b}\\link\u{1b}]8;;\u{1b}\\ \
+                           \u{1b}[2J \u{9b}31m \u{202e}rtl \rover";
+
+    /// Whether `text` holds a byte or character a terminal would act on.
+    fn has_hazard(text: &str) -> bool {
+        text.chars()
+            .any(|c| c != '\n' && ipe_diagnostics::terminal::is_display_hazard(c))
+    }
+
+    /// `text` with the colour palette's own escapes removed.
+    fn unpainted(text: &str) -> String {
+        let p = &Palette::COLOR;
+        [
+            p.yellow,
+            p.bright_yellow,
+            p.dim,
+            p.green,
+            p.red,
+            p.light_red,
+            p.orange,
+            p.white,
+            p.bold,
+            p.reset,
+        ]
+        .iter()
+        .fold(text.to_owned(), |acc, escape| acc.replace(escape, ""))
+    }
+
+    /// `markdown` laid out under every palette and width, palette escapes removed.
+    fn pages(markdown: &str) -> Vec<String> {
+        let title = TerminalLine::sanitize("t");
+        [&Palette::PLAIN, &Palette::COLOR]
+            .into_iter()
+            .flat_map(|palette| {
+                [Width::NO_WRAP, Width::DEFAULT].map(|width| {
+                    unpainted(doc_page(&title, Some("guide"), markdown, width, palette).as_str())
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hostile_body_rendered_inert() {
+        let entry = ipe_docs::Entry {
+            kind: ipe_docs::EntryKind::Construct,
+            source_key: "case".to_owned(),
+            text: format!("# {HOSTILE}\n\n{HOSTILE}\n\n```\n{HOSTILE}\n```\n\n- {HOSTILE}\n"),
+        };
+        let plain = render_doc_entry_plain(&entry);
+        assert!(!has_hazard(plain.as_str()), "{:?}", plain.as_str());
+        assert!(plain.as_str().contains("pre"));
+        for page in pages(&entry.text) {
+            assert!(!has_hazard(&page), "{page:?}");
+            assert!(
+                !page.contains("52;c") && !page.contains("http://x"),
+                "{page:?}"
+            );
+            assert!(page.contains("rtl"));
+        }
+    }
+
+    #[test]
+    fn hostile_doc_comment_after_lexer_inert() {
+        let module = ModuleDoc {
+            name: "Evil".to_owned(),
+            kind: ModuleKind::Local,
+            comment: String::new(),
+            unions: Vec::new(),
+            values: vec![ValueDoc {
+                name: "f".to_owned(),
+                signature: ValueSignature::Written("Int".to_owned()),
+                comment: format!("Doc {HOSTILE}"),
+            }],
+        };
+        let shown = shown_member(&module, "f", None);
+        let plain = member_plain(&shown);
+        assert!(!has_hazard(plain.as_str()), "{:?}", plain.as_str());
+        assert!(plain.as_str().starts_with("Evil.f : Int\nDoc pre"));
+        for page in pages(shown.comment) {
+            assert!(!has_hazard(&page), "{page:?}");
+        }
+    }
+
+    #[test]
+    fn indented_doc_comment_example_is_code() {
+        let page = doc_page(
+            &TerminalLine::sanitize("t"),
+            None,
+            "Use it:\n\n    f 1\n",
+            Width::NO_WRAP,
+            &Palette::PLAIN,
+        );
+        assert_eq!(page.as_str(), "t\n\nUse it:\n\n  f 1\n");
     }
 }

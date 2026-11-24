@@ -179,7 +179,7 @@ impl Folded {
         Self {
             key: fold(key),
             key_cut: key.len() < entry.key.len(),
-            title: fold(field(&entry.title)),
+            title: fold(field(entry.title.as_str())),
         }
     }
 
@@ -342,7 +342,7 @@ fn classify(
     } else if title.starts_with(q) {
         Tier::TitlePrefix
     } else if segment_starts_with(field(&entry.key), q)
-        || segment_starts_with(field(&entry.title), q)
+        || segment_starts_with(field(entry.title.as_str()), q)
     {
         Tier::Segment
     } else if key.contains(q) || title.contains(q) {
@@ -513,7 +513,7 @@ impl DocMiss {
 /// terminal line, then cut to [`SUMMARY_CHARS`] characters with `…` marking
 /// the cut.
 fn summary(entry: &DocEntry) -> TerminalLine {
-    let title = entry.title.trim();
+    let title = entry.title.as_str().trim();
     let source = if title.is_empty() || title == entry.key {
         entry
             .body
@@ -548,7 +548,7 @@ mod tests {
         DocEntry {
             kind,
             key: key.to_owned(),
-            title: title.to_owned(),
+            title: TerminalLine::sanitize(title),
             body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         }
@@ -971,7 +971,7 @@ mod tests {
         let hostile = DocEntry {
             kind: DocKind::Topic,
             key: "x".to_owned(),
-            title: "Ti\u{1b}]0;pwned\u{7}tle\u{202e}\r\n\tend".to_owned(),
+            title: TerminalLine::sanitize("Ti\u{1b}]0;pwned\u{7}tle\u{202e}\r\n\tend"),
             body: crate::style::TerminalSafe::sanitize(""),
             order: None,
         };
@@ -990,13 +990,13 @@ mod tests {
         let e = DocEntry {
             kind: DocKind::Symbol,
             key: "Ipe.List.map".to_owned(),
-            title: "Ipe.List.map".to_owned(),
+            title: TerminalLine::sanitize("Ipe.List.map"),
             body: crate::style::TerminalSafe::sanitize("\n\n# Apply a function\nmore"),
             order: None,
         };
         assert_eq!(summary(&e).as_str(), "Apply a function");
         let long = DocEntry {
-            title: "é".repeat(SUMMARY_CHARS.saturating_mul(2)),
+            title: TerminalLine::sanitize(&"é".repeat(SUMMARY_CHARS.saturating_mul(2))),
             ..e
         };
         let cut = summary(&long);
@@ -1006,7 +1006,7 @@ mod tests {
         );
         assert!(cut.as_str().ends_with('…'));
         let exact = DocEntry {
-            title: "a".repeat(SUMMARY_CHARS),
+            title: TerminalLine::sanitize(&"a".repeat(SUMMARY_CHARS)),
             ..long
         };
         assert_eq!(summary(&exact).as_str(), "a".repeat(SUMMARY_CHARS));

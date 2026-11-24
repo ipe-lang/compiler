@@ -27,7 +27,7 @@ use crate::CliError;
 use crate::cli_args::json;
 use crate::io_bounded::SMALL_FILE_READ_CAP;
 use crate::output_dir::held::HeldDir;
-use crate::style::TerminalSafe;
+use crate::style::{TerminalLine, TerminalSafe};
 
 // == Embedded doc-corpus ======================================================
 
@@ -242,8 +242,8 @@ pub struct DocEntry {
     /// The canonical lookup key within its kind (unique per kind).
     pub key: String,
     /// The human-readable title -- the first `# ` heading, a humanised slug,
-    /// or an overridden `title:` from YAML front-matter.
-    pub title: String,
+    /// or an overridden `title:` from YAML front-matter -- as one terminal-safe line.
+    pub title: TerminalLine,
     /// The Markdown body (front-matter already stripped when present), terminal-safe.
     pub body: TerminalSafe,
     /// Optional sort position from front-matter `order:` -- lower values sort
@@ -928,7 +928,7 @@ fn insert_entry(
         DocEntry {
             kind,
             key,
-            title,
+            title: TerminalLine::sanitize(&title),
             body,
             order,
         },
@@ -1203,7 +1203,7 @@ mod tests {
         let map = maps.get(&DocKind::Topic).expect("topic map");
         let entry = map.get("foo").expect("foo entry");
         assert_eq!(entry.key, "foo");
-        assert_eq!(entry.title, "Foo topic");
+        assert_eq!(entry.title.as_str(), "Foo topic");
         assert!(entry.body.as_str().contains("Some prose."));
     }
 
@@ -1219,7 +1219,7 @@ mod tests {
         ingest(&tmp, DocKind::Topic, &mut maps).expect("ingest");
         let map = maps.get(&DocKind::Topic).expect("topic map");
         assert!(map.contains_key("overridden"), "key overridden: {map:?}");
-        assert_eq!(map["overridden"].title, "Overridden Title");
+        assert_eq!(map["overridden"].title.as_str(), "Overridden Title");
     }
 
     #[test]

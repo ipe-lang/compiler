@@ -3011,6 +3011,7 @@ dependencies = [
  "ipe-git-https-fixture",
  "ipe-runtime-rust",
  "ipe-test-temp",
+ "ipe_annotate",
  "ipe_backend",
  "ipe_backend_rust",
  "ipe_canon",
