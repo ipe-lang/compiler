@@ -63,21 +63,26 @@ $ ipe capabilities --json <entry>
 {"schema":"ipe.cli.capabilities/1","status":"ok","command":"capabilities","payload":{"capabilities":["network","clock"],"serves":null}}
 ```
 
-`--plain` is the bare capability names, one per line — a pure program prints
-nothing, so `| wc -l` counts them. `--json` is the shared `{schema, status,
+`--plain` starts with the bare capability names, one per line — a pure program
+in a project with no frame origins prints nothing. `--json` is the shared `{schema, status,
 command, payload}` machine envelope; the sorted name array (empty for a pure
 program) rides under `payload.capabilities`, so `jq '.payload.capabilities'`
 reads it.
 
 A built program that serves — a `Web` host or `Server.listen` — listens on one
 inbound port. `--plain` ends with one `serves:web:<port>`, `serves:server:<port>`
-or `serves:server:dynamic` line for it, and `--json` carries the same token
-under `payload.serves`, `null` for a program that serves nothing. The human
-report names the port and the variable that overrides it.
+or `serves:server:dynamic` line for it (`serves:several` when it reaches both
+hosts), and `--json` carries the same token under `payload.serves`, `null` for a
+program that serves nothing. The human report names the port and the variable
+that overrides it. A project that lists `delivery.frameOrigins` also gets
+`frame:`, `frame-program:` and `frame-not-applicable:` lines before it. No
+capability name starts with `frame` or `serves:`, so dropping those lines leaves
+the bare names.
 
-> **Migration.** `--plain` is byte-for-byte the old default `ipe capabilities`
-> output. A script that parsed the bare list adopts `--plain` with no other
-> change; the unflagged command is now the human report.
+> **Migration.** For a program that serves nothing and lists no frame origins,
+> `--plain` is byte-for-byte the old default `ipe capabilities` output. A script
+> that parsed the bare list drops the `frame` and `serves:` lines; the unflagged
+> command is now the human report.
 
 ### `version`
 
