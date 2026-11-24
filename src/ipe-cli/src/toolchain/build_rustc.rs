@@ -25,12 +25,19 @@
 //! unsupported-toolchain diagnostic.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{ErrorKind, Read as _};
+use std::io::ErrorKind;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use ipe_fs_open::{ByteCap, OpenRefusal, RegularFile};
+
 /// The largest Cargo configuration file read, in bytes.
 const CONFIG_CAP: u64 = 1 << 20;
+
+/// [`CONFIG_CAP`] as a [`ByteCap`].
+const CONFIG_BYTE_CAP: ByteCap =
+    ByteCap::from_nonzero(const { NonZeroU64::MIN.saturating_add(CONFIG_CAP - 1) });
 
 /// Where the build's compiler comes from, with the program it names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +88,12 @@ pub enum RustcUnresolved {
         file: PathBuf,
         /// Why it cannot be read.
         kind: ErrorKind,
+    },
+    /// A Cargo configuration path names a directory, FIFO, device or socket,
+    /// not a regular file.
+    ConfigNotAFile {
+        /// The path.
+        file: PathBuf,
     },
     /// A Cargo configuration file is larger than [`CONFIG_CAP`].
     ConfigTooLarge {
@@ -263,8 +276,8 @@ fn config_rustc(
     let mut walked = Vec::new();
     for dir in cwd.ancestors() {
         let cargo_dir = dir.join(".cargo");
-        if let Some(file) = config_file(&cargo_dir) {
-            let found = read_rustc(&file)?;
+        if let Some((file, handle)) = config_file(&cargo_dir)? {
+            let found = read_rustc(&file, handle)?;
             if deepest.is_none() {
                 deepest = found.map(|value| (file, program_at(dir, &value, BACKSLASH_IS_PATH)));
             }
@@ -272,9 +285,9 @@ fn config_rustc(
         }
     }
     if let Some(home) = cargo_home.filter(|home| !walked.iter().any(|dir| dir == home))
-        && let Some(file) = config_file(home)
+        && let Some((file, handle)) = config_file(home)?
     {
-        let found = read_rustc(&file)?;
+        let found = read_rustc(&file, handle)?;
         if deepest.is_none() {
             let root = home.parent().unwrap_or(home);
             deepest = found.map(|value| (file, program_at(root, &value, BACKSLASH_IS_PATH)));
@@ -283,34 +296,58 @@ fn config_rustc(
     Ok(deepest)
 }
 
-/// The configuration file in `cargo_dir`: `config` when it opens, else
-/// `config.toml` when it exists.
-fn config_file(cargo_dir: &Path) -> Option<PathBuf> {
-    let bare = cargo_dir.join("config");
-    if std::fs::File::open(&bare).is_ok() {
-        return Some(bare);
+/// The configuration file in `cargo_dir`, opened: `config` when it exists,
+/// else `config.toml` when it exists.
+///
+/// Each is opened non-blocking and proven a regular file on the opened
+/// handle, so a FIFO, device, socket or directory there is refused, never
+/// waited on or read; cargo would stop on it too.
+fn config_file(cargo_dir: &Path) -> Result<Option<(PathBuf, RegularFile)>, RustcUnresolved> {
+    for name in ["config", "config.toml"] {
+        let file = cargo_dir.join(name);
+        match RegularFile::open_user_named(&file) {
+            Ok(handle) => return Ok(Some((file, handle))),
+            Err(OpenRefusal::Absent | OpenRefusal::Io(ErrorKind::NotADirectory)) => {}
+            Err(why) => return Err(config_refusal(file, why)),
+        }
     }
-    let toml = cargo_dir.join("config.toml");
-    toml.exists().then_some(toml)
+    Ok(None)
 }
 
-/// The `build.rustc` string `file` sets, if any.
-fn read_rustc(file: &Path) -> Result<Option<String>, RustcUnresolved> {
-    let unreadable = |e: std::io::Error| RustcUnresolved::ConfigUnreadable {
-        file: file.to_path_buf(),
-        kind: e.kind(),
-    };
-    let mut bytes = Vec::new();
-    std::fs::File::open(file)
-        .map_err(unreadable)?
-        .take(CONFIG_CAP.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(unreadable)?;
-    if !u64::try_from(bytes.len()).is_ok_and(|len| len <= CONFIG_CAP) {
-        return Err(RustcUnresolved::ConfigTooLarge {
-            file: file.to_path_buf(),
-        });
+/// The refusal of the configuration file `file` for `why`.
+const fn config_refusal(file: PathBuf, why: OpenRefusal) -> RustcUnresolved {
+    match why {
+        OpenRefusal::NotRegular(_) | OpenRefusal::Link => RustcUnresolved::ConfigNotAFile { file },
+        OpenRefusal::TooLarge(_) => RustcUnresolved::ConfigTooLarge { file },
+        OpenRefusal::NotUtf8 => RustcUnresolved::ConfigMalformed { file },
+        OpenRefusal::Absent => RustcUnresolved::ConfigUnreadable {
+            file,
+            kind: ErrorKind::NotFound,
+        },
+        OpenRefusal::Denied => RustcUnresolved::ConfigUnreadable {
+            file,
+            kind: ErrorKind::PermissionDenied,
+        },
+        OpenRefusal::InUse => RustcUnresolved::ConfigUnreadable {
+            file,
+            kind: ErrorKind::ResourceBusy,
+        },
+        OpenRefusal::Io(kind) => RustcUnresolved::ConfigUnreadable { file, kind },
+        OpenRefusal::TooManyEntries(_) | OpenRefusal::BadName => {
+            RustcUnresolved::ConfigUnreadable {
+                file,
+                kind: ErrorKind::InvalidInput,
+            }
+        }
     }
+}
+
+/// The `build.rustc` string the configuration file `file`, opened as
+/// `handle`, sets, if any.
+fn read_rustc(file: &Path, handle: RegularFile) -> Result<Option<String>, RustcUnresolved> {
+    let bytes = handle
+        .read_bytes(CONFIG_BYTE_CAP)
+        .map_err(|why| config_refusal(file.to_path_buf(), why))?;
     let malformed = || RustcUnresolved::ConfigMalformed {
         file: file.to_path_buf(),
     };
@@ -624,6 +661,77 @@ mod tests {
             "{verdict:?}"
         );
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable
+    fn a_fifo_config_is_refused_without_blocking() {
+        let good = reporting("cfg_fifo", &PINNED_RELEASE.to_string());
+        let cargo_dir = good.dir().join(".cargo");
+        std::fs::create_dir_all(&cargo_dir).expect("create .cargo");
+        let made = Command::new("mkfifo")
+            .arg(cargo_dir.join("config.toml"))
+            .status()
+            .expect("run mkfifo");
+        assert!(made.success(), "mkfifo failed");
+        let mut build = build_in(good.dir());
+        build.env("RUSTC", good.program());
+        let (sent, verdict) = std::sync::mpsc::channel();
+        let _judge = std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sent.send(judged(&build));
+            })
+            .expect("spawn the judging thread");
+        let verdict = verdict.recv_timeout(std::time::Duration::from_secs(10));
+        assert!(
+            matches!(
+                &verdict,
+                Ok(Err(ToolchainFloorRefusal {
+                    found: FloorReading::Unresolved(RustcUnresolved::ConfigNotAFile { .. }),
+                    ..
+                }))
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable
+    fn a_directory_config_is_refused() {
+        let good = reporting("cfg_dir", &PINNED_RELEASE.to_string());
+        std::fs::create_dir_all(good.dir().join(".cargo").join("config"))
+            .expect("create the config directory");
+        let verdict = judged(&build_in(good.dir()));
+        assert!(
+            matches!(
+                &verdict,
+                Err(ToolchainFloorRefusal {
+                    found: FloorReading::Unresolved(RustcUnresolved::ConfigNotAFile { .. }),
+                    ..
+                })
+            ),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // the test temp root is writable
+    fn a_cargo_file_that_is_not_a_directory_is_no_config() {
+        let bad = reporting("cfg_dot_file", &below_pin());
+        std::fs::write(bad.dir().join(".cargo"), "").expect("write the .cargo file");
+        let mut build = build_in(bad.dir());
+        build.env("PATH", path_of(&bad));
+        let verdict = judged(&build);
+        assert!(
+            matches!(
+                &verdict,
+                Err(ToolchainFloorRefusal {
+                    found: FloorReading::Below(_, RustcSource::Path),
+                    ..
+                })
+            ),
+            "{verdict:?}"
+        );
     }
 
     #[test]

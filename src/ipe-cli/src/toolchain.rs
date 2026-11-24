@@ -752,6 +752,10 @@ fn unresolved_detail(why: &RustcUnresolved, required: RustRelease) -> String {
             "The Cargo configuration file {} cannot be read ({kind}).",
             shown(file).as_str()
         ),
+        RustcUnresolved::ConfigNotAFile { file } => format!(
+            "The Cargo configuration path {} is not a regular file.",
+            shown(file).as_str()
+        ),
         RustcUnresolved::ConfigTooLarge { file } => format!(
             "The Cargo configuration file {} is larger than Ipê reads.",
             shown(file).as_str()
