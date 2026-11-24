@@ -291,6 +291,13 @@ pub enum LockDrift {
         /// Its version.
         version: Version,
     },
+    /// A crates.io package the set does not pin, locked without a checksum.
+    Unchecksummed {
+        /// The package.
+        name: CrateName,
+        /// Its locked version.
+        version: Version,
+    },
     /// A package from a source other than crates.io.
     ForeignSource {
         /// The package.
@@ -331,6 +338,9 @@ impl fmt::Display for LockDrift {
             },
             Self::ChecksumDiffers { name, version } => {
                 f.write_str(&text::lock_drift_checksum(name, version))
+            }
+            Self::Unchecksummed { name, version } => {
+                f.write_str(&text::lock_drift_unchecksummed(name, version))
             }
             Self::ForeignSource { name, source } => {
                 f.write_str(&text::lock_drift_foreign_source(name, source))
@@ -374,6 +384,7 @@ impl FfiPosture {
                 Self::FfiFree | Self::FfiBearing,
                 LockDrift::Moved { .. }
                 | LockDrift::ChecksumDiffers { .. }
+                | LockDrift::Unchecksummed { .. }
                 | LockDrift::ForeignSource { .. }
                 | LockDrift::Unparsable(_)
                 | LockDrift::WrapperDiffers
@@ -410,6 +421,7 @@ impl LockRefusal {
                 LockDrift::Unpinned { .. }
                 | LockDrift::Moved { .. }
                 | LockDrift::ChecksumDiffers { .. }
+                | LockDrift::Unchecksummed { .. }
                 | LockDrift::ForeignSource { .. },
             ) => Internal,
             (_, LockDrift::WrapperDiffers)
@@ -418,6 +430,7 @@ impl LockRefusal {
                 LockDrift::Unpinned { .. }
                 | LockDrift::Moved { .. }
                 | LockDrift::ChecksumDiffers { .. }
+                | LockDrift::Unchecksummed { .. }
                 | LockDrift::ForeignSource { .. },
             ) => User,
         }
@@ -425,8 +438,35 @@ impl LockRefusal {
 }
 
 impl fmt::Display for LockRefusal {
+    /// A move ipe's own graph made names no requester: its remedy is ipe's,
+    /// not a requirement the user could relax.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&text::cli_lock_drift(&self.lock.display(), &self.drift))
+        let lock = self.lock.display();
+        match (self.fault(), &self.drift) {
+            (
+                crate::screen::Fault::Internal,
+                LockDrift::Moved {
+                    name,
+                    locked,
+                    pinned,
+                    ..
+                },
+            ) => f.write_str(&text::cli_lock_drift(
+                &lock,
+                &text::lock_drift_moved_internal(name, locked, pinned),
+            )),
+            (
+                crate::screen::Fault::Internal | crate::screen::Fault::User,
+                LockDrift::Unpinned { .. }
+                | LockDrift::Moved { .. }
+                | LockDrift::ChecksumDiffers { .. }
+                | LockDrift::Unchecksummed { .. }
+                | LockDrift::ForeignSource { .. }
+                | LockDrift::Unparsable(_)
+                | LockDrift::WrapperDiffers
+                | LockDrift::SetUnreadable(_),
+            ) => f.write_str(&text::cli_lock_drift(&lock, &self.drift)),
+        }
     }
 }
 
@@ -552,6 +592,7 @@ impl PinnedSet {
                         Admission::Refuse,
                         LockDrift::Moved { .. }
                         | LockDrift::ChecksumDiffers { .. }
+                        | LockDrift::Unchecksummed { .. }
                         | LockDrift::ForeignSource { .. }
                         | LockDrift::Unparsable(_)
                         | LockDrift::WrapperDiffers
@@ -570,9 +611,15 @@ impl PinnedSet {
         package: &LockedPackage,
         checksum: Option<&Sha256Hex>,
     ) -> Option<LockDrift> {
-        let unpinned = || LockDrift::Unpinned {
-            name: package.name.clone(),
-            version: package.version.clone(),
+        let unpinned = || match checksum {
+            Some(_) => LockDrift::Unpinned {
+                name: package.name.clone(),
+                version: package.version.clone(),
+            },
+            None => LockDrift::Unchecksummed {
+                name: package.name.clone(),
+                version: package.version.clone(),
+            },
         };
         let Some(pins) = self.by_name.get(&package.name) else {
             return Some(unpinned());
@@ -609,24 +656,24 @@ impl PinnedSet {
 
     /// The crate of `lock` whose requirement locked `moved`.
     ///
-    /// A dependent that is not itself a pin is preferred: a pinned dependent
-    /// accepts the pinned version too, so the user crate beside it forced the
-    /// move.
+    /// Each dependent is ranked by its [`RequesterRole`] and the strongest
+    /// claim wins, the first in lock order within a rank; the bundled runtime
+    /// is never named, since its requirements are ipe's own.
     fn requester(&self, lock: &LockFile, moved: &LockedPackage) -> Option<Requester> {
-        let mut dependents = lock.packages.iter().filter(|package| {
-            package.dependencies.iter().any(|dep| {
-                dep.name == moved.name
-                    && dep
-                        .version
-                        .as_ref()
-                        .is_none_or(|version| *version == moved.version)
+        lock.packages
+            .iter()
+            .filter(|package| {
+                package.dependencies.iter().any(|dep| {
+                    dep.name == moved.name
+                        && dep
+                            .version
+                            .as_ref()
+                            .is_none_or(|version| *version == moved.version)
+                })
             })
-        });
-        let first = dependents.clone().next();
-        dependents
-            .find(|package| !self.pins_exactly(package))
-            .or(first)
-            .map(|package| match package.origin {
+            .filter_map(|package| Some((self.role(lock, package)?, package)))
+            .min_by_key(|(role, _)| *role)
+            .map(|(_, package)| match package.origin {
                 Origin::Local => Requester::Project {
                     name: package.name.clone(),
                 },
@@ -636,6 +683,47 @@ impl PinnedSet {
                 },
             })
     }
+
+    /// The claim `dependent` of `lock` has to have forced a move, or `None`
+    /// for the bundled runtime, which is never the one to relax.
+    fn role(&self, lock: &LockFile, dependent: &LockedPackage) -> Option<RequesterRole> {
+        match &dependent.origin {
+            Origin::Local if dependent.name.as_str() == crate::runtime_embed::RUNTIME_PACKAGE => {
+                None
+            }
+            Origin::Local => Some(
+                if lock.packages.iter().any(|package| {
+                    package
+                        .dependencies
+                        .iter()
+                        .any(|dep| dep.name == dependent.name)
+                }) {
+                    RequesterRole::Forcer
+                } else {
+                    RequesterRole::Root
+                },
+            ),
+            Origin::CratesIo { .. } | Origin::Foreign { .. } => {
+                Some(if self.pins_exactly(dependent) {
+                    RequesterRole::Pinned
+                } else {
+                    RequesterRole::Forcer
+                })
+            }
+        }
+    }
+}
+
+/// A dependent's claim to have forced a pin to move, strongest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RequesterRole {
+    /// A user crate outside the set: a registry or foreign package that is
+    /// not exactly a pin, or a path crate the project depends on.
+    Forcer,
+    /// The project's own root package, which no package depends on.
+    Root,
+    /// An exact pin, which accepts the pinned version too.
+    Pinned,
 }
 
 /// Whether one caret requirement admits both `a` and `b`.

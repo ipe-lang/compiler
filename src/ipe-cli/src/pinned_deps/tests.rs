@@ -267,3 +267,148 @@ fn only_an_ffi_bearing_crate_admits_and_only_an_unpinned_name() {
     };
     assert_eq!(refusal.fault(), crate::screen::Fault::Internal);
 }
+
+/// One path `[[package]]` table.
+fn local(name: &str, deps: &str) -> String {
+    format!("[[package]]\nname = \"{name}\"\nversion = \"0.1.0\"\ndependencies = [{deps}]\n\n")
+}
+
+#[test]
+fn the_forcing_user_crate_is_named_never_the_root_or_the_bundled_runtime() {
+    let Some(set) = set() else {
+        assert!(set().is_some(), "the small set parses");
+        return;
+    };
+    let runtime = crate::runtime_embed::RUNTIME_PACKAGE;
+    let forced = format!(
+        "version = 4\n\n{}{}{}{}",
+        local(
+            "ipe-app",
+            &format!("\"{runtime}\", \"serde_json\", \"zstd_user\""),
+        ),
+        local(runtime, "\"serde_json\""),
+        registry("serde_json", "1.0.100", SUM_A, ""),
+        registry("zstd_user", "1.0.0", SUM_A, "\"serde_json\""),
+    );
+    for posture in [FfiPosture::FfiFree, FfiPosture::FfiBearing] {
+        let verdict = set.judge_text(&forced, posture);
+        assert!(
+            matches!(
+                &verdict,
+                Err(LockDrift::Moved { requested_by: Some(by), .. })
+                    if matches!(&**by, Requester::Crate { name, version }
+                        if name.as_str() == "zstd_user" && version.to_string() == "1.0.0")
+            ),
+            "the user crate that forced the move is named under {posture:?}: {verdict:?}"
+        );
+    }
+    // The runtime written first: lock order must not choose it.
+    let own = format!(
+        "version = 4\n\n{}{}{}",
+        local(runtime, "\"serde_json\""),
+        local("ipe-app", &format!("\"{runtime}\", \"serde_json\"")),
+        registry("serde_json", "1.0.100", SUM_A, ""),
+    );
+    let verdict = set.judge_text(&own, FfiPosture::FfiBearing);
+    assert!(
+        matches!(
+            &verdict,
+            Err(LockDrift::Moved { requested_by: Some(by), .. })
+                if matches!(&**by, Requester::Project { name } if name.as_str() == "ipe-app")
+        ),
+        "the root is named, never the bundled runtime: {verdict:?}"
+    );
+    let only_runtime = format!(
+        "version = 4\n\n{}{}{}",
+        local("ipe-app", &format!("\"{runtime}\"")),
+        local(runtime, "\"serde_json\""),
+        registry("serde_json", "1.0.100", SUM_A, ""),
+    );
+    assert!(
+        matches!(
+            set.judge_text(&only_runtime, FfiPosture::FfiBearing),
+            Err(LockDrift::Moved {
+                requested_by: None,
+                ..
+            })
+        ),
+        "a move only the runtime asks for names no requester to relax"
+    );
+}
+
+#[test]
+fn a_move_in_ipes_own_graph_is_worded_as_ipes_not_the_users() {
+    let Some(set) = set() else {
+        assert!(set().is_some(), "the small set parses");
+        return;
+    };
+    let text = lock(
+        "\"serde_json\"",
+        &registry("serde_json", "1.0.100", SUM_A, ""),
+    );
+    for (posture, fault) in [
+        (FfiPosture::FfiFree, crate::screen::Fault::Internal),
+        (FfiPosture::FfiBearing, crate::screen::Fault::User),
+    ] {
+        let verdict = set.judge_text(&text, posture);
+        assert!(
+            matches!(&verdict, Err(LockDrift::Moved { .. })),
+            "{verdict:?}"
+        );
+        let Err(drift) = verdict else { return };
+        let refusal = LockRefusal {
+            lock: "Cargo.lock".into(),
+            posture,
+            drift,
+        };
+        assert_eq!(refusal.fault(), fault);
+        let shown = refusal.to_string();
+        match fault {
+            crate::screen::Fault::Internal => assert!(
+                shown.contains("ipe's own dependency graph")
+                    && shown.contains("serde_json 1.0.140")
+                    && !shown.contains("relax"),
+                "an internal move names no user remedy: {shown}"
+            ),
+            crate::screen::Fault::User => assert!(
+                shown.contains("relax app's `serde_json` requirement"),
+                "a user move names the user's remedy: {shown}"
+            ),
+        }
+    }
+}
+
+#[test]
+fn an_unpinned_crate_without_a_checksum_is_refused_under_every_posture() {
+    let Some(set) = set() else {
+        assert!(set().is_some(), "the small set parses");
+        return;
+    };
+    let text = lock(
+        "\"extra\"",
+        "[[package]]\nname = \"extra\"\nversion = \"2.0.0\"\n\
+         source = \"registry+https://github.com/rust-lang/crates.io-index\"\n",
+    );
+    for (posture, fault) in [
+        (FfiPosture::FfiFree, crate::screen::Fault::Internal),
+        (FfiPosture::FfiBearing, crate::screen::Fault::User),
+    ] {
+        let verdict = set.judge_text(&text, posture);
+        assert!(
+            matches!(
+                &verdict,
+                Err(LockDrift::Unchecksummed { name, .. }) if name.as_str() == "extra"
+            ),
+            "a checksum-less addition is refused under {posture:?}: {verdict:?}"
+        );
+        let Err(drift) = verdict else { return };
+        assert_eq!(posture.admits(&drift), Admission::Refuse);
+        let refusal = LockRefusal {
+            lock: "Cargo.lock".into(),
+            posture,
+            drift,
+        };
+        assert_eq!(refusal.fault(), fault);
+        assert!(refusal.to_string().contains("without a checksum"));
+    }
+}

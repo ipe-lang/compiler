@@ -486,7 +486,8 @@ const QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<60>(),
 });
 
-/// The ceilings of an offline cargo lock step, which reads only the local registry cache.
+/// The ceilings of an offline cargo lock step (the lock probe and the offline
+/// `cargo update`), which reads only the local registry cache.
 ///
 /// Its stdout is held to 64 KiB and its run to two minutes, so a held
 /// `.package-cache` lock or a wedged resolve cannot hold the CLI.
@@ -495,7 +496,7 @@ pub const LOCK_RESOLVE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<120>(),
 });
 
-/// The ceilings of a cargo lock update, which may fetch the registry index.
+/// The ceilings of an online cargo lock update, which fetches the registry index.
 ///
 /// Its stdout is held to 64 KiB and its run to ten minutes, the wall of
 /// [`INDEX_CLONE`].

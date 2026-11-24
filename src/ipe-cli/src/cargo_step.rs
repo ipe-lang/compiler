@@ -914,9 +914,9 @@ fn rendered_diagnostics(cargo_json_stdout: &str) -> String {
 /// [`LOCK_RESOLVE_LIMITS`], and a lock it holds is judged against the pinned
 /// set ([`crate::pinned_deps::pinned_set`]). Every other lock (absent,
 /// drifted, or disagreeing) is replaced by the set's own bytes and narrowed
-/// to this crate by `cargo update --workspace`, offline first and online
-/// once only if that fails, both under [`LOCK_FETCH_LIMITS`]; the result is
-/// judged again. Both steps are the one silent gap before cargo's own
+/// to this crate by `cargo update --workspace`, offline first under
+/// [`LOCK_RESOLVE_LIMITS`] and online once only if that fails, under
+/// [`LOCK_FETCH_LIMITS`]; the result is judged again. Both steps are the one silent gap before cargo's own
 /// progress starts, so a [`Verbosity::Progress`] build covers them with one
 /// stage, settled before the relay starts.
 ///
@@ -966,11 +966,11 @@ fn derive_lock(build: &Command, crate_dir: &OwnedDir) -> Result<Locked, CliError
     }
     seed_lock(&held, set)?;
     let env = LockEnv::Build(build);
-    let offline = update_lock_within(env, dir, Network::Offline, LOCK_FETCH_LIMITS)?;
+    let offline = update_lock_offline_within(env, dir, LOCK_RESOLVE_LIMITS)?;
     let updated = if offline.status.success() {
         offline
     } else {
-        update_lock_within(env, dir, Network::Online, LOCK_FETCH_LIMITS)?
+        update_lock_online_within(env, dir, LOCK_FETCH_LIMITS)?
     };
     if !updated.status.success() {
         return Err(CliError::EmittedBuildFailed {
@@ -1158,47 +1158,56 @@ impl LockEnv<'_> {
     }
 }
 
-/// Whether a lock update may reach the registry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Network {
-    /// `--offline`: only the local registry cache is read.
-    Offline,
-    /// The registry index may be fetched.
-    Online,
-}
-
-/// Narrow the lock in `dir` to its crate with `cargo update --workspace`.
+/// Narrow the lock in `dir` to its crate with `cargo update --workspace --offline`.
 ///
 /// `--workspace` keeps every non-member pin of the seeded lock: cargo adds
-/// the crate's own packages and prunes the ones it does not reach. It is the
-/// one place a lock is rewritten, held to `ceiling` ([`LOCK_FETCH_LIMITS`] in
-/// production). Its stderr is kept for the failure diagnostic, never relayed;
-/// its exit is the caller's to judge.
+/// the crate's own packages and prunes the ones it does not reach. Only the
+/// local registry cache is read, so it is held to `ceiling`
+/// ([`LOCK_RESOLVE_LIMITS`] in production), the probe's. Its stderr is kept
+/// for the failure diagnostic, never relayed; its exit is the caller's to judge.
 ///
 /// # Errors
 /// - [`CliError::LocalLimitExceeded`] if the update crosses a ceiling.
 /// - [`CliError::Io`] if it cannot be spawned or waited on.
 /// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
-fn update_lock_within(
+fn update_lock_offline_within(
     env: LockEnv<'_>,
     dir: &Path,
-    network: Network,
     ceiling: LocalCeiling,
 ) -> Result<Captured, CliError> {
     let mut update = Command::new(env.program());
+    narrow_to_workspace(&mut update, env, dir);
+    update.arg("--offline");
+    run_local(update, ceiling, LocalSource::LockResolve).map_err(|e| local_run_error(dir, e))
+}
+
+/// Narrow the lock in `dir` to its crate with `cargo update --workspace`, fetching the index.
+///
+/// The online twin of [`update_lock_offline_within`], held to `ceiling`
+/// ([`LOCK_FETCH_LIMITS`] in production): the index fetch is the one step
+/// that may take the wall of a registry clone.
+///
+/// # Errors
+/// - [`CliError::LocalLimitExceeded`] if the update crosses a ceiling.
+/// - [`CliError::Io`] if it cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
+fn update_lock_online_within(
+    env: LockEnv<'_>,
+    dir: &Path,
+    ceiling: LocalCeiling,
+) -> Result<Captured, CliError> {
+    let mut update = Command::new(env.program());
+    narrow_to_workspace(&mut update, env, dir);
+    run_local(update, ceiling, LocalSource::LockFetch).map_err(|e| local_run_error(dir, e))
+}
+
+/// Make `update` a `cargo update --workspace` in `dir` with `env`'s environment.
+fn narrow_to_workspace(update: &mut Command, env: LockEnv<'_>, dir: &Path) {
     update.args(["update", "--workspace"]).current_dir(dir);
-    let source = match network {
-        Network::Offline => {
-            update.arg("--offline");
-            LocalSource::LockResolve
-        }
-        Network::Online => LocalSource::LockFetch,
-    };
     match env {
-        LockEnv::Build(build) => forward_build_env(build, &mut update),
+        LockEnv::Build(build) => forward_build_env(build, update),
         LockEnv::Bare(_) => {}
     }
-    run_local(update, ceiling, source).map_err(|e| local_run_error(dir, e))
 }
 
 /// How an offline lock derivation that ran within its ceilings ended.
@@ -1218,7 +1227,7 @@ pub enum LockOutcome {
 /// Derive the `Cargo.lock` of the crate at `crate_dir` from the pinned set, offline.
 ///
 /// The set's bytes are written as the lock through a held handle, narrowed
-/// by an offline `cargo update --workspace` under [`LOCK_FETCH_LIMITS`] with
+/// by an offline `cargo update --workspace` under [`LOCK_RESOLVE_LIMITS`] with
 /// stdin closed, and judged FFI-bearing: user crates may add names, never
 /// move a pin. A non-zero exit is a [`LockOutcome::Unresolved`] and a
 /// disagreement a [`LockOutcome::Drift`], not errors: the caller decides
@@ -1240,12 +1249,7 @@ pub fn lock_offline(cargo: &Path, crate_dir: &Path) -> Result<LockOutcome, CliEr
     let held = HeldDir::open(crate_dir)?
         .ok_or_else(|| CliError::from(OutputRefusal::Replaced(crate_dir.to_path_buf())))?;
     seed_lock(&held, set)?;
-    let updated = update_lock_within(
-        LockEnv::Bare(cargo),
-        crate_dir,
-        Network::Offline,
-        LOCK_FETCH_LIMITS,
-    )?;
+    let updated = update_lock_offline_within(LockEnv::Bare(cargo), crate_dir, LOCK_RESOLVE_LIMITS)?;
     if !updated.status.success() {
         return Ok(LockOutcome::Unresolved {
             code: updated.status.code(),
@@ -2416,8 +2420,8 @@ mod tests {
 
         use super::super::{
             BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, LockEnv, LockOutcome,
-            LockProbe, Network, Verbosity, WatchBuild, lock_offline, probe_lock_within,
-            target_directory, target_directory_within, update_lock_within,
+            LockProbe, Verbosity, WatchBuild, lock_offline, probe_lock_within, target_directory,
+            target_directory_within, update_lock_offline_within, update_lock_online_within,
         };
         use super::TARGET;
         use crate::CliError;
@@ -2524,11 +2528,10 @@ mod tests {
             let base = scratch("lock-wall");
             let cargo = sleeping_stub(&base);
             let started = std::time::Instant::now();
-            let locked = update_lock_within(
+            let locked = update_lock_offline_within(
                 LockEnv::Bare(cargo.path()),
                 &base,
-                Network::Offline,
-                LOCK_FETCH_LIMITS.with_wall(LocalWall::of_secs::<1>()),
+                LOCK_RESOLVE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );
             assert!(
                 matches!(
@@ -2612,10 +2615,9 @@ mod tests {
             let cargo = sleeping_stub(&base);
             let build = std::process::Command::new(cargo.path());
             let started = std::time::Instant::now();
-            let locked = update_lock_within(
+            let locked = update_lock_online_within(
                 LockEnv::Build(&build),
                 &base,
-                Network::Online,
                 LOCK_FETCH_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );
             assert!(
@@ -2957,12 +2959,16 @@ mod tests {
                 ),
             );
             let crate_dir = emitted_crate(&base, false);
+            // FFI-bearing: a user crate beside ipe's graph is the user's to relax.
+            std::fs::create_dir(crate_dir.path().join("src")).expect("create src");
+            std::fs::write(crate_dir.path().join("src").join("ffi.rs"), "").expect("write ffi");
             let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
             assert!(
                 matches!(
                     &built,
                     Err(CliError::LockDrift(refusal))
                         if matches!(&refusal.drift, crate::pinned_deps::LockDrift::Moved { .. })
+                            && refusal.posture == crate::pinned_deps::FfiPosture::FfiBearing
                 ),
                 "a lock the update moves off its pin is refused, got {built:?}"
             );

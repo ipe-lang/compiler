@@ -2854,6 +2854,14 @@ it locks {name} {version}, a crate outside the tested set
 
 it locks {name} {locked}, but ipe pins {name} {pinned} — relax the requirement that asks for {name} {locked} to one compatible with {name} {pinned}
 
+## lock-drift-moved-internal
+
+ipe's own dependency graph locks {name} {locked}, but ipe pins {name} {pinned}: this `ipe` emitted a requirement its tested set does not satisfy
+
+## lock-drift-unchecksummed
+
+it locks {name} {version} from crates.io without a checksum, so its bytes cannot be verified — delete the lock entry and let cargo record it again
+
 ## lock-drift-checksum
 
 it locks {name} {version} with a checksum other than the tested one

@@ -1989,6 +1989,10 @@ messages! {
     lock_drift_moved_by_crate(name, locked, pinned, requester, version) = "lock-drift-moved-by-crate";
     /// A pinned crate moved, with no requester found in the lock.
     lock_drift_moved_unrequested(name, locked, pinned) = "lock-drift-moved-unrequested";
+    /// ipe's own emitted graph moved a pinned crate.
+    lock_drift_moved_internal(name, locked, pinned) = "lock-drift-moved-internal";
+    /// A crates.io crate locked without a checksum.
+    lock_drift_unchecksummed(name, version) = "lock-drift-unchecksummed";
     /// A pinned version locked with another checksum.
     lock_drift_checksum(name, version) = "lock-drift-checksum";
     /// A lock takes a crate from a source other than crates.io.
