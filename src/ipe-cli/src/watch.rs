@@ -100,7 +100,8 @@ use crate::{CliError, write_emitted_project};
 mod surface;
 
 use surface::{
-    AppearanceRoute, ChildStdin, ChildSurface, StartOrder, TerminalLease, TtyRestore, apply_order,
+    AppearanceRoute, ChildExit, ChildStdin, ChildSurface, StartOrder, TerminalHandOver,
+    TerminalLease, TerminalRestore, TtyRestore, apply_order,
 };
 
 /// A lifecycle notification from a running watch session.
@@ -1255,34 +1256,38 @@ fn run_inner(
     // outcome is returned.
     let mut ended: Result<(), CliError> = Ok(());
     loop {
-        // While a dev child owns the terminal, the loop wakes on a bounded
-        // poll to notice the child exiting on its own: an interrupted child
-        // ends the watch, any other exit hands the terminal back and waits
-        // for the next save.
-        let event = if lease.is_held() {
+        // While a dev child runs, whatever its surface, the loop wakes on a
+        // bounded poll, and every wake first reaps a child that exited on its
+        // own: an interrupted terminal owner ends the watch, any other exit
+        // leaves nothing running and waits for the next save.
+        let received = if matches!(supervisor, ipe_watch::SupervisorState::Running { .. }) {
             match evt_rx.recv_timeout(CHILD_EXIT_POLL) {
-                Ok(event) => event,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    match lease.reap_exited_owner(&mut supervisor) {
-                        Some(status) if exited_interrupted(status) => break,
-                        Some(status) => {
-                            running_surface = after_owner_exit(proxy.as_ref());
-                            emit_watch_line(
-                                &crate::style::TerminalSafe::sanitize(&app_exited_line(status)),
-                                WatchRole::Info,
-                            );
-                        }
-                        None => {}
-                    }
-                    continue;
-                }
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         } else {
             match evt_rx.recv() {
-                Ok(event) => event,
+                Ok(event) => Some(event),
                 Err(mpsc::RecvError) => break,
             }
+        };
+        if let Some(exit) = after_child_exit(
+            &lease,
+            &mut supervisor,
+            &mut running_surface,
+            proxy.as_ref(),
+        ) {
+            if exit.hand_over == TerminalHandOver::Owns && exited_interrupted(exit.status) {
+                break;
+            }
+            emit_watch_line(
+                &crate::style::TerminalSafe::sanitize(&app_exited_line(exit.status)),
+                WatchRole::Info,
+            );
+        }
+        let Some(event) = received else {
+            continue;
         };
         match event {
             OrchestratorEvent::FsBatch { settle } => {
@@ -2128,7 +2133,7 @@ fn free_loopback_port() -> std::io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
-/// How often the watch checks whether a terminal-owning dev child exited on its own.
+/// How often the watch checks whether its running dev child exited on its own.
 const CHILD_EXIT_POLL: Duration = Duration::from_millis(200);
 
 /// The notice for a dev child that exited on its own; the status follows it.
@@ -3205,14 +3210,25 @@ const fn stop_first_upstream(
     }
 }
 
-/// What the watch keeps once the terminal owner exited on its own: no running
-/// surface, and an engaged proxy routes nothing, so the port the owner
+/// Reap the running dev child if it exited on its own, and decide every consequence of that exit.
+///
+/// Whatever the child's surface, its exit leaves the supervisor holding its
+/// binary as the last good one, releases the terminal when the child owned it,
+/// leaves no running surface for a status post or an appearance route to
+/// reach, and routes an engaged proxy to nothing, so the port the child
 /// released is never an upstream any local process could bind.
-fn after_owner_exit(proxy: Option<&ipe_watch::DevProxy>) -> Option<ChildSurface> {
+fn after_child_exit<R: TerminalRestore>(
+    lease: &TerminalLease<R>,
+    supervisor: &mut ipe_watch::SupervisorState,
+    running_surface: &mut Option<ChildSurface>,
+    proxy: Option<&ipe_watch::DevProxy>,
+) -> Option<ChildExit> {
+    let exit = lease.reap_exited_child(supervisor)?;
+    *running_surface = None;
     if let Some(proxy) = proxy {
         proxy.set_upstream(0);
     }
-    None
+    Some(exit)
 }
 
 /// Whether a restart outcome left an app actually serving — the two outcomes
@@ -3576,7 +3592,7 @@ mod tests {
     use super::{
         AppearanceRoute, BuildAccel, ChildSurface, Command, Duration, FallbackNote,
         OrchestratorEvent, RESOLVE_RETRY_DELAY, RebuildTimings, UpstreamRoute, WatchRole,
-        after_owner_exit, app_status_port, apply_build_accel_env, child_env, choose_build_accel,
+        app_status_port, apply_build_accel_env, child_env, choose_build_accel,
         compile_failed_frame, dir_has_dep_rlib, emitted_binds_http, entry_shape, env_flag_on,
         first_error_line, mint_hot_token, mpsc, prove_green_crate, push_control_appearance,
         resolve_project_sources, schedule_resolve_retry, send_control_frame, stop_first_upstream,
@@ -3584,7 +3600,7 @@ mod tests {
         watch_status_body,
     };
     #[cfg(unix)]
-    use super::{child_command, failure_fallback, spawn_command};
+    use super::{after_child_exit, child_command, failure_fallback, spawn_command};
     use crate::delivery::Shape;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -4115,24 +4131,109 @@ mod tests {
         }
     }
 
-    /// A terminal owner that exited on its own released its port: an engaged
-    /// proxy stops forwarding there, and no surface is left running for a
-    /// status post or an appearance route to reach.
-    #[test]
-    fn an_owner_that_exits_leaves_the_proxy_routing_nothing() {
+    /// A supervisor running a `/bin/true` child of `hand_over` that has already exited.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a host without /bin/true is a test-environment bug
+    fn an_exited_child(
+        lease: &super::surface::TerminalLease<RestoreRecorder>,
+        hand_over: super::surface::TerminalHandOver,
+    ) -> ipe_watch::SupervisorState {
+        let mut child = lease
+            .spawn_after_stop(hand_over, || Command::new("/bin/true").spawn())
+            .expect("spawn /bin/true");
+        child.wait().expect("reap /bin/true");
+        ipe_watch::SupervisorState::Running {
+            child,
+            artifact: ipe_watch::LastGoodBinary {
+                artifact_path: PathBuf::from("/bin/true"),
+                content_hash: [0; 32],
+            },
+        }
+    }
+
+    /// A loopback proxy forwarding to `upstream`, or `None` when the host binds none.
+    #[cfg(unix)]
+    fn a_proxy_routing_to(upstream: u16) -> Option<ipe_watch::DevProxy> {
         let bound = super::free_loopback_port().and_then(ipe_watch::DevProxy::bind);
         assert!(
             bound.is_ok(),
             "a loopback proxy binds: {:?}",
             bound.as_ref().err()
         );
-        let Ok(mut proxy) = bound else {
+        let proxy = bound.ok()?;
+        proxy.set_upstream(upstream);
+        Some(proxy)
+    }
+
+    /// A terminal owner that exited on its own released its port: the one exit
+    /// fold hands the terminal back, an engaged proxy stops forwarding there,
+    /// and no surface is left running for a status post or an appearance route
+    /// to reach.
+    #[cfg(unix)]
+    #[test]
+    fn an_owner_that_exits_leaves_the_proxy_routing_nothing() {
+        use super::surface::{TerminalHandOver, TerminalLease};
+        let recorder = RestoreRecorder::default();
+        let restores = std::rc::Rc::clone(&recorder.restores);
+        let lease = TerminalLease::new(recorder);
+        let mut supervisor = an_exited_child(&lease, TerminalHandOver::Owns);
+        let Some(mut proxy) = a_proxy_routing_to(40_003) else {
             return;
         };
-        proxy.set_upstream(40_003);
-        assert_eq!(after_owner_exit(Some(&proxy)), None);
+        let mut running = Some(ChildSurface::Terminal {
+            listener: super::surface::Listener::Tcp,
+        });
+        let exit = after_child_exit(&lease, &mut supervisor, &mut running, Some(&proxy));
+        assert_eq!(exit.map(|e| e.hand_over), Some(TerminalHandOver::Owns));
+        assert_eq!(restores.get(), 1, "the owner's terminal is restored once");
+        assert!(!lease.is_held());
+        assert_eq!(running, None);
         assert_eq!(proxy.current_upstream(), 0);
-        assert_eq!(after_owner_exit(None), None);
+        assert!(
+            after_child_exit(&lease, &mut supervisor, &mut running, Some(&proxy)).is_none(),
+            "an exit is reaped once"
+        );
+        proxy.shutdown();
+    }
+
+    /// Prove the refusal: a web child that exited on its own, owning no
+    /// terminal, is reaped too, so the session's hot token is posted to no
+    /// port, behind the proxy or bound directly, and the proxy forwards to
+    /// nothing a local process could bind next.
+    #[cfg(unix)]
+    #[test]
+    fn a_web_child_that_exits_leaves_no_status_port_and_no_upstream() {
+        use super::surface::{TerminalHandOver, TerminalLease};
+        let recorder = RestoreRecorder::default();
+        let restores = std::rc::Rc::clone(&recorder.restores);
+        let lease = TerminalLease::new(recorder);
+        let mut supervisor = an_exited_child(&lease, TerminalHandOver::None);
+        let Some(mut proxy) = a_proxy_routing_to(40_004) else {
+            return;
+        };
+        let port = 8_123;
+        let mut running = Some(ChildSurface::WebApp);
+        assert_eq!(
+            app_status_port(running, Some(&proxy), port),
+            Some(40_004),
+            "before the reap the dead child still reads as serving"
+        );
+        let exit = after_child_exit(&lease, &mut supervisor, &mut running, Some(&proxy));
+        assert!(
+            exit.is_some_and(|e| e.status.success() && e.hand_over == TerminalHandOver::None),
+            "the web child's own exit is observed"
+        );
+        assert_eq!(restores.get(), 0, "no terminal was held, none is restored");
+        assert_eq!(app_status_port(running, Some(&proxy), port), None);
+        assert_eq!(app_status_port(running, None, port), None);
+        assert_eq!(proxy.current_upstream(), 0);
+        assert!(
+            matches!(
+                supervisor,
+                ipe_watch::SupervisorState::NotRunning { last_good: Some(_) }
+            ),
+            "the exited child's binary stays the last good one"
+        );
         proxy.shutdown();
     }
 
@@ -4854,7 +4955,7 @@ mod tests {
         };
         lease.release_unless_live(&mut supervisor);
         assert_eq!(restores.get(), 0, "no restore over a live owner");
-        assert!(lease.reap_exited_owner(&mut supervisor).is_none());
+        assert!(lease.reap_exited_child(&mut supervisor).is_none());
         assert!(lease.is_held(), "a live owner keeps the lease");
         if let ipe_watch::SupervisorState::Running { child, .. } = &mut supervisor {
             child.kill().expect("kill /bin/sleep");
@@ -4889,8 +4990,9 @@ mod tests {
         };
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let status = loop {
-            if let Some(status) = lease.reap_exited_owner(&mut supervisor) {
-                break Some(status);
+            if let Some(exit) = lease.reap_exited_child(&mut supervisor) {
+                assert_eq!(exit.hand_over, TerminalHandOver::Owns);
+                break Some(exit.status);
             }
             if std::time::Instant::now() > deadline {
                 break None;
