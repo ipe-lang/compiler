@@ -1,9 +1,10 @@
-//! A bare `Get` seen through two open imports is refused, never picked.
+//! A bare `Get` named by two explicit imports is refused, never picked.
 //!
-//! `Ipe.Http` exposes `HttpMethod(Get, Post, ..)` and `Ipe.Html.Attributes`
-//! exposes `Method(Get, Post)`. A module that opens both and writes a bare
-//! `Get` (in an expression or a pattern) fails closed with IPE-N0024 naming
-//! both modules; a qualified `A.Get` resolves to the form method.
+//! `Ipe.Http` (a kernel module) exposes `HttpMethod(Get, Post, ..)` and
+//! `Ipe.Html.Attributes` exposes `Method(Get, Post)`. A module that names both
+//! types' constructors explicitly fails closed with IPE-N0024 naming both
+//! modules, in an expression and in a pattern; a qualified `A.Get` or
+//! `Http.Get` resolves to its own module's constructor.
 
 use std::collections::BTreeMap;
 
@@ -14,37 +15,32 @@ use ipe_canon::{
 use ipe_diagnostics::{DResult, Diagnostic, NameError};
 use ipe_intern::{Interner, Symbol};
 
-/// The `HttpMethod` declaration of `Ipe.Http`, as the stdlib module declares it.
-const HTTP_STUB: &str = "module Ipe.Http exposing (HttpMethod(..))\n\n\
-                         type HttpMethod = Get | Post | Put | Delete | Patch | Head | Options\n";
-
 /// The `Method` declaration of `Ipe.Html.Attributes`, whose `Get` and `Post`
-/// share the names.
+/// share the names of `Ipe.Http`'s `HttpMethod` constructors.
 const ATTRIBUTES_STUB: &str = "module Ipe.Html.Attributes exposing (Method(..))\n\n\
                                type Method = Get | Post\n";
 
-/// Canonicalise the stdlib `stubs` (as embedded stdlib modules) and then the
-/// user module `main` against their exports.
-fn canonicalise_main(stubs: &[&str], main: &str) -> (DResult<Module>, Interner) {
+/// Canonicalise the `Ipe.Html.Attributes` stub (as an embedded stdlib module)
+/// and then the user module `main` against its exports; `Ipe.Http` resolves
+/// as the kernel module it is.
+fn canonicalise_main(main: &str) -> (DResult<Module>, Interner) {
     let mut interner = Interner::new();
     let mut deps: BTreeMap<Vec<Symbol>, ModuleExports> = BTreeMap::new();
-    for stub in stubs {
-        let stub_result = ipe_parse::parse_module(stub, &mut interner).and_then(|parsed| {
-            let expected = parsed.name.value.clone();
-            canonicalise_module_with_origin(
-                &parsed,
-                &expected,
-                &deps,
-                ModuleOrigin::EmbeddedStdlib,
-                &mut interner,
-            )
-        });
-        match stub_result {
-            Ok((_, exports)) => {
-                deps.insert(exports.path.clone(), exports);
-            }
-            Err(err) => return (Err(err), interner),
+    let stub_result = ipe_parse::parse_module(ATTRIBUTES_STUB, &mut interner).and_then(|parsed| {
+        let expected = parsed.name.value.clone();
+        canonicalise_module_with_origin(
+            &parsed,
+            &expected,
+            &deps,
+            ModuleOrigin::EmbeddedStdlib,
+            &mut interner,
+        )
+    });
+    match stub_result {
+        Ok((_, exports)) => {
+            deps.insert(exports.path.clone(), exports);
         }
+        Err(err) => return (Err(err), interner),
     }
     let result = ipe_parse::parse_module(main, &mut interner).and_then(|parsed| {
         let expected = parsed.name.value.clone();
@@ -74,7 +70,7 @@ fn main_get_home(module: &Module, interner: &Interner) -> Option<String> {
     segments.map(|s| s.join("."))
 }
 
-/// Assert `result` is IPE-N0024 for `Get`, naming both defining modules.
+/// Assert `result` is IPE-N0024 for `Get`, naming both modules.
 #[track_caller]
 fn assert_ambiguous_get(result: &DResult<Module>) {
     assert!(
@@ -85,7 +81,7 @@ fn assert_ambiguous_get(result: &DResult<Module>) {
                 ..
             })
         ),
-        "a bare `Get` under two open imports must be IPE-N0024, got {result:?}"
+        "a bare `Get` under two explicit imports must be IPE-N0024, got {result:?}"
     );
     let Err(Diagnostic::Name {
         msg: NameError::AmbiguousImport { name, modules },
@@ -99,25 +95,34 @@ fn assert_ambiguous_get(result: &DResult<Module>) {
     assert_eq!(rendered, vec!["Ipe.Html.Attributes", "Ipe.Http"]);
 }
 
+/// The home of the `Get` that `main`'s body names, which must canonicalise.
+#[track_caller]
+fn main_get_home_of(main: &str) -> Option<String> {
+    let (result, interner) = canonicalise_main(main);
+    let Ok(module) = &result else {
+        assert!(result.is_ok(), "`{main}` must canonicalise, got {result:?}");
+        return None;
+    };
+    main_get_home(module, &interner)
+}
+
 #[test]
-fn a_bare_get_under_both_open_imports_is_ambiguous() {
+fn a_bare_get_under_both_explicit_imports_is_ambiguous() {
     let (result, _) = canonicalise_main(
-        &[HTTP_STUB, ATTRIBUTES_STUB],
         "module Main exposing (main)\n\n\
-         import Ipe.Http exposing (..)\n\
-         import Ipe.Html.Attributes exposing (..)\n\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\
+         import Ipe.Html.Attributes exposing (Method(..))\n\n\
          main = Get\n",
     );
     assert_ambiguous_get(&result);
 }
 
 #[test]
-fn a_bare_get_pattern_under_both_open_imports_is_ambiguous() {
+fn a_bare_get_pattern_under_both_explicit_imports_is_ambiguous() {
     let (result, _) = canonicalise_main(
-        &[HTTP_STUB, ATTRIBUTES_STUB],
         "module Main exposing (main)\n\n\
-         import Ipe.Http exposing (..)\n\
-         import Ipe.Html.Attributes exposing (..)\n\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\
+         import Ipe.Html.Attributes exposing (Method(..))\n\n\
          main m =\n    case m of\n        Get -> 0\n        _ -> 1\n",
     );
     assert_ambiguous_get(&result);
@@ -125,23 +130,23 @@ fn a_bare_get_pattern_under_both_open_imports_is_ambiguous() {
 
 #[test]
 fn a_qualified_get_resolves_to_the_form_method() {
-    let (result, interner) = canonicalise_main(
-        &[HTTP_STUB, ATTRIBUTES_STUB],
+    let home = main_get_home_of(
         "module Main exposing (main)\n\n\
-         import Ipe.Http exposing (..)\n\
+         import Ipe.Http exposing (HttpMethod(..))\n\
          import Ipe.Html.Attributes as A exposing (..)\n\n\
          main = A.Get\n",
     );
-    let Ok(module) = &result else {
-        assert!(
-            result.is_ok(),
-            "a qualified `A.Get` must canonicalise, got {result:?}"
-        );
-        return;
-    };
-    assert_eq!(
-        main_get_home(module, &interner).as_deref(),
-        Some("Ipe.Html.Attributes"),
-        "`A.Get` must be `Ipe.Html.Attributes.Method`'s constructor"
+    assert_eq!(home.as_deref(), Some("Ipe.Html.Attributes"));
+}
+
+#[test]
+fn a_qualified_http_get_resolves_to_the_http_method() {
+    let home = main_get_home_of(
+        "module Main exposing (main)\n\n\
+         import Ipe.Http as Http\n\
+         import Ipe.Html.Attributes exposing (Method(..))\n\n\
+         main = Http.Get\n",
     );
+    assert!(home.is_some(), "`Http.Get` must resolve to a constructor");
+    assert_ne!(home.as_deref(), Some("Ipe.Html.Attributes"));
 }
