@@ -10,6 +10,11 @@
 //! cannot supply the program; a jail tool planted there would otherwise run
 //! unjailed, as the invoker, before any jail exists.
 //!
+//! A program a user names — a `CC_<triple>` value — enters through
+//! [`resolve_user_program`] under the same admission: an absolute path to an
+//! executable regular file, or a bare name searched over the absolute `PATH`
+//! entries, never a relative path.
+//!
 //! The file is not canonicalised: a rustup shim and a busybox applet dispatch
 //! on the name they are run as, so the resolved path keeps the directory the
 //! entry named and the file name the tool has.
@@ -20,10 +25,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ipe_path_core::Regime;
+use ipe_target_toolchains::CcCandidate;
 
 /// A host program `ipe` may spawn.
 ///
-/// Closed: a program outside this list has no path to `Command::new`.
+/// Closed: a program outside this list reaches `Command::new` only when a user
+/// names it, through [`resolve_user_program`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HostTool {
     /// Bubblewrap, the Linux jail.
@@ -60,6 +67,11 @@ pub enum HostTool {
     Curl,
     /// The POSIX shell.
     Sh,
+    /// `cc`, the host's native C compiler driver.
+    Cc,
+    /// A C compiler for a static release triple, from the closed candidate set
+    /// the target toolchain table names.
+    CCompiler(CcCandidate),
 }
 
 impl HostTool {
@@ -84,6 +96,8 @@ impl HostTool {
             Self::Git => "git",
             Self::Curl => "curl",
             Self::Sh => "sh",
+            Self::Cc => "cc",
+            Self::CCompiler(candidate) => candidate.name(),
         }
     }
 
@@ -352,9 +366,113 @@ pub fn resolve_in_dirs(
     })
 }
 
+/// Why a program a user named did not resolve.
+///
+/// The rendering never repeats the user's word: the caller names the variable
+/// it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserProgramRefusal {
+    /// The value is empty.
+    Empty,
+    /// The value is a relative path, which would be taken from the working
+    /// directory.
+    RelativePath,
+    /// The absolute path is not an executable regular file.
+    NotExecutable,
+    /// The value is a bare name and the `PATH` variable is not set.
+    NoPath,
+    /// No absolute `PATH` entry holds the bare name as an executable regular
+    /// file.
+    NotFound {
+        /// How many entries were not absolute and so were never joined.
+        relative_entries_skipped: usize,
+    },
+}
+
+impl fmt::Display for UserProgramRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str("the value is empty, so it names no program"),
+            Self::RelativePath => f.write_str(
+                "the value is a relative path; name the program by an absolute path or by a \
+                 bare name found on PATH, since a program is never taken from the working \
+                 directory",
+            ),
+            Self::NotExecutable => f.write_str("the path is not an executable regular file"),
+            Self::NoPath => f.write_str("the name cannot be looked up: PATH is not set"),
+            Self::NotFound {
+                relative_entries_skipped: 0,
+            } => f.write_str("the name is not an executable file in any PATH directory"),
+            Self::NotFound {
+                relative_entries_skipped,
+            } => write!(
+                f,
+                "the name is not an executable file in any absolute PATH directory \
+                 ({relative_entries_skipped} relative PATH entries were skipped: a program is \
+                 never taken from the working directory)"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UserProgramRefusal {}
+
+/// Resolve a program a user named, such as a `CC_<triple>` value.
+///
+/// An absolute path is admitted when it is an executable regular file. A bare
+/// name — a value that is its own file name — is searched over the absolute
+/// entries of `path_var` like a [`HostTool`], with `.exe` appended under the
+/// Windows regime when the name has no extension. Anything else is a relative
+/// path and is refused, never joined to the working directory.
+///
+/// # Errors
+///
+/// [`UserProgramRefusal`] naming why the value admits no program.
+pub fn resolve_user_program(
+    word: &OsStr,
+    path_var: Option<&OsStr>,
+    regime: Regime,
+) -> Result<ToolPath, UserProgramRefusal> {
+    if word.is_empty() {
+        return Err(UserProgramRefusal::Empty);
+    }
+    let spelled = Path::new(word);
+    if spelled.is_absolute() {
+        return match (spelled.parent(), spelled.file_name()) {
+            (Some(dir), Some(file)) => {
+                ToolPath::admitted(dir, file).ok_or(UserProgramRefusal::NotExecutable)
+            }
+            _ => Err(UserProgramRefusal::NotExecutable),
+        };
+    }
+    if spelled.file_name() != Some(word) {
+        return Err(UserProgramRefusal::RelativePath);
+    }
+    let mut file = word.to_owned();
+    if regime.is_windows() && spelled.extension().is_none() {
+        file.push(".exe");
+    }
+    let Some(path_var) = path_var else {
+        return Err(UserProgramRefusal::NoPath);
+    };
+    let mut relative_entries_skipped = 0usize;
+    for dir in std::env::split_paths(path_var) {
+        if !dir.is_absolute() {
+            relative_entries_skipped = relative_entries_skipped.saturating_add(1);
+            continue;
+        }
+        if let Some(found) = ToolPath::admitted(&dir, &file) {
+            return Ok(found);
+        }
+    }
+    Err(UserProgramRefusal::NotFound {
+        relative_entries_skipped,
+    })
+}
+
 /// Every [`HostTool`], in declaration order.
 #[cfg(test)]
-pub(crate) const EVERY_HOST_TOOL: [HostTool; 17] = [
+pub(crate) const EVERY_HOST_TOOL: [HostTool; 21] = [
     HostTool::Bwrap,
     HostTool::Prlimit,
     HostTool::Timeout,
@@ -372,6 +490,10 @@ pub(crate) const EVERY_HOST_TOOL: [HostTool; 17] = [
     HostTool::Git,
     HostTool::Curl,
     HostTool::Sh,
+    HostTool::Cc,
+    HostTool::CCompiler(CcCandidate::X8664LinuxMuslGcc),
+    HostTool::CCompiler(CcCandidate::Aarch64LinuxMuslGcc),
+    HostTool::CCompiler(CcCandidate::MuslGcc),
 ];
 
 /// The index `tool` has in [`EVERY_HOST_TOOL`]; a variant missing here
@@ -396,6 +518,10 @@ const fn listed_at(tool: HostTool) -> usize {
         HostTool::Git => 14,
         HostTool::Curl => 15,
         HostTool::Sh => 16,
+        HostTool::Cc => 17,
+        HostTool::CCompiler(CcCandidate::X8664LinuxMuslGcc) => 18,
+        HostTool::CCompiler(CcCandidate::Aarch64LinuxMuslGcc) => 19,
+        HostTool::CCompiler(CcCandidate::MuslGcc) => 20,
     }
 }
 
@@ -637,6 +763,132 @@ mod tests {
                 !name.contains(['/', '\\', '.']),
                 "{name}: a name is a file name, never a path or a suffixed file"
             );
+        }
+        for candidate in CcCandidate::ALL {
+            assert!(
+                EVERY_HOST_TOOL.contains(&HostTool::CCompiler(candidate)),
+                "{candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_c_compiler_resolves_by_its_candidate_name() {
+        let tool = HostTool::CCompiler(CcCandidate::X8664LinuxMuslGcc);
+        let t = dir_with("host-tool-cc-candidate", &[tool, HostTool::Cc]);
+        let found = resolve_in(t.path().as_os_str(), tool, Regime::Unix).expect("musl gcc in t");
+        assert_eq!(found.file_name(), OsStr::new("x86_64-linux-musl-gcc"));
+        let cc = resolve_in(t.path().as_os_str(), HostTool::Cc, Regime::Unix).expect("cc in t");
+        assert_eq!(cc.file_name(), OsStr::new("cc"));
+        let refusal = resolve_in(
+            t.path().as_os_str(),
+            HostTool::CCompiler(CcCandidate::Aarch64LinuxMuslGcc),
+            Regime::Unix,
+        )
+        .expect_err("only the x86_64 compiler is planted");
+        assert_eq!(skipped(&refusal), Some(0));
+    }
+
+    #[test]
+    fn a_user_program_resolves_by_absolute_path_or_bare_name() {
+        let t = TestDir::new("host-tool-user-program").expect("test dir");
+        plant(t.path(), OsStr::new("my-cc"), 0o755);
+        let absolute = t.path().join("my-cc");
+        let found = resolve_user_program(absolute.as_os_str(), None, Regime::Unix)
+            .expect("an absolute path needs no PATH");
+        assert_eq!(found.as_path(), absolute);
+        let path = path_var(&[OsStr::new("."), t.path().as_os_str()]);
+        let found = resolve_user_program(OsStr::new("my-cc"), Some(&path), Regime::Unix)
+            .expect("a bare name is searched on PATH");
+        assert_eq!(found.dir(), t.path());
+        assert_eq!(found.file_name(), OsStr::new("my-cc"));
+    }
+
+    #[test]
+    fn a_user_program_is_never_a_relative_path() {
+        let t = TestDir::new("host-tool-user-relative").expect("test dir");
+        plant(t.path(), OsStr::new("my-cc"), 0o755);
+        let path = path_var(&[t.path().as_os_str()]);
+        for word in ["./my-cc", "bin/my-cc", "my-cc/", ".", ".."] {
+            assert_eq!(
+                resolve_user_program(OsStr::new(word), Some(&path), Regime::Unix),
+                Err(UserProgramRefusal::RelativePath),
+                "{word:?}"
+            );
+        }
+        assert_eq!(
+            resolve_user_program(OsStr::new(""), Some(&path), Regime::Unix),
+            Err(UserProgramRefusal::Empty)
+        );
+    }
+
+    #[test]
+    fn a_user_program_refusal_is_typed() {
+        let t = TestDir::new("host-tool-user-refusal").expect("test dir");
+        std::fs::create_dir_all(t.path().join("a-dir")).expect("dir");
+        for absolute in [t.path().join("absent"), t.path().join("a-dir")] {
+            assert_eq!(
+                resolve_user_program(absolute.as_os_str(), None, Regime::Unix),
+                Err(UserProgramRefusal::NotExecutable),
+                "{absolute:?}"
+            );
+        }
+        assert_eq!(
+            resolve_user_program(OsStr::new("my-cc"), None, Regime::Unix),
+            Err(UserProgramRefusal::NoPath)
+        );
+        let path = path_var(&[OsStr::new("rel"), t.path().as_os_str()]);
+        assert_eq!(
+            resolve_user_program(OsStr::new("my-cc"), Some(&path), Regime::Unix),
+            Err(UserProgramRefusal::NotFound {
+                relative_entries_skipped: 1
+            })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_executable_user_program_is_refused() {
+        let t = TestDir::new("host-tool-user-mode").expect("test dir");
+        plant(t.path(), OsStr::new("my-cc"), 0o644);
+        assert_eq!(
+            resolve_user_program(t.path().join("my-cc").as_os_str(), None, Regime::Unix),
+            Err(UserProgramRefusal::NotExecutable)
+        );
+        let path = path_var(&[t.path().as_os_str()]);
+        assert_eq!(
+            resolve_user_program(OsStr::new("my-cc"), Some(&path), Regime::Unix),
+            Err(UserProgramRefusal::NotFound {
+                relative_entries_skipped: 0
+            })
+        );
+    }
+
+    #[test]
+    fn a_bare_user_name_takes_exe_under_windows() {
+        let t = TestDir::new("host-tool-user-exe").expect("test dir");
+        plant(t.path(), OsStr::new("my-cc.exe"), 0o755);
+        let path = path_var(&[t.path().as_os_str()]);
+        let found = resolve_user_program(OsStr::new("my-cc"), Some(&path), Regime::Windows)
+            .expect("my-cc.exe");
+        assert_eq!(found.file_name(), OsStr::new("my-cc.exe"));
+        assert!(
+            resolve_user_program(OsStr::new("my-cc.exe"), Some(&path), Regime::Windows).is_ok()
+        );
+        assert!(resolve_user_program(OsStr::new("my-cc"), Some(&path), Regime::Unix).is_err());
+    }
+
+    #[test]
+    fn a_user_program_refusal_never_echoes_the_value() {
+        let word = "evil\u{1b}[2Jname";
+        let refusals = [
+            resolve_user_program(OsStr::new("./evil\u{1b}[2Jname"), None, Regime::Unix),
+            resolve_user_program(OsStr::new(word), None, Regime::Unix),
+            resolve_user_program(OsStr::new(word), Some(OsStr::new("")), Regime::Unix),
+        ];
+        for refusal in refusals {
+            let text = refusal.map_or_else(|refused| refused.to_string(), |_| word.to_owned());
+            assert!(!text.contains("evil") && !text.contains('\u{1b}'), "{text}");
         }
     }
 }

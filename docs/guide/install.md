@@ -22,6 +22,11 @@ with `fetch` on FreeBSD. It verifies the download with `sha256sum`, `shasum`,
 `sha256` or `openssl`, one of which every host above ships. A wget that is not
 GNU Wget, such as the BusyBox wget on Alpine, is not used: install curl.
 
+A static build (`--static`) also needs the target's Rust standard library and a
+C compiler that targets musl; [Target
+toolchains](../reference/requirements.md#target-toolchains) lists the commands
+for each target and host.
+
 ## 2. Rust
 
 Install Rust 1.85 or later with [rustup](https://rustup.rs), then open a new

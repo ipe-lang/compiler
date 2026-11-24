@@ -11285,7 +11285,8 @@ mod canonicalize_tests {
             | Diagnostic::Consent { .. }
             | Diagnostic::RegistryUnreachable { .. }
             | Diagnostic::TargetDirUnlinkable { .. }
-            | Diagnostic::HostLinkerCannotOpenInput { .. } => false,
+            | Diagnostic::HostLinkerCannotOpenInput { .. }
+            | Diagnostic::HostToolchainMissing { .. } => false,
         }
     }
 

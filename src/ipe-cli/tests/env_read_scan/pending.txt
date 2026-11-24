@@ -12,7 +12,7 @@ src/compiler/sandbox/src/home.rs 1
 src/compiler/sandbox/src/lib.rs 2
 src/compiler/types/src/exhaust.rs 2
 src/compiler/types/src/solve.rs 2
-src/ipe-cli/src/build_plan.rs 12
+src/ipe-cli/src/build_plan.rs 11
 src/ipe-cli/src/cache.rs 4
 src/ipe-cli/src/cargo_step.rs 2
 src/ipe-cli/src/doc.rs 3

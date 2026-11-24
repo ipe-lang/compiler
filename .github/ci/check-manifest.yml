@@ -698,7 +698,12 @@ checks:
     disposition: informational
     producer: static.yml
     owner: release
-    note: portability build.
+    note: portability build (matrix leg).
+  - context: "linux-static-arm64 (mimalloc)"
+    disposition: informational
+    producer: static.yml
+    owner: release
+    note: portability build (matrix leg).
   - context: "windows-static (dlmalloc, MSVC +crt-static)"
     disposition: informational
     producer: static.yml
