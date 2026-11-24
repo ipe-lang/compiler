@@ -1611,11 +1611,13 @@ fn char_display_width(c: char, col: usize) -> usize {
     }
 }
 
-/// The display width of `text` starting from display column `start`, summing
-/// each character's cell width with tabs expanded to [`TAB_WIDTH`] stops. Used
-/// to place the caret indent and size the underline so both track the source
-/// line as a terminal draws it, not its byte or `char` count.
-fn display_width(text: &str, start: usize) -> usize {
+/// The display width of `text` starting from display column `start`.
+///
+/// Sums each character's cell width with tabs expanded to `TAB_WIDTH` stops:
+/// the columns a terminal draws, not the byte or `char` count. The caret
+/// indent, the underline, and the doc page wrap all measure with it.
+#[must_use]
+pub fn display_width(text: &str, start: usize) -> usize {
     let mut col = start;
     for c in text.chars() {
         col += char_display_width(c, col);
@@ -1623,11 +1625,13 @@ fn display_width(text: &str, start: usize) -> usize {
     col - start
 }
 
-/// Expand a source line's tabs to spaces at [`TAB_WIDTH`] stops. The snippet
-/// shows this expanded form so the caret line — which is measured in the same
+/// Expand a source line's tabs to spaces at `TAB_WIDTH` stops.
+///
+/// A snippet shows this expanded form so the caret line — measured in the same
 /// expanded space — stays aligned under it regardless of the terminal's own tab
 /// width. No other character is altered.
-fn expand_tabs(line: &str) -> String {
+#[must_use]
+pub fn expand_tabs(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut col = 0;
     for c in line.chars() {

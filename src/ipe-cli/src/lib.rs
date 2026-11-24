@@ -45,6 +45,7 @@ pub mod doc_pick;
 pub mod doc_search;
 pub(crate) mod doc_signature;
 pub(crate) mod doc_term;
+pub mod doc_terminal;
 pub mod doc_type_search;
 pub mod env_dir;
 pub mod ffi;

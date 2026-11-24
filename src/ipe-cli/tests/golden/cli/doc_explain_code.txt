@@ -5,80 +5,54 @@ exit: 0
 
   IPE-L0131  [diagnostic]
 
-  # IPE-L0131: a row-polymorphic record annotation is not yet emittable
+  IPE-L0131: a row-polymorphic record annotation is not yet emittable
 
-  A function was annotated with a **row-polymorphic** record type — a record type
-  that names a few required fields and leaves the rest open with a row variable —
-  in a position the backend cannot yet turn into Rust.
+  A function was annotated with a row-polymorphic record type — a record type that names a few required fields and leaves the rest open with a row variable — in a position the backend cannot yet turn into Rust.
 
-  ```ipe
-  -- `r` is the row variable: "any record that has AT LEAST a `name` field"
-  getName : { r | name : String } -> String
-  getName rec =
-      rec.name
-  ```
+    -- `r` is the row variable: "any record that has AT LEAST a `name` field"
+    getName : { r | name : String } -> String
+    getName rec =
+        rec.name
 
-  The type `{ r | name : String }` reads as: "a record carrying a `name : String`
-  field, plus any other fields, which the variable `r` stands in for." A record is
-  a small bundle of named values, like `{ name = "Ada", age = 36 }`. Row
-  polymorphism lets one function accept every record that has the fields it needs,
-  no matter what extra fields ride along.
+  The type { r | name : String } reads as: "a record carrying a name : String field, plus any other fields, which the variable r stands in for." A record is a small bundle of named values, like { name = "Ada", age = 36 }. Row polymorphism lets one function accept every record that has the fields it needs, no matter what extra fields ride along.
 
-  A row-polymorphic annotation whose open row sits **in an argument position** and
-  carries **one or more required fields** — like `getName` above, or
-  `{ r | name : String, id : Int }` — is accepted and compiles: the backend erases
-  the open row into a Rust generic bounded by one per-field witness trait, and the
-  Rust compiler generates one specialised copy per record shape it is called with.
+  A row-polymorphic annotation whose open row sits in an argument position and carries one or more required fields — like getName above, or { r | name : String, id : Int } — is accepted and compiles: the backend erases the open row into a Rust generic bounded by one per-field witness trait, and the Rust compiler generates one specialised copy per record shape it is called with.
 
-  This diagnostic fires for the row-polymorphic forms that **do not yet** have a
-  backend emission:
+  This diagnostic fires for the row-polymorphic forms that do not yet have a backend emission:
 
-  - an open row in **return position** (`touch : { r | n : T } -> { r | n : T }`);
-  - an open row **nested** inside another type — under a `List`, a `Maybe`, a
-    tuple, or another record (`List { r | name : String }`);
-  - an open row whose **field type is itself an open row**
-    (`{ r | inner : { s | name : String } }`).
+  - an open row in return position (touch : { r | n : T } -> { r | n : T });
+  - an open row nested inside another type — under a List, a Maybe, a
 
-  ## How to fix
+  tuple, or another record (List { r | name : String });
 
-  **Give the function a closed record type** that lists every field the callers
-  actually pass. A closed type has no row variable:
+  - an open row whose field type is itself an open row
 
-  ```ipe
-  -- accepted: a closed record type — the exact field set is known
-  describe : { name : String, age : Int } -> String
-  describe rec =
-      rec.name
-  ```
+  ({ r | inner : { s | name : String } }).
 
-  **Or drop the annotation** and let the compiler infer the type. Without a
-  signature, the field access `rec.name` still works, and the compiler pins the
-  parameter to whatever concrete record you pass at the one call site:
+  How to fix
 
-  ```ipe
-  import Ipe.Io as Io
+  Give the function a closed record type that lists every field the callers actually pass. A closed type has no row variable:
 
-  -- accepted: no signature; the compiler infers a concrete record shape
-  -- from its one call site below
-  describe rec =
-      rec.name
+    -- accepted: a closed record type — the exact field set is known
+    describe : { name : String, age : Int } -> String
+    describe rec =
+        rec.name
 
-  main : Task Error ()
-  main =
-      Io.println (describe { name = "Ada", age = 36 })
-  ```
+  Or drop the annotation and let the compiler infer the type. Without a signature, the field access rec.name still works, and the compiler pins the parameter to whatever concrete record you pass at the one call site:
 
-  ## Why this happens
+    import Ipe.Io as Io
 
-  Ipe's Rust backend represents each closed record shape as a dedicated `struct`,
-  keyed by its exact, sorted field set. A supported argument-position open row is
-  lowered instead to a generic bounded by one synthesised field-witness trait per
-  required field, so each field read resolves through a getter and the Rust
-  compiler specialises the function per shape — concrete and fast, with no runtime
-  field lookup.
+    -- accepted: no signature; the compiler infers a concrete record shape
+    -- from its one call site below
+    describe rec =
+        rec.name
 
-  The forms listed above need emission machinery that does not exist yet
-  (return-position generics, chained bounds for nested rows) and are planned later
-  increments of the same design. Until each lands, the compiler stops here rather
-  than emit Rust that would fail to build after `ipe dev build` already reported
-  success.
+    main : Task Error ()
+    main =
+        Io.println (describe { name = "Ada", age = 36 })
+
+  Why this happens
+
+  Ipe's Rust backend represents each closed record shape as a dedicated struct, keyed by its exact, sorted field set. A supported argument-position open row is lowered instead to a generic bounded by one synthesised field-witness trait per required field, so each field read resolves through a getter and the Rust compiler specialises the function per shape — concrete and fast, with no runtime field lookup.
+
+  The forms listed above need emission machinery that does not exist yet (return-position generics, chained bounds for nested rows) and are planned later increments of the same design. Until each lands, the compiler stops here rather than emit Rust that would fail to build after ipe dev build already reported success.

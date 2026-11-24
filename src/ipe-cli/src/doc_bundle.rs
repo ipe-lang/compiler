@@ -27,7 +27,7 @@ use crate::CliError;
 use crate::cli_args::json;
 use crate::io_bounded::SMALL_FILE_READ_CAP;
 use crate::output_dir::held::HeldDir;
-use crate::style::TerminalSafe;
+use crate::style::{TerminalLine, TerminalSafe};
 
 // == Embedded doc-corpus ======================================================
 
@@ -242,8 +242,8 @@ pub struct DocEntry {
     /// The canonical lookup key within its kind (unique per kind).
     pub key: String,
     /// The human-readable title -- the first `# ` heading, a humanised slug,
-    /// or an overridden `title:` from YAML front-matter.
-    pub title: String,
+    /// or an overridden `title:` from YAML front-matter -- as one terminal-safe line.
+    pub title: TerminalLine,
     /// The Markdown body (front-matter already stripped when present), terminal-safe.
     pub body: TerminalSafe,
     /// Optional sort position from front-matter `order:` -- lower values sort
@@ -301,7 +301,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Module,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -311,7 +311,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Symbol,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -326,7 +326,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Diagnostic,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -336,7 +336,7 @@ impl DocBundle {
                 &mut maps,
                 DocKind::Cli,
                 src.key.clone(),
-                src.title.clone(),
+                TerminalLine::sanitize(&src.title),
                 TerminalSafe::sanitize(&src.body),
                 None,
             )?;
@@ -449,7 +449,7 @@ impl DocBundle {
             &mut self.maps,
             kind,
             key,
-            title,
+            TerminalLine::from(title),
             TerminalSafe::sanitize(body),
             None,
         )
@@ -633,7 +633,14 @@ pub(crate) fn ingest_embedded_dir(
             body,
             order,
         } = parse_markdown_file(slug, raw, &source_label)?;
-        insert_entry(maps, kind, key, title, TerminalSafe::sanitize(&body), order)?;
+        insert_entry(
+            maps,
+            kind,
+            key,
+            TerminalLine::sanitize(&title),
+            TerminalSafe::sanitize(&body),
+            order,
+        )?;
     }
     Ok(())
 }
@@ -711,7 +718,14 @@ fn ingest_held_dir_additive(
         if maps.get(&kind).is_some_and(|m| m.contains_key(&key)) {
             continue;
         }
-        insert_entry(maps, kind, key, title, TerminalSafe::sanitize(&body), order)?;
+        insert_entry(
+            maps,
+            kind,
+            key,
+            TerminalLine::sanitize(&title),
+            TerminalSafe::sanitize(&body),
+            order,
+        )?;
     }
     Ok(())
 }
@@ -898,7 +912,7 @@ fn ingest_embedded_assets(
             maps,
             kind,
             key.to_owned(),
-            title.to_owned(),
+            TerminalLine::sanitize(title),
             TerminalSafe::sanitize(body),
             None,
         )?;
@@ -911,7 +925,7 @@ fn insert_entry(
     maps: &mut BTreeMap<DocKind, BTreeMap<String, DocEntry>>,
     kind: DocKind,
     key: String,
-    title: String,
+    title: TerminalLine,
     body: TerminalSafe,
     order: Option<i64>,
 ) -> Result<(), BundleError> {
@@ -1163,7 +1177,7 @@ mod tests {
             &mut maps,
             DocKind::Guide,
             crate::agents_guide::GUIDE_KEY.to_owned(),
-            "A page".to_owned(),
+            TerminalLine::sanitize("A page"),
             TerminalSafe::sanitize("# A page\n"),
             None,
         )
@@ -1203,7 +1217,7 @@ mod tests {
         let map = maps.get(&DocKind::Topic).expect("topic map");
         let entry = map.get("foo").expect("foo entry");
         assert_eq!(entry.key, "foo");
-        assert_eq!(entry.title, "Foo topic");
+        assert_eq!(entry.title.as_str(), "Foo topic");
         assert!(entry.body.as_str().contains("Some prose."));
     }
 
@@ -1219,7 +1233,7 @@ mod tests {
         ingest(&tmp, DocKind::Topic, &mut maps).expect("ingest");
         let map = maps.get(&DocKind::Topic).expect("topic map");
         assert!(map.contains_key("overridden"), "key overridden: {map:?}");
-        assert_eq!(map["overridden"].title, "Overridden Title");
+        assert_eq!(map["overridden"].title.as_str(), "Overridden Title");
     }
 
     #[test]
