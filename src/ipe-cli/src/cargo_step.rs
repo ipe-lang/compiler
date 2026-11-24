@@ -1175,8 +1175,7 @@ fn update_lock_offline_within(
     dir: &Path,
     ceiling: LocalCeiling,
 ) -> Result<Captured, CliError> {
-    let mut update = Command::new(env.program());
-    narrow_to_workspace(&mut update, env, dir);
+    let mut update = narrow_to_workspace(env, dir);
     update.arg("--offline");
     run_local(update, ceiling, LocalSource::LockResolve).map_err(|e| local_run_error(dir, e))
 }
@@ -1196,18 +1195,19 @@ fn update_lock_online_within(
     dir: &Path,
     ceiling: LocalCeiling,
 ) -> Result<Captured, CliError> {
-    let mut update = Command::new(env.program());
-    narrow_to_workspace(&mut update, env, dir);
+    let update = narrow_to_workspace(env, dir);
     run_local(update, ceiling, LocalSource::LockFetch).map_err(|e| local_run_error(dir, e))
 }
 
-/// Make `update` a `cargo update --workspace` in `dir` with `env`'s environment.
-fn narrow_to_workspace(update: &mut Command, env: LockEnv<'_>, dir: &Path) {
+/// A `cargo update --workspace` in `dir` with `env`'s environment.
+fn narrow_to_workspace(env: LockEnv<'_>, dir: &Path) -> Command {
+    let mut update = Command::new(env.program());
     update.args(["update", "--workspace"]).current_dir(dir);
     match env {
-        LockEnv::Build(build) => forward_build_env(build, update),
+        LockEnv::Build(build) => forward_build_env(build, &mut update),
         LockEnv::Bare(_) => {}
     }
+    update
 }
 
 /// How an offline lock derivation that ran within its ceilings ended.
