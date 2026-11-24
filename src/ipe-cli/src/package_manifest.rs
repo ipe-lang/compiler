@@ -1879,12 +1879,16 @@ impl Reader<'_> {
                 ));
             }
             let wire = capability_wire_name(ctor).ok_or_else(|| {
+                let valid = Capability::ALL
+                    .iter()
+                    .filter(|c| !matches!(c, Capability::JsPort(_)))
+                    .map(|c| c.manifest_spelling())
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 self.reject(
                     item.span,
                     &format!(
-                        "`{ctor}` is not a capability — use one of Network, Filesystem, Database, \
-                         Env, Subprocess, Clock, Random, NativeFfi, FfiRaw, Unsafe, CustomElement, \
-                         or `JsPort <WebAxis>`"
+                        "`{ctor}` is not a capability — use one of {valid}, or `JsPort <WebAxis>`"
                     ),
                 )
             })?;
@@ -1927,27 +1931,18 @@ fn web_capability_wire_suffix(ctor: &str) -> Option<&'static str> {
     WebCapability::from_ctor(ctor).map(WebCapability::as_str)
 }
 
-/// The wire name of a capability constructor, or `None` for a name outside the
-/// closed capability vocabulary. The mapping is the inverse of the constructor
-/// spelling in `Ipe.Package`'s `Capability` union, targeting the wire spelling
-/// the shared [`Capability`] `FromStr` consumes.
+/// The wire name of a nullary capability constructor, or `None` for a name
+/// outside the closed capability vocabulary. Derived from
+/// [`Capability::manifest_spelling`], the one constructor spelling, so the reader
+/// and the renderer cannot drift from it. `JsPort` carries a `WebCapability` axis
+/// and is read via the applied-ctor path, never here.
 fn capability_wire_name(ctor: &str) -> Option<&'static str> {
-    match ctor {
-        "Network" => Some("network"),
-        "Filesystem" => Some("filesystem"),
-        "Database" => Some("database"),
-        "Env" => Some("env"),
-        "Subprocess" => Some("subprocess"),
-        "Clock" => Some("clock"),
-        "Random" => Some("random"),
-        "NativeFfi" => Some("native-ffi"),
-        "FfiRaw" => Some("ffi-raw"),
-        "Unsafe" => Some("unsafe"),
-        "CustomElement" => Some("custom-element"),
-        // `JsPort` is not a nullary capability — it carries a `WebCapability` axis
-        // and is read via the applied-ctor path, never here.
-        _ => None,
-    }
+    Capability::ALL
+        .iter()
+        .copied()
+        .filter(|c| !matches!(c, Capability::JsPort(_)))
+        .find(|c| c.manifest_spelling() == ctor)
+        .map(Capability::as_str)
 }
 
 /// Whether `name` is a valid dotted Ipê module name: one or more `.`-separated
@@ -2137,7 +2132,7 @@ fn render_rust_dependencies(deps: &BTreeMap<String, RustDep>) -> String {
 }
 
 /// Render the `capabilities = { declares = …, accepts = …[, acceptsControl = …] }`
-/// field. The constructor spelling is the inverse of [`capability_wire_name`].
+/// field. The constructor spelling is [`Capability::manifest_spelling`].
 ///
 /// `acceptsControl` is rendered only when non-empty, so an existing manifest with
 /// no control-model acceptance round-trips unchanged (the empty strict default).
@@ -2152,7 +2147,7 @@ fn render_capabilities(
         }
         let items = set
             .iter()
-            .map(|c| capability_ctor_expr(c.as_str()))
+            .map(|c| c.manifest_spelling())
             .collect::<Vec<_>>()
             .join(", ");
         format!("[ {items} ]")
@@ -2182,41 +2177,6 @@ const fn control_model_ctor_name(model: crate::delivery::ControlModel) -> &'stat
         ControlModel::Tea => "Tea",
         ControlModel::Direct => "Direct",
     }
-}
-
-/// The `Ipe.Package` `Capability` constructor expression for a wire name — the
-/// inverse of the manifest reader. A `js-port:<axis>` wire renders as the applied
-/// ctor `JsPort <WebAxis>`; every other wire name is a bare nullary ctor. An
-/// unknown wire name (never expected from a typed [`Capability`]) passes through
-/// verbatim.
-fn capability_ctor_expr(wire: &str) -> String {
-    if let Some(suffix) = wire.strip_prefix("js-port:") {
-        return format!("JsPort {}", web_capability_ctor_name(suffix));
-    }
-    match wire {
-        "network" => "Network",
-        "filesystem" => "Filesystem",
-        "database" => "Database",
-        "env" => "Env",
-        "subprocess" => "Subprocess",
-        "clock" => "Clock",
-        "random" => "Random",
-        "native-ffi" => "NativeFfi",
-        "ffi-raw" => "FfiRaw",
-        "unsafe" => "Unsafe",
-        "custom-element" => "CustomElement",
-        other => other,
-    }
-    .to_owned()
-}
-
-/// The `WebCapability` constructor spelling for a wire suffix — the inverse of
-/// [`web_capability_wire_suffix`]. An unknown suffix passes through verbatim.
-fn web_capability_ctor_name(suffix: &str) -> &str {
-    WebCapability::ALL
-        .iter()
-        .find(|c| c.as_str() == suffix)
-        .map_or(suffix, |c| c.ctor_name())
 }
 
 /// Render the `programs = [ … ]` field from the typed vector.
@@ -4628,6 +4588,25 @@ mod tests {
         }
     }
 
+    /// The reader's constructor vocabulary and the renderer's are the one
+    /// [`Capability::manifest_spelling`]: every nullary capability the renderer
+    /// spells reads back to its own wire name, and a lowercase wire name is never
+    /// accepted as a constructor.
+    #[test]
+    fn every_rendered_capability_reads_back_to_itself() {
+        for &cap in Capability::ALL {
+            if matches!(cap, Capability::JsPort(_)) {
+                continue;
+            }
+            assert_eq!(
+                capability_wire_name(&cap.manifest_spelling()),
+                Some(cap.as_str()),
+                "{cap:?} must read back from its rendered constructor"
+            );
+            assert_eq!(capability_wire_name(cap.as_str()), None, "{cap:?}");
+        }
+    }
+
     #[test]
     fn js_port_web_axis_wire_names_round_trip_through_capability_from_str() {
         // Every `JsPort <WebAxis>` renders to a `js-port:<axis>` wire name that the
@@ -4647,7 +4626,10 @@ mod tests {
                 "wire {wire:?} for JsPort {axis} must parse as a Capability"
             );
             // The ctor renderer is the inverse: `js-port:<axis>` → `JsPort <Axis>`.
-            assert_eq!(capability_ctor_expr(&wire), format!("JsPort {axis}"));
+            let spelled = wire
+                .parse::<Capability>()
+                .map(Capability::manifest_spelling);
+            assert_eq!(spelled.ok(), Some(format!("JsPort {axis}")));
         }
         // A name genuinely outside the web-axis vocabulary must return None.
         assert!(web_capability_wire_suffix("NotARealAxis").is_none());

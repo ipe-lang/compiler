@@ -139,7 +139,7 @@ pub fn build_profile(
 /// profile holds a listener grant, and only here, never in
 /// [`run_jail::profile_from_capabilities`], so the capability-derived profile
 /// stays egress-free for a served program.
-fn grant_host_network_until_listener_handoff(profile: &mut SandboxProfile) {
+const fn grant_host_network_until_listener_handoff(profile: &mut SandboxProfile) {
     if profile.listen.is_some() {
         profile.network = true;
     }

@@ -295,11 +295,10 @@ pub enum CliError {
     /// A declared capability set did not equal the set inferred from the
     /// program. Carries the capabilities the program uses but did not declare
     /// (`missing`) and the ones declared but never used (`extra`), each a stable
-    /// sorted list of wire names. Consumed by SP2/SP4 to reject a drifted
-    /// manifest.
+    /// sorted list. Consumed by SP2/SP4 to reject a drifted manifest.
     CapabilityMismatch {
-        missing: Vec<&'static str>,
-        extra: Vec<&'static str>,
+        missing: Vec<ipe_ir::Capability>,
+        extra: Vec<ipe_ir::Capability>,
     },
     /// Package resolution failed for a non-security reason: an index entry could
     /// not be found or parsed, no published version satisfied the requirement, or
@@ -1511,20 +1510,11 @@ pub fn fmt_io_error(
     }
 }
 
-/// The `package.ipe` spellings of capability wire names, each backticked.
-///
-/// The token a capability-mismatch remedy tells the author to add or remove; a
-/// name outside the vocabulary is shown as given.
-fn manifest_spellings(wires: &[&str]) -> String {
-    wires
-        .iter()
-        .map(|wire| {
-            let spelled = wire.parse::<ipe_ir::Capability>().map_or_else(
-                |_| (*wire).to_owned(),
-                ipe_ir::Capability::manifest_spelling,
-            );
-            format!("`{spelled}`")
-        })
+/// The `package.ipe` spellings of `caps`, each backticked — the tokens a
+/// capability-mismatch remedy tells the author to add or remove.
+fn manifest_spellings(caps: &[ipe_ir::Capability]) -> String {
+    caps.iter()
+        .map(|cap| format!("`{}`", cap.manifest_spelling()))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1911,7 +1901,7 @@ mod tests {
     #[test]
     fn non_pipeline_json_renders_the_documented_schema_object() {
         let err = CliError::CapabilityMismatch {
-            missing: vec!["net"],
+            missing: vec![ipe_ir::Capability::Network],
             extra: vec![],
         };
         let line = machine_output::machine_error(
@@ -2105,8 +2095,11 @@ mod tests {
     #[test]
     fn capability_mismatch_names_both_remedies() {
         let shown = CliError::CapabilityMismatch {
-            missing: vec!["clock", "js-port:clipboard"],
-            extra: vec!["network"],
+            missing: vec![
+                ipe_ir::Capability::Clock,
+                ipe_ir::Capability::JsPort(ipe_ir::WebCapability::Clipboard),
+            ],
+            extra: vec![ipe_ir::Capability::Network],
         }
         .to_string();
         assert!(
@@ -2121,7 +2114,7 @@ mod tests {
         );
         let only_extra = CliError::CapabilityMismatch {
             missing: vec![],
-            extra: vec!["network"],
+            extra: vec![ipe_ir::Capability::Network],
         }
         .to_string();
         assert!(!only_extra.contains("add "), "{only_extra}");

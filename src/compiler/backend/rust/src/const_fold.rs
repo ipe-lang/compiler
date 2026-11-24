@@ -1283,7 +1283,7 @@ fn modpath_is(home: &ModPath, expected: &[&str], interner: &Interner) -> bool {
 /// A kernel carrying a capability, or opening the program's listener, is
 /// effectful: "no capability" alone is not "pure", because a serving kernel
 /// classifies no capability yet binds a socket.
-fn kernel_is_effect_free(k: KernelFn) -> bool {
+const fn kernel_is_effect_free(k: KernelFn) -> bool {
     let def = k.def();
     def.capability.is_none() && def.serves.is_none()
 }

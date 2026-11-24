@@ -3636,8 +3636,8 @@ pub fn verify_capabilities(
     if *declared == inferred {
         return Ok(());
     }
-    let missing: Vec<&'static str> = inferred.difference(declared).map(|c| c.as_str()).collect();
-    let extra: Vec<&'static str> = declared.difference(&inferred).map(|c| c.as_str()).collect();
+    let missing: Vec<ipe_ir::Capability> = inferred.difference(declared).copied().collect();
+    let extra: Vec<ipe_ir::Capability> = declared.difference(&inferred).copied().collect();
     Err(CliError::CapabilityMismatch { missing, extra })
 }
 

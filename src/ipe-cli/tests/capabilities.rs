@@ -393,7 +393,7 @@ fn a_widget_program_that_hides_custom_element_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"custom-element")
+                if missing.iter().any(|c| c.as_str() == "custom-element")
         ),
         "a widget program that omits `custom-element` must be rejected as under-declared, got: {r:?}"
     );
@@ -504,7 +504,7 @@ fn an_unmounted_handle_that_hides_custom_element_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"custom-element")
+                if missing.iter().any(|c| c.as_str() == "custom-element")
         ),
         "an unmounted-handle app that omits `custom-element` must be rejected as under-declared, got: {r:?}"
     );
@@ -828,7 +828,7 @@ fn a_port_program_that_hides_js_port_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:raw")
+                if missing.iter().any(|c| c.as_str() == "js-port:raw")
         ),
         "a port program that omits `js-port:raw` must be rejected as under-declared, got: {r:?}"
     );
@@ -981,7 +981,7 @@ fn a_geolocation_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:geolocation")
+                if missing.iter().any(|c| c.as_str() == "js-port:geolocation")
         ),
         "an ungranted geolocation app must be rejected naming js-port:geolocation, got: {r:?}"
     );
@@ -1088,7 +1088,7 @@ fn a_notification_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:notification")
+                if missing.iter().any(|c| c.as_str() == "js-port:notification")
         ),
         "an ungranted notification app must be rejected naming js-port:notification, got: {r:?}"
     );
@@ -1175,7 +1175,7 @@ fn a_storage_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:storage")
+                if missing.iter().any(|c| c.as_str() == "js-port:storage")
         ),
         "an ungranted storage app must be rejected naming js-port:storage, got: {r:?}"
     );
@@ -1255,7 +1255,7 @@ fn a_vibration_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:vibration")
+                if missing.iter().any(|c| c.as_str() == "js-port:vibration")
         ),
         "an ungranted vibration app must be rejected naming js-port:vibration, got: {r:?}"
     );
@@ -1351,7 +1351,7 @@ fn a_share_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:share")
+                if missing.iter().any(|c| c.as_str() == "js-port:share")
         ),
         "an ungranted share app must be rejected naming js-port:share, got: {r:?}"
     );
@@ -1435,7 +1435,7 @@ fn a_battery_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:battery")
+                if missing.iter().any(|c| c.as_str() == "js-port:battery")
         ),
         "an ungranted battery app must be rejected naming js-port:battery, got: {r:?}"
     );
@@ -1520,7 +1520,7 @@ fn a_network_info_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:network-info")
+                if missing.iter().any(|c| c.as_str() == "js-port:network-info")
         ),
         "an ungranted network-info app must be rejected naming js-port:network-info, got: {r:?}"
     );
@@ -1601,7 +1601,7 @@ fn a_file_picker_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:file")
+                if missing.iter().any(|c| c.as_str() == "js-port:file")
         ),
         "an ungranted file-picker app must be rejected naming js-port:file, got: {r:?}"
     );
@@ -1682,7 +1682,7 @@ fn a_camera_app_without_the_grant_is_rejected() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:camera")
+                if missing.iter().any(|c| c.as_str() == "js-port:camera")
         ),
         "an ungranted camera app must be rejected naming js-port:camera, got: {r:?}"
     );
@@ -1772,7 +1772,7 @@ fn a_microphone_app_without_the_grant_is_rejected_ipe_s0002() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:microphone")
+                if missing.iter().any(|c| c.as_str() == "js-port:microphone")
         ),
         "an ungranted microphone app must be rejected naming js-port:microphone (IPE-S0002), got: {r:?}"
     );
@@ -1856,7 +1856,7 @@ fn a_gamepad_app_without_the_grant_is_rejected_ipe_s0002() -> TestResult {
         matches!(
             &r,
             Err(ipe::CliError::CapabilityMismatch { missing, .. })
-                if missing.contains(&"js-port:gamepad")
+                if missing.iter().any(|c| c.as_str() == "js-port:gamepad")
         ),
         "an ungranted gamepad app must be rejected naming js-port:gamepad (IPE-S0002), got: {r:?}"
     );
@@ -2309,7 +2309,7 @@ fn verify_refuses_stale_network_on_a_served_program_and_the_remedy_clears_it() -
         matches!(
             &err,
             ipe::CliError::CapabilityMismatch { missing, extra }
-                if missing.is_empty() && extra.as_slice() == ["network"]
+                if missing.is_empty() && extra.as_slice() == [Capability::Network]
         ),
         "only `network` is over-declared: {err:?}"
     );
