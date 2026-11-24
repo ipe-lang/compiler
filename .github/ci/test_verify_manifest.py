@@ -10501,9 +10501,19 @@ class TestDenyRefusesStaleExemptions(unittest.TestCase):
             "true && cargo deny check advisories",
             "/usr/local/bin/cargo-deny check bans",
             "cargo deny --log-level warn check sources",
+            "cargo +1.95 deny check advisories",
+            "cargo --locked deny check bans",
+            "RUST_LOG=warn cargo deny check licenses",
+            "env FOO=1 cargo-deny check sources",
+            "timeout 600 ~/.cargo/bin/cargo deny check advisories",
         ):
             with self.subTest(run=run):
                 self.assertEqual(len(self.errors(f"{_DENY_LINE}\n{run}", [])), 1)
+
+    def test_non_check_deny_lines_pass(self) -> None:
+        for run in ("cargo deny fetch", "cargo install --locked cargo-deny", "cargo deny list"):
+            with self.subTest(run=run):
+                self.assertEqual(self.errors(f"{_DENY_LINE}\n{run}", []), [])
 
     def test_unsplittable_deny_line_refused(self) -> None:
         errors = self.errors(_DENY_LINE, ["cargo deny check 'advisories"])

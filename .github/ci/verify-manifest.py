@@ -9389,16 +9389,23 @@ _DENY_RELEVEL_SHORT = ("-A", "-W")
 
 
 def _deny_check_args(words: list[str]) -> list[str] | None:
-    """The words after `check` when `words` runs `cargo deny check`, else None."""
-    if len(words) >= 2 and words[0] == "cargo" and words[1] == "deny":
-        rest = words[2:]
-    elif words and posixpath.basename(words[0]) == "cargo-deny":
-        rest = words[1:]
-    else:
-        return None
-    if "check" not in rest:
-        return None
-    return rest[rest.index("check") + 1 :]
+    """The words after `check` when `words` runs `cargo deny check`, else None.
+
+    Read wherever the command sits in `words` — behind an env assignment,
+    `env`, `timeout` or another wrapper — and through a `+toolchain` or cargo
+    global options before `deny`: any `deny` word after a `cargo` word, or any
+    `cargo-deny` word, followed by `check`. A non-deny line that matches is
+    refused, never a deny line that slips past."""
+    for at, word in enumerate(words):
+        rest: list[str] | None = None
+        if posixpath.basename(word) == "cargo-deny":
+            rest = words[at + 1 :]
+        elif posixpath.basename(word) == "cargo" and "deny" in words[at + 1 :]:
+            after = words[at + 1 :]
+            rest = after[after.index("deny") + 1 :]
+        if rest is not None and "check" in rest:
+            return rest[rest.index("check") + 1 :]
+    return None
 
 
 def _is_relevel(word: str) -> bool:
