@@ -570,3 +570,27 @@ fn http_client_program_is_not_served() -> Result<(), Box<dyn Error>> {
     );
     Ok(())
 }
+
+/// The server template serves inbound but opens no outbound connection, so its
+/// capabilities carry no `network`.
+#[test]
+fn server_template_infers_no_network() -> Result<(), Box<dyn Error>> {
+    let caps = shared_capabilities(
+        "server_no_net",
+        &[("Main.ipe", include_str!("../templates/Main.server.ipe"))],
+    )?;
+    assert!(!caps.contains(&Capability::Network), "{caps:?}");
+    Ok(())
+}
+
+/// The web template serves inbound but opens no outbound connection, so its
+/// capabilities carry no `network`.
+#[test]
+fn web_template_infers_no_network() -> Result<(), Box<dyn Error>> {
+    let caps = shared_capabilities(
+        "web_no_net",
+        &[("Main.ipe", include_str!("../templates/Main.ipe"))],
+    )?;
+    assert!(!caps.contains(&Capability::Network), "{caps:?}");
+    Ok(())
+}

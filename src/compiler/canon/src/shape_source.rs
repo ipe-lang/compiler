@@ -785,9 +785,9 @@ mod tests {
     fn server_listen_head_is_script() {
         // A `Server.listen` main is a plain `Task Error ()` — the SAME interface
         // as a batch script — so it classifies `Script` (the `Direct` bucket),
-        // NOT a distinct shape. Server-ness is disclosed on the capability axis
-        // (`Server.listen` classifies `Capability::Network`), never as a shape or
-        // a control model.
+        // NOT a distinct shape. Server-ness is disclosed by the kernel's
+        // `serves` column (the served listener), never as a shape or a control
+        // model.
         let shape = classify(
             "module Main exposing (..)\n\nimport Ipe.Http.Server\n\nmain = Server.listen cfg\n",
         );

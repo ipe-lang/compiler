@@ -120,6 +120,7 @@ pub fn build_profile(
         run_jail::profile_from_capabilities(&caps.inferred, &caps.declared, axis, &[])
             .map_err(profile_refused)?;
     profile.listen = ListenGrant::from_served(&caps.served).map_err(profile_refused)?;
+    grant_host_network_until_listener_handoff(&mut profile);
     // A program granted `Database` sees the operator URL whatever its `env`
     // axis: the runtime's `Db.connect` reads it, and an unjailed run reads the
     // same variable. Every other variable stays outside the jail.
@@ -127,6 +128,21 @@ pub fn build_profile(
         profile.env_allowlist = vec![OPERATOR_DB_ENV.to_owned()];
     }
     Ok(profile)
+}
+
+/// Share the host network with a served program until the jail hands it its listener.
+///
+/// Serving kernels carry no `network`, so a served program's capabilities no
+/// longer grant the host network namespace; the jail does not yet pass the
+/// bound listener in, so without this step the program would bind inside an
+/// empty namespace nobody can reach. It sets `network` exactly when the
+/// profile holds a listener grant, and only here, never in
+/// [`run_jail::profile_from_capabilities`], so the capability-derived profile
+/// stays egress-free for a served program.
+fn grant_host_network_until_listener_handoff(profile: &mut SandboxProfile) {
+    if profile.listen.is_some() {
+        profile.network = true;
+    }
 }
 
 /// Exec `app` inside the jail, with no unconfined fallback of any kind.
@@ -683,15 +699,46 @@ mod tests {
         )
         .module("Serve", SERVE_MODULE);
         let resolved = resolve_tree(&tree);
-        assert!(
-            resolved.inferred.contains(&Capability::Network),
-            "the package-wide union discloses the sibling's listener: {:?}",
-            resolved.inferred
-        );
         assert_eq!(resolved.served, ServedListener::NotServed);
         let profile =
             build_profile(&resolved, ipe_backend_rust::DbDriver::Sqlite).expect("profile");
         assert_eq!(profile.listen, None);
+        // The sibling's listener grants the built entry no host network either.
+        assert!(!profile.network);
+    }
+
+    /// A served profile shares the host network only through the named
+    /// handoff step: its capabilities alone grant no egress.
+    #[test]
+    #[allow(clippy::expect_used)] // a refused profile is the test failure
+    fn a_served_profile_keeps_network_until_the_listener_is_handed_over() {
+        let served = resolve_tree(&crate::project_root::SourceTree::main(
+            "module Main exposing (main)\n\nimport Ipe.Server.Http as Server\n\n\nmain =\n    Server.listen 8000 []\n",
+        ));
+        assert!(
+            !served.union().contains(&Capability::Network),
+            "a served program infers no egress: {:?}",
+            served.inferred
+        );
+        let from_caps = run_jail::profile_from_capabilities(
+            &served.inferred,
+            &served.declared,
+            DatabaseAxis::NotApplicable,
+            &[],
+        )
+        .expect("capability profile");
+        assert!(!from_caps.network);
+        let profile = build_profile(&served, ipe_backend_rust::DbDriver::Sqlite).expect("profile");
+        assert!(profile.listen.is_some());
+        assert!(profile.network);
+
+        let mut unserved = SandboxProfile::maximally_isolated();
+        grant_host_network_until_listener_handoff(&mut unserved);
+        assert!(!unserved.network);
+        let mut granted = SandboxProfile::maximally_isolated();
+        granted.listen = profile.listen;
+        grant_host_network_until_listener_handoff(&mut granted);
+        assert!(granted.network);
     }
 
     /// A built entry that calls `Server.listen` with a literal is granted that port.

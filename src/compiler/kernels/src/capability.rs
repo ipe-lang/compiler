@@ -19,8 +19,9 @@
     Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub enum Capability {
-    /// Outbound or inbound network access (HTTP client/server, WebSocket,
-    /// email send).
+    /// Outbound network access (HTTP client, WebSocket client, email send, a
+    /// database connection); serving inbound on the program's own listener is
+    /// not egress and needs no `network`.
     Network,
     /// Reading or writing the filesystem (files, directories, an `.env` or
     /// config file). Does not include database access — see [`Self::Database`].
@@ -788,7 +789,8 @@ impl Capability {
     pub const fn grants(self) -> &'static str {
         match self {
             Self::Network => {
-                "Outbound or inbound network access (HTTP client/server, WebSocket, email send)."
+                "Outbound network access (HTTP client, WebSocket client, email send, database \
+                 connection); serving inbound on the program's own listener needs no network."
             }
             Self::Filesystem => {
                 "Reading or writing the filesystem (files, directories, config files)."

@@ -14423,8 +14423,10 @@ impl StdlibKernel {
     }
 
     /// The security-relevant capability this kernel exercises, or `None` when it
-    /// is pure. Classified by effect family: HTTP / server / WebSocket / email →
-    /// [`Capability::Network`]; file / database / config-and-`.env`-file reads →
+    /// is pure. Classified by effect: outbound HTTP / WebSocket client / email /
+    /// database connect → [`Capability::Network`] (egress only; the server-side
+    /// route, response, middleware and listener kernels carry none, and the
+    /// listener is the [`KernelDef::serves`] column); file / database / config-and-`.env`-file reads →
     /// [`Capability::Filesystem`]; environment-variable and argv reads →
     /// [`Capability::Env`]; wall-clock / sleep / timer → [`Capability::Clock`];
     /// RNG / random tokens / UUIDs → [`Capability::Random`]. `Env.public` reads
@@ -14442,69 +14444,17 @@ impl StdlibKernel {
     /// It is private: every consumer reads the capability off the [`KernelDef`]
     /// row that [`Self::def`] returns, so the fact has exactly one public home.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::match_same_arms)] // the serving set is its own arm so each or-pattern stays under the panic-scan nesting ceiling
     const fn capability_classification(self) -> Option<Capability> {
         match self {
+            // Egress: each opens a connection to a host the program names.
             Self::HttpGet
             | Self::HttpPost
             | Self::HttpRequest
-            | Self::ServerGet
-            | Self::ServerPost
-            | Self::ServerPut
-            | Self::ServerDelete
-            | Self::ServerAny
-            | Self::ServerApi
-            | Self::ServerStatic
-            | Self::ServerMountApp
-            | Self::ServerListen
-            | Self::ServerText
-            | Self::ServerJson
-            | Self::ServerHtml
-            | Self::ServerWithStatus
-            | Self::ServerWithHeader
-            | Self::ServerRedirect
-            | Self::ServerParam
-            | Self::ServerQueryParam
-            | Self::ServerHeader
-            | Self::ServerGetCookie
-            | Self::ServerBody
-            | Self::ServerPath
-            | Self::ServerMethod
-            | Self::ServerCookieNew
-            | Self::ServerWithCookie
-            | Self::ServerAuthConfig
-            | Self::ServerTokenBearer
-            | Self::ServerCookieToken
-            | Self::ServerWithRevocation
-            | Self::ServerGetAuthed
-            | Self::ServerPostAuthed
-            | Self::ServerPutAuthed
-            | Self::ServerDeleteAuthed
-            | Self::MiddlewareWithCors
-            | Self::MiddlewareWithLogging
-            | Self::MiddlewareWithBasicAuth
-            | Self::MiddlewareWithRateLimit
-            | Self::MiddlewareWithCsrf
-            | Self::RateLimitAllow
-            | Self::StreamStream
-            | Self::StreamEmit
-            | Self::StreamFinish
-            | Self::StreamWithContentType
             | Self::HttpStreamOpen
             | Self::HttpStreamForEachChunk
             | Self::HttpStreamClose
             | Self::HttpStreamChunks
-            | Self::WsDefaultCfg
-            | Self::WsWithOnConnect
-            | Self::WsWithOnMessage
-            | Self::WsWithOnClose
-            | Self::WsWithOnError
-            | Self::WsWithMaxMessageBytes
-            | Self::WsWithOriginPatterns
-            | Self::WsUpgrade
-            | Self::WsSendToClient
-            | Self::WsSendBinaryToClient
-            | Self::WsBroadcast
-            | Self::WsCloseClient
             | Self::WebSocketConnect
             | Self::WebSocketConnectWith
             | Self::WebSocketSend
@@ -14694,6 +14644,64 @@ impl StdlibKernel {
             // Mints a random `jti` from OS entropy (also reads the clock for `iat`;
             // the entropy draw is the security-relevant disclosure).
             | Self::AuthSignToken => Some(Capability::Random),
+            // Serving: route, response, middleware, stream and server-side
+            // WebSocket builders describe handlers on the listener the host
+            // binds; they open no outbound connection, so they carry no egress.
+            // The listener itself is the `serves` column, never `network`.
+            Self::ServerGet
+            | Self::ServerPost
+            | Self::ServerPut
+            | Self::ServerDelete
+            | Self::ServerAny
+            | Self::ServerApi
+            | Self::ServerStatic
+            | Self::ServerMountApp
+            | Self::ServerListen
+            | Self::ServerText
+            | Self::ServerJson
+            | Self::ServerHtml
+            | Self::ServerWithStatus
+            | Self::ServerWithHeader
+            | Self::ServerRedirect
+            | Self::ServerParam
+            | Self::ServerQueryParam
+            | Self::ServerHeader
+            | Self::ServerGetCookie
+            | Self::ServerBody
+            | Self::ServerPath
+            | Self::ServerMethod
+            | Self::ServerCookieNew
+            | Self::ServerWithCookie
+            | Self::ServerAuthConfig
+            | Self::ServerTokenBearer
+            | Self::ServerCookieToken
+            | Self::ServerWithRevocation
+            | Self::ServerGetAuthed
+            | Self::ServerPostAuthed
+            | Self::ServerPutAuthed
+            | Self::ServerDeleteAuthed
+            | Self::MiddlewareWithCors
+            | Self::MiddlewareWithLogging
+            | Self::MiddlewareWithBasicAuth
+            | Self::MiddlewareWithRateLimit
+            | Self::MiddlewareWithCsrf
+            | Self::RateLimitAllow
+            | Self::StreamStream
+            | Self::StreamEmit
+            | Self::StreamFinish
+            | Self::StreamWithContentType
+            | Self::WsDefaultCfg
+            | Self::WsWithOnConnect
+            | Self::WsWithOnMessage
+            | Self::WsWithOnClose
+            | Self::WsWithOnError
+            | Self::WsWithMaxMessageBytes
+            | Self::WsWithOriginPatterns
+            | Self::WsUpgrade
+            | Self::WsSendToClient
+            | Self::WsSendBinaryToClient
+            | Self::WsBroadcast
+            | Self::WsCloseClient => None,
             Self::LogInfo
             | Self::LogDebug
             | Self::LogWarn
@@ -20633,6 +20641,114 @@ mod tests {
         ));
     }
 
+    /// Every kernel that describes or opens the served listener carries no egress.
+    ///
+    /// Listed per kernel, not by family: a serving program reaches `network`
+    /// only through an egress kernel or a declaration.
+    #[test]
+    fn every_serving_kernel_has_no_egress_capability() {
+        let serving_side: &[StdlibKernel] = &[
+            StdlibKernel::ServerGet,
+            StdlibKernel::ServerPost,
+            StdlibKernel::ServerPut,
+            StdlibKernel::ServerDelete,
+            StdlibKernel::ServerAny,
+            StdlibKernel::ServerApi,
+            StdlibKernel::ServerStatic,
+            StdlibKernel::ServerMountApp,
+            StdlibKernel::ServerListen,
+            StdlibKernel::ServerText,
+            StdlibKernel::ServerJson,
+            StdlibKernel::ServerHtml,
+            StdlibKernel::ServerWithStatus,
+            StdlibKernel::ServerWithHeader,
+            StdlibKernel::ServerRedirect,
+            StdlibKernel::ServerParam,
+            StdlibKernel::ServerQueryParam,
+            StdlibKernel::ServerHeader,
+            StdlibKernel::ServerGetCookie,
+            StdlibKernel::ServerBody,
+            StdlibKernel::ServerPath,
+            StdlibKernel::ServerMethod,
+            StdlibKernel::ServerCookieNew,
+            StdlibKernel::ServerWithCookie,
+            StdlibKernel::ServerAuthConfig,
+            StdlibKernel::ServerTokenBearer,
+            StdlibKernel::ServerCookieToken,
+            StdlibKernel::ServerWithRevocation,
+            StdlibKernel::ServerGetAuthed,
+            StdlibKernel::ServerPostAuthed,
+            StdlibKernel::ServerPutAuthed,
+            StdlibKernel::ServerDeleteAuthed,
+            StdlibKernel::MiddlewareWithCors,
+            StdlibKernel::MiddlewareWithLogging,
+            StdlibKernel::MiddlewareWithBasicAuth,
+            StdlibKernel::MiddlewareWithRateLimit,
+            StdlibKernel::MiddlewareWithCsrf,
+            StdlibKernel::RateLimitAllow,
+            StdlibKernel::StreamStream,
+            StdlibKernel::StreamEmit,
+            StdlibKernel::StreamFinish,
+            StdlibKernel::StreamWithContentType,
+            StdlibKernel::WsDefaultCfg,
+            StdlibKernel::WsWithOnConnect,
+            StdlibKernel::WsWithOnMessage,
+            StdlibKernel::WsWithOnClose,
+            StdlibKernel::WsWithOnError,
+            StdlibKernel::WsWithMaxMessageBytes,
+            StdlibKernel::WsWithOriginPatterns,
+            StdlibKernel::WsUpgrade,
+            StdlibKernel::WsSendToClient,
+            StdlibKernel::WsSendBinaryToClient,
+            StdlibKernel::WsBroadcast,
+            StdlibKernel::WsCloseClient,
+            StdlibKernel::WebApp,
+            StdlibKernel::WebAppRouted,
+            StdlibKernel::WebAppWith,
+            StdlibKernel::WebEmbed,
+        ];
+        for k in serving_side {
+            assert_eq!(k.def().capability, None, "{k:?}");
+        }
+        for k in super::SERVING_KERNELS {
+            assert!(serving_side.contains(&k), "{k:?}");
+        }
+    }
+
+    /// Exactly the kernels that open an outbound connection keep `network`.
+    ///
+    /// The list is the whole `network` partition: a kernel joining or leaving
+    /// it changes this table in review.
+    #[test]
+    fn every_egress_kernel_keeps_network() {
+        use super::Capability;
+        let egress: &[StdlibKernel] = &[
+            StdlibKernel::HttpGet,
+            StdlibKernel::HttpPost,
+            StdlibKernel::HttpRequest,
+            StdlibKernel::DbConnOpen,
+            StdlibKernel::HttpStreamOpen,
+            StdlibKernel::HttpStreamForEachChunk,
+            StdlibKernel::HttpStreamClose,
+            StdlibKernel::HttpStreamChunks,
+            StdlibKernel::WebSocketConnect,
+            StdlibKernel::WebSocketConnectWith,
+            StdlibKernel::WebSocketSend,
+            StdlibKernel::WebSocketSendBinary,
+            StdlibKernel::WebSocketClose,
+            StdlibKernel::WebSocketCloseWithCode,
+            StdlibKernel::SubSubscribeWebSocket,
+            StdlibKernel::EmailSend,
+            StdlibKernel::RemoteCall,
+        ];
+        let network: Vec<StdlibKernel> = StdlibKernel::ALL
+            .iter()
+            .copied()
+            .filter(|k| k.def().capability == Some(Capability::Network))
+            .collect();
+        assert_eq!(network, egress.to_vec());
+    }
+
     /// One representative kernel per effect family maps to the right capability,
     /// and a pure kernel maps to `None`.
     #[test]
@@ -20652,7 +20768,7 @@ mod tests {
         //     clock for `exp`/`nbf`.
         let cases: &[(StdlibKernel, Option<Capability>)] = &[
             (StdlibKernel::HttpGet, Some(Capability::Network)),
-            (StdlibKernel::ServerListen, Some(Capability::Network)),
+            (StdlibKernel::ServerListen, None),
             (StdlibKernel::EmailSend, Some(Capability::Network)),
             (StdlibKernel::FileReadFile, Some(Capability::Filesystem)),
             (StdlibKernel::PathAbsolute, Some(Capability::Filesystem)),

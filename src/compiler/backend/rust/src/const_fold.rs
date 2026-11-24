@@ -1278,10 +1278,20 @@ fn modpath_is(home: &ModPath, expected: &[&str], interner: &Interner) -> bool {
             .all(|(seg, want)| interner.resolve(*seg) == Some(*want))
 }
 
+/// Whether a kernel is free of every effect the kernel row records.
+///
+/// A kernel carrying a capability, or opening the program's listener, is
+/// effectful: "no capability" alone is not "pure", because a serving kernel
+/// classifies no capability yet binds a socket.
+fn kernel_is_effect_free(k: KernelFn) -> bool {
+    let def = k.def();
+    def.capability.is_none() && def.serves.is_none()
+}
+
 /// Evaluate a pure kernel over already-constant arguments.
 ///
-/// Gated on [`KernelFn::capability`] being `None` (no security-relevant effect
-/// — the reused kernel analysis): an effectful kernel is never folded even if a
+/// Gated on [`kernel_is_effect_free`] (no capability and no listener — the
+/// reused kernel analysis): an effectful kernel is never folded even if a
 /// case below happened to match its arity. The set of kernels with a folded
 /// implementation is the pure string / numeric builders the appearance
 /// pipelines reach (`String.fromInt` / `fromFloat` / `append` / `concat` /
@@ -1290,9 +1300,8 @@ fn modpath_is(home: &ModPath, expected: &[&str], interner: &Interner) -> bool {
 fn eval_kernel(k: KernelFn, args: &[ConstValue]) -> Option<ConstValue> {
     use ConstValue::{Float, Int, List, Str};
 
-    // A kernel carrying any security-relevant capability is effectful; never
-    // fold it, regardless of the arms below.
-    if k.def().capability.is_some() {
+    // An effectful kernel is never folded, regardless of the arms below.
+    if !kernel_is_effect_free(k) {
         return None;
     }
 
@@ -1852,6 +1861,26 @@ mod tests {
         expected = rt_string::string_append(expected, "forwards".to_string());
 
         assert_eq!(fold_const(&pipeline, &env), Some(ConstValue::Str(expected)));
+    }
+
+    /// A serving kernel binds a listener while classifying no capability; the
+    /// fold gate still refuses it, and every capability-bearing kernel too.
+    #[test]
+    fn a_serving_kernel_is_never_folded() {
+        for k in ipe_kernels::SERVING_KERNELS {
+            assert_eq!(k.def().capability, None, "{k:?}");
+            assert!(!kernel_is_effect_free(k), "{k:?}");
+            assert_eq!(
+                eval_kernel(k, &[ConstValue::Int(8000), ConstValue::List(Vec::new())]),
+                None
+            );
+        }
+        for k in KernelFn::ALL {
+            if k.def().capability.is_some() {
+                assert!(!kernel_is_effect_free(*k), "{k:?}");
+            }
+        }
+        assert!(kernel_is_effect_free(KernelFn::StringAppend));
     }
 
     #[test]
