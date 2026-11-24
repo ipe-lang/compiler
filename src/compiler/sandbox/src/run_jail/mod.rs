@@ -642,9 +642,9 @@ fn jail_argv_unproven<'fd>(
         argv.push(fd.render());
     }
 
-    // Scrubbed env: the fixed minimal allowlist, then the profile's declared
-    // env names re-exported from the host (only when `env` was granted). A named
-    // var absent from the host is simply not re-exported (never a placeholder).
+    // Scrubbed env: the fixed minimal allowlist, then the profile's allowlisted
+    // env names re-exported from the host. A named var absent from the host is
+    // simply not re-exported (never a placeholder).
     argv.push("--setenv".into());
     argv.push("PATH".into());
     argv.push("/usr/bin:/bin".into());

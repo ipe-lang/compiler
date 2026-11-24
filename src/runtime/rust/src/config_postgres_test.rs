@@ -11,7 +11,7 @@
 // under both selectors. Nothing here is ever emitted.
 
 // The re-included template carries the full driver surface (`DbPool`,
-// `ipe_db_url`, `db_last_insert_id`, ...); only `db_format_sql` is driven, so
+// `db_last_insert_id`, ...); only `db_format_sql` is driven, so
 // the rest reads as dead code in this test-only view.
 #[cfg(not(feature = "db-postgres"))]
 #[allow(dead_code)]

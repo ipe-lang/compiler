@@ -543,7 +543,7 @@ widget-assets = ["crypto-core", "encoding"]
 # runtime's pool-opening tests need, and `full,db-postgres` is the every-feature
 # PostgreSQL build CI lints with every target. `db` links both sqlx drivers. `jwt` + `url` cover
 # the JWT/auth and URL/SSRF surfaces that `db`/`web`/`http_client` reach.
-full = ["async", "json", "jwt", "url", "db", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time-core", "log", "regex", "uuid", "random", "decimal", "char-category"]
+full = ["async", "json", "jwt", "url", "db", "db-operator", "redis_store", "crypto", "crypto-core", "secret", "compression", "csv_kernel", "cache_kernel", "tui", "config", "server", "http_client", "email", "websocket_client", "web", "time-core", "log", "regex", "uuid", "random", "decimal", "char-category"]
 # Development-only time-travelling debugger core (recorder / re-fold / export /
 # import). NOT in `full` and NOT implied by `wasm-client` — the debugger is a
 # build-mode opt-in (`ipe dev build/run --debugger`), never a default. `ipe release`
@@ -591,6 +591,12 @@ debugger = ["control-wire", "async", "tokio/net", "tokio/io-util"]
 # production, so a release artifact keeps the console closed until
 # `IPE_CONSOLE_AUTH` names a credential mode.
 dev-posture = []
+# `db-operator`: the program serves and reaches `Db.connect`, so a server start
+# judges `DATABASE_URL` and the `Db.url` setting before it binds. The start
+# check's only callers are server starts, so the feature implies `server`: no
+# selection can compile the check without a caller. A `Db.open`-only program,
+# or a `Db.connect` program that never serves, leaves it off.
+db-operator = ["db", "server"]
 # Browser-WASM TEA sink (`src/wasm/`): mount + patch-apply + delegated events.
 # Compiles only on wasm32 (the module is target-cfg'd); NOT in `full` — native
 # builds never link the wasm glue.

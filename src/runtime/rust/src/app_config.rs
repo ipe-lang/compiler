@@ -966,20 +966,13 @@ pub(crate) fn auth_ceilings() -> Result<(), crate::system::EnvCeilingRefusal> {
     Ok(())
 }
 
-/// The resolved database URL from the installed `Db.url` setting, if one was set
-/// and no `DATABASE_URL` env override applies. The secret is revealed only here,
-/// at the point of use, and returned to the caller that configures the pool; it
-/// is never logged. `None` means keep resolving (env present, or no setting).
-/// `env > setting-in-code > fallback`.
+/// The installed `Db.url` setting, if the app set one.
+///
+/// Reads no environment variable: the database resolver in `db.rs` orders
+/// `DATABASE_URL` above this setting and parses each once.
 #[cfg(feature = "db")]
-pub(crate) fn resolve_db_url_override() -> Option<String> {
-    if crate::system::read_env_var("DATABASE_URL").is_ok() {
-        return None;
-    }
-    INSTALLED
-        .get()
-        .and_then(|c| c.db_url.clone())
-        .map(crate::secret::secret_reveal)
+pub(crate) fn installed_db_url_setting() -> Option<&'static crate::secret::Secret> {
+    INSTALLED.get().and_then(|c| c.db_url.as_ref())
 }
 
 /// The installed `Console.*Token` secret for `kind`, revealed at the point of

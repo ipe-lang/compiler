@@ -84,6 +84,7 @@ fn program(name: Symbol, funcs: Vec<Func>, records: Vec<IrType>, entry: Option<F
             uses_locale: false,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_debug: false,
             uses_ffi: false,
             uses_async_runtime: false,

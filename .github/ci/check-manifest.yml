@@ -120,6 +120,7 @@ checks:
         - cargo clippy -p ipe-runtime-rust --no-default-features --features url --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-sqlite,decimal,encoding,json,random,time-core,url --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-postgres,decimal,encoding,json,random,time-core,url --all-targets -- -D warnings
+        - cargo clippy -p ipe-runtime-rust --no-default-features --features async,crypto-core,db-operator,db-sqlite,decimal,encoding,json,random,server,time-core,url,uuid --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features dev-posture --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features debugger,dev-posture --all-targets -- -D warnings
         - cargo clippy -p ipe-runtime-rust --no-default-features --features async,control-wire,dev-posture,random,tui --all-targets -- -D warnings

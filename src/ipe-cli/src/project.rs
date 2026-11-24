@@ -1060,7 +1060,7 @@ pub fn is_denylisted_public_env_name(name: &str) -> bool {
         "APIKEY",
     ];
     let upper = name.to_ascii_uppercase();
-    upper == "DATABASE_URL"
+    upper == crate::run_sandbox::OPERATOR_DB_ENV
         || upper.starts_with("IPE_")
         || upper
             .split('_')
@@ -3198,6 +3198,24 @@ import String
             }
         });
         assert!(result.is_err(), "A ↔ B cycle must be detected");
+    }
+
+    /// T19: the operator database variable has one name: the CLI constant the
+    /// jail passes through is the runtime resolver's, and `publicEnv` refuses it.
+    #[test]
+    fn operator_db_env_name_is_one_const() {
+        use crate::run_sandbox::OPERATOR_DB_ENV;
+        let db_rs =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../runtime/rust/src/db.rs");
+        let runtime = std::fs::read_to_string(&db_rs).expect("read the runtime's db.rs");
+        let declared = format!("const OPERATOR_DB_ENV: &str = \"{OPERATOR_DB_ENV}\";");
+        assert_eq!(runtime.matches(declared.as_str()).count(), 1, "{declared}");
+        let read = format!("read_env_var(\"{OPERATOR_DB_ENV}\")");
+        assert_eq!(runtime.matches(read.as_str()).count(), 1, "{read}");
+        assert!(is_denylisted_public_env_name(OPERATOR_DB_ENV));
+        assert!(is_denylisted_public_env_name(
+            &OPERATOR_DB_ENV.to_ascii_lowercase()
+        ));
     }
 
     #[test]

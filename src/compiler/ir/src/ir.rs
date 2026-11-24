@@ -419,6 +419,14 @@ pub struct Module {
     /// and append `pub mod env_public; pub use env_public::*;` to the
     /// emitted `ipe_runtime/mod.rs`.
     pub uses_env_public: bool,
+    /// `true` when the lowerer detected a kernel call that opens the operator
+    /// database (`Db.connect`), which reads `DATABASE_URL` and the `Db.url`
+    /// setting.
+    ///
+    /// The backend reads it to select the `db-operator` runtime feature, which
+    /// judges those values at a server start. A `Db.open`-only program leaves
+    /// it `false` and never reads `DATABASE_URL`.
+    pub uses_db_operator: bool,
     /// `true` when the lowerer detected at least one development-only
     /// `Debug.*` escape-hatch call (`Debug.log`) in the module's function
     /// bodies. Set unconditionally (regardless of build profile) at the same
@@ -5826,6 +5834,7 @@ mod tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,
@@ -6360,6 +6369,7 @@ mod serde_persistence_tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,
@@ -6454,6 +6464,7 @@ mod serde_persistence_tests {
                 uses_locale: false,
                 uses_time: false,
                 uses_env_public: false,
+                uses_db_operator: false,
                 uses_debug: false,
                 uses_ffi: false,
                 uses_async_runtime: false,

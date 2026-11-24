@@ -1,5 +1,5 @@
 // DB kernel functions — generic over E and over backend.
-// Uses DbPool, DbRow, ipe_db_url, db_last_insert_id, db_format_sql from
+// Uses DbPool, DbRow, db_last_insert_id, db_format_sql from
 // config.rs (generated at build time per package.ipe database driver).
 use super::json::{
     Decoder, JsonVal, decode_and_map, decode_err_str, decode_field, decode_ok, integral_i64,
@@ -1969,6 +1969,7 @@ fn url_scheme(url: &str) -> Option<&str> {
 }
 
 /// A SQLite connection URL, parsed into the options the driver opens.
+#[derive(Clone)]
 pub struct SqliteUrl {
     options: sqlx::sqlite::SqliteConnectOptions,
     /// A file every pool connection shares, as opposed to a private in-memory database.
@@ -2094,6 +2095,7 @@ impl DialTarget {
 
 /// A PostgreSQL connection URL, every target it makes the driver dial, and
 /// the transport its connections use.
+#[derive(Clone)]
 pub struct PostgresUrl {
     url: UnambiguousUrl,
     targets: Vec<DialTarget>,
@@ -2129,6 +2131,7 @@ impl PostgresUrl {
 /// The engine a pool is opened with, the SSRF gate's dial targets, and the
 /// SQLite WAL setup all read this one value, so they cannot disagree.
 /// Holds the URL's credentials, so it has no `Debug` or `Display`.
+#[derive(Clone)]
 pub enum DbUrl {
     /// `sqlite:` or `file:`, or a bare path naming no scheme.
     Sqlite(SqliteUrl),
@@ -2612,7 +2615,7 @@ impl std::fmt::Debug for PoolKey {
 /// builds an uncached pool.
 async fn connect_cached<E: Send + crate::FromIpeError + 'static>(
     key: Option<PoolKey>,
-    db_url: DbUrl,
+    db_url: &DbUrl,
     journal: Journal,
 ) -> IpeResult<E, Db> {
     let max_pools: usize = match DB_POOLS_CEILING.read() {
@@ -2628,7 +2631,7 @@ async fn connect_cached<E: Send + crate::FromIpeError + 'static>(
     {
         return ok_res(open);
     }
-    let pool = match build_pool::<E>(&db_url, journal).await {
+    let pool = match build_pool::<E>(db_url, journal).await {
         IpeResult::Ok(pool) => pool,
         IpeResult::Err(e) => return IpeResult::Err(e),
     };
@@ -2897,23 +2900,590 @@ pub fn process_pools() -> &'static OwnedPools {
     &OWNED_POOLS
 }
 
-/// Connect the operator URL `url`, pooled per URL unless it names a private
-/// in-memory database.
-async fn connect_operator<E: Send + crate::FromIpeError + 'static>(
-    url: String,
-) -> IpeResult<E, Db> {
-    let db_url = match DbUrl::parse(&url) {
-        Ok(db_url) => db_url,
-        Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
-    };
-    let key = url_is_cacheable(&url).then_some(PoolKey::Operator(url));
-    connect_cached(key, db_url, Journal::WalIfShared).await
+// ─── The operator store `Db.connect` opens ────────────────────────────────────
+//
+// One resolver chooses the store: the parsed `DATABASE_URL`, else the parsed
+// `Db.url` setting, else a runtime-authored default. A value that is set is
+// never skipped: it parses or it is refused, and the refusal carries no text
+// from it. Only the default branch warns, once, naming the store it opens.
+
+/// The environment variable that names the operator database.
+pub(crate) const OPERATOR_DB_ENV: &str = "DATABASE_URL";
+
+/// The local server a PostgreSQL build connects to when no URL is configured.
+const LOCAL_POSTGRES_DEFAULT: &str = "postgres://postgres@localhost/ipe";
+
+/// The file a SQLite build stores its data in when no URL is configured.
+const DEFAULT_SQLITE_FILE: &str = "ipe.db";
+
+/// The SQLite URL the warning and the refusals offer as an example.
+const SQLITE_URL_EXAMPLE: &str = "sqlite://app.db?mode=rwc";
+
+/// The PostgreSQL URL the warning and the refusals offer as an example.
+const POSTGRES_URL_EXAMPLE: &str = "postgres://app@localhost/app";
+
+/// The default-store warning for a SQLite file whose absolute name is known.
+const WARN_SQLITE_ABSOLUTE: &str = "warning: DATABASE_URL is not set, so this app stores its data \
+                                    in {path} (created if missing)";
+
+/// The default-store warning for a SQLite file named relative to the working directory.
+const WARN_SQLITE_WORKING_DIRECTORY: &str = "warning: DATABASE_URL is not set, so this app stores \
+                                             its data in ipe.db in the working directory (created \
+                                             if missing)";
+
+/// The default-store warning for the local PostgreSQL server.
+const WARN_LOCAL_POSTGRES: &str = "warning: DATABASE_URL is not set, so this app connects to {url}";
+
+/// The second warning line: how to choose the database.
+const WARN_REMEDY: &str =
+    "  to choose the database, set DATABASE_URL, for example DATABASE_URL={example}";
+
+/// A URL `engine` can open, offered as the example in the warning and refusals.
+const fn url_example(engine: DbEngine) -> &'static str {
+    match engine {
+        DbEngine::Sqlite => SQLITE_URL_EXAMPLE,
+        DbEngine::Postgres => POSTGRES_URL_EXAMPLE,
+    }
 }
 
+/// The store an `engine` build opens when no URL is configured, as the
+/// refusals name it.
+const fn default_store_shown(engine: DbEngine) -> &'static str {
+    match engine {
+        DbEngine::Sqlite => DEFAULT_SQLITE_FILE,
+        DbEngine::Postgres => LOCAL_POSTGRES_DEFAULT,
+    }
+}
+
+/// Where an operator database URL was configured.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperatorUrlSource {
+    /// The `DATABASE_URL` environment variable.
+    Env,
+    /// The installed `Db.url` setting.
+    Setting,
+}
+
+impl OperatorUrlSource {
+    /// The name a refusal gives the source.
+    const fn shown(self) -> &'static str {
+        match self {
+            Self::Env => OPERATOR_DB_ENV,
+            Self::Setting => "the `Db.url` setting",
+        }
+    }
+
+    /// The refusal for an empty or blank value from this source.
+    const fn empty(self) -> OperatorUrlRefusal {
+        match self {
+            Self::Env => OperatorUrlRefusal::EnvEmpty,
+            Self::Setting => OperatorUrlRefusal::SettingEmpty,
+        }
+    }
+}
+
+/// The rule a configured database URL broke.
+///
+/// Carries no text from the value, so no refusal built from it can echo a
+/// credential.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DbUrlRefusalKind {
+    /// The value has whitespace before or after it.
+    SurroundingWhitespace,
+    /// The value holds a control character.
+    Control,
+    /// The scheme selects no engine the runtime supports.
+    UnsupportedScheme,
+    /// The value does not parse as a database URL.
+    InvalidUrl,
+    /// An `@` or `\` lies outside the user name and password.
+    MisplacedUserinfo,
+    /// The URL names more hosts than the runtime dials.
+    TooManyHosts {
+        /// The most hosts one URL may name.
+        limit: usize,
+    },
+    /// The URL names an `sslmode` that does not verify a remote server.
+    UnverifiedTls,
+    /// The URL selects another engine than this build's driver.
+    EngineMismatch {
+        /// The engine the URL selects.
+        url: DbEngine,
+        /// The engine the driver speaks.
+        driver: DbEngine,
+    },
+}
+
+impl DbUrlRefusalKind {
+    /// The rule a URL parse refused.
+    ///
+    /// A parse yields only the URL-shape refusals; the dial and driver
+    /// refusals cannot arise from one and read as an invalid URL.
+    const fn of_parse(refused: &DbConnectError) -> Self {
+        match refused {
+            DbConnectError::UnsupportedScheme => Self::UnsupportedScheme,
+            DbConnectError::MisplacedUserinfo => Self::MisplacedUserinfo,
+            DbConnectError::TooManyDialTargets { limit } => Self::TooManyHosts { limit: *limit },
+            DbConnectError::UnverifiedTls { .. } => Self::UnverifiedTls,
+            DbConnectError::EngineMismatch { url, driver } => Self::EngineMismatch {
+                url: *url,
+                driver: *driver,
+            },
+            DbConnectError::InvalidUrl
+            | DbConnectError::HostRefused(_)
+            | DbConnectError::Unreachable(_)
+            | DbConnectError::RelayUnavailable
+            | DbConnectError::VersionUnreadable(_)
+            | DbConnectError::EngineRefused(_) => Self::InvalidUrl,
+        }
+    }
+}
+
+impl std::fmt::Display for DbUrlRefusalKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SurroundingWhitespace => f.write_str("has whitespace around it"),
+            Self::Control => f.write_str("holds a control character"),
+            Self::UnsupportedScheme => f.write_str(
+                "uses an unsupported scheme (use sqlite:, file:, postgres: or postgresql:)",
+            ),
+            Self::InvalidUrl => f.write_str("is not a valid database URL"),
+            Self::MisplacedUserinfo => f.write_str(
+                "has an `@` or `\\` outside its user name and password (percent-encode `@`, \
+                 `/`, `?`, `#` and `\\` there as %40, %2F, %3F, %23, %5C)",
+            ),
+            Self::TooManyHosts { limit } => write!(f, "names more than {limit} hosts to dial"),
+            Self::UnverifiedTls => f.write_str(
+                "names an sslmode that does not verify a remote server (use \
+                 sslmode=verify-full)",
+            ),
+            Self::EngineMismatch { url, driver } => write!(
+                f,
+                "selects {} but this build's driver is {}",
+                url.name(),
+                driver.name()
+            ),
+        }
+    }
+}
+
+/// Why a configured operator database URL was refused.
+///
+/// Carries no text from the value: a set value is either parsed or refused
+/// by the rule it broke, and never falls through to a lower source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OperatorUrlRefusal {
+    /// `DATABASE_URL` is set to an empty or blank value.
+    EnvEmpty,
+    /// `DATABASE_URL` is set to a value that is not valid UTF-8.
+    EnvNotUnicode,
+    /// The `Db.url` setting is empty or blank.
+    SettingEmpty,
+    /// The value from `source` broke the rule `kind`.
+    Malformed {
+        /// Where the value was configured.
+        source: OperatorUrlSource,
+        /// The rule it broke.
+        kind: DbUrlRefusalKind,
+    },
+}
+
+impl std::fmt::Display for OperatorUrlRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write_for(KERNEL_ENGINE, f)
+    }
+}
+
+impl OperatorUrlRefusal {
+    /// The refusal as an `engine` build shows it: the example URL and the
+    /// default store are that engine's.
+    fn write_for(self, engine: DbEngine, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let source = match self {
+            Self::EnvEmpty | Self::EnvNotUnicode => OperatorUrlSource::Env,
+            Self::SettingEmpty => OperatorUrlSource::Setting,
+            Self::Malformed { source, .. } => source,
+        };
+        f.write_str("db: ")?;
+        f.write_str(source.shown())?;
+        match self {
+            Self::EnvEmpty | Self::SettingEmpty => f.write_str(" is empty")?,
+            Self::EnvNotUnicode => f.write_str(" is not valid UTF-8")?,
+            Self::Malformed { kind, .. } => write!(f, " {kind}")?,
+        }
+        write!(
+            f,
+            "; set it to a URL for this app's database, for example {}, or unset it so the app \
+             uses {}",
+            url_example(engine),
+            default_store_shown(engine)
+        )
+    }
+
+    /// The refusal as the caller's error.
+    ///
+    /// A dial-target ceiling is `LimitExceeded`; every other refusal is
+    /// `InvalidInput`.
+    pub(crate) fn into_ipe_error(self) -> IpeError {
+        let message = self.to_string();
+        match self {
+            Self::Malformed {
+                kind: DbUrlRefusalKind::TooManyHosts { .. },
+                ..
+            } => IpeError::limit_exceeded(message),
+            Self::EnvEmpty | Self::EnvNotUnicode | Self::SettingEmpty | Self::Malformed { .. } => {
+                IpeError::invalid_input(message)
+            }
+        }
+    }
+}
+
+/// A parsed `DATABASE_URL` or `Db.url`.
+///
+/// Holds credentials, so it has no `Debug` or `Display`.
+#[derive(Clone)]
+struct ConfiguredUrl {
+    /// The parsed URL the pool opens.
+    url: DbUrl,
+    /// The configured text, the pool cache key.
+    key: String,
+}
+
+/// How the default SQLite store's warning names its file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DefaultPath {
+    /// The sealed name is the absolute path of the file.
+    Absolute,
+    /// The working directory could not be named, so the file is `./ipe.db`.
+    WorkingDirectory,
+}
+
+/// The store a build opens when no URL is configured.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DefaultStore {
+    /// A SQLite file opened under [`FileMode::CreateIfMissing`].
+    SqliteFile {
+        /// The sealed file name handed to the driver.
+        name: SqliteFileName,
+        /// How the warning names it.
+        shown: DefaultPath,
+    },
+    /// [`LOCAL_POSTGRES_DEFAULT`].
+    LocalPostgres,
+}
+
+/// The store `Db.connect` opens.
+#[derive(Clone)]
+enum OperatorStore {
+    /// A URL the operator or the app configured.
+    Configured(Box<ConfiguredUrl>),
+    /// The runtime-authored default.
+    Default(DefaultStore),
+}
+
+/// The parse of one operator URL source: absent, a URL, or a refusal.
+type SourceParse = Result<Option<ConfiguredUrl>, OperatorUrlRefusal>;
+
+/// The store `Db.connect` uses, or the refusal of a configured value.
+type StoreChoice = Result<OperatorStore, OperatorUrlRefusal>;
+
+/// Parse `text`, configured at `source`, into a URL `engine` can open.
+///
+/// Never trims: a value with whitespace around it is refused, not read as a
+/// different value.
+fn parse_configured(
+    text: &str,
+    source: OperatorUrlSource,
+    engine: DbEngine,
+) -> Result<ConfiguredUrl, OperatorUrlRefusal> {
+    let malformed = |kind| OperatorUrlRefusal::Malformed { source, kind };
+    if text.trim().is_empty() {
+        return Err(source.empty());
+    }
+    if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
+        return Err(malformed(DbUrlRefusalKind::SurroundingWhitespace));
+    }
+    if text.contains(char::is_control) {
+        return Err(malformed(DbUrlRefusalKind::Control));
+    }
+    let url =
+        DbUrl::parse(text).map_err(|refused| malformed(DbUrlRefusalKind::of_parse(&refused)))?;
+    if url.engine() != engine {
+        return Err(malformed(DbUrlRefusalKind::EngineMismatch {
+            url: url.engine(),
+            driver: engine,
+        }));
+    }
+    Ok(ConfiguredUrl {
+        url,
+        key: text.to_owned(),
+    })
+}
+
+/// Parse a `DATABASE_URL` read for a build whose driver speaks `engine`.
+///
+/// Only an absent variable is `None`; a value that is not UTF-8 is refused.
+fn parse_env(raw: Result<String, std::env::VarError>, engine: DbEngine) -> SourceParse {
+    match raw {
+        Ok(text) => parse_configured(&text, OperatorUrlSource::Env, engine).map(Some),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(OperatorUrlRefusal::EnvNotUnicode),
+    }
+}
+
+/// Parse the installed `Db.url` setting for a build whose driver speaks `engine`.
+fn parse_setting(raw: Option<&crate::secret::Secret>, engine: DbEngine) -> SourceParse {
+    raw.map_or(Ok(None), |secret| {
+        let text = crate::secret::secret_reveal(secret.clone());
+        parse_configured(&text, OperatorUrlSource::Setting, engine).map(Some)
+    })
+}
+
+impl SqliteFileName {
+    /// `./ipe.db`, the default file named relative to the working directory.
+    fn working_directory_default() -> Self {
+        Self(format!("./{DEFAULT_SQLITE_FILE}"))
+    }
+}
+
+/// The store a build whose driver speaks `engine` opens with no URL configured.
+///
+/// SQLite: `ipe.db` under the absolute working directory `cwd`, sealed as a
+/// file name, or `./ipe.db` when `cwd` is absent, relative, or refused by the
+/// seal. PostgreSQL: [`LOCAL_POSTGRES_DEFAULT`]. Never a refusal.
+fn default_store_for(engine: DbEngine, cwd: Option<&str>) -> DefaultStore {
+    match engine {
+        DbEngine::Sqlite => {
+            let absolute = cwd
+                .filter(|dir| std::path::Path::new(dir).is_absolute())
+                .and_then(|dir| {
+                    let joined = std::path::Path::new(dir).join(DEFAULT_SQLITE_FILE);
+                    let joined = joined.to_str()?;
+                    SqliteFileName::parse_under(joined, super::path_core::HOST).ok()
+                });
+            absolute.map_or_else(
+                || DefaultStore::SqliteFile {
+                    name: SqliteFileName::working_directory_default(),
+                    shown: DefaultPath::WorkingDirectory,
+                },
+                |name| DefaultStore::SqliteFile {
+                    name,
+                    shown: DefaultPath::Absolute,
+                },
+            )
+        }
+        DbEngine::Postgres => DefaultStore::LocalPostgres,
+    }
+}
+
+/// The two warning lines naming `store`, each without its `[ipe.db]` tag.
+fn default_warning(store: &DefaultStore) -> [String; 2] {
+    let (first, engine) = match store {
+        DefaultStore::SqliteFile {
+            name,
+            shown: DefaultPath::Absolute,
+        } => (
+            WARN_SQLITE_ABSOLUTE.replacen("{path}", name.as_str(), 1),
+            DbEngine::Sqlite,
+        ),
+        DefaultStore::SqliteFile {
+            shown: DefaultPath::WorkingDirectory,
+            ..
+        } => (WARN_SQLITE_WORKING_DIRECTORY.to_owned(), DbEngine::Sqlite),
+        DefaultStore::LocalPostgres => (
+            WARN_LOCAL_POSTGRES.replacen("{url}", LOCAL_POSTGRES_DEFAULT, 1),
+            DbEngine::Postgres,
+        ),
+    };
+    [
+        first,
+        WARN_REMEDY.replacen("{example}", url_example(engine), 1),
+    ]
+}
+
+/// The store chosen from a parsed `env` and `setting`, or `default()` when
+/// neither is configured.
+///
+/// A configured value that was refused refuses the choice, whichever source
+/// would have won: a value that is set is never skipped.
+fn choose_store(
+    env: SourceParse,
+    setting: &SourceParse,
+    default: impl FnOnce() -> DefaultStore,
+) -> StoreChoice {
+    let env = env?;
+    let setting = setting.as_ref().map_err(|refused| *refused)?;
+    Ok(match (env, setting) {
+        (Some(url), _) => OperatorStore::Configured(Box::new(url)),
+        (None, Some(url)) => OperatorStore::Configured(Box::new(url.clone())),
+        (None, None) => OperatorStore::Default(default()),
+    })
+}
+
+/// The cells that fix a process's operator store.
+struct OperatorCells {
+    /// The parse of the installed `Db.url`, final once the setting is installed.
+    setting: std::sync::OnceLock<SourceParse>,
+    /// The store `Db.connect` uses, fixed by its first resolution.
+    store: std::sync::OnceLock<StoreChoice>,
+}
+
+impl OperatorCells {
+    const fn new() -> Self {
+        Self {
+            setting: std::sync::OnceLock::new(),
+            store: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The parse of `installed`, forced once.
+    fn setting(&self, installed: Option<&crate::secret::Secret>, engine: DbEngine) -> &SourceParse {
+        self.setting
+            .get_or_init(|| parse_setting(installed, engine))
+    }
+
+    /// The store, resolved once from `env`, the setting and the default.
+    ///
+    /// `warn` receives the warning lines only when the default is chosen, so it
+    /// runs at most once per cell.
+    fn store(
+        &self,
+        env: Result<String, std::env::VarError>,
+        installed: Option<&crate::secret::Secret>,
+        engine: DbEngine,
+        cwd: impl FnOnce() -> Option<String>,
+        warn: impl FnOnce(&[String; 2]),
+    ) -> &StoreChoice {
+        self.store.get_or_init(|| {
+            let setting = self.setting(installed, engine);
+            let chosen = choose_store(parse_env(env, engine), setting, || {
+                default_store_for(engine, cwd().as_deref())
+            });
+            if let Ok(OperatorStore::Default(default)) = &chosen {
+                warn(&default_warning(default));
+            }
+            chosen
+        })
+    }
+
+    /// Judge every operator URL present now, before a server binds.
+    ///
+    /// Forces the setting. Fixes the store only when `env` is present: an
+    /// absent variable may still be set by a `.env` the app loads later, so the
+    /// default is left to the first `Db.connect`.
+    #[cfg(any(test, feature = "db-operator"))]
+    fn check_at_start(
+        &self,
+        env: Result<String, std::env::VarError>,
+        installed: Option<&crate::secret::Secret>,
+        engine: DbEngine,
+    ) -> Result<(), OperatorUrlRefusal> {
+        let setting = self.setting(installed, engine);
+        match parse_env(env, engine) {
+            Ok(None) => setting.as_ref().map(|_| ()).map_err(|refused| *refused),
+            present => {
+                let store = self.store.get_or_init(|| {
+                    choose_store(present, setting, || default_store_for(engine, None))
+                });
+                store.as_ref().map(|_| ()).map_err(|refused| *refused)
+            }
+        }
+    }
+}
+
+/// The process's operator store cells.
+static OPERATOR: OperatorCells = OperatorCells::new();
+
+/// The process working directory as UTF-8 text, or `None`.
+fn working_directory() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|dir| dir.into_os_string().into_string().ok())
+}
+
+/// Write the default-store warning through the runtime log, one line per call.
+fn emit_default_warning(lines: &[String; 2]) {
+    for line in lines {
+        crate::system::emit_runtime_log("db", line);
+    }
+}
+
+/// The raw `DATABASE_URL`: the one read of [`OPERATOR_DB_ENV`], spelled as a
+/// literal so the environment-read scan sees a host variable.
+fn read_operator_db_env() -> Result<String, std::env::VarError> {
+    crate::system::read_env_var("DATABASE_URL")
+}
+
+/// The process's operator store, resolved and warned about once.
+fn operator_store() -> &'static StoreChoice {
+    OPERATOR.store(
+        read_operator_db_env(),
+        crate::app_config::installed_db_url_setting(),
+        KERNEL_ENGINE,
+        working_directory,
+        emit_default_warning,
+    )
+}
+
+/// Refuse a server start whose `DATABASE_URL` or `Db.url` is set but bad.
+///
+/// # Errors
+///
+/// The [`OperatorUrlRefusal`] of the first configured value refused.
+#[cfg(feature = "db-operator")]
+pub(crate) fn check_operator_url_at_start() -> Result<(), OperatorUrlRefusal> {
+    OPERATOR.check_at_start(
+        read_operator_db_env(),
+        crate::app_config::installed_db_url_setting(),
+        KERNEL_ENGINE,
+    )
+}
+
+/// Connect the configured operator URL `url`, pooled per URL unless it names
+/// a private in-memory database.
+async fn connect_configured<E: Send + crate::FromIpeError + 'static>(
+    url: &ConfiguredUrl,
+) -> IpeResult<E, Db> {
+    let key = url_is_cacheable(&url.key).then(|| PoolKey::Operator(url.key.clone()));
+    connect_cached(key, &url.url, Journal::WalIfShared).await
+}
+
+/// Connect `store`, the operator store, or refuse with its refusal.
+async fn connect_operator_store<E: Send + crate::FromIpeError + 'static>(
+    store: &StoreChoice,
+) -> IpeResult<E, Db> {
+    match store {
+        Err(refused) => IpeResult::Err(E::from_ipe_error(refused.into_ipe_error())),
+        Ok(OperatorStore::Configured(url)) => connect_configured(url).await,
+        Ok(OperatorStore::Default(DefaultStore::SqliteFile { name, .. })) => {
+            let mode = FileMode::CreateIfMissing;
+            match DbUrl::sqlite_file(name, mode) {
+                Ok(db_url) => {
+                    let key = PoolKey::File {
+                        name: name.clone(),
+                        mode,
+                    };
+                    connect_cached(Some(key), &db_url, Journal::Wal).await
+                }
+                Err(refused) => IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
+            }
+        }
+        Ok(OperatorStore::Default(DefaultStore::LocalPostgres)) => {
+            match DbUrl::parse(LOCAL_POSTGRES_DEFAULT) {
+                Ok(db_url) => {
+                    let key = PoolKey::Operator(LOCAL_POSTGRES_DEFAULT.to_owned());
+                    connect_cached(Some(key), &db_url, Journal::WalIfShared).await
+                }
+                Err(refused) => IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
+            }
+        }
+    }
+}
+
+/// `Db.connect : () -> Task Error Db` — open the operator store.
 pub fn db_connect<E: Send + From<String> + crate::FromIpeError + 'static>(
     _unit: (),
 ) -> IpeTask<E, Db> {
-    Box::pin(connect_operator(ipe_db_url()))
+    Box::pin(connect_operator_store(operator_store()))
 }
 
 /// The parsed URL a [`crate::dsn::Dsn`] names, its host vetted for a
@@ -2967,10 +3537,10 @@ pub fn db_open<E: Send + From<String> + crate::FromIpeError + 'static>(
                     FileMode::ReadExisting => Journal::Unchanged,
                     FileMode::WriteExisting | FileMode::CreateIfMissing => Journal::Wal,
                 };
-                connect_cached(Some(PoolKey::File { name, mode }), db_url, journal).await
+                connect_cached(Some(PoolKey::File { name, mode }), &db_url, journal).await
             }
             LocationKind::Memory => match DbUrl::sqlite_memory() {
-                Ok(db_url) => connect_cached(None, db_url, Journal::Unchanged).await,
+                Ok(db_url) => connect_cached(None, &db_url, Journal::Unchanged).await,
                 Err(refused) => IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
             },
             LocationKind::Dsn(dsn) => match dsn_db_url(&dsn).await {
@@ -2978,7 +3548,7 @@ pub fn db_open<E: Send + From<String> + crate::FromIpeError + 'static>(
                     let shared =
                         matches!(db_url, DbUrl::Postgres(_)) || db_url.is_shared_sqlite_file();
                     let key = shared.then(|| PoolKey::Dsn(dsn.connection_url()));
-                    connect_cached(key, db_url, Journal::WalIfShared).await
+                    connect_cached(key, &db_url, Journal::WalIfShared).await
                 }
                 Err(refused) => IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
             },
@@ -7978,23 +8548,469 @@ mod tests {
         );
     }
 
-    /// A connection URL one target past the dial-target ceiling fails the
-    /// connect with a `LimitExceeded` error, its message unchanged.
-    #[tokio::test]
-    async fn build_pool_past_the_dial_target_ceiling_is_limit_exceeded() {
+    /// An operator URL one target past the dial-target ceiling is refused at
+    /// its parse as a `LimitExceeded` error naming the ceiling.
+    #[test]
+    fn operator_url_past_the_dial_target_ceiling_is_limit_exceeded() {
         let hosts: Vec<String> = (0..MAX_POSTGRES_DIAL_TARGETS)
             .map(|i| format!("host=h{i}.example"))
             .collect();
         let url = format!("postgres://db.example/app?{}", hosts.join("&"));
-        let refused = match connect_operator::<IpeError>(url).await {
-            IpeResult::Err(e) => Some(e),
-            IpeResult::Ok(_) => None,
-        };
+        let refused = parse_env(Ok(url), DbEngine::Postgres).err();
         assert_eq!(
             refused,
-            Some(IpeError::limit_exceeded(format!(
-                "db: the connection URL names more than {MAX_POSTGRES_DIAL_TARGETS} hosts to dial"
-            )))
+            Some(OperatorUrlRefusal::Malformed {
+                source: OperatorUrlSource::Env,
+                kind: DbUrlRefusalKind::TooManyHosts {
+                    limit: MAX_POSTGRES_DIAL_TARGETS
+                },
+            })
+        );
+        let Some(refused) = refused else { return };
+        let error = refused.into_ipe_error();
+        assert_eq!(
+            error,
+            IpeError::limit_exceeded(refused.to_string()),
+            "the ceiling is a limit refusal"
+        );
+        assert!(
+            refused.to_string().contains(&format!(
+                "names more than {MAX_POSTGRES_DIAL_TARGETS} hosts"
+            )),
+            "{refused}"
+        );
+    }
+
+    /// A `DATABASE_URL` value read for the operator store.
+    fn env_value(text: &str) -> Result<String, std::env::VarError> {
+        Ok(text.to_owned())
+    }
+
+    /// The configured key of `choice`, or `None` for a default or a refusal.
+    fn configured_key(choice: &StoreChoice) -> Option<&str> {
+        match choice {
+            Ok(OperatorStore::Configured(url)) => Some(url.key.as_str()),
+            Ok(OperatorStore::Default(_)) | Err(_) => None,
+        }
+    }
+
+    /// T1: an absent variable and an absent setting are absent, not refused.
+    #[test]
+    fn operator_url_unset_is_none() {
+        for engine in [DbEngine::Sqlite, DbEngine::Postgres] {
+            assert!(matches!(
+                parse_env(Err(std::env::VarError::NotPresent), engine),
+                Ok(None)
+            ));
+            assert!(matches!(parse_setting(None, engine), Ok(None)));
+        }
+    }
+
+    /// T2: an empty or blank `DATABASE_URL` is refused and never falls through
+    /// to a valid setting or the default.
+    #[test]
+    fn operator_url_empty_env_refuses_never_falls_through() {
+        let setting = crate::secret::secret_from_string("sqlite://setting.db?mode=rwc".to_owned());
+        for blank in ["", "  ", "\t"] {
+            assert_eq!(
+                parse_env(env_value(blank), DbEngine::Sqlite).err(),
+                Some(OperatorUrlRefusal::EnvEmpty),
+                "{blank:?}"
+            );
+            let setting_parse = parse_setting(Some(&setting), DbEngine::Sqlite);
+            assert!(matches!(setting_parse, Ok(Some(_))));
+            let mut defaulted = false;
+            let chosen = choose_store(
+                parse_env(env_value(blank), DbEngine::Sqlite),
+                &setting_parse,
+                || {
+                    defaulted = true;
+                    default_store_for(DbEngine::Sqlite, None)
+                },
+            );
+            assert!(
+                matches!(chosen, Err(OperatorUrlRefusal::EnvEmpty)),
+                "{blank:?} fell through"
+            );
+            assert!(!defaulted, "{blank:?} reached the default");
+        }
+    }
+
+    /// T3: a `DATABASE_URL` that is not UTF-8 is refused, never read as unset.
+    #[cfg(unix)]
+    #[test]
+    fn operator_url_not_unicode_refuses() {
+        use std::os::unix::ffi::OsStringExt;
+        let raw = std::ffi::OsString::from_vec(vec![b's', 0xff, b'x']);
+        assert_eq!(
+            parse_env(Err(std::env::VarError::NotUnicode(raw)), DbEngine::Sqlite).err(),
+            Some(OperatorUrlRefusal::EnvNotUnicode)
+        );
+    }
+
+    /// T4: a malformed `DATABASE_URL` is refused by the rule it broke, and
+    /// neither the message nor the `Debug` of the refusal carries its text.
+    #[test]
+    fn operator_url_malformed_refuses_without_echo() {
+        let cases = [
+            ("mysql://u:hunter2@dbhost-x9/db", DbEngine::Sqlite),
+            (
+                "postgres://u:hunter2@dbhost-x9:99999/db",
+                DbEngine::Postgres,
+            ),
+            (" sqlite://dbhost-x9.db", DbEngine::Sqlite),
+            ("sqlite://dbhost-x9.db\n", DbEngine::Sqlite),
+            ("sqlite://dbhost\u{7}x9.db", DbEngine::Sqlite),
+            ("postgres://u:hunter2@dbhost-x9/db", DbEngine::Sqlite),
+        ];
+        for (url, engine) in cases {
+            let refused = parse_env(env_value(url), engine).err();
+            assert!(
+                matches!(
+                    refused,
+                    Some(OperatorUrlRefusal::Malformed {
+                        source: OperatorUrlSource::Env,
+                        ..
+                    })
+                ),
+                "{url:?} -> {refused:?}"
+            );
+            let Some(refused) = refused else { return };
+            let shown = format!("{refused} {refused:?} {:?}", refused.into_ipe_error());
+            for leak in ["hunter2", "u:", "dbhost", "x9"] {
+                assert!(!shown.contains(leak), "{url:?} leaked {leak:?}: {shown}");
+            }
+            assert!(shown.contains("DATABASE_URL"), "{shown}");
+        }
+        assert_eq!(
+            parse_env(
+                env_value("postgres://u:hunter2@dbhost-x9/db"),
+                DbEngine::Sqlite
+            )
+            .err(),
+            Some(OperatorUrlRefusal::Malformed {
+                source: OperatorUrlSource::Env,
+                kind: DbUrlRefusalKind::EngineMismatch {
+                    url: DbEngine::Postgres,
+                    driver: DbEngine::Sqlite,
+                },
+            })
+        );
+        assert_eq!(
+            parse_env(env_value(" sqlite://a.db"), DbEngine::Sqlite).err(),
+            Some(OperatorUrlRefusal::Malformed {
+                source: OperatorUrlSource::Env,
+                kind: DbUrlRefusalKind::SurroundingWhitespace,
+            })
+        );
+    }
+
+    /// The operator URL has one environment read, under [`OPERATOR_DB_ENV`]'s
+    /// spelling, so the name a refusal shows is the name the runtime reads.
+    #[test]
+    fn operator_db_env_is_read_once_under_its_const() {
+        let source = include_str!("db.rs");
+        let read = format!("read_env_var(\"{OPERATOR_DB_ENV}\")");
+        assert_eq!(source.matches(read.as_str()).count(), 1, "{read}");
+        assert_eq!(OperatorUrlSource::Env.shown(), OPERATOR_DB_ENV);
+    }
+
+    /// T5: an empty or malformed `Db.url` setting is refused, naming the setting.
+    #[test]
+    fn operator_url_setting_empty_and_malformed_refuse() {
+        let empty = crate::secret::secret_from_string(String::new());
+        assert_eq!(
+            parse_setting(Some(&empty), DbEngine::Sqlite).err(),
+            Some(OperatorUrlRefusal::SettingEmpty)
+        );
+        let malformed = crate::secret::secret_from_string("mysql://u:hunter2@h/db".to_owned());
+        let refused = parse_setting(Some(&malformed), DbEngine::Sqlite).err();
+        assert_eq!(
+            refused,
+            Some(OperatorUrlRefusal::Malformed {
+                source: OperatorUrlSource::Setting,
+                kind: DbUrlRefusalKind::UnsupportedScheme,
+            })
+        );
+        for refused in [OperatorUrlRefusal::SettingEmpty]
+            .into_iter()
+            .chain(refused)
+        {
+            let shown = refused.to_string();
+            assert!(shown.contains("`Db.url`"), "{shown}");
+            assert!(!shown.contains("DATABASE_URL is"), "{shown}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+        }
+    }
+
+    /// A refusal names the store its own engine's build falls back to: a
+    /// PostgreSQL build never offers the SQLite file, nor a SQLite build the
+    /// local server.
+    #[test]
+    fn operator_url_refusal_names_the_engine_default_store() {
+        struct Shown(OperatorUrlRefusal, DbEngine);
+        impl std::fmt::Display for Shown {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.write_for(self.1, f)
+            }
+        }
+        for refused in [
+            OperatorUrlRefusal::EnvEmpty,
+            OperatorUrlRefusal::EnvNotUnicode,
+            OperatorUrlRefusal::SettingEmpty,
+        ] {
+            let sqlite = Shown(refused, DbEngine::Sqlite).to_string();
+            assert!(sqlite.ends_with("so the app uses ipe.db"), "{sqlite}");
+            assert!(!sqlite.contains("postgres"), "{sqlite}");
+            let postgres = Shown(refused, DbEngine::Postgres).to_string();
+            assert!(
+                postgres.ends_with("so the app uses postgres://postgres@localhost/ipe"),
+                "{postgres}"
+            );
+            assert!(!postgres.contains("ipe.db"), "{postgres}");
+            assert!(!postgres.contains("sqlite"), "{postgres}");
+        }
+        assert_eq!(
+            OperatorUrlRefusal::EnvEmpty.to_string(),
+            Shown(OperatorUrlRefusal::EnvEmpty, KERNEL_ENGINE).to_string()
+        );
+    }
+
+    /// T6: `DATABASE_URL` outranks the setting, which outranks the default.
+    #[test]
+    fn operator_store_precedence() {
+        let env_url = "sqlite://env.db?mode=rwc";
+        let setting_url = "sqlite://setting.db?mode=rwc";
+        let setting = crate::secret::secret_from_string(setting_url.to_owned());
+        let resolve = |env: Result<String, std::env::VarError>,
+                       installed: Option<&crate::secret::Secret>| {
+            let cells = OperatorCells::new();
+            let mut warnings = 0;
+            let key = {
+                let choice = cells.store(
+                    env,
+                    installed,
+                    DbEngine::Sqlite,
+                    || Some("/srv/app".to_owned()),
+                    |_| warnings += 1,
+                );
+                (
+                    configured_key(choice).map(str::to_owned),
+                    matches!(choice, Ok(OperatorStore::Default(_))),
+                )
+            };
+            (key, warnings)
+        };
+        assert_eq!(
+            resolve(env_value(env_url), Some(&setting)),
+            ((Some(env_url.to_owned()), false), 0)
+        );
+        assert_eq!(
+            resolve(Err(std::env::VarError::NotPresent), Some(&setting)),
+            ((Some(setting_url.to_owned()), false), 0)
+        );
+        assert_eq!(
+            resolve(Err(std::env::VarError::NotPresent), None),
+            ((None, true), 1)
+        );
+    }
+
+    /// T7: every example and default URL parses and is one its engine opens.
+    #[test]
+    fn operator_url_examples_and_defaults_parse() {
+        for engine in [DbEngine::Sqlite, DbEngine::Postgres] {
+            let example = url_example(engine);
+            assert!(
+                DbUrl::parse(example).is_ok_and(|url| url.engine() == engine),
+                "{example}"
+            );
+            assert!(
+                parse_configured(example, OperatorUrlSource::Env, engine).is_ok(),
+                "{example}"
+            );
+        }
+        assert!(SQLITE_URL_EXAMPLE.contains("mode=rwc"));
+        let local = DbUrl::parse(LOCAL_POSTGRES_DEFAULT);
+        assert!(
+            matches!(
+                &local,
+                Ok(DbUrl::Postgres(PostgresUrl {
+                    transport: PgTransport::Local(crate::dsn::UnverifiedSslMode::Prefer),
+                    ..
+                }))
+            ),
+            "the local default dials loopback with `prefer`"
+        );
+        assert!(
+            parse_configured(
+                LOCAL_POSTGRES_DEFAULT,
+                OperatorUrlSource::Env,
+                DbEngine::Postgres
+            )
+            .is_ok()
+        );
+    }
+
+    /// T8: the SQLite default is `ipe.db` under the absolute working directory,
+    /// or `./ipe.db` when that directory cannot be named; never a refusal.
+    #[test]
+    fn default_store_sqlite_is_absolute_cwd_ipe_db() {
+        let working = DefaultStore::SqliteFile {
+            name: SqliteFileName::working_directory_default(),
+            shown: DefaultPath::WorkingDirectory,
+        };
+        assert_eq!(
+            SqliteFileName::parse_under(DEFAULT_SQLITE_FILE, crate::path_core::HOST),
+            Ok(SqliteFileName::working_directory_default()),
+            "the fallback name is the sealed relative name"
+        );
+        if cfg!(unix) {
+            assert_eq!(
+                default_store_for(DbEngine::Sqlite, Some("/srv/x")),
+                DefaultStore::SqliteFile {
+                    name: SqliteFileName("/srv/x/ipe.db".to_owned()),
+                    shown: DefaultPath::Absolute,
+                }
+            );
+            let long = format!("/{}", "a".repeat(SQLITE_FILE_NAME_MAX));
+            for cwd in [
+                None,
+                Some("/a:b"),
+                Some("relative/dir"),
+                Some(long.as_str()),
+            ] {
+                assert_eq!(default_store_for(DbEngine::Sqlite, cwd), working, "{cwd:?}");
+            }
+        }
+        assert_eq!(default_store_for(DbEngine::Sqlite, None), working);
+    }
+
+    /// T9: the PostgreSQL default is the local server.
+    #[test]
+    fn default_store_postgres_is_local() {
+        for cwd in [None, Some("/srv/x")] {
+            assert_eq!(
+                default_store_for(DbEngine::Postgres, cwd),
+                DefaultStore::LocalPostgres
+            );
+        }
+    }
+
+    /// T10: the warning lines are the documented text, and only a default
+    /// store warns.
+    #[test]
+    fn default_warning_text() {
+        let tagged =
+            |store: &DefaultStore| default_warning(store).map(|line| format!("[ipe.db] {line}"));
+        assert_eq!(
+            tagged(&DefaultStore::SqliteFile {
+                name: SqliteFileName("/srv/x/ipe.db".to_owned()),
+                shown: DefaultPath::Absolute,
+            }),
+            [
+                "[ipe.db] warning: DATABASE_URL is not set, so this app stores its data in /srv/x/ipe.db (created if missing)".to_owned(),
+                "[ipe.db]   to choose the database, set DATABASE_URL, for example DATABASE_URL=sqlite://app.db?mode=rwc".to_owned(),
+            ]
+        );
+        assert_eq!(
+            tagged(&DefaultStore::SqliteFile {
+                name: SqliteFileName::working_directory_default(),
+                shown: DefaultPath::WorkingDirectory,
+            }),
+            [
+                "[ipe.db] warning: DATABASE_URL is not set, so this app stores its data in ipe.db in the working directory (created if missing)".to_owned(),
+                "[ipe.db]   to choose the database, set DATABASE_URL, for example DATABASE_URL=sqlite://app.db?mode=rwc".to_owned(),
+            ]
+        );
+        assert_eq!(
+            tagged(&DefaultStore::LocalPostgres),
+            [
+                "[ipe.db] warning: DATABASE_URL is not set, so this app connects to postgres://postgres@localhost/ipe".to_owned(),
+                "[ipe.db]   to choose the database, set DATABASE_URL, for example DATABASE_URL=postgres://app@localhost/app".to_owned(),
+            ]
+        );
+        let cells = OperatorCells::new();
+        let mut warned = false;
+        let _ = cells.store(
+            env_value("sqlite://env.db?mode=rwc"),
+            None,
+            DbEngine::Sqlite,
+            || Some("/srv/x".to_owned()),
+            |_| warned = true,
+        );
+        assert!(!warned, "a configured store must not warn");
+        let mut warnings = 0;
+        let cells = OperatorCells::new();
+        for _ in 0..2 {
+            let _ = cells.store(
+                Err(std::env::VarError::NotPresent),
+                None,
+                DbEngine::Sqlite,
+                || Some("/srv/x".to_owned()),
+                |_| warnings += 1,
+            );
+        }
+        assert_eq!(warnings, 1, "the default warns once per process");
+    }
+
+    /// T11: the start check fixes the store only from a present `DATABASE_URL`,
+    /// and refuses a malformed setting even when the variable is valid.
+    #[test]
+    fn start_check_fixes_store_only_from_env() {
+        let cells = OperatorCells::new();
+        assert_eq!(
+            cells.check_at_start(Err(std::env::VarError::NotPresent), None, DbEngine::Sqlite),
+            Ok(())
+        );
+        assert!(cells.setting.get().is_some(), "the setting is forced");
+        assert!(
+            cells.store.get().is_none(),
+            "the default is left to Db.connect"
+        );
+
+        let cells = OperatorCells::new();
+        assert_eq!(
+            cells.check_at_start(
+                env_value("sqlite://env.db?mode=rwc"),
+                None,
+                DbEngine::Sqlite
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            cells.store.get().and_then(configured_key),
+            Some("sqlite://env.db?mode=rwc")
+        );
+
+        let cells = OperatorCells::new();
+        assert_eq!(
+            cells.check_at_start(env_value(""), None, DbEngine::Sqlite),
+            Err(OperatorUrlRefusal::EnvEmpty)
+        );
+
+        let malformed = crate::secret::secret_from_string("mysql://u:p@h/db".to_owned());
+        let setting_refusal = Err(OperatorUrlRefusal::Malformed {
+            source: OperatorUrlSource::Setting,
+            kind: DbUrlRefusalKind::UnsupportedScheme,
+        });
+        let cells = OperatorCells::new();
+        assert_eq!(
+            cells.check_at_start(
+                Err(std::env::VarError::NotPresent),
+                Some(&malformed),
+                DbEngine::Sqlite
+            ),
+            setting_refusal
+        );
+        let cells = OperatorCells::new();
+        assert_eq!(
+            cells.check_at_start(
+                env_value("sqlite://env.db?mode=rwc"),
+                Some(&malformed),
+                DbEngine::Sqlite
+            ),
+            setting_refusal,
+            "a malformed setting refuses the start under a valid DATABASE_URL"
         );
     }
 
@@ -9370,16 +10386,6 @@ mod tests {
             let got: String = build_refusal("db.upsertFields", &err);
             assert_eq!(got, want, "refusal text drifted for {err:?}");
         }
-    }
-
-    // AUD-07 (b): with DATABASE_URL set, ipe_db_url() returns it verbatim.
-    #[test]
-    fn ipe_db_url_reads_database_url_env() {
-        use crate::system::{locked_remove_var, locked_set_var};
-        locked_set_var("DATABASE_URL", "postgres://ci-host/testdb_aud07");
-        let url = crate::config::ipe_db_url();
-        locked_remove_var("DATABASE_URL");
-        assert_eq!(url, "postgres://ci-host/testdb_aud07");
     }
 
     /// A corpus of identifiers that MUST be rejected at the SQL-interpolation
@@ -15047,63 +16053,77 @@ mod tests {
             );
         }
 
-        // AUD-07 (a): when DATABASE_URL is absent, ipe_db_url() returns the sqlite
-        // file default — never the hardcoded "sqlite::memory:" that caused silent
-        // data loss on every Db.connect() call.
-        #[test]
-        fn ipe_db_url_fallback_is_sqlite_file() {
-            if crate::system::read_env_var("DATABASE_URL").is_ok() {
-                // DATABASE_URL already set; test (b) covers the env-read path.
-                return;
-            }
-            let url = crate::config::ipe_db_url();
-            assert!(
-                !url.contains(":memory:"),
-                "default URL must not be in-memory: {url}"
-            );
-            assert!(
-                url.contains("ipe.db"),
-                "default URL must reference a named file: {url}"
-            );
-        }
-
-        // AUD-07 (c): two sequential operator connects with the same file URL
-        // observe the same database — data written via one pool is visible via the
-        // other. Proves the old sqlite::memory: per-call-fresh-db bug is closed.
+        /// T12: two operator connects of one configured file share one pool,
+        /// so data written through one is visible through the other.
         #[tokio::test]
-        async fn ipe_db_url_shared_connection_sees_same_data() {
-            use crate::system::{locked_remove_var, locked_set_var};
+        async fn operator_store_shared_pool_sees_same_data() {
             let tmp = crate::scratch_core::test_temp_root()
-                .join(format!("ipe_aud07_shared_{}.db", std::process::id()));
+                .join(format!("ipe_operator_shared_{}.db", std::process::id()));
             let url = format!("sqlite://{}?mode=rwc", tmp.display());
-            locked_set_var("DATABASE_URL", &url);
-            let resolved = crate::config::ipe_db_url();
-            locked_remove_var("DATABASE_URL");
-
-            let conn1 = connect_operator::<String>(resolved.clone()).await;
-            let conn2 = connect_operator::<String>(resolved).await;
-            let pool1 = match conn1 {
-                IpeResult::Ok(p) => p,
-                IpeResult::Err(e) => panic!("connect1 failed: {e}"),
+            let choice = choose_store(parse_env(Ok(url), DbEngine::Sqlite), &Ok(None), || {
+                default_store_for(DbEngine::Sqlite, None)
+            });
+            assert!(
+                configured_key(&choice).is_some(),
+                "the env URL was not chosen"
+            );
+            let conn1 = connect_operator_store::<String>(&choice).await;
+            let conn2 = connect_operator_store::<String>(&choice).await;
+            assert!(matches!(conn1, IpeResult::Ok(_)), "connect1 failed");
+            assert!(matches!(conn2, IpeResult::Ok(_)), "connect2 failed");
+            let (IpeResult::Ok(pool1), IpeResult::Ok(pool2)) = (conn1, conn2) else {
+                return;
             };
-            let pool2 = match conn2 {
-                IpeResult::Ok(p) => p,
-                IpeResult::Err(e) => panic!("connect2 failed: {e}"),
-            };
-            sqlx::query("CREATE TABLE IF NOT EXISTS aud07_t (v INTEGER NOT NULL)")
+            sqlx::query("CREATE TABLE IF NOT EXISTS operator_shared_t (v INTEGER NOT NULL)")
                 .execute(&pool1)
                 .await
                 .expect("create table");
-            sqlx::query("INSERT INTO aud07_t VALUES (99)")
+            sqlx::query("INSERT INTO operator_shared_t VALUES (99)")
                 .execute(&pool1)
                 .await
                 .expect("insert");
-            let (v,): (i64,) = sqlx::query_as("SELECT v FROM aud07_t")
+            let (v,): (i64,) = sqlx::query_as("SELECT v FROM operator_shared_t")
                 .fetch_one(&pool2)
                 .await
                 .expect("select");
             assert_eq!(v, 99, "data written via pool1 must be visible via pool2");
-            let _ = std::fs::remove_file(&tmp);
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", tmp.display()));
+            }
+        }
+
+        /// The default store opens its file under `CreateIfMissing` and shares
+        /// the pool `Db.open` caches for the same file.
+        #[tokio::test]
+        async fn default_store_creates_its_file_and_shares_the_db_open_pool() {
+            let dir = crate::scratch_core::test_temp_root()
+                .join(format!("ipe_operator_default_{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("scratch dir");
+            let cwd = dir.to_str().map(str::to_owned);
+            let store = default_store_for(DbEngine::Sqlite, cwd.as_deref());
+            let DefaultStore::SqliteFile { name, shown } = store.clone() else {
+                return;
+            };
+            assert_eq!(shown, DefaultPath::Absolute);
+            let choice: StoreChoice = Ok(OperatorStore::Default(store));
+            let connected = connect_operator_store::<String>(&choice).await;
+            assert!(
+                matches!(connected, IpeResult::Ok(_)),
+                "default connect failed"
+            );
+            assert!(
+                dir.join(DEFAULT_SQLITE_FILE).exists(),
+                "the default file was not created"
+            );
+            assert!(
+                cached_open_pool(&PoolKey::File {
+                    name,
+                    mode: FileMode::CreateIfMissing,
+                })
+                .is_some(),
+                "the default store was not pooled under its file key"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         /// SSOT proof (entry level): every public kernel that interpolates a
@@ -15408,20 +16428,33 @@ mod tests {
         /// other engine as `InvalidInput`, with the typed reason and no credential.
         #[tokio::test]
         async fn operator_connect_refuses_urls_the_build_cannot_open() {
-            for (url, expected) in [
+            for (url, kind) in [
                 (
                     "mysql://admin:s3cr3t-pw@db.example/app",
-                    DbConnectError::UnsupportedScheme,
+                    DbUrlRefusalKind::UnsupportedScheme,
                 ),
                 (
                     "postgres://admin:s3cr3t-pw@1.1.1.1/app",
-                    DbConnectError::EngineMismatch {
+                    DbUrlRefusalKind::EngineMismatch {
                         url: DbEngine::Postgres,
                         driver: DbEngine::Sqlite,
                     },
                 ),
             ] {
-                let refused = match connect_operator::<String>(url.to_owned()).await {
+                let choice = choose_store(
+                    parse_env(Ok(url.to_owned()), KERNEL_ENGINE),
+                    &Ok(None),
+                    || default_store_for(KERNEL_ENGINE, None),
+                );
+                let expected = OperatorUrlRefusal::Malformed {
+                    source: OperatorUrlSource::Env,
+                    kind,
+                };
+                assert!(
+                    matches!(choice, Err(refused) if refused == expected),
+                    "{url:?}"
+                );
+                let refused = match connect_operator_store::<String>(&choice).await {
                     IpeResult::Err(e) => Some(e),
                     IpeResult::Ok(_) => None,
                 };
@@ -15430,6 +16463,9 @@ mod tests {
                     Some(format!("InvalidInput: {expected}")),
                     "{url:?}"
                 );
+                let shown = refused.unwrap_or_default();
+                assert!(!shown.contains("s3cr3t"), "{shown}");
+                assert!(!shown.contains("admin"), "{shown}");
             }
         }
 

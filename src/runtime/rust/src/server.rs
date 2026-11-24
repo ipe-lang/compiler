@@ -3276,6 +3276,9 @@ enum ServerStartRefusal {
     },
     /// The router refused an insert every listen check admitted.
     RouterRejected { endpoint: RefusedText },
+    /// `DATABASE_URL` or the `Db.url` setting is set but refused.
+    #[cfg(feature = "db-operator")]
+    Database(crate::db::OperatorUrlRefusal),
 }
 
 impl std::fmt::Display for ServerStartRefusal {
@@ -3299,6 +3302,8 @@ impl std::fmt::Display for ServerStartRefusal {
                 "Server.listen: the router refused to register endpoint `{endpoint}` beside the \
                  routes before it, although every listen check admitted the route set"
             ),
+            #[cfg(feature = "db-operator")]
+            Self::Database(refusal) => write!(f, "Server.listen: {refusal}"),
         }
     }
 }
@@ -3313,6 +3318,8 @@ impl ServerStartRefusal {
             Self::Overlap { .. } | Self::SharedPrefix { .. } | Self::RouterRejected { .. } => {
                 IpeError::conflict(message)
             }
+            #[cfg(feature = "db-operator")]
+            Self::Database(refusal) => refusal.into_ipe_error().with_message(message),
         }
     }
 }
@@ -3964,6 +3971,12 @@ pub fn server_listen<E: crate::FromIpeError + Send + 'static>(
         // so a router conflict can never panic the listener task.
         if let Some(refusal) = endpoint_conflict(&routes).or_else(|| mount_conflict(&routes)) {
             return refuse(refusal);
+        }
+        // A `DATABASE_URL` or `Db.url` that is set but refused stops the start
+        // before a port binds, never at the first request.
+        #[cfg(feature = "db-operator")]
+        if let Err(refusal) = crate::db::check_operator_url_at_start() {
+            return refuse(ServerStartRefusal::Database(refusal));
         }
         // Bind host obeys the one runtime-config precedence: `IPE_HTTP_BIND`
         // (env) > the app's `Host.bind` setting > `127.0.0.1`. A present

@@ -194,6 +194,12 @@ pub enum RuntimeFeature {
     /// console default open, and only on a loopback bind; without it every
     /// absent posture resolves to production and the console stays closed.
     DevPosture,
+    /// `db-operator` — the program serves and reaches `Db.connect`
+    /// ([`EmitCtx::uses_db_operator`] with [`EmitCtx::serves`]), so a web app or
+    /// `Server.listen` judges `DATABASE_URL` and the `Db.url` setting before it
+    /// binds. Implies `db` and `server`, the start check's only callers; a
+    /// `Db.open`-only or non-serving program selects it not.
+    DbOperator,
 }
 
 impl RuntimeFeature {
@@ -240,6 +246,7 @@ impl RuntimeFeature {
         Self::Debugger,
         Self::ControlWire,
         Self::DevPosture,
+        Self::DbOperator,
     ];
 
     /// A stable per-variant index for `const`-context identity. The exhaustive,
@@ -281,6 +288,7 @@ impl RuntimeFeature {
             Self::Debugger => 30,
             Self::ControlWire => 31,
             Self::DevPosture => 32,
+            Self::DbOperator => 33,
         }
     }
 
@@ -304,7 +312,7 @@ impl RuntimeFeature {
     /// domain size grows in lockstep with the variant set and the seal then
     /// forces the variant into `ALL` too.
     pub(crate) const fn index_domain_size() -> usize {
-        Self::DevPosture.index() + 1
+        Self::DbOperator.index() + 1
     }
 
     /// The exact cargo feature name in `src/runtime/rust/Cargo.toml`.
@@ -343,6 +351,7 @@ impl RuntimeFeature {
             Self::Debugger => "debugger",
             Self::ControlWire => "control-wire",
             Self::DevPosture => "dev-posture",
+            Self::DbOperator => "db-operator",
         }
     }
 }
@@ -405,7 +414,7 @@ impl RuntimeFeature {
                 enables_tokio: true,
                 features: &[Sync, Net],
             },
-            Self::Server => TokioProjection {
+            Self::Server | Self::DbOperator => TokioProjection {
                 enables_tokio: true,
                 features: &[Net, Sync, Signal],
             },
@@ -534,6 +543,17 @@ impl RuntimeFeature {
             Self::Debugger => &["control-wire", "debugger", "encoding", "json", "serde"],
             Self::ControlWire => &["control-wire", "encoding", "json", "serde"],
             Self::DevPosture => &["dev-posture"],
+            Self::DbOperator => &[
+                "db",
+                "db-operator",
+                "decimal",
+                "encoding",
+                "json",
+                "secret",
+                "serde",
+                "server",
+                "time-core",
+            ],
         }
     }
 }
@@ -736,6 +756,7 @@ mod tests {
             uses_locale: false,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_http: false,
             uses_config: false,
             uses_compression: false,
@@ -1297,6 +1318,68 @@ mod tests {
                 "{driver:?} selects exactly one driver alias, not `{other}`: {f:?}"
             );
         }
+    }
+
+    /// T17b: `db-operator` follows a serving `Db.connect` program alone — a
+    /// `Db.open`-only program never compiles the start check that reads
+    /// `DATABASE_URL`, a `Db.connect` program that never serves has no start to
+    /// check (the check would compile with no caller), and the flag without the
+    /// database layer selects nothing.
+    #[test]
+    fn db_operator_feature_selected_by_serving_db_connect_only() {
+        let mut interner = Interner::new();
+        let main = interner.intern("Main").expect("intern Main");
+        let mut connect = db_module(&mut interner, main);
+        connect.uses_db_operator = true;
+        connect.uses_server = true;
+        let mut web = db_module(&mut interner, main);
+        web.uses_db_operator = true;
+        web.uses_web = true;
+        let mut script = db_module(&mut interner, main);
+        script.uses_db_operator = true;
+        let mut open_only = db_module(&mut interner, main);
+        open_only.uses_server = true;
+        let flag_only = ctx_module(main, |m| {
+            m.uses_db_operator = true;
+            m.uses_server = true;
+        });
+
+        let features = |modules: Vec<Module>| {
+            let prog = Program {
+                imports_unsafe_submodule: false,
+                imported_web_capabilities: std::collections::BTreeSet::new(),
+                modules,
+            };
+            let backend = RustBackend::new(&interner).with_db_driver(DbDriver::Sqlite);
+            let ctx = backend.emit_ctx_for_tests(&prog).expect("build EmitCtx");
+            super::runtime_features(&ctx).as_feature_names()
+        };
+
+        let f = features(vec![connect]);
+        assert!(
+            f.contains(&"db-operator"),
+            "a served `Db.connect` selects it: {f:?}"
+        );
+        let f = features(vec![web]);
+        assert!(
+            f.contains(&"db-operator"),
+            "a web `Db.connect` selects it: {f:?}"
+        );
+        let f = features(vec![script]);
+        assert!(
+            !f.contains(&"db-operator"),
+            "a `Db.connect` program that never serves does not: {f:?}"
+        );
+        let f = features(vec![open_only]);
+        assert!(
+            !f.contains(&"db-operator"),
+            "`Db.open` alone does not: {f:?}"
+        );
+        let f = features(vec![flag_only]);
+        assert!(
+            !f.contains(&"db-operator"),
+            "no database layer, no operator check: {f:?}"
+        );
     }
 
     /// A module carrying the injected `SqlValue` enum the backend reads to set
