@@ -1260,17 +1260,10 @@ fn run_inner(
         // bounded poll, and every wake first reaps a child that exited on its
         // own: an interrupted terminal owner ends the watch, any other exit
         // leaves nothing running and waits for the next save.
-        let received = if matches!(supervisor, ipe_watch::SupervisorState::Running { .. }) {
-            match evt_rx.recv_timeout(CHILD_EXIT_POLL) {
-                Ok(event) => Some(event),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        } else {
-            match evt_rx.recv() {
-                Ok(event) => Some(event),
-                Err(mpsc::RecvError) => break,
-            }
+        let received = match next_event(&evt_rx, event_wait(&supervisor)) {
+            Received::Event(event) => Some(event),
+            Received::Wake => None,
+            Received::Closed => break,
         };
         if let Some(exit) = after_child_exit(
             &lease,
@@ -2135,6 +2128,46 @@ fn free_loopback_port() -> std::io::Result<u16> {
 
 /// How often the watch checks whether its running dev child exited on its own.
 const CHILD_EXIT_POLL: Duration = Duration::from_millis(200);
+
+/// How long the watch loop may wait for its next event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventWait {
+    /// A dev child runs, whatever its surface: wake within the bound to reap it
+    /// if it exited on its own.
+    Bounded(Duration),
+    /// No dev child runs: only an event can change anything.
+    Unbounded,
+}
+
+/// The wait the supervisor's state allows: bounded exactly while any dev child runs.
+const fn event_wait(supervisor: &ipe_watch::SupervisorState) -> EventWait {
+    match supervisor {
+        ipe_watch::SupervisorState::Running { .. } => EventWait::Bounded(CHILD_EXIT_POLL),
+        ipe_watch::SupervisorState::NotRunning { .. } => EventWait::Unbounded,
+    }
+}
+
+/// What one wait on the watch's event channel yielded.
+enum Received {
+    /// An event to handle.
+    Event(OrchestratorEvent),
+    /// A bounded wait elapsed with no event.
+    Wake,
+    /// Every sender is gone.
+    Closed,
+}
+
+/// Wait on `evt_rx` for at most what `wait` allows.
+fn next_event(evt_rx: &mpsc::Receiver<OrchestratorEvent>, wait: EventWait) -> Received {
+    match wait {
+        EventWait::Bounded(bound) => match evt_rx.recv_timeout(bound) {
+            Ok(event) => Received::Event(event),
+            Err(mpsc::RecvTimeoutError::Timeout) => Received::Wake,
+            Err(mpsc::RecvTimeoutError::Disconnected) => Received::Closed,
+        },
+        EventWait::Unbounded => evt_rx.recv().map_or(Received::Closed, Received::Event),
+    }
+}
 
 /// The notice for a dev child that exited on its own; the status follows it.
 const APP_EXITED: &str = "[ipe dev watch] app exited";
@@ -3600,7 +3633,10 @@ mod tests {
         watch_status_body,
     };
     #[cfg(unix)]
-    use super::{after_child_exit, child_command, failure_fallback, spawn_command};
+    use super::{
+        EventWait, Received, after_child_exit, child_command, event_wait, failure_fallback,
+        next_event, spawn_command,
+    };
     use crate::delivery::Shape;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
@@ -4235,6 +4271,37 @@ mod tests {
             "the exited child's binary stays the last good one"
         );
         proxy.shutdown();
+    }
+
+    /// Prove the refusal: the watch loop waits on a bound while any dev child
+    /// runs, a web child that owns no terminal included, so its exit on its
+    /// own is reaped on the next wake rather than after an event that may
+    /// never come; only with nothing running may the wait be unbounded.
+    #[cfg(unix)]
+    #[test]
+    fn the_loop_wakes_to_reap_a_child_that_owns_no_terminal() {
+        use super::surface::{TerminalHandOver, TerminalLease};
+        let lease = TerminalLease::new(RestoreRecorder::default());
+        let mut supervisor = an_exited_child(&lease, TerminalHandOver::None);
+        let wait = event_wait(&supervisor);
+        assert_eq!(wait, EventWait::Bounded(super::CHILD_EXIT_POLL));
+        let (evt_tx, evt_rx) = mpsc::channel::<OrchestratorEvent>();
+        assert!(
+            matches!(next_event(&evt_rx, wait), Received::Wake),
+            "a bounded wait with a live sender and no event wakes"
+        );
+        assert!(after_child_exit(&lease, &mut supervisor, &mut None, None).is_some());
+        assert_eq!(event_wait(&supervisor), EventWait::Unbounded);
+        assert!(evt_tx.send(OrchestratorEvent::Shutdown).is_ok());
+        assert!(matches!(
+            next_event(&evt_rx, EventWait::Unbounded),
+            Received::Event(OrchestratorEvent::Shutdown)
+        ));
+        drop(evt_tx);
+        assert!(matches!(
+            next_event(&evt_rx, EventWait::Unbounded),
+            Received::Closed
+        ));
     }
 
     /// A stop-first apply behind an engaged proxy never forwards to a port no
