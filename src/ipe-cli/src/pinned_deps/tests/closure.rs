@@ -196,11 +196,45 @@ fn manifest(text: &str, at: &str) -> Result<toml::Table, String> {
         .map_err(|e| format!("{at}: not a manifest: {e}"))
 }
 
+/// Whether `cargo deny` judges the dependencies of the `[target.<key>]` table.
+///
+/// The deny graph (`deny.toml [graph]`, no target filter) drops an edge whose
+/// `cfg` expression names no predicate and is false — `cfg(any())` — so a pin
+/// spelled there is locked but never judged for advisories, licences, bans or
+/// sources. Any predicate-free `cfg` counts as unjudged (fail closed); a pin
+/// that must never compile uses a contradiction such as
+/// `cfg(all(unix, not(unix)))`, whose predicates keep the edge in the graph.
+fn deny_judges_target(key: &str) -> bool {
+    let Some(expr) = key
+        .trim()
+        .strip_prefix("cfg")
+        .and_then(|rest| rest.trim_start().strip_prefix('('))
+    else {
+        return true;
+    };
+    expr.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|word| !word.is_empty() && !matches!(word, "any" | "all" | "not"))
+}
+
+/// `manifest` without the `[target.*]` tables `cargo deny` never judges.
+fn judged_only(mut manifest: toml::Table) -> toml::Table {
+    if let Some(targets) = manifest
+        .get_mut("target")
+        .and_then(toml::Value::as_table_mut)
+    {
+        targets.retain(|key, _| deny_judges_target(key));
+    }
+    manifest
+}
+
 /// What the workspace members turn on, per package and the pinned version each declaration resolves to.
+///
+/// Only a declaration `cargo deny` judges provisions a crate: a pin the
+/// supply-chain scan never sees is no pin of a crate that ships.
 fn provision(set: &PinnedSet, members: &[(String, String)]) -> Result<Provision, String> {
     let mut provided = Provision::new();
     for (at, text) in members {
-        for dep in registry_deps(&manifest(text, at)?, at)? {
+        for dep in registry_deps(&judged_only(manifest(text, at)?), at)? {
             let Some(version) = pin_for(set, &dep.package, &dep.req) else {
                 continue;
             };
@@ -470,8 +504,8 @@ fn the_embedded_set_holds_the_emitter_closure() {
     assert!(
         found.is_empty(),
         "every crate an emitted manifest can name must be pinned and provisioned by a \
-         workspace member (template-only crates go under the `cfg(any())` table of \
-         src/compiler/backend/rust/Cargo.toml):\n{}",
+         workspace member (template-only crates go under the \
+         `cfg(all(unix, not(unix)))` table of src/compiler/backend/rust/Cargo.toml):\n{}",
         found.join("\n")
     );
 }
@@ -500,6 +534,30 @@ fn a_provisioned_dependency_has_no_gap() {
     let emitted = "[dependencies]\nserde_json = { version = \"1\", features = [\"preserve_order\"] }\n\
                    [target.'cfg(unix)'.dependencies]\nitoa = { path = \"x\" }\n";
     assert_eq!(gaps_of(member, emitted), Vec::<String>::new());
+}
+
+#[test]
+fn a_pin_the_deny_graph_drops_provisions_nothing() {
+    let emitted = "[dependencies]\nitoa = \"1\"\n";
+    for dropped in ["cfg(any())", "cfg(not(any()))", "cfg ( all ( ) )"] {
+        let member = format!("[target.'{dropped}'.dependencies]\nitoa = \"1\"\n");
+        let found = gaps_of(&member, emitted);
+        assert!(
+            found.len() == 1
+                && found
+                    .iter()
+                    .all(|gap| gap.contains("no workspace member declares itoa")),
+            "{dropped}: {found:?}"
+        );
+    }
+    for judged in [
+        "cfg(all(unix, not(unix)))",
+        "cfg(windows)",
+        "x86_64-unknown-linux-gnu",
+    ] {
+        let member = format!("[target.'{judged}'.dependencies]\nitoa = \"1\"\n");
+        assert_eq!(gaps_of(&member, emitted), Vec::<String>::new(), "{judged}");
+    }
 }
 
 #[test]
