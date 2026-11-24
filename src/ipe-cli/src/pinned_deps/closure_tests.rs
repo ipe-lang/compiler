@@ -548,8 +548,8 @@ fn a_manifest_const_is_found_and_a_test_const_is_not() {
                   const B: &str = \"not a manifest\";\n\
                   #[cfg(test)] const C: &str = \"[package]\\n\";\n\
                   #[cfg(test)] mod tests { const D: &str = \"[package]\\n\"; }";
-    let syntax = syn::parse_file(sample);
-    assert!(syntax.is_ok(), "{syntax:?}");
+    let syntax = syn::parse_file(sample).map_err(|e| e.to_string());
+    assert!(syntax.is_ok(), "{:?}", syntax.as_ref().err());
     let Ok(syntax) = syntax else { return };
     let mut consts = ManifestConsts { found: Vec::new() };
     consts.visit_file(&syntax);
