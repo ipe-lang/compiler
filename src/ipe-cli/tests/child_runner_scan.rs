@@ -3743,39 +3743,36 @@ fn literal_sites_in(syntax: &syn::File, wanted: &str) -> Vec<String> {
 
 /// The production sites of the literal `wanted` across the `ipe` crate's
 /// source, one `file: fn` line each.
-fn literal_sites(wanted: &str) -> Vec<String> {
+fn literal_sites(wanted: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let root = src_root();
-    let roots = crate_roots(&root).expect("crate roots listable");
-    let walked = walk(&root, roots).expect("module tree walkable");
-    assert!(
-        walked.reached.get("cargo_step.rs") == Some(&true),
-        "the walk must reach src/cargo_step.rs as production"
-    );
+    let walked = walk(&root, crate_roots(&root)?)?;
+    if walked.reached.get("cargo_step.rs") != Some(&true) {
+        return Err("the walk must reach src/cargo_step.rs as production".into());
+    }
     let mut found = Vec::new();
     for (file, production) in &walked.reached {
         if !production {
             continue;
         }
-        let source = std::fs::read_to_string(root.join(file)).expect("source readable");
-        let syntax = syn::parse_file(&source).expect("source parses");
+        let syntax = syn::parse_file(&std::fs::read_to_string(root.join(file))?)?;
         found.extend(
             literal_sites_in(&syntax, wanted)
                 .into_iter()
                 .map(|within| format!("{file}: {within}")),
         );
     }
-    found
+    Ok(found)
 }
 
 #[test]
 fn no_source_resolves_a_lock_afresh_and_only_the_lock_owner_updates_one() {
-    let fresh = literal_sites(FRESH_RESOLVE);
+    let fresh = literal_sites(FRESH_RESOLVE).expect("source tree scannable");
     assert!(
         fresh.is_empty(),
         "every lock derives from the pinned set; nothing names `{FRESH_RESOLVE}`:\n{}",
         fresh.join("\n")
     );
-    let updates = literal_sites(LOCK_UPDATE);
+    let updates = literal_sites(LOCK_UPDATE).expect("source tree scannable");
     let owners: Vec<String> = LOCK_UPDATE_OWNERS
         .iter()
         .map(|owner| format!("cargo_step.rs: {owner}"))

@@ -967,13 +967,7 @@ impl CliError {
         use crate::screen::Fault::{Internal, User};
         match self {
             Self::EmittedBuildFailed { stderr, .. } => {
-                match EmittedBuildCause::of(stderr.as_str().trim()) {
-                    EmittedBuildCause::RegistryUnreachable
-                    | EmittedBuildCause::HostLinkerCannotOpenInput(_) => User,
-                    EmittedBuildCause::MissingRuntimeFeature(_) | EmittedBuildCause::Miscompile => {
-                        Internal
-                    }
-                }
+                EmittedBuildCause::of(stderr.as_str().trim()).fault()
             }
             Self::RuntimeVersionMismatch { .. }
             | Self::BundledManifest { .. }
@@ -1754,6 +1748,17 @@ impl EmittedBuildCause {
             },
             Self::MissingRuntimeFeature,
         )
+    }
+
+    /// Who the failure belongs to: an unreachable registry or a host linker
+    /// input is the user's; a stale runtime crate or a miscompile is ipe's.
+    const fn fault(&self) -> crate::screen::Fault {
+        match self {
+            Self::RegistryUnreachable | Self::HostLinkerCannotOpenInput(_) => {
+                crate::screen::Fault::User
+            }
+            Self::MissingRuntimeFeature(_) | Self::Miscompile => crate::screen::Fault::Internal,
+        }
     }
 }
 

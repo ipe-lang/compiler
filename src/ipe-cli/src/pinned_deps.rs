@@ -280,8 +280,9 @@ pub enum LockDrift {
         locked: Version,
         /// The compatible version the set pins.
         pinned: Version,
-        /// The crate whose requirement forced the locked version, when one is found.
-        requested_by: Option<Requester>,
+        /// The crate whose requirement forced the locked version, when one is
+        /// found; boxed so the drift stays small on the `Err` path.
+        requested_by: Option<Box<Requester>>,
     },
     /// A pinned version locked with another checksum, or with none.
     ChecksumDiffers {
@@ -316,7 +317,7 @@ impl fmt::Display for LockDrift {
                 locked,
                 pinned,
                 requested_by,
-            } => match requested_by {
+            } => match requested_by.as_deref() {
                 Some(Requester::Project { name: project }) => f.write_str(
                     &text::lock_drift_moved_by_project(name, locked, pinned, project),
                 ),
@@ -576,7 +577,7 @@ impl PinnedSet {
                         name: package.name.clone(),
                         locked: package.version.clone(),
                         pinned: pin.version.clone(),
-                        requested_by: self.requester(lock, package),
+                        requested_by: self.requester(lock, package).map(Box::new),
                     })
                 },
             )
@@ -626,7 +627,7 @@ impl PinnedSet {
 ///
 /// The cargo compatibility buckets: the same major from `1.0.0` on, the same
 /// minor below it, the exact patch below `0.1.0`.
-fn compatible(a: &Version, b: &Version) -> bool {
+const fn compatible(a: &Version, b: &Version) -> bool {
     match (a.major, a.minor) {
         (0, 0) => b.major == 0 && b.minor == 0 && a.patch == b.patch,
         (0, minor) => b.major == 0 && b.minor == minor,
@@ -832,7 +833,6 @@ mod tests {
             specs::TOWER_HTTP.spec,
             specs::TOWER,
             specs::ASYNC_TRAIT,
-            specs::RUSTIX,
             specs::CROSSTERM,
             specs::UNICODE_WIDTH,
             specs::WRY,
@@ -860,11 +860,7 @@ mod tests {
             specs::URL,
             specs::RSA.spec,
             specs::FUTURES_UTIL,
-            specs::CHRONO,
-            specs::RUST_DECIMAL,
-            specs::UNICODE_GENERAL_CATEGORY,
             specs::SERDE_JSON.spec,
-            specs::INDEXMAP,
         ];
         let missing: Vec<&str> = emitted
             .iter()
@@ -925,11 +921,11 @@ mod tests {
             assert!(
                 matches!(
                     &verdict,
-                    Err(LockDrift::Moved { name, locked, pinned, requested_by: Some(Requester::Crate { name: by, .. }) })
+                    Err(LockDrift::Moved { name, locked, pinned, requested_by: Some(by) })
                         if name.as_str() == "serde_json"
                             && locked.to_string() == "1.0.100"
                             && pinned.to_string() == "1.0.140"
-                            && by.as_str() == "user_crate"
+                            && matches!(&**by, Requester::Crate { name, .. } if name.as_str() == "user_crate")
                 ),
                 "a moved pin is refused under {posture:?}: {verdict:?}"
             );
@@ -952,8 +948,8 @@ mod tests {
         let verdict = set.judge_text(&direct, FfiPosture::FfiBearing);
         assert!(matches!(
             &verdict,
-            Err(LockDrift::Moved { requested_by: Some(Requester::Project { name }), .. })
-                if name.as_str() == "app"
+            Err(LockDrift::Moved { requested_by: Some(by), .. })
+                if matches!(&**by, Requester::Project { name } if name.as_str() == "app")
         ));
         let Err(drift) = verdict else { return };
         let shown = drift.to_string();

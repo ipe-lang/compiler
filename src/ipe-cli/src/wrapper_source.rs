@@ -156,7 +156,7 @@ impl WrapperSource {
 
     /// The committed `Cargo.lock`'s bytes, as read through the held root.
     #[must_use]
-    pub fn lock_bytes(&self) -> &[u8] {
+    pub const fn lock_bytes(&self) -> &[u8] {
         self.lock.as_bytes()
     }
 
