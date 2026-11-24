@@ -148,6 +148,10 @@ ipe doc serve: --port needs a number
 
 ipe doc: expected a single <key> argument
 
+## doc-quote-query
+
+ipe doc: a query of several words is one quoted argument: `ipe doc "{query}"`
+
 ## doc-single-path
 
 ipe doc: expected a single <path> argument

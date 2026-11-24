@@ -171,6 +171,7 @@ fn module_for_mask(name: ipe_intern::Symbol, mask: u32) -> Module {
         uses_locale: f(29),
         uses_time: false,
         uses_env_public: f(10),
+        uses_db_operator: false,
         uses_http: f(11),
         uses_config: f(12),
         uses_compression: f(13),
@@ -1018,6 +1019,7 @@ fn uses_locale_selects_locale_feature() {
             uses_locale: true,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_async_runtime: false,
         }],
     };
@@ -1085,6 +1087,7 @@ fn uses_email_selects_email_feature() {
             uses_locale: false,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_async_runtime: false,
         }],
     };
@@ -1202,6 +1205,7 @@ fn email_parse_address_only_cargo_builds() -> DResult<()> {
             uses_locale: false,
             uses_time: false,
             uses_env_public: false,
+            uses_db_operator: false,
             uses_async_runtime: false,
         }],
     };

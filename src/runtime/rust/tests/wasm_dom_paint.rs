@@ -683,3 +683,38 @@ fn an_unfocused_controlled_field_is_rebuilt_with_the_programs_value() {
     assert_eq!(after.value(), "new");
     root.remove();
 }
+
+/// A ticked box whose view now says unticked carries only the controlled
+/// marker, which alone makes it the view's: it is rebuilt unticked.
+#[wasm_bindgen_test]
+fn an_unfocused_marked_unchecked_field_is_rebuilt() {
+    let doc = document();
+    assert!(doc.is_some(), "run_in_browser must provide a document");
+    let Some(doc) = doc else { return };
+    let root = view(
+        &doc,
+        "kpm",
+        r#"<input ipe-id="kpm_0_input" id="kpm-box" type="checkbox" checked ipe-controlled="">"#,
+    );
+    assert!(root.is_some(), "the view must attach");
+    let Some(root) = root else { return };
+    let before = by_id(&doc, "kpm-box");
+    assert!(before.is_some(), "the box must attach");
+    let Some(before) = before else { return };
+    let swap = [patch(
+        "kpm",
+        Some(r#"<input ipe-id="kpm_0_input" id="kpm-box" type="checkbox" ipe-controlled="">"#),
+        &[],
+    )];
+    apply_frame(&doc, &swap, None, &QueuedCause::default());
+    let after =
+        by_id(&doc, "kpm-box").and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok());
+    assert!(after.is_some(), "the box must attach");
+    let Some(after) = after else { return };
+    assert!(
+        !same_object(&before, after.as_ref()),
+        "a marked field is the view's, not the user's"
+    );
+    assert!(!after.checked(), "the view's unticked state wins");
+    root.remove();
+}

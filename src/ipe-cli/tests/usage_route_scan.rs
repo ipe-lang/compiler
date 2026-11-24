@@ -81,8 +81,14 @@ const ADMITTED: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "doc.rs",
+        "extra_word_refusal",
+        1,
+        "an `ipe doc` query given as several unquoted words, or followed by a path",
+    ),
+    (
+        "doc.rs",
         "parse_doc_flags",
-        14,
+        13,
         "a flag of `ipe doc` that is unknown, repeated, valueless, or out of its mode",
     ),
     (

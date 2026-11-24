@@ -191,7 +191,8 @@ wasmtime-wasi = { version = "48.0.10", default-features = false, features = ["p1
 # check adds no new vetted crate. Unix-only: the query has no portable analogue
 # on the non-Unix targets this CLI builds for.
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["fs", "process"] }
+# `termios` snapshots and restores the terminal a dev-watch child may own.
+rustix = { version = "1.1", features = ["fs", "process", "termios"] }
 # A remote transfer's child runs in its own process group so a refusal can kill
 # every process it spawned; the group is then outside the terminal's reach, so
 # the interrupt, quit, hangup and stop keys are relayed to it through
@@ -207,6 +208,9 @@ cap-primitives = "4.0.3"
 # A transfer's process tree lives in a kill-on-close job object, and the CLI in
 # a job of its own, through the same safe wrapper the run jail uses.
 win32job = "2"
+# The dev watch puts the console back in cooked mode after a terminal-owning
+# child stops; the same version the runtime's `tui` feature already locks.
+crossterm = "0.29"
 
 [dev-dependencies]
 # Turns on `test-fixtures` for this package's own test targets. Its key `ipe`
@@ -233,6 +237,10 @@ proc-macro2 = "1"
 syn = { version = "3", default-features = false, features = ["full", "visit", "parsing"] }
 # Assembles the WAT guests the WASI preopen confinement tests run.
 wat = "1"
+
+# The dev-watch terminal tests drive a real pseudo-terminal with no `unsafe`.
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "1.1", features = ["pty", "termios", "process"] }
 
 [lints]
 workspace = true

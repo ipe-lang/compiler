@@ -2,15 +2,17 @@
 # Run the browser E2E Playwright specs against locally built binaries.
 #
 # Usage:
-#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT] [INSTALL_OFFER_PORT] [INSTALL_OFFER_OFF_PORT] [PAGE_NAVIGATION_PORT]
+#   bash tools/scripts/browser-e2e/run.sh [GEO_PORT] [LAYOUT_PORT] [FOCUS_PORT] [CSP_STYLES_PORT] [INSTALL_OFFER_PORT] [INSTALL_OFFER_OFF_PORT] [PAGE_NAVIGATION_PORT] [CONTROL_SYNC_PORT]
 #
 # GEO_PORT defaults to 18080, LAYOUT_PORT to 18081, FOCUS_PORT to 18082,
 # CSP_STYLES_PORT to 18083, INSTALL_OFFER_PORT to 18084,
-# INSTALL_OFFER_OFF_PORT to 18085 and PAGE_NAVIGATION_PORT to 18086.
+# INSTALL_OFFER_OFF_PORT to 18085, PAGE_NAVIGATION_PORT to 18086 and
+# CONTROL_SYNC_PORT to 18087.
 # The script:
 #   1. Builds the ipe compiler (cargo build -p ipe --release).
 #   2. Compiles each example (geo-clipboard, layout-fill, focus-across-patch,
-#      csp-styles, install-offer, install-offer-off, page-navigation) via
+#      csp-styles, install-offer, install-offer-off, page-navigation,
+#      control-sync) via
 #      `ipe dev build`.
 #   3. Cargo-builds each emitted Rust project.
 #   4. Spawns each binary on its port.
@@ -34,6 +36,7 @@ CSP_STYLES_PORT="${4:-18083}"
 INSTALL_OFFER_PORT="${5:-18084}"
 INSTALL_OFFER_OFF_PORT="${6:-18085}"
 PAGE_NAVIGATION_PORT="${7:-18086}"
+CONTROL_SYNC_PORT="${8:-18087}"
 
 export IPE_GEO_CLIPBOARD_PORT="$GEO_PORT"
 export IPE_LAYOUT_FILL_PORT="$LAYOUT_PORT"
@@ -42,6 +45,7 @@ export IPE_CSP_STYLES_PORT="$CSP_STYLES_PORT"
 export IPE_INSTALL_OFFER_PORT="$INSTALL_OFFER_PORT"
 export IPE_INSTALL_OFFER_OFF_PORT="$INSTALL_OFFER_OFF_PORT"
 export IPE_PAGE_NAVIGATION_PORT="$PAGE_NAVIGATION_PORT"
+export IPE_CONTROL_SYNC_PORT="$CONTROL_SYNC_PORT"
 export IPE_RUNTIME_DIR="${IPE_RUNTIME_DIR:-$REPO_ROOT/src/runtime/rust/src}"
 
 echo "==> Building ipe compiler..."
@@ -100,6 +104,7 @@ serve csp-styles "$CSP_STYLES_PORT"
 serve install-offer "$INSTALL_OFFER_PORT"
 serve install-offer-off "$INSTALL_OFFER_OFF_PORT"
 serve page-navigation "$PAGE_NAVIGATION_PORT"
+serve control-sync "$CONTROL_SYNC_PORT"
 
 # bundle_client NAME VAR — build examples/shapes/web/NAME as the `web client`
 # browser bundle and export its `www/` directory as VAR, which the spec serves

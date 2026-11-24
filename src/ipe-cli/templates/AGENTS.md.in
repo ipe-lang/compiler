@@ -212,6 +212,7 @@ errorText err =
 | Errors | `Result Error a` / `Task Error a`; domain errors as ADTs |
 | Money | `Ipe.Money` on `Ipe.Decimal`; never `Float` for currency |
 | DB | `Ipe.Db` + SQLite for prototypes; PostgreSQL for multi-instance |
+| DB location | `Db.connect` reads DATABASE_URL, then `Db.url`; with neither set it warns once and uses ipe.db in the working directory (a Postgres build: the local server) |
 | Auth | `Ipe.Auth` (bcrypt + HS256 JWT cookies) |
 | Forms with passwords | `Ui.form` + `onSubmit` + typed record; password uncontrolled |
 | Observability | `Ipe.Log`; dev console at `/_ipe/console` |

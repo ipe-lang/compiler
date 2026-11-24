@@ -9,7 +9,8 @@
  * gate, the port-tag and the port-correlation refusals on the geo-clipboard
  * app, the install offer on the install-offer / install-offer-off apps, and
  * the URL that follows the page on the page-navigation app, served and as its
- * browser bundle).
+ * browser bundle, and the form fields that follow the view on the
+ * control-sync app).
  *
  * A single Chromium project — the only browser target for these tests.
  * The geo/clipboard browser APIs (navigator.geolocation,
@@ -42,6 +43,7 @@ export default {
     "port-tag-gate.spec.mjs",
     "port-correlation.spec.mjs",
     "page-navigation.spec.mjs",
+    "control-sync.spec.mjs",
   ],
   timeout: 30_000,
   retries: 0,

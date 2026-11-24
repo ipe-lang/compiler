@@ -1,0 +1,177 @@
+module Main exposing (main)
+
+-- | control-sync — a form field shows the value the view gives it once the
+-- user's edit has landed.
+--
+-- `draft` is a text field the `add` button empties as it appends a row; the
+-- field and the button are the only children of `entry`, so emptying the field
+-- patches its attributes in place. Each row of the unkeyed `list` holds a
+-- checkbox `tickN`, its text `textN` and a `deleteN` button, where `N` is the
+-- row's position; deleting a row moves the next one into its place. `memo` is
+-- a textarea the `clear` button empties. A query holding `tick` arms a timer
+-- that renders `ticks` every 100 ms, so a render no event of the tab caused
+-- lands while the user types.
+--
+-- Co-located, no JS ports.
+
+import Ipe.List as List
+import Ipe.String as String
+import Ipe.Tea.Web as Web
+import Ipe.Tea.Web.Cmd as Cmd
+import Ipe.Tea.Web.Sub as Sub
+import Ipe.Ui as Ui
+import Ipe.Ui.Input as Input
+
+
+type alias Item =
+    { key : Int
+    , text : String
+    , done : Bool
+    }
+
+
+type alias Model =
+    { draft : String
+    , items : List Item
+    , nextKey : Int
+    , memo : String
+    , ticking : Bool
+    , ticks : Int
+    }
+
+
+type Msg
+    = Draft String
+    | Add
+    | Toggle Int
+    | Delete Int
+    | Memo String
+    | ClearMemo
+    | Tick
+    | NoOp
+
+
+init : WebReq -> ( Model, Cmd.Cmd Msg )
+init req =
+    ( { draft = ""
+      , items = []
+      , nextKey = 0
+      , memo = ""
+      , ticking = String.contains "tick" req.query
+      , ticks = 0
+      }
+    , Cmd.none
+    )
+
+
+toggleItem : Int -> Item -> Item
+toggleItem key item =
+    if item.key == key then
+        { item | done = not item.done }
+
+    else
+        item
+
+
+update : Msg -> Model -> ( Model, Cmd.Cmd Msg )
+update msg model =
+    case msg of
+        Draft text ->
+            ( { model | draft = text }, Cmd.none )
+
+        Add ->
+            ( { model
+                | draft = ""
+                , items = model.items ++ [ { key = model.nextKey, text = model.draft, done = False } ]
+                , nextKey = model.nextKey + 1
+              }
+            , Cmd.none
+            )
+
+        Toggle key ->
+            ( { model | items = List.map (toggleItem key) model.items }, Cmd.none )
+
+        Delete key ->
+            ( { model | items = List.filter (\item -> item.key /= key) model.items }, Cmd.none )
+
+        Memo text ->
+            ( { model | memo = text }, Cmd.none )
+
+        ClearMemo ->
+            ( { model | memo = "" }, Cmd.none )
+
+        Tick ->
+            ( { model | ticks = model.ticks + 1 }, Cmd.none )
+
+        NoOp ->
+            ( model, Cmd.none )
+
+
+subscriptions : Model -> Sub.Sub Msg
+subscriptions model =
+    if model.ticking then
+        Sub.every 100 Tick
+
+    else
+        Sub.none
+
+
+row : Int -> Item -> Ui.Element Msg
+row position item =
+    let
+        n =
+            String.fromInt position
+    in
+    Ui.row []
+        [ Input.checkbox
+            [ Ui.id ("tick" ++ n) ]
+            { onChange = \_ -> Toggle item.key
+            , checked = item.done
+            , icon = \_ -> Ui.text "x"
+            , label = Input.labelHidden ("Done " ++ n)
+            }
+        , Ui.el [ Ui.id ("text" ++ n) ] (Ui.text item.text)
+        , Ui.button [ Ui.id ("delete" ++ n) ] { onPress = Just (Delete item.key), label = Ui.text "delete" }
+        ]
+
+
+view : Model -> Ui.Element Msg
+view model =
+    Ui.column []
+        [ Ui.el [ Ui.id "ticks" ] (Ui.text ("ticks: " ++ String.fromInt model.ticks))
+        , Ui.column
+            [ Ui.id "entry" ]
+            [ Input.text
+                [ Ui.id "draft" ]
+                { label = Input.labelHidden "Draft"
+                , text = model.draft
+                , onChange = Draft
+                , placeholder = Nothing
+                }
+            , Ui.button [ Ui.id "add" ] { onPress = Just Add, label = Ui.text "add" }
+            ]
+        , Ui.column [ Ui.id "list" ] (List.indexedMap row model.items)
+        , Ui.column
+            [ Ui.id "notes" ]
+            [ Input.multiline
+                [ Ui.id "memo" ]
+                { label = Input.labelHidden "Memo"
+                , onChange = Memo
+                , placeholder = Nothing
+                , spellcheck = False
+                , text = model.memo
+                }
+            , Ui.button [ Ui.id "clear" ] { onPress = Just ClearMemo, label = Ui.text "clear" }
+            ]
+        ]
+
+
+main =
+    Web.tea
+        { init = init
+        , update = update
+        , view = view
+        , subscriptions = subscriptions
+        , routes = []
+        , notFound = NoOp
+        }

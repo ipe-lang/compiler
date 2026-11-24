@@ -90,6 +90,7 @@ fn wasm_module_for_mask(name: ipe_intern::Symbol, mask: u32) -> Module {
         uses_locale: false,
         uses_time: f(10),
         uses_env_public: f(11),
+        uses_db_operator: false,
         uses_http: f(12),
         uses_config: false,
         uses_compression: false,

@@ -65,10 +65,29 @@ var __IPE_FRAME_LOADERS = [["embed", "src"], ["object", "data"], ["frame", "src"
 var __IPE_TRUSTED_SANDBOX_TOKENS = ["allow-downloads", "allow-forms", "allow-modals", "allow-orientation-lock", "allow-pointer-lock", "allow-popups", "allow-popups-to-escape-sandbox", "allow-presentation", "allow-same-origin", "allow-scripts", "allow-storage-access-by-user-activation", "allow-top-navigation", "allow-top-navigation-by-user-activation", "allow-top-navigation-to-custom-protocols"];
 var __IPE_FRAME_PERMISSIONS = ["allow", "allowfullscreen", "allowpaymentrequest", "allowusermedia"];
 var __IPE_DELEGATION_FEATURES = [["accelerometer", "undisclosed", []], ["ambient-light-sensor", "undisclosed", []], ["autoplay", "plain", []], ["bluetooth", "undisclosed", []], ["camera", "gated", ["camera", "recorder"]], ["clipboard-read", "undisclosed", []], ["clipboard-write", "plain", []], ["compute-pressure", "undisclosed", []], ["display-capture", "undisclosed", []], ["encrypted-media", "plain", []], ["fullscreen", "plain", []], ["gamepad", "plain", []], ["geolocation", "gated", ["geolocation"]], ["gyroscope", "undisclosed", []], ["hid", "undisclosed", []], ["identity-credentials-get", "undisclosed", []], ["idle-detection", "undisclosed", []], ["local-fonts", "undisclosed", []], ["magnetometer", "undisclosed", []], ["microphone", "gated", ["microphone", "recorder"]], ["midi", "undisclosed", []], ["otp-credentials", "undisclosed", []], ["payment", "never", []], ["picture-in-picture", "plain", []], ["publickey-credentials-create", "undisclosed", []], ["publickey-credentials-get", "undisclosed", []], ["screen-wake-lock", "plain", []], ["serial", "undisclosed", []], ["storage-access", "undisclosed", []], ["usb", "undisclosed", []], ["web-share", "plain", []], ["window-management", "undisclosed", []], ["xr-spatial-tracking", "undisclosed", []]];
+// The node keep's field tables (`dom/keep.rs` `FIELD_TAGS`, `AUTHORITY_ATTRS`
+// and `CONTROLLED_ATTR`); a native test asserts this copy equals them. A
+// field is a form element whose value the user edits, an authority attribute
+// carries that value, and the render sink writes the marker on every field
+// whose view owns its value, so an unticked box or an empty field the view
+// set is still the view's.
+var __IPE_FIELD_TAGS = ["input", "textarea", "select"];
+var __IPE_AUTHORITY_ATTRS = ["value", "checked", "selected"];
+var __IPE_CONTROLLED_ATTR = "ipe-controlled";
 // `s` with its ASCII letters lowercased and every other character kept, as
 // the runtime compares tags, keys and tokens.
 function __ipeAsciiLower(s) {
   return String(s).replace(/[A-Z]+/g, function(m) { return m.toLowerCase(); });
+}
+// Whether the element `el` is one of `__IPE_FIELD_TAGS`.
+function __ipeIsField(el) {
+  return !!el && el.nodeType === 1 &&
+      __IPE_FIELD_TAGS.indexOf(__ipeAsciiLower(__ipeNode.tag(el))) !== -1;
+}
+// Whether the attribute name `n` is one of `__IPE_AUTHORITY_ATTRS`, ASCII
+// case folded.
+function __ipeIsAuthorityAttr(n) {
+  return __IPE_AUTHORITY_ATTRS.indexOf(__ipeAsciiLower(n)) !== -1;
 }
 // The canonical sandbox of the `sandbox` value `v` (null when absent): the
 // known tokens it holds, split on ASCII whitespace, once each in table order.
@@ -642,134 +661,153 @@ var __ipeSwapToast = __ipeBootCfg["swapToast"];
 // the swap toast greets only reconnects, never the first load.
 var __ipeHelloEverOk = false;
 
-// ── Input authority protocol state ───────────────────────────
-// See docs/internals/web/input-authority-protocol.md §Client state.
-// Step 2 populates these counters + per-input table on every send
-// and response; Step 3 activates the patch filter that reads them;
-// Step 4 activates the stale-drop test against __ipeLastAppliedSeq.
-//
-// Cycle 3 P47 (pub/sub global+local seq split — see
-// docs/internals/web/pubsub-design.md §3.2): __ipeLastGlobalSeq is the
-// app-wide broadcast counter. The server stamps it onto every
-// broadcast-derived SSE frame (event:patches OR event:patch); the
-// client dedupes against the largest value already applied so a
-// replayed broadcast (e.g. SSE reconnect that re-delivers buffered
-// frames) drops at the boundary without mutating state twice. Frames
-// from per-session dispatch (the common case) carry globalSeq=0 OR
-// omit the field; the guard treats 0 / missing as "no broadcast
-// ordering constraint" and never blocks.
-var __ipeClientSeq = 0;       // monotonic, client-owned; bumped on every __ipeSend
-var __ipeLastAppliedSeq = 0;  // server-owned; largest local seq already applied
-var __ipeLastGlobalSeq = 0;   // server-owned; largest broadcast globalSeq already applied (P47)
-var __ipeInputs = {};         // ipe-id → InputEntry (populated by __ipeBindOne)
+// ── Input authority state ────────────────────────────────────
+// __ipeClientSeq numbers this page's events. __ipeLastAppliedSeq is the
+// largest local seq already applied. __ipeLastGlobalSeq is the app-wide
+// broadcast counter the server stamps onto every broadcast-derived frame: a
+// frame whose globalSeq is already applied (a broadcast an SSE reconnect
+// re-delivers) drops at the boundary. A frame with no globalSeq, or 0, has
+// no broadcast ordering constraint.
+var __ipeClientSeq = 0;
+var __ipeLastAppliedSeq = 0;
+var __ipeLastGlobalSeq = 0;
+// ipe-id → the entry of a field the user has typed into.
+var __ipeInputs = {};
 
+// The entry of the field `sid`, made on its first input event.
+//   * liveValue is the value the field shows. The input handler writes it,
+//     and every server write to the field re-reads it, so it mirrors the DOM.
+//   * edited is true from an input event until the next event stamps it.
+//   * pendingSeq is the seq of the event that carries the user's latest
+//     value, or 0. It ends once the server has answered an event at or after
+//     it: an accept, a stale answer, or a render frame of this tab's own
+//     event. While it holds, the field is the user's, not the view's.
+//   * refusedValue is the value a refused event carried, or null. While the
+//     field still shows it, no later event carries it.
 function __ipeInputEntry(sid) {
   var e = __ipeInputs[sid];
   if (!e) {
     e = __ipeInputs[sid] = {
-      liveValue: "", lastSentSeq: 0, lastAckedSeq: 0,
-      pendingDebounceId: null, pendingSend: null,
-      // The value a refused event carried for this input, or null. While the
-      // input still shows it, no later event carries it.
-      refusedValue: null
+      liveValue: "", edited: false, pendingSeq: 0, refusedValue: null
     };
   }
   return e;
 }
 
-// __ipeInputsSnapshot — dirty-input projection bundled into every
-// outgoing event. Only entries whose user-typed value is newer than
-// the server's latest ack are included, so the wire stays compact
-// when the client and server agree. A value the server refused is left out
-// until the user edits it: the refusal would otherwise ride on every event.
+// Stamp every field edited since its last stamp with the event `seq` that
+// carries its value.
+function __ipeStampEdited(seq) {
+  var ids = Object.keys(__ipeInputs);
+  for (var i = 0; i < ids.length; i++) {
+    var e = __ipeInputs[ids[i]];
+    if (!e.edited) continue;
+    e.pendingSeq = seq;
+    e.edited = false;
+  }
+}
+
+// End every pending value an event at or before `seq` carries: the server
+// has answered that event, so the view's value is the field's again. An
+// earlier event's answer that never arrives cannot hold a value pending.
+function __ipeRetirePending(seq) {
+  if (typeof seq !== "number" || seq <= 0) return;
+  var ids = Object.keys(__ipeInputs);
+  for (var i = 0; i < ids.length; i++) {
+    var e = __ipeInputs[ids[i]];
+    if (e.pendingSeq > 0 && e.pendingSeq <= seq) e.pendingSeq = 0;
+  }
+}
+
+// Retire what a stream `frame` answers: a render of this tab's own event
+// `tabSeq` follows that event's dispatch.
+function __ipeRetireOwnFrame(frame) {
+  if (!frame || !__ipeTabId || frame.tab !== __ipeTabId) return;
+  __ipeRetirePending(frame.tabSeq);
+}
+
+// Re-read the field `el` into its entry after the server wrote it.
+function __ipeResyncField(el) {
+  var sid = __ipeNode.attr(el, "ipe-id");
+  if (sid === null) return;
+  var e = __ipeInputs[sid];
+  if (e) e.liveValue = String(__ipeFieldValue(el));
+}
+
+// Re-read every entry's field after a swap, and drop the entry of a field
+// the page no longer holds, so the table is bounded by the live document.
+function __ipeResyncInputs() {
+  var ids = Object.keys(__ipeInputs);
+  for (var i = 0; i < ids.length; i++) {
+    var el = null;
+    try { el = __ipeDoc.query("[ipe-id=" + __ipeCssString(ids[i]) + "]"); } catch (_) { el = null; }
+    if (!__ipeIsField(el)) {
+      delete __ipeInputs[ids[i]];
+      continue;
+    }
+    __ipeInputs[ids[i]].liveValue = String(__ipeFieldValue(el));
+  }
+}
+
+// The values of pending fields, bundled into every outgoing event. A field
+// the server has answered for is left out, so an accepted value rides no
+// later event. A value the server refused is left out until the user edits
+// it: the refusal would otherwise ride on every event.
 function __ipeInputsSnapshot() {
   var out = null;
   var ids = Object.keys(__ipeInputs);
   for (var i = 0; i < ids.length; i++) {
     var e = __ipeInputs[ids[i]];
     if (e.refusedValue !== null && e.refusedValue !== e.liveValue) e.refusedValue = null;
-    if (e.lastSentSeq <= e.lastAckedSeq) continue;
+    if (e.pendingSeq === 0) continue;
     if (e.refusedValue !== null) continue;
     if (!out) out = {};
-    out[ids[i]] = {value: e.liveValue, seq: e.lastSentSeq};
+    out[ids[i]] = {value: e.liveValue, seq: e.pendingSeq};
   }
   return out;
 }
 
-// __ipeIngestSeq — fold a response or SSE frame's {seq, ackInputs}
-// into client state. seq advances __ipeLastAppliedSeq monotonically;
-// ackInputs retires per-input dirty flags so the next snapshot omits
-// caught-up fields.
-// __ipeIsDirty — a typable form field (input / textarea / select)
-// whose DOM state is authoritative over the server's view. The check
-// is scoped to those tags ONLY: buttons, anchors, divs and other
-// focused-but-non-typable elements have no keystrokes to preserve,
-// so treating them as dirty would wrongly block patches that wipe
-// their containing subtree (e.g. navigating from a "new game"
-// screen into a board view, where the focused button legitimately
-// disappears). Scope signals: focus, pending debounce keyed by
-// data-ipe-hid, or an unacked typed value at the input's ipe-id.
+// __ipeIsDirty — a field whose DOM state is authoritative over the server's
+// view: it holds focus, its debounced input event has not been sent, or its
+// sent value is pending. Only fields count: a focused button or link has no
+// keystrokes to keep, and treating it as dirty would block the patch that
+// replaces its subtree.
 function __ipeIsDirty(el) {
-  if (!el || el.nodeType !== 1) return false;
-  var tag = __ipeNode.tag(el);
-  if (tag !== "INPUT" && tag !== "TEXTAREA" && tag !== "SELECT") return false;
+  if (!__ipeIsField(el)) return false;
   if (el === __ipeDoc.active()) return true;
-  var hid = el.getAttribute && el.getAttribute("data-ipe-hid");
+  var hid = __ipeNode.attr(el, "data-ipe-hid");
   if (hid && __ipeInputPending[hid]) return true;
-  var sid = el.getAttribute && el.getAttribute("ipe-id");
-  if (sid) {
+  var sid = __ipeNode.attr(el, "ipe-id");
+  if (sid !== null) {
     var e = __ipeInputs[sid];
-    if (e && e.lastSentSeq > e.lastAckedSeq) return true;
+    if (e && e.pendingSeq > 0) return true;
   }
   return false;
 }
 
-function __ipeIngestSeq(seq, ackInputs, globalSeq) {
+// Fold a response or frame's `seq` and `globalSeq` into the applied counters,
+// each monotonically. A missing, zero or non-numeric globalSeq has no
+// broadcast ordering constraint.
+function __ipeIngestSeq(seq, globalSeq) {
   if (typeof seq === "number" && seq > __ipeLastAppliedSeq) {
     __ipeLastAppliedSeq = seq;
   }
-  // Cycle 3 P47: monotonic-applied semantics on the broadcast counter,
-  // mirroring the local-seq path. Missing / zero / non-numeric globalSeq
-  // is treated as "no broadcast ordering constraint" and ignored.
   if (typeof globalSeq === "number" && globalSeq > __ipeLastGlobalSeq) {
     __ipeLastGlobalSeq = globalSeq;
   }
-  if (ackInputs) {
-    var ids = Object.keys(ackInputs);
-    for (var i = 0; i < ids.length; i++) {
-      var e = __ipeInputs[ids[i]];
-      if (!e) continue;
-      var n = ackInputs[ids[i]];
-      if (n > e.lastAckedSeq) e.lastAckedSeq = n;
-    }
-  }
 }
 
-// __ipeHandleResponse — gate DOM-mutating work behind the monotonic
-// seq check (Step 4 / I2). An out-of-order or replayed frame with
-// seq ≤ __ipeLastAppliedSeq is dropped entirely: a newer frame has
-// already landed with a later view, and applying the stale payload
-// would regress the DOM. Legacy frames that omit seq (or report 0)
-// always apply — pre-upgrade servers keep working.
-//
-// Cycle 3 P47 (pub/sub global+local seq split — see
-// docs/internals/web/pubsub-design.md §3.2): broadcast-derived frames also
-// carry an OPTIONAL globalSeq. If supplied AND already applied (i.e.
-// globalSeq > 0 && globalSeq <= __ipeLastGlobalSeq) the frame is
-// dropped — a replayed broadcast (e.g. an SSE reconnect re-delivering
-// buffered frames) would otherwise mutate state twice. Both guards
-// fire independently: a frame is dropped if EITHER counter has already
-// passed it; the localSeq guard alone suffices for the legacy
-// non-broadcast case (globalSeq omitted / 0 → broadcast guard always
-// passes).
-function __ipeHandleResponse(seq, ackInputs, applyFn, globalSeq) {
+// __ipeHandleResponse — run `applyFn` unless a newer frame already landed:
+// a frame whose seq is at or below __ipeLastAppliedSeq, or whose globalSeq is
+// at or below __ipeLastGlobalSeq, would regress the DOM and is dropped. Either
+// guard drops alone. A frame with no seq (or 0) always applies.
+function __ipeHandleResponse(seq, applyFn, globalSeq) {
   if (typeof seq === "number" && seq > 0 && seq <= __ipeLastAppliedSeq) {
-    return; // stale — a newer local-seq frame already landed
+    return;
   }
   if (typeof globalSeq === "number" && globalSeq > 0 && globalSeq <= __ipeLastGlobalSeq) {
-    return; // stale — a newer broadcast frame already landed
+    return;
   }
-  __ipeIngestSeq(seq, ackInputs, globalSeq);
+  __ipeIngestSeq(seq, globalSeq);
   applyFn();
 }
 
@@ -802,28 +840,25 @@ function __ipeHandleResponse(seq, ackInputs, applyFn, globalSeq) {
 // a property of the document). Selection is lost and must be
 // restored too.
 
-// __ipePlaceholderUncontrolled — true when the server-rendered
-// element has no authority attribute set (no value/checked/selected,
-// no textarea content, no option[selected]). For these the user-
-// owned client state is canonical; we splice the live node across
-// the swap so the user's typing isn't blanked. See
-// docs/internals/web/input-authority-protocol.md §I6 (full-body
-// preservation).
+// __ipePlaceholderUncontrolled — true when the server-rendered field
+// leaves its value to the user: no `__IPE_CONTROLLED_ATTR` marker, no
+// authority attribute, no textarea text, no option[selected]. Such a
+// field's live node is spliced across the swap so the user's state is
+// not blanked; a controlled one is rebuilt with the view's value. The
+// same rule as `dom/keep.rs` `Control::of`.
 function __ipePlaceholderUncontrolled(placeholder) {
   if (!placeholder) return false;
-  if (placeholder.hasAttribute("value")) return false;
-  if (placeholder.hasAttribute("checked")) return false;
-  if (placeholder.hasAttribute("selected")) return false;
-  var tag = placeholder.tagName;
-  if (tag === "TEXTAREA") {
+  if (placeholder.hasAttribute(__IPE_CONTROLLED_ATTR)) return false;
+  for (var i = 0; i < __IPE_AUTHORITY_ATTRS.length; i++) {
+    if (placeholder.hasAttribute(__IPE_AUTHORITY_ATTRS[i])) return false;
+  }
+  var tag = __ipeAsciiLower(placeholder.tagName);
+  if (tag === "textarea") {
     return (placeholder.textContent || "").length === 0;
   }
-  if (tag === "SELECT") {
+  if (tag === "select") {
     return placeholder.querySelectorAll("option[selected]").length === 0;
   }
-  // type=file: browsers refuse programmatic value assignment, the
-  // user's selection is the only truth — always treat as uncontrolled.
-  if (tag === "INPUT" && placeholder.getAttribute("type") === "file") return true;
   return true;
 }
 
@@ -995,9 +1030,7 @@ function __ipeSwapPreservingFocus(container, tmp) {
   var focused = __ipeDoc.active();
   var inside = focused && focused !== __ipeDoc.body() &&
       __ipeNode.contains(container, focused);
-  var focusTag = inside ? __ipeNode.tag(focused) : "";
-  var focusedInside = inside &&
-      (focusTag === "INPUT" || focusTag === "TEXTAREA" || focusTag === "SELECT");
+  var focusedInside = inside && __ipeIsField(focused);
 
   // Snapshot focused-state BEFORE any DOM mutation. Selection read
   // throws on some input types, so catch.
@@ -1017,7 +1050,7 @@ function __ipeSwapPreservingFocus(container, tmp) {
   // server-side placeholder is uncontrolled (no value/checked/
   // selected) — i.e. user state is canonical.
   var preservedFocus = null;
-  var liveNodes = __ipeNode.queryAll(container, "input, textarea, select");
+  var liveNodes = __ipeNode.queryAll(container, __IPE_FIELD_TAGS.join(", "));
   for (var i = 0; i < liveNodes.length; i++) {
     var live = liveNodes[i];
     var placeholder = __ipeFindPlaceholder(tmp, live);
@@ -1066,6 +1099,7 @@ function __ipeSwapPreservingFocus(container, tmp) {
     }
     if (scrollTop) preservedFocus.scrollTop = scrollTop;
   }
+  __ipeResyncInputs();
 }
 
 // The focus keep: focus after a frame is a function of the view, never of the
@@ -1362,9 +1396,7 @@ function __ipeFocusAutofocus(root, el) {
 // live focused input into a server-rendered placeholder.
 function __ipeCopyAttrsExceptAuthority(src, dst) {
   if (!src || !dst || !src.attributes || !dst.attributes) return;
-  var isAuthority = function(n) {
-    return n === "value" || n === "checked" || n === "selected";
-  };
+  var isAuthority = __ipeIsAuthorityAttr;
   // Drop attrs that aren't present in src.
   var toRemove = [];
   for (var i = 0; i < dst.attributes.length; i++) {
@@ -1652,6 +1684,7 @@ function __ipeCollectPendingBatch() {
 function __ipeFlushPendingBeacon() {
   if (__ipeEnded) return;
   var batch = __ipeCollectPendingBatch();
+  if (batch) __ipeStampEdited(__ipeClientSeq);
   var snapshot = __ipeInputsSnapshot();
   if (!batch && !snapshot) return;
   var body = { sessionId: __ipeSid };
@@ -1734,24 +1767,16 @@ window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 //   * epoch names the render handlerId was read from.
 //   * opts.focus (client-only, never posted) is the focus epoch read at the
 //     user act that raised the event; without it the event records no focus.
-//   * inputState carries the user's current DOM values for every
-//     dirty input so the server's diff can align against reality
-//     before emitting patches.
+//   * inputState carries the user's value of every pending field.
 function __ipeSend(msgName, args, handlerId, opts) {
   if (__ipeEnded) return;
   opts = opts || {};
   if (!opts.noLoader) __ipeLoaderStart();
   __ipeClientSeq++;
   var mySeq = __ipeClientSeq;
-  // Stamp every currently-dirty input with this seq. The server's
-  // ack (for a future response) will clear them back to parity.
-  var dirtyIds = Object.keys(__ipeInputs);
-  for (var di = 0; di < dirtyIds.length; di++) {
-    var de = __ipeInputs[dirtyIds[di]];
-    if (de.liveValue !== "" || de.pendingDebounceId !== null) {
-      de.lastSentSeq = mySeq;
-    }
-  }
+  // This event carries every value edited since the last event; the
+  // server's answer to it ends them.
+  __ipeStampEdited(mySeq);
   var snapshot = __ipeInputsSnapshot();
   var body = {
     sessionId: __ipeSid,
@@ -1846,9 +1871,12 @@ function __ipePostEvent(body, fromQueue) {
         return r.json().then(function(data) {
           __ipeLoaderEnd();
           __ipeOnPostSuccess();
+          // The server answered the event: its values are no longer the
+          // user's alone, and the render it sent is the view's.
+          __ipeRetirePending(body.seq);
           if (!data || typeof data.body !== "string") return;
           // The epoch gate orders this render against the DOM on screen; the
-          // seq it carries is the session's, which an earlier ack may equal.
+          // seq it carries is the session's, which an earlier frame may equal.
           __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, data.route);
         }).catch(function() { __ipeLoaderEnd(); });
       case __IPE_EVENT_ANSWER.SESSION_LOST:
@@ -1905,11 +1933,14 @@ function __ipePostEvent(body, fromQueue) {
       __ipeLoaderEnd();
       __ipeOnPostSuccess();
       if (!data) return;
-      // An accepted event is acked with its seq; its render arrives over
-      // the stream, whose frames name the epochs they move between. Any
-      // patches an answer carries have no epoch to gate on: they never
-      // apply.
-      __ipeHandleResponse(data.seq, data.ackInputs, function() {}, data.globalSeq);
+      // An accepted event's render arrives over the stream, whose frames
+      // name the epochs they move between. Any patches an answer carries
+      // have no epoch to gate on: they never apply. The answer's `seq` is
+      // the session's commit count, not this tab's event seq, so it neither
+      // retires a value nor moves the frame gate: folded there, it would drop
+      // a `patch` frame (a reconnect's resync) of an equal or lower count.
+      // The marked accept of this event ends every value it carries.
+      if (ipeMark === "1" && typeof data.seq === "number") __ipeRetirePending(body.seq);
     });
   }).catch(function() {
     if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;
@@ -2139,6 +2170,7 @@ function __ipeApplyPatches(patches) {
         savedScrollTop = el.scrollTop;
       }
       var valueChanged = false;
+      var wroteAuthority = false;
       var framePlan = __ipeFramePlan(el, p.attrs);
       for (var f = 0; f < framePlan.length; f++) {
         if (framePlan[f][1] === null) __ipeNode.removeAttr(el, framePlan[f][0]);
@@ -2154,13 +2186,13 @@ function __ipeApplyPatches(patches) {
         }
         // A frame key is written by the frame plan above, never alone.
         if (frameKeys.indexOf(__ipeAsciiLower(k)) !== -1) continue;
-        // Authority filter: the user is currently editing this
-        // field, so the server's proposed value/checked/selected
-        // would stomp in-flight keystrokes. Drop them and let the
-        // next event round-trip settle the state.
-        if (dirty && (k === "value" || k === "checked" || k === "selected")) {
-          continue;
-        }
+        // Authority filter: the user owns this field's value until the
+        // server has answered the event carrying it, so the server's
+        // proposed value/checked/selected would stomp in-flight
+        // keystrokes. Drop them; the render after that answer settles it.
+        var authority = __ipeIsAuthorityAttr(k);
+        if (dirty && authority) continue;
+        if (authority) wroteAuthority = true;
         var prop = Object.prototype.hasOwnProperty.call(__IPE_LIVE_PROPS, k)
             ? __IPE_LIVE_PROPS[k] : null;
         // A removal crosses as null; a set as a string, the empty string
@@ -2180,6 +2212,7 @@ function __ipeApplyPatches(patches) {
           if (prop !== null) el[prop] = v !== "false";
         }
       }
+      if (wroteAuthority) __ipeResyncField(el);
       // Restore selection on focused input/textarea after a value
       // update. Clamp to the new value length so a shorter server
       // value does not throw RangeError. Scroll restore matters
@@ -2212,8 +2245,7 @@ function __ipeContainsFocus(el) {
   if (!a || a === __ipeDoc.body()) return false;
   if (!__ipeNode.contains(el, a)) return false;
   if (el !== a) return true;
-  var tag = __ipeNode.tag(a);
-  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+  return __ipeIsField(a);
 }
 
 function __ipeEscapeHTML(s) {
@@ -2267,6 +2299,7 @@ function __ipeBindOne(eventName) {
         if (sid) {
           var e = __ipeInputEntry(sid);
           e.liveValue = args && args.length > 0 ? String(args[0]) : "";
+          e.edited = true;
         }
         __ipeDebouncedSend(msgName, args, hid, 150, epoch, focus);
         return;
@@ -2282,15 +2315,21 @@ function __ipeBindOne(eventName) {
 //   * input / change                   → [value]    (typed input value)
 //   * submit                           → [formData] (plain object of [name]=value)
 //   * keydown / keyup / keypress       → [key]      (event.key string)
+// The value the field `t` shows, as an input or change event posts it: a
+// checkbox or radio's checkedness, a number or range's number, otherwise
+// its text.
+function __ipeFieldValue(t) {
+  if (t.type === "checkbox" || t.type === "radio") return t.checked;
+  if (t.type === "number" || t.type === "range") return t.valueAsNumber || 0;
+  return t.value == null ? "" : String(t.value);
+}
+
 function __ipeExtractArgs(ev) {
   var t = ev.target;
   switch (ev.type) {
     case "input":
     case "change":
-      if (!t) return [""];
-      if (t.type === "checkbox" || t.type === "radio") return [t.checked];
-      if (t.type === "number" || t.type === "range") return [t.valueAsNumber || 0];
-      return [t.value == null ? "" : String(t.value)];
+      return [t ? __ipeFieldValue(t) : ""];
     case "submit":
       // Form-data assembly. Two non-obvious rules:
       //
@@ -2959,7 +2998,7 @@ function __ipeShowSwapToast() {
 }
 
 // ── Server-Sent Events ───────────────────────────────────────
-// Frame envelope since v0.9.3+: {seq, body, ackInputs?}. Falls back to
+// Frame envelope: {seq, body, ...}. Falls back to
 // treating e.data as a raw HTML body when JSON parsing fails, so a
 // mixed-version rollout doesn't break the open-SSE connection.
 //
@@ -3073,9 +3112,9 @@ function __ipeOpenSSE() {
   });
 }
 // The handlers of the stream frames a leader relays, keyed by event type. Each
-// takes the frame text and whether it came relayed from the leader tab: a
-// relayed frame never retires this tab's input acks, which belong to the
-// tab whose typing the server acked.
+// takes the frame text and whether it came relayed from the leader tab. A
+// frame retires pending input values only when its `tab` names this tab,
+// relayed or not.
 var __ipeLiveFrames = {
   hello: function(text, relayed) {
     // Handshake received — we know we hit a real Ipe.Web v2 server,
@@ -3140,7 +3179,8 @@ var __ipeLiveFrames = {
     // render history to gate on and is dropped.
     try { frame = JSON.parse(text); } catch (_) { return; }
     if (frame && typeof frame === "object") {
-      __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
+      __ipeHandleResponse(frame.seq, function() {
+        __ipeRetireOwnFrame(frame);
         if (!frame.body) return;
         var body = frame.body.replace(/\\n/g, "\n");
         var apply = function() {
@@ -3164,10 +3204,9 @@ var __ipeLiveFrames = {
   // handler above stays for first-renders, reconnect-resync,
   // full-replace fallbacks, and any pre-P50a server.
   //
-  // Shape parity with the HTTP /_ipe/event reply: frame is
-  // {seq, ackInputs, patches} — identical to writeEventJSON's
-  // envelope, so __ipeApplyPatches consumes both routes without
-  // divergence. seq-gating via __ipeHandleResponse means out-of-
+  // A frame of this tab's own event names it as {tab, tabSeq}: its
+  // render follows that event's dispatch, so it ends the values that
+  // event carries before the patches apply. seq-gating via __ipeHandleResponse means out-of-
   // order frames (a stale patches frame arriving after a fresher
   // patch frame, e.g. across a brief network blip) are dropped at
   // the same monotonic guard the HTTP path uses.
@@ -3230,7 +3269,8 @@ var __ipeLiveFrames = {
       }
       return;
     }
-    __ipeHandleResponse(frame.seq, relayed ? null : frame.ackInputs, function() {
+    __ipeHandleResponse(frame.seq, function() {
+      __ipeRetireOwnFrame(frame);
       __ipeAdoptPatches(frame);
     }, frame.globalSeq);
   },

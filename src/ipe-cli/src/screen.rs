@@ -467,16 +467,20 @@ pub fn error_screen(err: &CliError, color: bool) -> Option<Screen> {
 }
 
 /// The `ipe doc` miss: the query in the user-error tone, then the numbered
-/// entries, each as the exact command that opens it.
+/// entries, each as the exact command that opens it; a miss that matched
+/// nothing names the next step in their place.
 fn doc_not_found(screen: &mut Screen, miss: &DocMiss) {
     screen.line(
         Tone::UserError,
         &crate::text::cli_doc_not_found(&miss.query),
     );
+    let (header, more) = crate::doc_pick::human_parts(miss);
     if miss.hits.is_empty() {
+        if matches!(miss.closeness, crate::doc_search::Closeness::Nothing) {
+            screen.blank().line(Tone::Text, header);
+        }
         return;
     }
-    let (header, more) = crate::doc_pick::human_parts(miss);
     screen.blank().line(Tone::Text, header);
     for line in crate::doc_pick::human_lines(miss) {
         screen.line(Tone::Text, &line);
