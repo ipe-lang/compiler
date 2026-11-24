@@ -478,7 +478,7 @@ mod served {
             }
             let previous = self
                 .unlogged
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
                 .unwrap_or(u64::MAX);
             LogDecision::Counted(previous.saturating_add(1))
         }

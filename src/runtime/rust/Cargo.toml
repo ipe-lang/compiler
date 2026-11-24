@@ -738,6 +738,9 @@ wasm-bindgen-test = "0.3"
 [lints.rust]
 # Mirrors the workspace `unsafe_code` deny (this crate keeps its own `[lints]`).
 unsafe_code = "deny"
+# Mirrors the workspace `deprecated` / `deprecated_in_future` denies.
+deprecated = "deny"
+deprecated_in_future = "deny"
 
 [lints.clippy]
 # No-runtime-errors gate: a panic vector reached from well-typed code is a bug.

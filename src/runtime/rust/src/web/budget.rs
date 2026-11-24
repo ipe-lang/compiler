@@ -6,7 +6,7 @@
 //! on its session's [`SessionCmds`] of [`SESSION_CMD_CEILING`], nested in the
 //! one process budget of [`PROCESS_CMD_BUDGET`]. Both run on one engine,
 //! [`Budget`]: a charge takes its units from every budget of the chain or from
-//! none, each step one atomic `fetch_update`, so no budget's `used` ever passes
+//! none, each step one atomic `try_update`, so no budget's `used` ever passes
 //! its `limit`; the units return only when the charge drops.
 
 use std::sync::Arc;
@@ -213,7 +213,7 @@ impl<U: Quantity> Budget<U> {
     fn take(&self, amount: U) -> Result<(), OverBudget> {
         let limit = self.limit.units();
         self.used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(amount.units()).filter(|now| *now <= limit)
             })
             .map(drop)
@@ -226,7 +226,7 @@ impl<U: Quantity> Budget<U> {
         // saturating keeps a broken pairing from wrapping into a huge `used`.
         let _ = self
             .used
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 Some(used.saturating_sub(amount.units()))
             });
         self.freed.notify_waiters();

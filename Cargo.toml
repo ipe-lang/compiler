@@ -56,6 +56,11 @@ license = "Apache-2.0"
 # AGENTS.md); `deny` rather than `forbid` so exactly those sites can opt out.
 [workspace.lints.rust]
 unsafe_code = "deny"
+# A std item already deprecated, or scheduled for deprecation in a later
+# release (`#[deprecated(since = <future>)]`), is refused on the pinned
+# toolchain, so the release that starts warning users finds no use left.
+deprecated = "deny"
+deprecated_in_future = "deny"
 
 # THE SSOT for the workspace clippy policy. Every `cargo clippy` — in CI and in
 # the docs — is just `-- -D warnings`; it inherits this set, so what is enforced

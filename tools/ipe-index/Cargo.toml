@@ -29,6 +29,9 @@ unicode-general-category = "1"
 [lints.rust]
 # Mirrors the compiler workspace's `unsafe_code` deny for this standalone tool.
 unsafe_code = "deny"
+# Mirrors the workspace `deprecated` / `deprecated_in_future` denies.
+deprecated = "deny"
+deprecated_in_future = "deny"
 
 [lints.clippy]
 # Mirrors the workspace `mem_forget` deny: a forgotten `Drop` guard leaks.

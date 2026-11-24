@@ -20,6 +20,9 @@ ipe-test-temp = { path = "../test-temp" }
 [lints.rust]
 # Mirrors the workspace `unsafe_code` deny (this crate keeps its own `[lints]`).
 unsafe_code = "deny"
+# Mirrors the workspace `deprecated` / `deprecated_in_future` denies.
+deprecated = "deny"
+deprecated_in_future = "deny"
 
 [lints.clippy]
 # Mirrors the workspace `mem_forget` deny: a forgotten `Drop` guard leaks.
