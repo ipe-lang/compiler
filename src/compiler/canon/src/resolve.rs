@@ -2217,7 +2217,9 @@ fn wrong_shape_cmd_sub(span: Span, segment: &str, family: CmdOrSub, app: AppSurf
 /// filled by [`Env::initial`]. This is the kernel
 /// counterpart of [`inject_dep_exports`] and binds at the same tiers:
 ///
-/// * `exposing (..)` binds every value member at [`Tier::Open`].
+/// * `exposing (..)` binds every value member, every exported type, and every
+///   constructor of an exported built-in union with a qualified home at
+///   [`Tier::Open`] — the same constructors `Type(..)` delivers.
 /// * `exposing (name, …)` binds each named value at [`Tier::Explicit`]. A
 ///   lowercase name that is not a value member of the module is
 ///   [`NameError::NameNotExposed`], never an invented binding.
@@ -2271,11 +2273,7 @@ fn bind_stdlib_kernel_import(
                 );
                 bind_expr(env, name, Tier::Open, origin, interner)?;
             }
-            for (name, export) in types.into_iter().flatten() {
-                let name = interner.intern(name)?;
-                let origin = kernel_type_origin(export, dep_path, import.name.span);
-                bind_type(env, name, Tier::Open, origin, interner)?;
-            }
+            bind_open_kernel_types(types, dep_path, import.name.span, env, interner)?;
         }
         src::Exposing::List(items) => {
             for item in items {
@@ -2339,6 +2337,45 @@ fn bind_stdlib_kernel_import(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Bind, at [`Tier::Open`], every type a kernel module exports and every
+/// constructor of an exported built-in union with a qualified home — the
+/// constructors an explicit `Type(..)` clause delivers.
+///
+/// # Errors
+/// The clash [`bind_type`] / [`bind_expr`] refuses; [`Diagnostic::CompilerBug`]
+/// if interning exhausts the interner or a union's home pools no constructors.
+fn bind_open_kernel_types(
+    types: Option<&BTreeMap<&'static str, KernelTypeExport>>,
+    dep_path: &[Symbol],
+    span: Span,
+    env: &mut Env,
+    interner: &mut Interner,
+) -> DResult<()> {
+    let mut ctors = Vec::new();
+    for (name, export) in types.into_iter().flatten() {
+        let name = interner.intern(name)?;
+        let origin = kernel_type_origin(export, dep_path, span);
+        bind_type(env, name, Tier::Open, origin, interner)?;
+        match export {
+            KernelTypeExport::Builtin(row) => {
+                ctors.extend(builtin_import_ctors(*row, env, interner)?);
+            }
+            KernelTypeExport::Alias(_) => {}
+        }
+    }
+    for ctor in ctors {
+        let name = ctor.name;
+        let origin = imported(
+            ExprTarget::Ctor(ctor.clone()),
+            ctor_identity(&ctor),
+            dep_path,
+            span,
+        );
+        bind_expr(env, name, Tier::Open, origin, interner)?;
     }
     Ok(())
 }

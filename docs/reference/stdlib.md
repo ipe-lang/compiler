@@ -2121,6 +2121,9 @@ Ipe.Html — HTML element builders.
 | `style` | (no summary) |
 | `title` | (no summary) |
 | `autocomplete` | (no summary) |
+| `Method` | (no summary) |
+| `method` | `method m` — the form's `method` attribute, rendered as `method="get"` or |
+| `action` | `action target` — the form's `action` attribute over a safe `LinkTarget` |
 | `checked` | (no summary) |
 | `disabled` | (no summary) |
 | `readonly` | (no summary) |

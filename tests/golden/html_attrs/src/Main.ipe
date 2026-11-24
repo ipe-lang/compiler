@@ -10,10 +10,12 @@ import Ipe.Task as Task exposing (Task)
 
 -- #76: Ipe.Html.Attributes family end-to-end golden. Exercises fixed-key
 -- string attrs (class/id/href/value/type_/placeholder), fixed-key bool attrs
--- (checked/disabled), the generic `attribute`/`boolAttribute` builders, and
+-- (checked/disabled), the typed form attributes (`method` / `action`), the
+-- generic `attribute`/`boolAttribute` builders, and
 -- the render-sink SECURITY gate (a hostile `attribute "onclick" ...` and an
 -- unsafe value must be neutralised, never reflected verbatim). The `href`
--- target is sealed ONCE at the boundary; an `Err` fails loud via `Task.fail`.
+-- target, shared by the form `action`, is sealed ONCE at the boundary; an `Err`
+-- fails loud via `Task.fail`.
 -- oracle_divergence = true: pure Rust-backend HTML; asserted by substring.
 main : Task Error ()
 main =
@@ -42,6 +44,8 @@ main =
                             , ariaValuenow 3
                             ]
                         , a [ href go ] [ text "go" ]
+                        , form [ method Post, action go ] []
+                        , form [ method Get ] []
                         ]
                     )
                 )

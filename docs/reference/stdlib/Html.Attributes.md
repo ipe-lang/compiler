@@ -169,6 +169,37 @@ title : String -> Attribute msg
 autocomplete : String -> Attribute msg
 ```
 
+## `Method`
+
+## `method`
+
+```ipe
+method : Method -> Attribute msg
+```
+
+`method m` — the form's `method` attribute, rendered as `method="get"` or
+`method="post"`.
+
+```ipe
+[ method Post ]
+```
+
+## `action`
+
+```ipe
+action : LinkTarget -> Attribute msg
+```
+
+`action target` — the form's `action` attribute over a safe `LinkTarget`
+(build one with `linkTarget`), the URL a submit navigates to. A bare `String`
+is a type error, so a `javascript:` or `data:` action cannot be written.
+
+```ipe
+import Ipe.Html as Html
+
+Result.map (\target -> Html.form [ method Post, action target ] []) (linkTarget "/signup")
+```
+
 ## `checked`
 
 ```ipe

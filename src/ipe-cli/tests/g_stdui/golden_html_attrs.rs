@@ -11,6 +11,8 @@
 //!   Ipê-keyword-avoidance fixup `type_` → `type`.
 //! * Fixed-key bool attrs render bare-when-true (`checked`) and omitted-when-
 //!   false (`disabled`).
+//! * The typed form attributes render `method="post"` / `method="get"` and an
+//!   `action` over a sealed `LinkTarget`.
 //! * The generic `attribute k v` / `boolAttribute k b` builders round-trip.
 //! * SECURITY (P1): the render sink escapes attribute VALUES (`<` → `&lt;`,
 //!   `"` → `&#34;`, `'` → `&#39;`) and DROPS a hostile event attribute name
@@ -96,6 +98,15 @@ fn html_attributes_family_renders_and_escapes() {
         !html.contains("q='z"),
         "html_attrs: raw single-quote must NOT reach the href\n--- actual ---\n{html}"
     );
+
+    // Typed form attributes: each `Method` renders its lowercase wire spelling,
+    // and `action` takes the same sealed `LinkTarget` an `href` does.
+    for needle in ["method=\"post\"", "method=\"get\"", "action=\"/x?q=%27z\""] {
+        assert!(
+            html.contains(needle),
+            "html_attrs: expected form `{needle}`\n--- actual ---\n{html}"
+        );
+    }
 
     // SECURITY: the hostile event-attribute name must be DROPPED at the sink.
     assert!(
