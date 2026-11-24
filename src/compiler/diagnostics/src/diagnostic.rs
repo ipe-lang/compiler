@@ -2803,6 +2803,40 @@ pub enum Diagnostic {
         /// The file the linker could not open, and how to fix it, ready for display.
         detail: String,
     },
+    /// The host is missing a toolchain component a build needs (`IPE-E0013`).
+    ///
+    /// Span-free: the defect is in the host environment, not in the user's
+    /// source. `kind` is matchable by callers that need to branch on which
+    /// component is missing; `detail` is the fully rendered remedy text.
+    HostToolchainMissing {
+        /// Which toolchain component is missing.
+        kind: ToolchainMissingKind,
+        /// The rendered remedy, ready for display.
+        detail: String,
+    },
+}
+
+/// Which host toolchain component a build found missing (`IPE-E0013`).
+///
+/// Kept distinct from `detail`'s free text so a caller (a health check, a
+/// test) can match the kind directly instead of re-parsing rendered prose.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ToolchainMissingKind {
+    /// No host linker was found at all.
+    LinkerMissing,
+    /// macOS: the Xcode Command Line Tools are not installed.
+    AppleDeveloperToolsMissing,
+    /// Windows: the MSVC build tools are not installed.
+    MsvcBuildToolsMissing,
+    /// Linux: a C library's development headers are not installed.
+    LibcDevFilesMissing,
+    /// No host C compiler was found at all.
+    CCompilerMissing,
+    /// A C compiler was found, but not one able to target another triple
+    /// (a musl or cross build).
+    CCompilerTargetsOther,
+    /// The target triple's Rust standard library is not installed.
+    TargetStdMissing,
 }
 
 /// Result alias used throughout the compiler.
@@ -3050,6 +3084,7 @@ impl Diagnostic {
             Self::RegistryUnreachable { .. } => IPE_E0001,
             Self::TargetDirUnlinkable { .. } => IPE_E0002,
             Self::HostLinkerCannotOpenInput { .. } => IPE_E0003,
+            Self::HostToolchainMissing { .. } => IPE_E0013,
         }
     }
 
@@ -3074,7 +3109,8 @@ impl Diagnostic {
             | Self::Consent { .. }
             | Self::RegistryUnreachable { .. }
             | Self::TargetDirUnlinkable { .. }
-            | Self::HostLinkerCannotOpenInput { .. } => Severity::Error,
+            | Self::HostLinkerCannotOpenInput { .. }
+            | Self::HostToolchainMissing { .. } => Severity::Error,
             Self::Lower { msg, .. } => match msg {
                 LowerError::RoutedAppMissingPageField { .. } => Severity::Warning,
                 _ => Severity::Error,
@@ -3127,7 +3163,8 @@ impl Diagnostic {
             | Self::Consent { .. }
             | Self::RegistryUnreachable { .. }
             | Self::TargetDirUnlinkable { .. }
-            | Self::HostLinkerCannotOpenInput { .. } => Span::DUMMY,
+            | Self::HostLinkerCannotOpenInput { .. }
+            | Self::HostToolchainMissing { .. } => Span::DUMMY,
         }
     }
 
@@ -3146,7 +3183,8 @@ impl Diagnostic {
             Self::CompilerBug { .. }
             | Self::RegistryUnreachable { .. }
             | Self::TargetDirUnlinkable { .. }
-            | Self::HostLinkerCannotOpenInput { .. } => Vec::new(),
+            | Self::HostLinkerCannotOpenInput { .. }
+            | Self::HostToolchainMissing { .. } => Vec::new(),
         }
     }
 }
@@ -3235,7 +3273,8 @@ const _: () = assert!(
         && matches!(IPE_S0004.family(), Family::Security)
         && matches!(IPE_E0001.family(), Family::Environment)
         && matches!(IPE_E0002.family(), Family::Environment)
-        && matches!(IPE_E0003.family(), Family::Environment),
+        && matches!(IPE_E0003.family(), Family::Environment)
+        && matches!(IPE_E0013.family(), Family::Environment),
     "diagnostic code family drift: a producer returns a code outside its family",
 );
 

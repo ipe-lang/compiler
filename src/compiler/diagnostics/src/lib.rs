@@ -31,9 +31,9 @@ pub use diagnostic::{
     MountPrefixFault, NUMBER_TYPES, NameError, NonWebShape, OpenerText, Owed, ParseError,
     ROUTABLE_METHOD_NAMES, RoutePatternDefect, RustNameFoldKind, SQL_PARAM_TYPES, SandboxError,
     SealRejection, SortedNames, SpanRole, StdlibReach, StoreEqAccessorDefect,
-    StoreSelectProjectionDefect, Suggestion, TokenKind, TripleStringDefect, TyDoc, TypeClass,
-    TypeDeclDefect, TypeError, TypeSizeOrigin, WidgetFileRefusal, WidgetPathEscape,
-    WidgetUnreadable, WildcardDependence,
+    StoreSelectProjectionDefect, Suggestion, TokenKind, ToolchainMissingKind, TripleStringDefect,
+    TyDoc, TypeClass, TypeDeclDefect, TypeError, TypeSizeOrigin, WidgetFileRefusal,
+    WidgetPathEscape, WidgetUnreadable, WildcardDependence,
 };
 pub use render::{DOC_HINT_CMD, plain_message, render, render_json, render_ty};
 pub use span::{Located, Span};
@@ -174,6 +174,10 @@ mod tests {
             },
             IPE_E0003 => Diagnostic::HostLinkerCannotOpenInput {
                 detail: "the linker could not open C:\\Users\\ana\\Público\\symbols.o".into(),
+            },
+            IPE_E0013 => Diagnostic::HostToolchainMissing {
+                kind: ToolchainMissingKind::TargetStdMissing,
+                detail: "no `std` for target `aarch64-unknown-linux-musl`: run `rustup target add aarch64-unknown-linux-musl`".into(),
             },
             // Consent
             IPE_S0001 => Diagnostic::Consent {

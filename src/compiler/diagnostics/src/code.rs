@@ -800,6 +800,9 @@ code! {
     IPE_E0011 = "IPE-E0011", "a file argument outside the project sources", "IPE-E0011";
     /// a build command was given a file where it takes a project directory
     IPE_E0012 = "IPE-E0012", "a build command given a file", "IPE-E0012";
+    /// the host is missing a toolchain component a build needs (a C compiler,
+    /// a linker, or a target's Rust standard library)
+    IPE_E0013 = "IPE-E0013", "host toolchain missing", "IPE-E0013";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)
