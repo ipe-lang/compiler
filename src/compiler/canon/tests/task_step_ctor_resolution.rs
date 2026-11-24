@@ -280,22 +280,11 @@ fn a_bare_get_under_both_open_imports_is_ambiguous() {
 
 #[test]
 fn a_local_get_outranks_an_open_kernel_import() {
-    let (result, interner) = canonicalise_main(
-        &[],
+    let local = kernel_get_home_of(
         "module Main exposing (main)\n\n\
          import Ipe.Http exposing (..)\n\n\
          type Verb = Get\n\n\
          main = Get\n",
     );
-    let Ok(module) = &result else {
-        assert!(
-            result.is_ok(),
-            "a local `Get` must canonicalise, got {result:?}"
-        );
-        return;
-    };
-    assert_eq!(
-        main_ctor_home(module, "Get", &interner).as_deref(),
-        Some("Main")
-    );
+    assert_eq!(local.as_deref(), Some("Main"));
 }
