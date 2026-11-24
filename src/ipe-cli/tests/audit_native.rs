@@ -1547,6 +1547,84 @@ mod real_jail {
         );
     }
 
+    /// A jailed Database app opens its default `ipe.db` in the working tree.
+    ///
+    /// The launcher attests the tree it proved private on the host, so the
+    /// app's ownership walk stops there instead of refusing the overflow-owned
+    /// directories above it; the same app in a world-writable tree is refused
+    /// with the fix text and creates nothing.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn a_jailed_app_opens_its_default_database() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if e2e_tools().is_none() {
+            return;
+        }
+        let _runtime = e2e_support::require_runtime();
+        let base = non_tmp_base("release-run-db");
+        let pkg = base.join("pkg");
+        std::fs::create_dir_all(pkg.join("src")).expect("pkg src");
+        std::fs::write(
+            pkg.join("package.ipe"),
+            "module Package exposing (package)\n\n\npackage =\n\
+             \x20   { name = \"releasedb\"\n\
+             \x20   , version = \"0.1.0\"\n\
+             \x20   , capabilities = { declares = [ Database ], accepts = [] }\n\
+             \x20   }\n",
+        )
+        .expect("package.ipe");
+        std::fs::write(
+            pkg.join("src").join("Main.ipe"),
+            "module Main exposing (main)\n\n\
+             import Ipe.Db as Db\n\
+             import Ipe.Io as Io\n\
+             import Ipe.Task as Task\n\n\n\
+             main =\n\
+             \x20   Task.andThen (\\_ -> Io.println \"opened\") (Db.connect ())\n",
+        )
+        .expect("Main.ipe");
+        let run = || {
+            let mut cmd = std::process::Command::new(super::support::ipe_bin());
+            cmd.arg("release")
+                .arg("run")
+                .arg(&pkg)
+                .arg("--out")
+                .arg(base.join("out"))
+                .current_dir(&pkg)
+                .env_remove("DATABASE_URL");
+            let out = super::run_child(cmd).expect("run ipe release run");
+            (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            )
+        };
+        let store = pkg.join("ipe.db");
+
+        let (ok, stdout, stderr) = run();
+        let created = store.is_file();
+        assert!(
+            ok && stdout.contains("opened") && created,
+            "a jailed app opens <tree>/ipe.db:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+
+        let _ = std::fs::remove_file(&store);
+        std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o777))
+            .expect("open the tree to every user");
+        let (_, stdout, stderr) = run();
+        let created = store.exists();
+        let _ = std::fs::set_permissions(&pkg, std::fs::Permissions::from_mode(0o755));
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            !stdout.contains("opened") && !created,
+            "a world-writable tree is never attested:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("holding the SQLite file is writable by other users"),
+            "the refusal carries the fix text:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
     /// A built artifact directory runs verified and jailed.
     ///
     /// A directory holding no verifiable bundle refuses before anything runs.

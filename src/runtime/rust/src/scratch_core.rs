@@ -76,6 +76,9 @@ const FALLBACK_LABEL: &str = "scratch";
 /// The variable naming the current user's profile directory on Windows.
 pub const PROFILE_VAR: &str = scratch_host::PROFILE_VAR;
 
+/// The variable a jail launcher sets to the roots it proved trusted on the host.
+pub const JAIL_TRUSTED_ROOTS_VAR: &str = scratch_host::JAIL_TRUSTED_ROOTS_VAR;
+
 /// Longest leaf name, in bytes, one filesystem component may carry.
 const MAX_LEAF_BYTES: usize = 255;
 
@@ -748,6 +751,52 @@ impl JailAttestation {
     pub fn covers(&self, id: DirId) -> bool {
         self.0.contains(&id)
     }
+
+    /// The value [`JailAttestation::parse`] reads back, or `None` when no root is attested.
+    #[must_use]
+    pub fn render(&self) -> Option<String> {
+        if self.0.is_empty() {
+            return None;
+        }
+        let pairs: Vec<String> = self
+            .0
+            .iter()
+            .map(|id| format!("{}:{}", id.dev, id.ino))
+            .collect();
+        Some(pairs.join(","))
+    }
+}
+
+/// The attestation a launcher grants: each root whose whole chain passes, judged with real ids.
+///
+/// Each root is a canonical directory the jail binds at the same path. Its
+/// chain is judged to `/` with no attestation, the root itself taking
+/// [`holding_verdict`]; a root that fails is left out. Roots past
+/// [`JAIL_ATTESTATION_MAX_ROOTS`] are never attested.
+pub fn attest_roots<F>(
+    roots: &[&Path],
+    who: Identity,
+    posture: GroupWritePosture,
+    mut facts_of: F,
+) -> JailAttestation
+where
+    F: FnMut(&Path) -> io::Result<ChainEntry>,
+{
+    let mut attested = Vec::new();
+    for root in roots.iter().take(JAIL_ATTESTATION_MAX_ROOTS) {
+        let mut root_id = None;
+        let proven = judge_chain(root, who, posture, &JailAttestation::none(), |dir| {
+            let entry = facts_of(dir)?;
+            root_id.get_or_insert(entry.id);
+            Ok(entry)
+        });
+        if let (Ok(()), Some(id)) = (proven, root_id)
+            && !attested.contains(&id)
+        {
+            attested.push(id);
+        }
+    }
+    JailAttestation(attested)
 }
 
 /// One `dev:ino` pair of plain decimal digits, or `None`.
@@ -2076,13 +2125,15 @@ mod tests {
             posture: GroupWritePosture,
             attested: &JailAttestation,
         ) -> Result<(), ChainRefusal> {
-            judge_chain(Path::new(dir), who, posture, attested, |p| {
-                self.0
-                    .iter()
-                    .find(|(known, _)| known == p)
-                    .map(|(_, entry)| *entry)
-                    .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
-            })
+            judge_chain(Path::new(dir), who, posture, attested, |p| self.read(p))
+        }
+
+        fn read(&self, path: &Path) -> io::Result<ChainEntry> {
+            self.0
+                .iter()
+                .find(|(known, _)| known == path)
+                .map(|(_, entry)| *entry)
+                .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))
         }
     }
 
@@ -2304,6 +2355,103 @@ mod tests {
             );
         }
         assert!(!JailAttestation::none().covers(id));
+    }
+
+    /// The host attests a root only when its whole chain passes with real ids.
+    ///
+    /// A world-writable root, a root under another user's directory, and a
+    /// root that cannot be read are each left out; the passing root's
+    /// rendered value reads back to the same attestation.
+    #[test]
+    fn the_host_attests_only_roots_whose_chain_passes() {
+        let chain = Chain::of(&[
+            ("/home/me/tree", dir(1000, 1000, 0o755)),
+            ("/home/me/open", dir(1000, 1000, 0o777)),
+            ("/home/me", dir(1000, 1000, 0o755)),
+            ("/home", dir(0, 0, 0o755)),
+            ("/srv/theirs/tree", dir(1000, 1000, 0o700)),
+            ("/srv/theirs", dir(2000, 2000, 0o755)),
+            ("/srv", dir(0, 0, 0o755)),
+            ("/", dir(0, 0, 0o755)),
+        ]);
+        let (Some(tree), Some(open), Some(theirs)) = (
+            chain.id_of("/home/me/tree"),
+            chain.id_of("/home/me/open"),
+            chain.id_of("/srv/theirs/tree"),
+        ) else {
+            assert!(
+                chain.id_of("/home/me/tree").is_some(),
+                "fixture names its roots"
+            );
+            return;
+        };
+        let roots = [
+            Path::new("/home/me/open"),
+            Path::new("/srv/theirs/tree"),
+            Path::new("/home/me/gone"),
+            Path::new("/home/me/tree"),
+        ];
+        let attested = attest_roots(&roots, ME, GroupWritePosture::PrivateGroup, |p| {
+            chain.read(p)
+        });
+        assert!(attested.covers(tree), "{attested:?}");
+        assert!(
+            !attested.covers(open),
+            "a world-writable root is never attested"
+        );
+        assert!(
+            !attested.covers(theirs),
+            "a root under another user's directory is never attested"
+        );
+        let Some(rendered) = attested.render() else {
+            assert!(attested.render().is_some(), "a passing root renders");
+            return;
+        };
+        assert_eq!(rendered, format!("{}:{}", tree.dev, tree.ino));
+        assert_eq!(JailAttestation::parse(&rendered), attested);
+        let nothing = attest_roots(
+            &[Path::new("/home/me/open")],
+            ME,
+            GroupWritePosture::PrivateGroup,
+            |p| chain.read(p),
+        );
+        assert_eq!(nothing, JailAttestation::none());
+        assert_eq!(nothing.render(), None, "no root renders no value");
+    }
+
+    /// Roots past the attestation ceiling are never attested, and a repeated root is named once.
+    #[test]
+    fn the_host_attests_at_most_the_ceiling_of_roots() {
+        let names = ["/r1", "/r2", "/r3", "/r4", "/r5"];
+        let mut entries: Vec<(&str, EntryFacts)> =
+            names.iter().map(|n| (*n, dir(1000, 1000, 0o700))).collect();
+        entries.push(("/", dir(0, 0, 0o755)));
+        let chain = Chain::of(&entries);
+        let roots: Vec<&Path> = names.iter().map(Path::new).collect();
+        let attested = attest_roots(&roots, ME, GroupWritePosture::PrivateGroup, |p| {
+            chain.read(p)
+        });
+        let covered = names
+            .iter()
+            .filter(|n| chain.id_of(n).is_some_and(|id| attested.covers(id)))
+            .count();
+        assert_eq!(covered, JAIL_ATTESTATION_MAX_ROOTS);
+        assert!(
+            chain.id_of("/r5").is_some_and(|id| !attested.covers(id)),
+            "the root past the ceiling is left out"
+        );
+        let Some(rendered) = attested.render() else {
+            assert!(attested.render().is_some(), "passing roots render");
+            return;
+        };
+        assert_eq!(JailAttestation::parse(&rendered), attested, "{rendered}");
+        let twice = attest_roots(
+            &[Path::new("/r1"), Path::new("/r1")],
+            ME,
+            GroupWritePosture::PrivateGroup,
+            |p| chain.read(p),
+        );
+        assert_eq!(twice.render().map(|v| v.matches(':').count()), Some(1));
     }
 
     /// The release posture grants group write only to a user-private group, gid equal to uid.

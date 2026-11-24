@@ -253,7 +253,7 @@ pub(crate) fn connect_refusal<E: crate::FromIpeError>(
             E::from_ipe_error(IpeError::unavailable(format!("{context}{refused}")))
         }
         DbConnectError::UntrustedLocation(location) => {
-            E::from_ipe_error(location.into_error(format!("{context}{refused}")))
+            E::from_ipe_error(location.error_with(format!("{context}{refused}")))
         }
     }
 }
@@ -4057,7 +4057,7 @@ impl DbPathRefusal {
     ///
     /// A malformed name is the caller's input error; a missing worker is
     /// unavailable; every location an attacker could reach is permission denied.
-    fn into_error(&self, message: String) -> IpeError {
+    fn error_with(&self, message: String) -> IpeError {
         match self {
             Self::FileUriName | Self::NoFileName => IpeError::invalid_input(message),
             Self::ProofUnavailable => IpeError::unavailable(message),
@@ -4177,6 +4177,21 @@ impl TrustedDbPath {
     ///
     /// The [`DbPathRefusal`] naming the first condition that fails.
     pub fn prove(path: &std::path::Path) -> Result<Self, DbPathRefusal> {
+        Self::prove_attested(path, crate::env_registry::data::jail_attestation())
+    }
+
+    /// Prove `path` as [`TrustedDbPath::prove`] does, the chain walk stopping at a root `attested` names.
+    ///
+    /// An attested root still takes its own verdict before the walk stops
+    /// there; the file and sibling checks never consult `attested`.
+    ///
+    /// # Errors
+    ///
+    /// The [`DbPathRefusal`] naming the first condition that fails.
+    pub fn prove_attested(
+        path: &std::path::Path,
+        attested: &crate::scratch_core::JailAttestation,
+    ) -> Result<Self, DbPathRefusal> {
         let name = path.file_name().ok_or(DbPathRefusal::NoFileName)?;
         let dir = path
             .parent()
@@ -4191,7 +4206,7 @@ impl TrustedDbPath {
                 }
             }
         })?;
-        judge_holding_dir(&canonical_dir)?;
+        judge_holding_dir(&canonical_dir, attested)?;
         let file = canonical_dir.join(name);
         judge_final_file(&file)?;
         for sibling in SqliteSibling::ALL {
@@ -4220,17 +4235,21 @@ impl TrustedDbPath {
     }
 }
 
-/// Judge `canonical_dir` and every directory above it to the filesystem root.
+/// Judge `canonical_dir` and every directory above it to the filesystem root, or to a root `attested` names.
 ///
-/// The runtime names no jail-attested root yet, so every chain is judged whole.
+/// Inside the run jail, directories above the bind roots read as the
+/// overflow id; the launcher names the roots it proved with real ids.
 #[cfg(unix)]
-fn judge_holding_dir(canonical_dir: &std::path::Path) -> Result<(), DbPathRefusal> {
-    use crate::scratch_core::{JailAttestation, chain_entry, current_identity, judge_chain};
+fn judge_holding_dir(
+    canonical_dir: &std::path::Path,
+    attested: &crate::scratch_core::JailAttestation,
+) -> Result<(), DbPathRefusal> {
+    use crate::scratch_core::{chain_entry, current_identity, judge_chain};
     judge_chain(
         canonical_dir,
         current_identity(),
         DB_POSTURE,
-        &JailAttestation::none(),
+        attested,
         chain_entry,
     )
     .map_err(DbPathRefusal::of_chain)
@@ -4239,9 +4258,13 @@ fn judge_holding_dir(canonical_dir: &std::path::Path) -> Result<(), DbPathRefusa
 /// Require `canonical_dir` inside the user's profile, the only tree proven private off Unix.
 ///
 /// The directory is already resolved, so a link or junction on its path is
-/// judged at its target.
+/// judged at its target. No jail attests a root off Unix, so `_attested` is
+/// never consulted.
 #[cfg(not(unix))]
-fn judge_holding_dir(canonical_dir: &std::path::Path) -> Result<(), DbPathRefusal> {
+fn judge_holding_dir(
+    canonical_dir: &std::path::Path,
+    _attested: &crate::scratch_core::JailAttestation,
+) -> Result<(), DbPathRefusal> {
     let home = crate::scratch_host::profile_dir();
     let profile = home.as_ref().map_err(|refusal| *refusal);
     crate::scratch_core::verify_root_within_profile(canonical_dir, profile)
@@ -18217,6 +18240,90 @@ mod trusted_db_path_tests {
     fn mkdir(path: &Path, mode: u32) {
         std::fs::create_dir(path).expect("mkdir");
         chmod(path, mode);
+    }
+
+    /// The attestation naming `dir`'s real `dev:ino`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a test whose fixture directory cannot be read cannot run
+    fn attesting(dir: &Path) -> crate::scratch_core::JailAttestation {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(dir).expect("fixture metadata");
+        crate::scratch_core::JailAttestation::parse(&format!("{}:{}", meta.dev(), meta.ino()))
+    }
+
+    /// An attested root cuts the walk above it, but only after it passes its
+    /// own verdict, and never relaxes the holding, file or sibling checks.
+    #[cfg(unix)]
+    #[test]
+    fn a_jail_attestation_cuts_only_the_walk_above_a_passing_root() {
+        let dir = private_dir("trusted-db-attested");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let root = shared.join("root");
+        mkdir(&root, 0o700);
+        let attested = attesting(&root);
+        let none = crate::scratch_core::JailAttestation::none();
+
+        let whole = TrustedDbPath::prove_attested(&root.join("app.db"), &none);
+        assert!(
+            matches!(
+                whole,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Ancestor,
+                    ..
+                })
+            ),
+            "unattested, the shared ancestor refuses: {whole:?}"
+        );
+        let cut = TrustedDbPath::prove_attested(&root.join("app.db"), &attested);
+        assert!(cut.is_ok(), "the attested root cuts the walk: {cut:?}");
+
+        let open = root.join("open");
+        mkdir(&open, 0o777);
+        let holding = TrustedDbPath::prove_attested(&open.join("app.db"), &attested);
+        assert!(
+            matches!(
+                holding,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    cause: ScratchRefusal::WritableByOthers,
+                    ..
+                })
+            ),
+            "a shared holding dir under an attested root: {holding:?}"
+        );
+
+        let file = root.join("shared.db");
+        let _ = std::fs::write(&file, b"");
+        chmod(&file, 0o666);
+        let final_file = TrustedDbPath::prove_attested(&file, &attested);
+        assert!(
+            matches!(final_file, Err(DbPathRefusal::FinalUntrusted { .. })),
+            "a shared file under an attested root: {final_file:?}"
+        );
+
+        let _ =
+            std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("linked.db-wal"));
+        let sibling = TrustedDbPath::prove_attested(&root.join("linked.db"), &attested);
+        assert!(
+            matches!(sibling, Err(DbPathRefusal::SiblingIsSymlink { .. })),
+            "a linked sibling under an attested root: {sibling:?}"
+        );
+
+        chmod(&root, 0o777);
+        let failing = TrustedDbPath::prove_attested(&root.join("app.db"), &attested);
+        chmod(&root, 0o700);
+        assert!(
+            matches!(
+                failing,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    cause: ScratchRefusal::WritableByOthers,
+                    ..
+                })
+            ),
+            "an attested root that fails its own verdict is no cut: {failing:?}"
+        );
     }
 
     /// The location `url` classifies to.

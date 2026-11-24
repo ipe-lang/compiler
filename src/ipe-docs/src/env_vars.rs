@@ -1284,6 +1284,10 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     // dev console proxy on the child they spawn (never operator-set); it
     // outranks the operator port vars and is never inherited by `Process.*` children.
     "IPE_INTERNAL_LISTEN_PORT",
+    // Run-jail-internal attestation — set by the `ipe release run` jail launcher
+    // on the jailed app to the bind roots it proved trusted on the host (never
+    // operator-set). Read by the SQLite database-path trust walk.
+    "IPE_JAIL_TRUSTED_ROOTS",
     // Dev-loop-internal control-channel port — allocated and injected by
     // `ipe dev watch` into the spawned child (never operator-set), like the relocation
     // port above. Present only in a dev-loop (web/debugger) build.

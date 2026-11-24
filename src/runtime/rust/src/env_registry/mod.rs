@@ -667,6 +667,55 @@ impl RetiredKey {
     }
 }
 
+/// A variable a jail launcher sets to the directories it proved trusted on the host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JailRootsKey(EnvEntry);
+
+impl JailRootsKey {
+    /// The attestation variable `name`; while it is unset no root is attested.
+    #[must_use]
+    pub const fn new(name: &'static str, doc: Doc) -> Self {
+        Self(EnvEntry {
+            name,
+            grammar: Grammar::JailRoots,
+            default: DefaultValue::Text("unset (no root is attested)"),
+            doc,
+        })
+    }
+
+    /// The registry entry.
+    #[must_use]
+    pub const fn entry(self) -> EnvEntry {
+        self.0
+    }
+
+    /// The variable's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0.name
+    }
+
+    /// Parses a raw lookup of this variable.
+    ///
+    /// An unset, non-Unicode, or malformed value attests nothing.
+    #[must_use]
+    pub fn parse(
+        self,
+        raw: Result<String, std::env::VarError>,
+    ) -> crate::scratch_core::JailAttestation {
+        raw.map_or_else(
+            |_| crate::scratch_core::JailAttestation::none(),
+            |value| crate::scratch_core::JailAttestation::parse(&value),
+        )
+    }
+
+    /// Reads and parses the live value (overlay first).
+    #[must_use]
+    pub fn read(self) -> crate::scratch_core::JailAttestation {
+        self.parse(crate::system::read_env_var(self.0.name))
+    }
+}
+
 /// Every subsystem's entries, in reference order.
 const SUBSYSTEMS: [&[EnvEntry]; 7] = [
     listen::ENTRIES,
@@ -730,6 +779,7 @@ pub fn startup_check() -> Result<(), Vec<EnvRefusal>> {
             refusals.push(refusal);
         }
         security::fix_posture();
+        data::fix_jail_attestation();
         crate::telemetry::fix_deployment_posture();
         crate::telemetry::fix_frame_ancestors();
         #[cfg(feature = "web")]

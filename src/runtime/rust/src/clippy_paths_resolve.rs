@@ -132,7 +132,7 @@ const _SQLX_SQLITE: () = {
     #[expect(clippy::disallowed_methods)]
     let _: fn(
         ::sqlx::sqlite::SqliteConnectOptions,
-        &str,
+        &'static str,
     ) -> ::sqlx::sqlite::SqliteConnectOptions = ::sqlx::sqlite::SqliteConnectOptions::filename;
 };
 

@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use ipe_diagnostics::{Code, Diagnostic as SharedDiag, IPE_F4413, SandboxError};
 use ipe_kernels::Capability;
 
+use crate::scratch::{JAIL_TRUSTED_ROOTS_VAR, JailAttestation};
 use crate::{HostTool, JailMounts, JailPathError, ToolPath};
 
 /// Stamp `$item` with the `#[cfg(...)]` for the targets that HAVE a real run
@@ -469,8 +470,10 @@ impl RunJailTools {
 /// payload jail argv without its filter is unrepresentable.
 ///
 /// The env is scrubbed with `--clearenv`; only the fixed minimal allowlist
-/// (`PATH`, `TMPDIR`, `LANG`) plus the profile's `env_allowlist` re-enter. There
-/// is NO shell token anywhere in the result.
+/// (`PATH`, `TMPDIR`, `LANG`) plus the profile's `env_allowlist` re-enter, and
+/// last the launcher's own [`JAIL_TRUSTED_ROOTS_VAR`]: the bind roots it proved
+/// trusted on the host, never a host or allowlisted value. There is NO shell
+/// token anywhere in the result.
 ///
 /// `scope` is the proof that the tools it carries jail with a process cap
 /// counting only the jail's own tasks; the argv names those tools.
@@ -552,6 +555,31 @@ pub fn run_jail_argv_with_delivery<'fd>(
         host_env,
         &payload,
     )
+}
+
+/// The jail's bind roots whose chains pass on the host, judged with real ids.
+///
+/// The working tree and the scoped tempdir are canonical and bound at the same
+/// path, and a bind keeps each directory's `(dev, ino)`, so the jailed app can
+/// stop its ownership walk at a root named here once that root re-passes its
+/// own verdict inside the jail. The host judges with the strictest posture.
+#[cfg(unix)]
+fn host_attested_roots(mounts: &JailMounts) -> JailAttestation {
+    crate::scratch::attest_roots(
+        &[
+            mounts.working_tree().as_path(),
+            mounts.scoped_tmp().as_path(),
+        ],
+        crate::scratch::current_identity(),
+        crate::scratch::GroupWritePosture::PrivateGroup,
+        crate::scratch::chain_entry,
+    )
+}
+
+/// No root is attested where the jail is not a Linux user namespace.
+#[cfg(not(unix))]
+fn host_attested_roots(_: &JailMounts) -> JailAttestation {
+    JailAttestation::none()
 }
 
 /// The one run-jail argv builder behind [`run_jail_argv`] and
@@ -657,10 +685,26 @@ fn jail_argv_unproven<'fd>(
         argv.push(lang);
     }
     for name in &profile.env_allowlist {
+        if name == JAIL_TRUSTED_ROOTS_VAR {
+            continue;
+        }
         if let Some(value) = host_env(name) {
             argv.push("--setenv".into());
             argv.push(name.into());
             argv.push(value);
+        }
+    }
+    // The bind roots the host proved trusted with real ids, set last so no
+    // host or allowlisted value can stand in for the launcher's own proof.
+    match host_attested_roots(mounts).render() {
+        Some(roots) => {
+            argv.push("--setenv".into());
+            argv.push(JAIL_TRUSTED_ROOTS_VAR.into());
+            argv.push(roots.into());
+        }
+        None => {
+            argv.push("--unsetenv".into());
+            argv.push(JAIL_TRUSTED_ROOTS_VAR.into());
         }
     }
 
@@ -1969,6 +2013,105 @@ mod tests {
         assert!(s.contains("--setenv DATABASE_URL postgres://x"), "{s}");
         // An absent named var is simply not re-exported.
         assert!(!s.contains("ABSENT"), "{s}");
+    }
+
+    /// The env operations an argv applies to `name`, in order.
+    fn env_ops_on(argv: &[String], name: &str) -> Vec<Vec<String>> {
+        let mut ops = Vec::new();
+        for (i, arg) in argv.iter().enumerate() {
+            let width = match arg.as_str() {
+                "--setenv" => 3,
+                "--unsetenv" => 2,
+                _ => continue,
+            };
+            if let Some(op) = argv.get(i..i + width)
+                && op.get(1).is_some_and(|n| n == name)
+            {
+                ops.push(op.to_vec());
+            }
+        }
+        ops
+    }
+
+    /// A bind root whose host chain passes is attested by its real `dev:ino`; a
+    /// world-writable or missing one is not, and no host or allowlisted value
+    /// can stand in for the launcher's own, which comes after the allowlist.
+    #[cfg(unix)]
+    #[test]
+    fn the_jail_attests_only_trusted_bind_roots() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let base_dir = crate::test_dir::TestDir::new("run-jail-attest").expect("test dir");
+        let tree = base_dir.path().join("tree");
+        std::fs::create_dir_all(&tree).expect("fixture dir");
+        let chmod = |mode: u32| {
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(mode))
+                .expect("chmod the tree");
+        };
+        chmod(0o700);
+        let meta = std::fs::symlink_metadata(&tree).expect("tree metadata");
+        let tree_id = format!("{}:{}", meta.dev(), meta.ino());
+        let profile = SandboxProfile {
+            filesystem: FilesystemScope::WorkingTreeReadWrite,
+            env_allowlist: vec![JAIL_TRUSTED_ROOTS_VAR.to_owned(), "LANG".to_owned()],
+            ..SandboxProfile::maximally_isolated()
+        };
+        let mounts = mounts_of(
+            CanonicalPath::assumed("/nonexistent-ipe-scoped-tmp"),
+            CanonicalPath::resolve(&tree).expect("fixture path"),
+            Vec::new(),
+            HomeMasks::unmasked(),
+        );
+        let forged = "1:1,2:2";
+        let host = |name: &str| (name == JAIL_TRUSTED_ROOTS_VAR).then(|| OsString::from(forged));
+        let argv_of = || -> Vec<String> {
+            fd_free_argv(&scope(), &profile, &mounts, &host, &[OsString::from("app")])
+                .expect("the argv builds")
+                .args()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let trusted = argv_of();
+        assert_eq!(
+            env_ops_on(&trusted, JAIL_TRUSTED_ROOTS_VAR),
+            vec![vec![
+                "--setenv".to_owned(),
+                JAIL_TRUSTED_ROOTS_VAR.to_owned(),
+                tree_id,
+            ]],
+            "only the private tree is attested, never the missing tempdir: {trusted:?}"
+        );
+        assert!(
+            !trusted.iter().any(|a| a.contains(forged)),
+            "a host value never re-enters: {trusted:?}"
+        );
+        let last_env_op = trusted
+            .iter()
+            .rposition(|a| a == "--setenv" || a == "--unsetenv");
+        let launcher_op = trusted
+            .windows(2)
+            .rposition(|w| w == ["--setenv", JAIL_TRUSTED_ROOTS_VAR]);
+        assert_eq!(
+            launcher_op, last_env_op,
+            "the launcher's value wins: {trusted:?}"
+        );
+
+        chmod(0o777);
+        let open = argv_of();
+        chmod(0o700);
+        assert_eq!(
+            env_ops_on(&open, JAIL_TRUSTED_ROOTS_VAR),
+            vec![vec![
+                "--unsetenv".to_owned(),
+                JAIL_TRUSTED_ROOTS_VAR.to_owned(),
+            ]],
+            "a world-writable tree is not attested: {open:?}"
+        );
+        assert!(
+            !open.iter().any(|a| a.contains(forged)),
+            "a host value never re-enters: {open:?}"
+        );
     }
 
     #[test]
