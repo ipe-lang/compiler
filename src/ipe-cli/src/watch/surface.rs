@@ -229,6 +229,15 @@ impl ChildStdin {
     }
 }
 
+/// A dev child that exited on its own, as the watch reaped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildExit {
+    /// How the child exited.
+    pub status: ExitStatus,
+    /// Whether the child owned the terminal when it exited.
+    pub hand_over: TerminalHandOver,
+}
+
 /// Records the terminal's state and puts it back.
 pub trait TerminalRestore {
     /// Record the terminal's state, once, before the first child that owns it.
@@ -316,6 +325,7 @@ impl<R: TerminalRestore> TerminalLease<R> {
     }
 
     /// Whether a child owns the terminal.
+    #[cfg(all(test, unix))]
     pub const fn is_held(&self) -> bool {
         self.owner.get().is_some()
     }
@@ -361,26 +371,31 @@ impl<R: TerminalRestore> TerminalLease<R> {
         }
     }
 
-    /// The status of an owner that exited on its own, after the lease is released.
+    /// The exit of the running child when it exited on its own, whatever its surface.
     ///
-    /// `supervisor` then holds no running child and keeps the owner's binary as
-    /// its last good one, so the next save starts it again.
-    pub fn reap_exited_owner(&self, supervisor: &mut SupervisorState) -> Option<ExitStatus> {
+    /// `supervisor` then holds no running child and keeps the child's binary as
+    /// its last good one, so the next save starts it again; when the child owned
+    /// the terminal, the lease is released first.
+    pub fn reap_exited_child(&self, supervisor: &mut SupervisorState) -> Option<ChildExit> {
         let SupervisorState::Running { child, artifact } = supervisor else {
             return None;
         };
-        if self.owner.get() != Some(child.id()) {
-            return None;
-        }
         let Ok(Some(status)) = child.try_wait() else {
             return None;
+        };
+        let hand_over = if self.owner.get() == Some(child.id()) {
+            TerminalHandOver::Owns
+        } else {
+            TerminalHandOver::None
         };
         let last_good = artifact.clone();
         *supervisor = SupervisorState::NotRunning {
             last_good: Some(last_good),
         };
-        self.release();
-        Some(status)
+        if hand_over == TerminalHandOver::Owns {
+            self.release();
+        }
+        Some(ChildExit { status, hand_over })
     }
 
     /// Restore the terminal when a child held it, then write the watch output held meanwhile.
