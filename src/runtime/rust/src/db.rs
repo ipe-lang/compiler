@@ -1421,6 +1421,17 @@ impl SqliteLocation {
             return Ok(Self::Memory(MemorySharing::Private));
         }
         if mode_memory || database == "file::memory:" {
+            // SQLite reads a `file:` name's own `?mode=` over the in-memory
+            // open flag, so a decoded name carrying a query would open a disk
+            // file no proof ever judged.
+            if options
+                .get_filename()
+                .as_os_str()
+                .as_encoded_bytes()
+                .contains(&b'?')
+            {
+                return Err(DbConnectError::InvalidUrl);
+            }
             return Ok(Self::Memory(if cache_shared {
                 MemorySharing::SharedCache
             } else {
@@ -2121,6 +2132,7 @@ impl PgTransport {
     }
 
     /// Whether the driver may negotiate TLS under this posture.
+    #[cfg(unix)]
     const fn negotiates_tls(self) -> bool {
         use crate::dsn::UnverifiedSslMode;
         match self {
@@ -18223,9 +18235,11 @@ mod like_prefix_tests {
 #[cfg(test)]
 mod trusted_db_path_tests {
     use super::{
-        DbConnectError, DbPathRefusal, DbUrl, MemorySharing, SqliteLocation, SqliteSibling,
-        TrustedDbPath, VettedPool, file_uri_path,
+        DbConnectError, DbPathRefusal, DbUrl, MemorySharing, SqliteLocation, TrustedDbPath,
+        file_uri_path,
     };
+    #[cfg(unix)]
+    use super::{SqliteSibling, VettedPool};
     use crate::scratch_core::{ChainRole, ScratchDir, ScratchRefusal};
     use std::path::{Path, PathBuf};
 
@@ -18648,6 +18662,38 @@ mod trusted_db_path_tests {
             location("sqlite://data/app.db?mode=rwc"),
             Ok(SqliteLocation::File(PathBuf::from("data/app.db")))
         );
+    }
+
+    /// SQLite reads a `file:` name's own `?mode=` over the in-memory open flag,
+    /// so an in-memory name whose decoded text carries a query would reopen a
+    /// disk file no proof judged: such a URL is refused, and nothing is created.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_db_path_refuses_a_memory_name_that_carries_a_query() {
+        let dir = private_dir("trusted-db-memory-query");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let base = shared.display();
+        for url in [
+            format!("sqlite:file:{base}/evil%3Fmode=rwc?mode=memory"),
+            format!("sqlite:file%3A{base}/evil%3Fmode=rwc?mode=memory"),
+            format!("sqlite:file:{base}/evil%3Fmode=rw?mode=memory&cache=shared"),
+        ] {
+            let parsed = DbUrl::parse(&url);
+            if let Ok(url) = &parsed
+                && let Ok(pool) = VettedPool::<sqlx::Sqlite>::connect(url, 1).await
+            {
+                pool.into_pool().close().await;
+            }
+            assert!(
+                !shared.join("evil").exists(),
+                "an in-memory URL opened a disk file unproven: {url}"
+            );
+            assert!(
+                matches!(parsed, Err(DbConnectError::InvalidUrl)),
+                "an in-memory name with a query parses: {url}"
+            );
+        }
     }
 
     #[test]

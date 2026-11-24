@@ -1758,7 +1758,7 @@ mod pinned_relay {
 /// that needs one is refused instead.
 #[cfg(all(feature = "db", not(unix)))]
 #[derive(Debug)]
-pub(crate) enum PinnedRelay {}
+pub enum PinnedRelay {}
 
 #[cfg(all(feature = "db", not(unix)))]
 impl PinnedRelay {

@@ -1758,6 +1758,7 @@ mod tests {
     }
 
     /// Every bwrap mount op before the payload separator, as `(op, target)` in argv order.
+    #[cfg(unix)]
     fn mount_targets(argv: &[String]) -> Vec<(String, String)> {
         let mut ops = Vec::new();
         let mut rest = argv.iter();
@@ -2010,6 +2011,7 @@ mod tests {
     }
 
     /// The env operations an argv applies to `name`, in order.
+    #[cfg(unix)]
     fn env_ops_on(argv: &[String], name: &str) -> Vec<Vec<String>> {
         let mut ops = Vec::new();
         for (i, arg) in argv.iter().enumerate() {
