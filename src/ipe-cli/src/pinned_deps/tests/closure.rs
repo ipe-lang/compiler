@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use semver::{Version, VersionReq};
 use syn::visit::{self, Visit};
 
-use super::{CrateName, PinnedSet, pinned_set};
+use super::super::{CrateName, PinnedSet, pinned_set};
 
 /// The dependency tables a manifest (or one of its `[target.*]` tables) can carry.
 const DEP_TABLES: &[&str] = &["dependencies", "dev-dependencies", "build-dependencies"];
@@ -478,7 +478,7 @@ fn the_embedded_set_holds_the_emitter_closure() {
 
 /// The small pinned set of the parent tests: `serde_json` 1.0.140 and `itoa` 1.0.15.
 fn small_set() -> Option<PinnedSet> {
-    PinnedSet::from_seed(super::tests::SET).ok()
+    PinnedSet::from_seed(super::SET).ok()
 }
 
 /// The gaps of one emitted manifest `emitted` against one member manifest `member`.
