@@ -13,6 +13,7 @@ assumed-tool-path = []
 [dependencies]
 ipe_diagnostics = { path = "../diagnostics" }
 ipe_kernels = { path = "../kernels" }
+ipe_target_toolchains = { path = "../target_toolchains" }
 ipe_env = { path = "../env" }
 # Held-handle, size-capped, no-follow reads of the VCS configuration a jail scans.
 ipe_fs_open = { path = "../fs_open" }

@@ -19,9 +19,12 @@
 # Matrix: dlmalloc (the pure-Rust default) and mimalloc (the explicit C
 # opt-in — kept green so the acknowledged path cannot rot).
 #
-# Jobs also cover the aarch64-unknown-linux-musl static target (cross-built +
-# QEMU-run) and the C-free (`--cfree`) axis (fail-closed refusal proof until the
-# pure-Rust dependency swaps land).
+# The mimalloc leg compiles C under `--static`, proving the musl C compiler the
+# target toolchain table names for each triple.
+#
+# Jobs also cover the aarch64-unknown-linux-musl static target (built and run
+# on a native aarch64 runner, same allocator matrix) and the C-free (`--cfree`)
+# axis (fail-closed refusal proof until the pure-Rust dependency swaps land).
 # ─────────────────────────────────────────────────────────────────────────────
 name: Static binaries
 
@@ -72,8 +75,8 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
-      # The emitted dep graph carries C compile units (zstd, ring) — the
-      # preflight requires a musl-capable C compiler; mimalloc adds its own.
+      # The preflight requires a musl-capable C compiler (`musl-gcc` here, as
+      # the target toolchain table names); the mimalloc leg compiles its C.
       # bubblewrap + util-linux supply the runtime jail primitives (bwrap,
       # prlimit) `ipe dev run` needs to confine a program; without them a
       # capability-bearing run is refused (IPE-F4413), which the gated
@@ -172,17 +175,23 @@ jobs:
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
   # ─── aarch64 static gate ───────────────────────────────────────────────────
-  # Cross-compiles the emitted example crate for aarch64-unknown-linux-musl from
-  # an x86_64 host. The emitted `.cargo/config.toml` pins the bundled `rust-lld`
-  # with `link-self-contained=yes`, so the musl startup objects come from rustup
-  # and only the C deps (zstd, ring) need a cross compiler — the widely-packaged
-  # `gcc-aarch64-linux-gnu` supplies it (the preflight's `cc_candidates` for this
-  # triple probe `aarch64-linux-musl-gcc` then `aarch64-linux-gnu-gcc`).
-  # Cross-run verification uses `qemu-user-static`.
+  # Builds the emitted example crate for aarch64-unknown-linux-musl on a native
+  # aarch64 host, with the packages the target toolchain table
+  # (`src/compiler/target_toolchains`) names for a Debian host of the target's
+  # architecture: `musl-tools`, whose native `musl-gcc` compiles the C units.
+  # The emitted `.cargo/config.toml` pins the bundled `rust-lld` with
+  # `link-self-contained=yes`, so the musl startup objects come from rustup. No
+  # glibc compiler is installed or named: C built against glibc headers fails
+  # the musl link. The mimalloc leg compiles mimalloc's C, so a C unit is built
+  # under `--static` on every run. The binary runs natively.
   linux-static-arm64:
-    name: linux-static-arm64 (dlmalloc)
-    runs-on: ubuntu-latest
+    name: linux-static-arm64 (${{ matrix.allocator }})
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        allocator: [dlmalloc, mimalloc]
 
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/ipe-lang-target
@@ -194,18 +203,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Assert the runner is aarch64
+        run: test "$(uname -m)" = aarch64
+
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           targets: aarch64-unknown-linux-musl
 
-      # musl-capable AArch64 C linker + QEMU for cross-run verification.
-      # Toolchain: gcc-aarch64-linux-gnu provides the cross-assembler/linker;
-      # musl-tools provides musl-libc headers; qemu-user-static enables
-      # transparent execution of aarch64 binaries on x86_64.
-      - name: Install aarch64 musl C toolchain + QEMU
+      - name: Install musl C toolchain
         uses: ./.github/actions/apt-install
         with:
-          packages: gcc-aarch64-linux-gnu musl-tools qemu-user-static
+          packages: musl-tools
 
       - name: Restore cargo target
         id: cargo-cache
@@ -214,18 +222,24 @@ jobs:
           path: |
             ~/.cargo/registry
             ${{ github.workspace }}/.cache/ipe-lang-target
-          key: ${{ runner.os }}-static-arm64-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-static-arm64-${{ matrix.allocator }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            ${{ runner.os }}-static-arm64-${{ matrix.allocator }}-
             ${{ runner.os }}-static-arm64-
 
       - name: Build ipe
         run: cargo build --release -p ipe
 
-      - name: ipe dev build --static --target aarch64-unknown-linux-musl
+      # cc-rs looks for `aarch64-linux-musl-gcc` for this triple; Debian ships
+      # the native compiler as `musl-gcc`, so the table's `CC_<triple>` names it.
+      - name: ipe dev build --static --target aarch64-unknown-linux-musl (${{ matrix.allocator }})
+        env:
+          ALLOCATOR: ${{ matrix.allocator }}
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: |
           cd examples/shapes/non-tea/hello-world
           "$CARGO_TARGET_DIR/release/ipe" dev build --out out \
-            --static --target aarch64-unknown-linux-musl --allocator dlmalloc
+            --static --target "$STATIC_TRIPLE" --allocator "$ALLOCATOR"
           cd out/rust
           cargo build --release --target "$STATIC_TRIPLE"
           # Cargo names the binary after the emitted crate's `[package] name`,
@@ -234,28 +248,28 @@ jobs:
           # name from the manifest cargo just built from — never assume `ipe-app`.
           CI_JOB_BIN_NAME="$(sed -n '/^\[package\]/,/^\[/{s/^name *= *"\(.*\)"/\1/p}' Cargo.toml | head -n1)"
           bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_BIN_NAME "$CI_JOB_BIN_NAME"
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
 
-      - name: Assert static-ness (file)
+      - name: Assert static-ness (file + ldd)
         run: |
           BIN="$CARGO_TARGET_DIR/$STATIC_TRIPLE/release/$CI_JOB_BIN_NAME"
           file "$BIN"
-          file "$BIN" | grep -Eq 'static-pie linked|statically linked|ELF 64-bit LSB.*static'
+          file "$BIN" | grep -Eq 'static-pie linked|statically linked'
+          LDD_OUT="$(ldd "$BIN" 2>&1 || true)"
+          echo "$LDD_OUT"
+          echo "$LDD_OUT" | grep -Eq 'statically linked|not a dynamic executable'
 
-      - name: Run via QEMU
+      - name: Run natively
         run: |
           BIN="$CARGO_TARGET_DIR/$STATIC_TRIPLE/release/$CI_JOB_BIN_NAME"
-          OUT="$(qemu-aarch64-static "$BIN")"
-          echo "qemu output: $OUT"
+          OUT="$("$BIN")"
+          echo "output: $OUT"
           echo "$OUT" | grep -q 'Hello, Ipê!'
 
       - name: Upload frozen-deps manifest (arm64)
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: static-frozen-deps-arm64-dlmalloc
+          name: static-frozen-deps-arm64-${{ matrix.allocator }}
           path: examples/shapes/non-tea/hello-world/out/rust/Cargo.lock
           if-no-files-found: warn
 

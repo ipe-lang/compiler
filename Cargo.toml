@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "src/compiler/intern",
     "src/compiler/path-core",
+    "src/compiler/target_toolchains",
     "src/compiler/env",
     "src/compiler/diagnostics",
     "src/compiler/kernels",

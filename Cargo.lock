@@ -3221,6 +3221,7 @@ dependencies = [
  "ipe_intern",
  "ipe_ir",
  "ipe_kernels",
+ "ipe_target_toolchains",
  "proc-macro2",
  "ryu",
  "serde",
@@ -3289,6 +3290,7 @@ dependencies = [
  "ipe_parse",
  "ipe_stdlib",
  "ipe_syntax",
+ "ipe_target_toolchains",
 ]
 
 [[package]]
@@ -3466,6 +3468,7 @@ dependencies = [
  "ipe_fs_open",
  "ipe_kernels",
  "ipe_path_core",
+ "ipe_target_toolchains",
  "rustix",
  "serde",
  "toml",
@@ -3492,6 +3495,10 @@ dependencies = [
  "ipe_diagnostics",
  "ipe_intern",
 ]
+
+[[package]]
+name = "ipe_target_toolchains"
+version = "0.7.4"
 
 [[package]]
 name = "ipe_types"

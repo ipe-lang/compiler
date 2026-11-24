@@ -12,7 +12,10 @@
 
 use std::fmt;
 
-use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
+use ipe_backend_rust::static_build::{
+    CProfile, CcCandidate, CpuArch, StaticAllocator, StaticPlan, StaticTriple,
+};
+use ipe_sandbox::host_tool::{self, HostTool};
 
 use crate::delivery::TargetTriple;
 use crate::remote_ingest::{LocalCeiling, LocalSource, TOOL_QUERY_LIMITS, run_local};
@@ -181,7 +184,7 @@ pub enum Refusal {
     TargetNotInstalled { triple: &'static str },
     /// The dependency graph carries C compile units (`zstd`, `ring`) and no
     /// musl-capable C compiler is reachable.
-    MuslCCompilerMissing { triple: &'static str },
+    MuslCCompilerMissing { triple: StaticTriple },
     /// A C-requiring allocator was requested alongside `--cfree`. `mimalloc`
     /// vendors and links C; `system` is the target libc's C malloc — neither
     /// can exist in a C-free artifact.
@@ -213,7 +216,7 @@ impl fmt::Display for Refusal {
             Self::WebviewStatic => text::msg::webview_static(),
             Self::TargetNotInstalled { triple } => text::target_not_installed(triple),
             Self::MuslCCompilerMissing { triple } => {
-                text::musl_c_compiler_missing(triple, &triple.replace('-', "_"))
+                text::musl_c_compiler_missing(&triple.as_str(), &triple.toolchain().cc_env)
             }
             Self::AllocatorRequiresC {
                 got: got @ AllocatorChoice::Mimalloc,
@@ -311,7 +314,7 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
 /// not a cryptic cargo error minutes later.
 ///
 /// The probed compiler names come from the plan's triple
-/// ([`StaticTriple::cc_candidates`]) so an aarch64 static build does not probe
+/// ([`StaticTriple::toolchain`]) so an aarch64 static build does not probe
 /// `x86_64`-only compiler names (which would spuriously pass on an `x86_64` host).
 /// Under a C-free plan the C-compiler check is skipped — there is no C unit to
 /// compile.
@@ -324,15 +327,68 @@ pub fn resolve(merged: &StaticRequestLayer) -> Result<Option<StaticPlan>, Refusa
 /// [`Refusal::TargetNotInstalled`] / [`Refusal::MuslCCompilerMissing`].
 pub fn preflight(plan: &StaticPlan) -> Result<(), Refusal> {
     let installed = rustup_installed_targets();
-    let cc_present = ipe_env::var_os(format!("CC_{}", plan.triple.as_str().replace('-', "_")))
-        .is_some()
-        || ipe_env::var_os("TARGET_CC").is_some()
-        || plan
-            .triple
-            .cc_candidates()
-            .iter()
-            .any(|name| binary_on_path(name));
+    let path = ipe_env::var_os("PATH");
+    let cc_present = c_compiler_reachable(
+        plan.triple,
+        CpuArch::HOST,
+        |name| ipe_env::var_os(name),
+        path.iter().flat_map(std::env::split_paths),
+        |dir, candidate| {
+            host_tool::resolve_in_dirs(
+                std::slice::from_ref(dir),
+                HostTool::CCompiler(candidate),
+                ipe_path_core::HOST,
+            )
+            .is_ok()
+        },
+    );
     preflight_with(plan, installed.as_deref(), cc_present)
+}
+
+/// Whether cc-rs reaches a C compiler for `triple` on a host of architecture
+/// `host`, given the environment `env` and the `PATH` entries `path_dirs`, in
+/// order, where `holds(dir, candidate)` says `dir` holds `candidate` as an
+/// executable file.
+///
+/// cc-rs takes the first of `CC_<triple>` (dashes), `CC_<triple>`
+/// (underscores), `TARGET_CC` and `CC` that is set. A blank value names no
+/// compiler and falls through to the `PATH` search; only the underscored
+/// variable and `TARGET_CC` are admitted, so the dashed spelling and a plain
+/// `CC` (often a glibc `gcc`) refuse. With no variable naming one, a set
+/// `CROSS_COMPILE` replaces the names cc-rs looks for, so it refuses too.
+/// Otherwise the first `PATH` entry holding any name cc-rs looks for unaided
+/// decides, in cc-rs's order within the entry, and the name it lands on must
+/// target the triple's architecture: a later entry's fitting compiler is never
+/// the one cc-rs runs.
+fn c_compiler_reachable<D>(
+    triple: StaticTriple,
+    host: Option<CpuArch>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    path_dirs: impl IntoIterator<Item = D>,
+    holds: impl Fn(&D, CcCandidate) -> bool,
+) -> bool {
+    let row = triple.toolchain();
+    let dashed = format!("CC_{}", triple.as_str());
+    let named = [dashed.as_str(), row.cc_env, "TARGET_CC", "CC"]
+        .into_iter()
+        .find_map(|name| env(name).map(|value| (name, value)));
+    if let Some((name, value)) = named
+        && !value.to_string_lossy().trim().is_empty()
+    {
+        return name == row.cc_env || name == "TARGET_CC";
+    }
+    if env("CROSS_COMPILE").is_some() {
+        return false;
+    }
+    path_dirs
+        .into_iter()
+        .find_map(|dir| {
+            row.cc_rs_unaided
+                .iter()
+                .copied()
+                .find(|candidate| holds(&dir, *candidate))
+        })
+        .is_some_and(|picked| row.found_unaided(picked, host))
 }
 
 /// [`preflight`]'s pure core.
@@ -358,7 +414,7 @@ pub fn preflight_with(
     }
     if !plan.is_c_free() && !c_cc_present {
         return Err(Refusal::MuslCCompilerMissing {
-            triple: plan.triple.as_str(),
+            triple: plan.triple,
         });
     }
     Ok(())
@@ -387,18 +443,15 @@ fn installed_targets_of(rustup: &std::ffi::OsStr, ceiling: LocalCeiling) -> Opti
     Some(text.lines().map(str::to_owned).collect())
 }
 
-/// Whether an executable named `name` exists on `PATH`.
-fn binary_on_path(name: &str) -> bool {
-    ipe_env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(name).is_file()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocatorChoice, Refusal, StaticRequestLayer, parse_bool, preflight_with, resolve,
+        AllocatorChoice, Refusal, StaticRequestLayer, c_compiler_reachable, parse_bool,
+        preflight_with, resolve,
     };
-    use ipe_backend_rust::static_build::{CProfile, StaticAllocator, StaticPlan, StaticTriple};
+    use ipe_backend_rust::static_build::{
+        CProfile, CcCandidate, CpuArch, StaticAllocator, StaticPlan, StaticTriple,
+    };
 
     /// A [`StaticPlan`] carrying a C-requiring allocator (the common test
     /// shape). C-free plans are built directly with [`CProfile::CFree`].
@@ -603,6 +656,121 @@ mod tests {
         // rustup absent → fail-soft on the target check, cc still gated.
         assert!(preflight_with(&plan, None, true).is_ok());
         assert!(preflight_with(&plan, None, false).is_err());
+    }
+
+    /// No variable set; `PATH` is `dirs`, each the candidates it holds.
+    fn reachable(triple: StaticTriple, host: Option<CpuArch>, dirs: &[&[CcCandidate]]) -> bool {
+        with_env(triple, host, &[], dirs)
+    }
+
+    /// `vars` set; `PATH` is `dirs`, each the candidates it holds.
+    fn with_env(
+        triple: StaticTriple,
+        host: Option<CpuArch>,
+        vars: &[(&str, &str)],
+        dirs: &[&[CcCandidate]],
+    ) -> bool {
+        c_compiler_reachable(
+            triple,
+            host,
+            |name| {
+                vars.iter()
+                    .find(|(set, _)| *set == name)
+                    .map(|(_, value)| (*value).into())
+            },
+            dirs.iter().copied(),
+            |dir: &&[CcCandidate], candidate| dir.contains(&candidate),
+        )
+    }
+
+    #[test]
+    fn a_compiler_cc_rs_does_not_use_is_not_reachable() {
+        let (x86, arm) = (Some(CpuArch::X8664), Some(CpuArch::Aarch64));
+        let (x64, a64) = (StaticTriple::X8664LinuxMusl, StaticTriple::Aarch64LinuxMusl);
+        // cc-rs never looks for `musl-gcc` under aarch64, on any host.
+        for host in [x86, arm] {
+            assert!(!reachable(a64, host, &[&[CcCandidate::MuslGcc]]));
+        }
+        // An aarch64 host's `musl-gcc` targets aarch64, not x86_64.
+        assert!(!reachable(x64, arm, &[&[CcCandidate::MuslGcc]]));
+        assert!(!reachable(x64, None, &[&[CcCandidate::MuslGcc]]));
+        assert!(reachable(x64, x86, &[&[CcCandidate::MuslGcc]]));
+        assert!(reachable(a64, x86, &[&[CcCandidate::Aarch64LinuxMuslGcc]]));
+        // The documented remedy for aarch64: set the triple's variable.
+        assert!(with_env(
+            a64,
+            arm,
+            &[("CC_aarch64_unknown_linux_musl", "musl-gcc")],
+            &[]
+        ));
+        assert!(with_env(
+            x64,
+            arm,
+            &[("TARGET_CC", "x86_64-linux-musl-gcc")],
+            &[]
+        ));
+    }
+
+    /// cc-rs takes the first `PATH` entry holding any name it looks for, so a
+    /// fitting compiler in a later entry never runs.
+    #[test]
+    fn the_first_path_entry_cc_rs_searches_decides() {
+        let arm = Some(CpuArch::Aarch64);
+        let x64 = StaticTriple::X8664LinuxMusl;
+        let native: &[CcCandidate] = &[CcCandidate::MuslGcc];
+        let cross: &[CcCandidate] = &[CcCandidate::X8664LinuxMuslGcc];
+        assert!(!reachable(x64, arm, &[native, cross]));
+        assert!(reachable(x64, arm, &[cross, native]));
+        assert!(reachable(x64, arm, &[&[], cross]));
+        // Within one entry cc-rs tries `x86_64-linux-musl-gcc` first.
+        assert!(reachable(
+            x64,
+            arm,
+            &[&[CcCandidate::MuslGcc, CcCandidate::X8664LinuxMuslGcc]]
+        ));
+    }
+
+    /// The variable cc-rs reads first decides; a blank one names no compiler.
+    #[test]
+    fn the_variable_cc_rs_reads_first_decides() {
+        let x86 = Some(CpuArch::X8664);
+        let x64 = StaticTriple::X8664LinuxMusl;
+        let musl: &[&[CcCandidate]] = &[&[CcCandidate::MuslGcc]];
+        let under = "CC_x86_64_unknown_linux_musl";
+        assert!(!with_env(x64, x86, &[(under, "  ")], &[]));
+        assert!(with_env(x64, x86, &[(under, " ")], musl));
+        assert!(!with_env(x64, x86, &[("TARGET_CC", "")], &[]));
+        assert!(!with_env(
+            x64,
+            x86,
+            &[("CC_x86_64-unknown-linux-musl", ""), (under, "musl-gcc")],
+            &[]
+        ));
+        // A plain `CC` or the dashed spelling preempts the `PATH` search.
+        assert!(!with_env(x64, x86, &[("CC", "gcc")], musl));
+        assert!(!with_env(
+            x64,
+            x86,
+            &[("CC_x86_64-unknown-linux-musl", "musl-gcc")],
+            musl
+        ));
+        assert!(with_env(
+            x64,
+            x86,
+            &[(under, "musl-gcc"), ("CC", "gcc")],
+            &[]
+        ));
+        // `CROSS_COMPILE` replaces the names cc-rs searches for.
+        assert!(!with_env(x64, x86, &[("CROSS_COMPILE", "")], musl));
+    }
+
+    #[test]
+    fn the_missing_compiler_refusal_names_the_table_variable() {
+        for triple in StaticTriple::ALL {
+            let shown = Refusal::MuslCCompilerMissing { triple }.to_string();
+            assert!(shown.contains(triple.toolchain().cc_env), "{shown}");
+            assert!(shown.contains(triple.as_str()), "{shown}");
+        }
     }
 
     #[test]
