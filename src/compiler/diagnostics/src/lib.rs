@@ -175,6 +175,9 @@ mod tests {
             IPE_E0003 => Diagnostic::HostLinkerCannotOpenInput {
                 detail: "the linker could not open C:\\Users\\ana\\Público\\symbols.o".into(),
             },
+            IPE_E0013 => Diagnostic::HostToolchainMissing {
+                detail: "no `std` for target `aarch64-unknown-linux-musl`: run `rustup target add aarch64-unknown-linux-musl`".into(),
+            },
             // Consent
             IPE_S0001 => Diagnostic::Consent {
                 msg: ConsentError::NonInteractive {

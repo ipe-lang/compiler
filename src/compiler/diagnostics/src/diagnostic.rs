@@ -10,30 +10,30 @@
 //! so existing call sites keep compiling while producers migrate.
 
 use crate::code::{
-    Code, Family, IPE_E0001, IPE_E0002, IPE_E0003, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410,
-    IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001, IPE_I0010, IPE_I0011,
-    IPE_I0100, IPE_I0101, IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201, IPE_I0202, IPE_I0203,
-    IPE_L0100, IPE_L0101, IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105, IPE_L0106, IPE_L0107,
-    IPE_L0108, IPE_L0110, IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114, IPE_L0115, IPE_L0116,
-    IPE_L0117, IPE_L0118, IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122, IPE_L0123, IPE_L0124,
-    IPE_L0125, IPE_L0126, IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131, IPE_L0132,
-    IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143, IPE_L0144,
-    IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151, IPE_L0152,
-    IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159, IPE_L0160,
-    IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0165, IPE_L0166, IPE_L0200, IPE_L0201,
-    IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011, IPE_N0012,
-    IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025, IPE_N0026,
-    IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033, IPE_N0034,
-    IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042, IPE_N0043,
-    IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050, IPE_N0051,
-    IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011, IPE_P0012,
-    IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020, IPE_P0021,
-    IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061, IPE_P0062,
-    IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069, IPE_P0070,
-    IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074, IPE_P0075, IPE_P0076, IPE_P0077, IPE_S0001,
-    IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004, IPE_T0010,
-    IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017, IPE_T0018,
-    IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
+    Code, Family, IPE_E0001, IPE_E0002, IPE_E0003, IPE_E0013, IPE_F4400, IPE_F4401, IPE_F4402,
+    IPE_F4410, IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001, IPE_I0010,
+    IPE_I0011, IPE_I0100, IPE_I0101, IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201, IPE_I0202,
+    IPE_I0203, IPE_L0100, IPE_L0101, IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105, IPE_L0106,
+    IPE_L0107, IPE_L0108, IPE_L0110, IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114, IPE_L0115,
+    IPE_L0116, IPE_L0117, IPE_L0118, IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122, IPE_L0123,
+    IPE_L0124, IPE_L0125, IPE_L0126, IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130, IPE_L0131,
+    IPE_L0132, IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142, IPE_L0143,
+    IPE_L0144, IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150, IPE_L0151,
+    IPE_L0152, IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158, IPE_L0159,
+    IPE_L0160, IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0165, IPE_L0166, IPE_L0200,
+    IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010, IPE_N0011,
+    IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024, IPE_N0025,
+    IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032, IPE_N0033,
+    IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041, IPE_N0042,
+    IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049, IPE_N0050,
+    IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010, IPE_P0011,
+    IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018, IPE_P0020,
+    IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060, IPE_P0061,
+    IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068, IPE_P0069,
+    IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074, IPE_P0075, IPE_P0076, IPE_P0077,
+    IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003, IPE_T0004,
+    IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016, IPE_T0017,
+    IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -2803,6 +2803,16 @@ pub enum Diagnostic {
         /// The file the linker could not open, and how to fix it, ready for display.
         detail: String,
     },
+    /// The host is missing a toolchain component a build needs (`IPE-E0013`).
+    ///
+    /// Span-free: the defect is in the host environment (a C compiler, a
+    /// linker, or a target's Rust standard library), not in the user's source.
+    /// Which component is missing is typed once, by the producer's gap type in
+    /// the CLI; this variant carries only that gap's rendered remedy.
+    HostToolchainMissing {
+        /// The missing component and how to install it, ready for display.
+        detail: String,
+    },
 }
 
 /// Result alias used throughout the compiler.
@@ -3050,6 +3060,7 @@ impl Diagnostic {
             Self::RegistryUnreachable { .. } => IPE_E0001,
             Self::TargetDirUnlinkable { .. } => IPE_E0002,
             Self::HostLinkerCannotOpenInput { .. } => IPE_E0003,
+            Self::HostToolchainMissing { .. } => IPE_E0013,
         }
     }
 
@@ -3074,7 +3085,8 @@ impl Diagnostic {
             | Self::Consent { .. }
             | Self::RegistryUnreachable { .. }
             | Self::TargetDirUnlinkable { .. }
-            | Self::HostLinkerCannotOpenInput { .. } => Severity::Error,
+            | Self::HostLinkerCannotOpenInput { .. }
+            | Self::HostToolchainMissing { .. } => Severity::Error,
             Self::Lower { msg, .. } => match msg {
                 LowerError::RoutedAppMissingPageField { .. } => Severity::Warning,
                 _ => Severity::Error,
@@ -3127,7 +3139,8 @@ impl Diagnostic {
             | Self::Consent { .. }
             | Self::RegistryUnreachable { .. }
             | Self::TargetDirUnlinkable { .. }
-            | Self::HostLinkerCannotOpenInput { .. } => Span::DUMMY,
+            | Self::HostLinkerCannotOpenInput { .. }
+            | Self::HostToolchainMissing { .. } => Span::DUMMY,
         }
     }
 
@@ -3146,7 +3159,8 @@ impl Diagnostic {
             Self::CompilerBug { .. }
             | Self::RegistryUnreachable { .. }
             | Self::TargetDirUnlinkable { .. }
-            | Self::HostLinkerCannotOpenInput { .. } => Vec::new(),
+            | Self::HostLinkerCannotOpenInput { .. }
+            | Self::HostToolchainMissing { .. } => Vec::new(),
         }
     }
 }
@@ -3235,7 +3249,8 @@ const _: () = assert!(
         && matches!(IPE_S0004.family(), Family::Security)
         && matches!(IPE_E0001.family(), Family::Environment)
         && matches!(IPE_E0002.family(), Family::Environment)
-        && matches!(IPE_E0003.family(), Family::Environment),
+        && matches!(IPE_E0003.family(), Family::Environment)
+        && matches!(IPE_E0013.family(), Family::Environment),
     "diagnostic code family drift: a producer returns a code outside its family",
 );
 
@@ -4748,6 +4763,9 @@ mod code_family_tests {
                 detail: "test".to_owned(),
             },
             Diagnostic::HostLinkerCannotOpenInput {
+                detail: "test".to_owned(),
+            },
+            Diagnostic::HostToolchainMissing {
                 detail: "test".to_owned(),
             },
         ]
