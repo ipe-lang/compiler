@@ -45,6 +45,54 @@ const _: () = assert!(
     "templates/main.rs must declare RECURSION_LIMIT_ATTR on its own line",
 );
 
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template stops carrying an FFI crate-scope item verbatim and ungated [ledger #boundary]
+const _: () = assert!(
+    has_every_scope_item(GOLDEN.as_bytes()),
+    "templates/main.rs must carry every `ipe_intern::FFI_SCOPE_ITEMS` entry, ungated",
+);
+
+/// Whether `text` carries every FFI crate-scope item as an ungated item.
+const fn has_every_scope_item(text: &[u8]) -> bool {
+    let mut items: &[&str] = &ipe_intern::FFI_SCOPE_ITEMS;
+    while let [item, tail @ ..] = items {
+        if !has_ungated_item(text, item.as_bytes()) {
+            return false;
+        }
+        items = tail;
+    }
+    true
+}
+
+/// Whether `item` occurs in `text` as whole lines no attribute governs.
+///
+/// An item under an outer attribute (`#[cfg(windows)]`), comment lines between
+/// them included, is gated: some crate built from the scope would lack it.
+const fn has_ungated_item(text: &[u8], item: &[u8]) -> bool {
+    let mut rest = text;
+    let mut under_attr = false;
+    loop {
+        if !under_attr && starts_with_line(rest, item) {
+            return true;
+        }
+        under_attr = match rest {
+            [b'#', b'[', ..] => true,
+            [b'/', b'/', ..] => under_attr,
+            _ => false,
+        };
+        // Advance past the next newline, to the start of the following line.
+        loop {
+            match rest {
+                [] => return false,
+                [b'\n', tail @ ..] => {
+                    rest = tail;
+                    break;
+                }
+                [_, tail @ ..] => rest = tail,
+            }
+        }
+    }
+}
+
 /// The number spelled by the decimal digits of `attr`, other bytes skipped.
 ///
 /// Saturates at `u64::MAX`, so an absurd literal still fails the equality check.
@@ -187,7 +235,9 @@ pub fn epilogue() -> DResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECURSION_LIMIT_ATTR, attr_limit, epilogue, has_own_line, preamble};
+    use super::{
+        RECURSION_LIMIT_ATTR, attr_limit, epilogue, has_every_scope_item, has_own_line, preamble,
+    };
     use ipe_diagnostics::DResult;
     use ipe_diagnostics::nesting::EMITTED_RECURSION_LIMIT;
 
@@ -217,6 +267,27 @@ mod tests {
         ));
         assert!(!has_own_line(b"#![recursion_limit = \"102\"]\n", attr));
         assert_ne!(attr_limit(b"#![recursion_limit = \"128\"]"), 1024);
+    }
+
+    /// A template missing a scope item, or gating one, fails the scope check.
+    ///
+    /// The live `const` assertion is the build-time half; this drives the same
+    /// fn over a template with one item dropped and one item put under `cfg`.
+    #[test]
+    fn ffi_scope_item_missing_from_template_is_refused() {
+        assert!(has_every_scope_item(GOLDEN.as_bytes()));
+        for item in ipe_intern::FFI_SCOPE_ITEMS {
+            assert_eq!(GOLDEN.matches(item).count(), 1, "{item}");
+            let dropped = GOLDEN.replacen(item, "", 1);
+            assert!(!has_every_scope_item(dropped.as_bytes()), "dropped: {item}");
+            let gated = GOLDEN.replacen(item, &format!("#[cfg(windows)]\n{item}"), 1);
+            assert!(!has_every_scope_item(gated.as_bytes()), "gated: {item}");
+            let commented = GOLDEN.replacen(item, &format!("#[cfg(windows)]\n// note\n{item}"), 1);
+            assert!(
+                !has_every_scope_item(commented.as_bytes()),
+                "commented: {item}"
+            );
+        }
     }
 
     /// Independent copy of the template, reconstructed by 1-indexed line ranges

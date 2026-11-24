@@ -178,7 +178,10 @@ mod tests {
             paths.iter().all(|p| p.starts_with("crate::ffi::semver::")),
             "every path is app-crate-absolute under the slug's module: {paths:?}"
         );
-        let src = emit_probe_main(&paths, "pub use ipe_runtime::*;\nmod ffi;");
+        let src = emit_probe_main(
+            &paths,
+            &format!("{}\nmod ffi;", ipe_intern::ffi_crate_scope()),
+        );
         // Address-of into a black-box sink — never an invocation (no `(` after a
         // path that would be a call).
         for p in &paths {
@@ -205,13 +208,13 @@ mod tests {
         // AFTER the inner `#![allow(unused_imports)]` (an item before an inner
         // attribute is a hard rustc error) and BEFORE `main`.
         let paths = vec!["crate::ffi::semver::semver_parse".to_owned()];
-        let prelude = "pub use ipe_runtime::*;\npub use ipe_runtime::error::IpeError;\nmod ffi;";
-        let src = emit_probe_main(&paths, prelude);
+        let prelude = format!("{}\nmod ffi;", ipe_intern::ffi_crate_scope());
+        let src = emit_probe_main(&paths, &prelude);
         let attr = src
             .find("#![allow(unused_imports)]")
             .expect("inner attribute");
         let prelude_at = src
-            .find("pub use ipe_runtime::*;")
+            .find(ipe_intern::RUNTIME_GLOB_ITEM)
             .expect("prelude present");
         let main_at = src.find("fn main()").expect("probe main");
         assert!(

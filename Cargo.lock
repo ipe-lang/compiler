@@ -1677,6 +1677,7 @@ version = "0.7.4"
 dependencies = [
  "ipe-test-temp",
  "ipe_env",
+ "ipe_intern",
  "proc-macro2",
  "quote",
  "serde_json",

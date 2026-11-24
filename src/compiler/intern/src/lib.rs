@@ -3,8 +3,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use ipe_diagnostics::{DResult, Diagnostic};
 
+mod ffi_scope;
 mod rust_keywords;
 mod rust_literal;
+pub use ffi_scope::{
+    ERROR_USE_ITEM, FFI_SCOPE_ITEMS, FFI_TASK_ALIAS, OK_RES_ITEM, RECURSION_GUARD_ITEM,
+    RUNTIME_GLOB_ITEM, TASK_ALIAS_ITEM, ffi_crate_scope, ffi_task_type,
+};
 pub use rust_keywords::{RUST_KEYWORDS, is_rust_keyword};
 pub use rust_literal::{
     EMIT_LEXABLE, LexerHazard, LexerHazardKind, find_lexer_hazard, rust_char_lit,
