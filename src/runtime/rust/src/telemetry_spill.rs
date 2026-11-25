@@ -304,7 +304,7 @@ mod tests {
     /// it is trivial). Cross-process visibility is a standard SQLite guarantee.
     #[tokio::test]
     async fn write_entry_maps_to_hub_schema() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("spill-we-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -387,7 +387,7 @@ mod tests {
     /// The spill pool registers itself, so a served app's stop closes it last.
     #[tokio::test]
     async fn the_spill_pool_registers_itself_for_the_stop() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("spill-owned-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -407,7 +407,7 @@ mod tests {
     /// busy timeout.
     #[tokio::test]
     async fn the_spill_pool_carries_the_declared_busy_timeout() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("spill-busy-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();

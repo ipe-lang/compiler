@@ -359,6 +359,23 @@ pub fn test_temp_root() -> PathBuf {
     std::env::temp_dir()
 }
 
+/// A private directory, shared by the process's tests, that holds their store files.
+///
+/// The temp root is shared and sticky, so a database file directly under it is
+/// refused by the SQLite location proof; this directory is created private to
+/// the current user and kept for the life of the test process.
+///
+/// # Panics
+/// When the private directory cannot be created.
+#[cfg(test)]
+#[allow(clippy::expect_used)] // a test process with no private directory cannot open a file store
+pub fn test_private_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<ScratchDir> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| ScratchDir::new("ipe-store-tests").expect("a private test directory"))
+        .path()
+        .to_path_buf()
+}
+
 /// The bases a length-bounded entry may live under: the OS temp root, then, on Unix, the short `/tmp`.
 ///
 /// # Errors

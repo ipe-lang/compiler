@@ -1123,7 +1123,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_services_distinct_sorted() {
-        let dir = crate::db::test_db_root().join(format!("hub-svc-{}.db", std::process::id()));
+        let dir = crate::scratch_core::test_private_root()
+            .join(format!("hub-svc-{}.db", std::process::id()));
         let path = dir.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
         let pool = seed(&path).await;
@@ -1183,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_logs_maps_attrs_and_filters_level() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-logs-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1242,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn filtered_logs_scopes_to_service() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-flogs-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1282,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_metrics_joins_sorted_labels() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-met-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1312,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_traces_computes_duration() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tr-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1344,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_errors_groups_by_message() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-err-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1449,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     async fn overview_splices_counts() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-ov-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1495,7 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_stats_aggregates_recent() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-stats-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1562,7 +1563,7 @@ mod tests {
     /// `hub_read_logs` / no-explicit-service shape).
     #[tokio::test]
     async fn hub_read_filtered_logs_two_tenants_no_cross_read() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-2t-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1602,7 +1603,7 @@ mod tests {
     /// `hub_read_filtered_logs`'s gate simply by calling the no-service kernel.
     #[tokio::test]
     async fn hub_read_logs_no_service_still_tenant_scoped() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-noservice-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1642,7 +1643,7 @@ mod tests {
     /// read, and never leak a cross-tenant row even in the Err path.
     #[tokio::test]
     async fn hub_read_filtered_logs_rejects_explicit_cross_tenant_svc() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-reject-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1676,7 +1677,7 @@ mod tests {
     /// builders, not just logs.
     #[tokio::test]
     async fn hub_read_filtered_metrics_traces_errors_scope_to_tenant() {
-        let path = crate::db::test_db_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-mte-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1746,7 +1747,7 @@ mod tests {
 
         /// Create a spill holding one log, error log, metric and span per service.
         async fn seed_spill(name: &str) -> String {
-            let path = crate::db::test_db_root()
+            let path = crate::scratch_core::test_private_root()
                 .join(format!("hub-tenant-{name}-{}.db", std::process::id()))
                 .to_string_lossy()
                 .to_string();

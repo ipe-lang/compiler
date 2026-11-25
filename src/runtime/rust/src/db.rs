@@ -3999,22 +3999,6 @@ impl DbUrl {
     }
 }
 
-/// A private directory, shared by the process's tests, that holds their SQLite files.
-///
-/// The temp root is shared and sticky, so a database file directly under it is
-/// refused by [`TrustedDbPath::prove`]; this directory is created private to the
-/// current user and kept for the life of the test process.
-#[cfg(test)]
-#[allow(clippy::expect_used)] // a test process with no private directory cannot open a file database
-pub fn test_db_root() -> std::path::PathBuf {
-    static ROOT: std::sync::OnceLock<crate::scratch_core::ScratchDir> = std::sync::OnceLock::new();
-    ROOT.get_or_init(|| {
-        crate::scratch_core::ScratchDir::new("ipe-db-tests").expect("a private test directory")
-    })
-    .path()
-    .to_path_buf()
-}
-
 /// The group-write rule a SQLite file's directories and the file itself are judged under.
 ///
 /// A development build keeps the owner's own group; every release build
@@ -9030,7 +9014,7 @@ mod tests {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let mut path = crate::db::test_db_root();
+        let mut path = crate::scratch_core::test_private_root();
         path.push(format!("ipe_{name}_{}_{nanos}", std::process::id()));
         path
     }
@@ -14073,7 +14057,7 @@ mod tests {
         // with `max_connections > 1` and WAL. Returns (pool, tempdir-guard); the
         // guard must outlive the pool so the file isn't deleted early.
         async fn fresh_file_db(max_conns: u32) -> (Db, std::path::PathBuf) {
-            let mut path = crate::db::test_db_root();
+            let mut path = crate::scratch_core::test_private_root();
             // Unique per test run to avoid cross-test contamination.
             let unique = format!(
                 "ipe_txn_test_{}_{}.db",
@@ -14115,7 +14099,7 @@ mod tests {
         fn schema_test_file() -> (sqlx::sqlite::SqliteConnectOptions, std::path::PathBuf) {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut path = crate::db::test_db_root();
+            let mut path = crate::scratch_core::test_private_root();
             path.push(format!(
                 "ipe_schema_test_{}_{n}_{}.db",
                 std::process::id(),
@@ -16699,7 +16683,7 @@ mod tests {
         /// so data written through one is visible through the other.
         #[tokio::test]
         async fn operator_store_shared_pool_sees_same_data() {
-            let tmp = crate::db::test_db_root()
+            let tmp = crate::scratch_core::test_private_root()
                 .join(format!("ipe_operator_shared_{}.db", std::process::id()));
             let url = format!("sqlite://{}?mode=rwc", tmp.display());
             let choice = choose_store(parse_env(Ok(url), DbEngine::Sqlite), &Ok(None), || {
@@ -16738,7 +16722,7 @@ mod tests {
         /// the pool `Db.open` caches for the same file.
         #[tokio::test]
         async fn default_store_creates_its_file_and_shares_the_db_open_pool() {
-            let dir = crate::db::test_db_root()
+            let dir = crate::scratch_core::test_private_root()
                 .join(format!("ipe_operator_default_{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("scratch dir");
             let cwd = dir.to_str().map(str::to_owned);
@@ -17123,7 +17107,7 @@ mod tests {
         /// busy timeout, not only the one a pool-level PRAGMA happened to reach.
         #[tokio::test]
         async fn every_pooled_sqlite_connection_carries_the_declared_busy_timeout() {
-            let path = crate::db::test_db_root().join(format!(
+            let path = crate::scratch_core::test_private_root().join(format!(
                 "ipe_busy_timeout_{}_{}.db",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -17453,7 +17437,7 @@ mod tests {
         #[tokio::test]
         #[allow(clippy::disallowed_methods)] // raw driver options for a pool with a test checkout hook
         async fn a_checkout_cut_mid_hook_closes_its_connection_before_the_pools_close() {
-            let mut path = crate::db::test_db_root();
+            let mut path = crate::scratch_core::test_private_root();
             path.push(format!(
                 "ipe_cut_checkout_{}_{}.db",
                 std::process::id(),
