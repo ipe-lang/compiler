@@ -159,6 +159,13 @@ const SITES: &[SiteRow] = &[
     ),
     (
         "cargo_step.rs",
+        "unpack_locked_sources",
+        "cargo",
+        Runner::Local("SOURCE_UNPACK_LIMITS"),
+        1,
+    ),
+    (
+        "cargo_step.rs",
         "target_directory_within",
         "cargo",
         Runner::Local("METADATA_LIMITS"),
