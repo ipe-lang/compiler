@@ -1361,8 +1361,8 @@ fn pool_cache() -> &'static std::sync::Mutex<HashMap<PoolKey, Db>> {
 /// one file, which is proven trusted before the driver opens it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SqliteLocation {
-    /// An in-memory database.
-    Memory(MemorySharing),
+    /// An in-memory database, by the name the driver is handed.
+    Memory(InMemory),
     /// A file, by the path the driver is handed once it is proven trusted.
     File(std::path::PathBuf),
 }
@@ -1377,13 +1377,90 @@ pub enum MemorySharing {
     SharedCache,
 }
 
+/// An in-memory database: the name the driver opens it by and whether pools share it.
+///
+/// Constructed only by [`InMemory::parse`], so every in-memory open hands
+/// SQLite a [`MemoryName`] and no URI parameter that could reopen it on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InMemory {
+    name: MemoryName,
+    sharing: MemorySharing,
+}
+
+/// The name of an in-memory database: text SQLite can never read as a URI
+/// query, a fragment, or an escape.
+///
+/// Under `SQLITE_OPEN_URI` SQLite reads a `file:` name's own `?mode=` over the
+/// in-memory open flag (`mode=rw` and `mode=rwc` reopen the named path on
+/// disk), so a name carrying `?` is unrepresentable here, as are `#` and `%`,
+/// which SQLite would decode a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryName(std::path::PathBuf);
+
+impl MemoryName {
+    /// The driver's decoded `name`, when it is non-empty and carries no `?`, `#` or `%`.
+    ///
+    /// An empty name is SQLite's private temporary on-disk database, so it is
+    /// refused too.
+    fn parse(name: &std::path::Path) -> Option<Self> {
+        let bytes = name.as_os_str().as_encoded_bytes();
+        let inert = !bytes.is_empty() && !bytes.iter().any(|b| matches!(b, b'?' | b'#' | b'%'));
+        inert.then(|| Self(name.to_path_buf()))
+    }
+}
+
+impl InMemory {
+    /// The in-memory database the driver-decoded `name` opens, shared as `sharing`.
+    ///
+    /// `vfs` and `immutable` name nothing an in-memory database uses, so a URL
+    /// carrying either is refused rather than handed through.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::InvalidUrl`] when [`MemoryName::parse`] refuses
+    /// `name`, or the URL names `vfs` or `immutable`.
+    fn parse(
+        name: &std::path::Path,
+        pairs: &HashMap<String, String>,
+        sharing: MemorySharing,
+    ) -> Result<Self, DbConnectError> {
+        if pairs.contains_key("vfs") || pairs.contains_key("immutable") {
+            return Err(DbConnectError::InvalidUrl);
+        }
+        let name = MemoryName::parse(name).ok_or(DbConnectError::InvalidUrl)?;
+        Ok(Self { name, sharing })
+    }
+
+    /// Whether separately opened pools reach one database.
+    #[must_use]
+    pub const fn sharing(&self) -> MemorySharing {
+        self.sharing
+    }
+
+    /// `options` rewritten to open this database in memory by its parsed name.
+    #[allow(clippy::disallowed_methods)] // names no file: a parsed in-memory name, forced in memory
+    fn apply(
+        &self,
+        options: sqlx::sqlite::SqliteConnectOptions,
+    ) -> sqlx::sqlite::SqliteConnectOptions {
+        options
+            .filename(&self.name.0)
+            .immutable(false)
+            .in_memory(true)
+    }
+}
+
 impl SqliteLocation {
     /// Whether every pool opened from the same URL reaches the same database.
     #[must_use]
     pub const fn is_shared(&self) -> bool {
         matches!(
             self,
-            Self::File(_) | Self::Memory(MemorySharing::SharedCache)
+            Self::File(_)
+                | Self::Memory(InMemory {
+                    sharing: MemorySharing::SharedCache,
+                    ..
+                })
         )
     }
 
@@ -1394,7 +1471,8 @@ impl SqliteLocation {
     /// strictly. A database whose parameters name `mode=memory`, or SQLite's
     /// `file::memory:`, is in memory; it shares a cache only when it names
     /// `cache=shared` and is not the bare `:memory:`, which SQLite never reads
-    /// as a URI. Every other database is a file: a `file:` spelling is mapped
+    /// as a URI; its name is the driver's decoded one, parsed by
+    /// [`InMemory::parse`]. Every other database is a file: a `file:` spelling is mapped
     /// once by [`file_uri_path`], any other is the driver's decoded name. The
     /// gated options are rewritten to this reading, so the driver opens what
     /// was classified, never a second reading of the URL.
@@ -1403,7 +1481,8 @@ impl SqliteLocation {
     ///
     /// [`DbConnectError::UntrustedLocation`] with [`DbPathRefusal::FileUriName`]
     /// for a `file:` spelling [`file_uri_path`] refuses, and
-    /// [`DbConnectError::InvalidUrl`] for malformed parameters or an empty file name.
+    /// [`DbConnectError::InvalidUrl`] for malformed or repeated parameters, an
+    /// empty file name, or an in-memory database [`InMemory::parse`] refuses.
     fn classify(
         url: &str,
         options: &sqlx::sqlite::SqliteConnectOptions,
@@ -1414,35 +1493,31 @@ impl SqliteLocation {
         let (database, params) = rest.split_once('?').unwrap_or((rest, ""));
         let pairs =
             crate::encoding::decode_form_query(params).map_err(|_| DbConnectError::InvalidUrl)?;
+        // The driver reads every repeated key in turn where this reading keeps
+        // the first, so a repeat would let the two readings disagree.
+        if params.split('&').filter(|p| !p.is_empty()).count() != pairs.len() {
+            return Err(DbConnectError::InvalidUrl);
+        }
         let named = |key: &str, value: &str| pairs.get(key).is_some_and(|v| v == value);
         let cache_shared = named("cache", "shared");
         let mode_memory = named("mode", "memory");
+        let name = options.get_filename();
         if database == ":memory:" {
-            return Ok(Self::Memory(MemorySharing::Private));
+            return InMemory::parse(name, &pairs, MemorySharing::Private).map(Self::Memory);
         }
         if mode_memory || database == "file::memory:" {
-            // SQLite reads a `file:` name's own `?mode=` over the in-memory
-            // open flag, so a decoded name carrying a query would open a disk
-            // file no proof ever judged.
-            if options
-                .get_filename()
-                .as_os_str()
-                .as_encoded_bytes()
-                .contains(&b'?')
-            {
-                return Err(DbConnectError::InvalidUrl);
-            }
-            return Ok(Self::Memory(if cache_shared {
+            let sharing = if cache_shared {
                 MemorySharing::SharedCache
             } else {
                 MemorySharing::Private
-            }));
+            };
+            return InMemory::parse(name, &pairs, sharing).map(Self::Memory);
         }
         let path = match database.strip_prefix("file:") {
             Some(uri) => file_uri_path(uri).ok_or(DbConnectError::UntrustedLocation(
                 DbPathRefusal::FileUriName,
             ))?,
-            None => options.get_filename().to_path_buf(),
+            None => name.to_path_buf(),
         };
         if path.as_os_str().is_empty() {
             return Err(DbConnectError::InvalidUrl);
@@ -2067,7 +2142,7 @@ impl SqliteUrl {
     /// [`DbConnectError::UntrustedLocation`] when the proof refuses the file.
     async fn gated(&self) -> Result<sqlx::sqlite::SqliteConnectOptions, DbConnectError> {
         match &self.location {
-            SqliteLocation::Memory(_) => Ok(self.options.clone().in_memory(true)),
+            SqliteLocation::Memory(memory) => Ok(memory.apply(self.options.clone())),
             SqliteLocation::File(path) => {
                 let path = path.clone();
                 let proven = crate::threads::join_blocking("db.sqlite_location", move || {
@@ -3900,10 +3975,8 @@ impl DbUrl {
             .parse::<sqlx::sqlite::SqliteConnectOptions>()
             .map_err(|_| DbConnectError::InvalidUrl)?
             .busy_timeout(SQLITE_BUSY_TIMEOUT);
-        Ok(Self::Sqlite(SqliteUrl {
-            options,
-            location: SqliteLocation::Memory(MemorySharing::Private),
-        }))
+        let location = SqliteLocation::classify(SQLITE_MEMORY_URL, &options)?;
+        Ok(Self::Sqlite(SqliteUrl { options, location }))
     }
 }
 
@@ -18627,7 +18700,11 @@ mod trusted_db_path_tests {
                 MemorySharing::SharedCache,
             ),
         ] {
-            assert_eq!(location(url), Ok(SqliteLocation::Memory(sharing)), "{url}");
+            let got = location(url);
+            assert!(
+                matches!(&got, Ok(SqliteLocation::Memory(memory)) if memory.sharing() == sharing),
+                "{url}: {got:?}"
+            );
         }
     }
 
@@ -18664,9 +18741,74 @@ mod trusted_db_path_tests {
         );
     }
 
-    /// SQLite reads a `file:` name's own `?mode=` over the in-memory open flag,
-    /// so an in-memory name whose decoded text carries a query would reopen a
-    /// disk file no proof judged: such a URL is refused, and nothing is created.
+    /// Every in-memory spelling whose name SQLite could read as a URI query, a
+    /// fragment, or a second escape, or whose parameters name nothing memory
+    /// uses, is refused as an invalid URL; a repeated key, which the driver
+    /// reads differently from this reading, is refused on every URL.
+    #[test]
+    fn trusted_db_path_refuses_every_memory_name_sqlite_could_reopen_on_disk() {
+        for url in [
+            "sqlite:file:d/evil%3Fmode=rwc?mode=memory",
+            "sqlite:file%3Ad/evil%3Fmode=rwc?mode=memory",
+            "sqlite:file:d/evil%3Fmode=rw?mode=memory&cache=shared",
+            "sqlite:file:d/evil%3Fvfs=unix?mode=memory",
+            "sqlite:file:d/evil%3Fimmutable=1?mode=memory",
+            "sqlite:file:d/evil%3Fnolock=1%26mode=rwc?mode=memory",
+            "sqlite:FILE:d/evil%3Fmode=rwc?mode=memory",
+            "sqlite:File:d/evil%3Fmode=rwc?mode=memory",
+            "sqlite:file:d/evil%253Fmode=rwc?mode=memory",
+            "sqlite:file:d/evil%2525mode?mode=memory",
+            "sqlite:file:d/evil%23x?mode=memory",
+            "sqlite:file::memory:%3Fmode=rwc?mode=memory",
+            "sqlite:?mode=memory",
+            "sqlite://?mode=memory",
+            "?mode=memory",
+            "sqlite:file::memory:?vfs=unix",
+            "sqlite:file::memory:?immutable=true",
+            "sqlite::memory:?vfs=unix",
+            "sqlite::memory:?immutable=1",
+            "sqlite:d/evil?mode=memory&vfs=unix",
+            "sqlite:d/evil?mode=memory&nolock=1",
+            "sqlite:d/evil?mode=memory&mode=rw",
+            "sqlite:d/evil?mode=rw&mode=memory",
+            "sqlite:d/evil?cache=shared&cache=private&mode=memory",
+            "sqlite:d/evil.db?mode=rwc&mode=rwc",
+        ] {
+            assert_eq!(location(url), Err(DbConnectError::InvalidUrl), "{url}");
+        }
+    }
+
+    /// A memory spelling with anything after it, or with its parameters inside
+    /// an escaped `file:` name, is no in-memory database: it is a file, so it
+    /// opens only once the trusted-directory proof judges it.
+    #[test]
+    fn trusted_db_path_reads_a_suffixed_memory_spelling_as_a_file() {
+        assert_eq!(
+            location("sqlite::memory:x"),
+            Ok(SqliteLocation::File(PathBuf::from(":memory:x")))
+        );
+        assert_eq!(
+            location("sqlite:%3Amemory%3A"),
+            Ok(SqliteLocation::File(PathBuf::from(":memory:")))
+        );
+        for url in [
+            "sqlite:file::memory:%3Fmode=rwc",
+            "sqlite:file::memory:#x",
+            "file::memory:x%3Fmode=rw",
+        ] {
+            assert_eq!(
+                location(url),
+                Err(DbConnectError::UntrustedLocation(
+                    DbPathRefusal::FileUriName
+                )),
+                "{url}"
+            );
+        }
+    }
+
+    /// An in-memory URL never opens a disk file: a name SQLite could read as a
+    /// URI query is refused before any open, and a refused or admitted URL
+    /// alike leaves the world-writable directory it names untouched.
     #[cfg(unix)]
     #[tokio::test]
     async fn trusted_db_path_refuses_a_memory_name_that_carries_a_query() {
@@ -18674,10 +18816,40 @@ mod trusted_db_path_tests {
         let shared = dir.path().join("shared");
         mkdir(&shared, 0o777);
         let base = shared.display();
-        for url in [
-            format!("sqlite:file:{base}/evil%3Fmode=rwc?mode=memory"),
-            format!("sqlite:file%3A{base}/evil%3Fmode=rwc?mode=memory"),
-            format!("sqlite:file:{base}/evil%3Fmode=rw?mode=memory&cache=shared"),
+        for (url, refused) in [
+            (
+                format!("sqlite:file:{base}/evil%3Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file%3A{base}/evil%3Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil%3Fmode=rw?mode=memory&cache=shared"),
+                true,
+            ),
+            (
+                format!("sqlite:FILE:{base}/evil%3Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil%253Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil?mode=memory&mode=rwc"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil?mode=memory&vfs=unix"),
+                true,
+            ),
+            (format!("sqlite:file:{base}/evil?mode=memory"), false),
+            (
+                format!("sqlite:{base}/evil?mode=memory&cache=shared"),
+                false,
+            ),
         ] {
             let parsed = DbUrl::parse(&url);
             if let Ok(url) = &parsed
@@ -18685,13 +18857,15 @@ mod trusted_db_path_tests {
             {
                 pool.into_pool().close().await;
             }
+            let created = std::fs::read_dir(&shared).map(|mut d| d.next().is_some());
             assert!(
-                !shared.join("evil").exists(),
+                matches!(created, Ok(false)),
                 "an in-memory URL opened a disk file unproven: {url}"
             );
-            assert!(
+            assert_eq!(
                 matches!(parsed, Err(DbConnectError::InvalidUrl)),
-                "an in-memory name with a query parses: {url}"
+                refused,
+                "{url}"
             );
         }
     }
