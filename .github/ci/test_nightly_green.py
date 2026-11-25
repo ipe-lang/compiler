@@ -12,6 +12,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import copy
+import dataclasses
 import importlib.util
 import io
 import itertools
@@ -1345,6 +1346,26 @@ class MainTableTest(unittest.TestCase):
             "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=None, gates=frozenset({'a', 'a'}), non_blocking=frozenset()),)",
             "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=1, gates=frozenset(), non_blocking=frozenset()),)",
             "PRODUCERS: tuple",
+            "PRODUCERS = (Producer(workflow='../a.yml', events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml/runs?branch=x', events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.txt', events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('push',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule', 'schedule'), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery='push', gates=frozenset(), non_blocking=frozenset()),)",
+            f"PRODUCERS = ({entry},)\nif True:\n    PRODUCERS = ()",
+            f"PRODUCERS = ({entry},)\ndef f():\n    global PRODUCERS\n    PRODUCERS = ()",
+            f"PRODUCERS = ({entry},)\nfrom m import PRODUCERS",
+            f"PRODUCERS = ({entry},)\nfrom m import x as PRODUCERS",
+            f"PRODUCERS = ({entry},)\nfrom m import *",
+            f"PRODUCERS = ({entry},)\n(PRODUCERS := ())",
+            f"PRODUCERS = ({entry},)\nPRODUCERS, X = ((), 1)",
+            f"PRODUCERS = ({entry},)\nfor PRODUCERS in ():\n    pass",
+            f"PRODUCERS = ({entry},)\ndel PRODUCERS",
+            f"PRODUCERS = ({entry},)\ndef PRODUCERS():\n    pass",
+            f"PRODUCERS = ({entry},)\nclass PRODUCERS:\n    pass",
+            f"PRODUCERS = ({entry},)\ntry:\n    pass\nexcept Exception as PRODUCERS:\n    pass",
+            f"PRODUCERS = ({entry},)\nmatch 0:\n    case _ as PRODUCERS:\n        pass",
+            f"PRODUCERS = ({entry},)\nwith open('x') as PRODUCERS:\n    pass",
         ]
         for source in bad:
             with self.subTest(source=source[:70]), self.assertRaises(ng.NightlyError):
@@ -1363,9 +1384,42 @@ class MainTableTest(unittest.TestCase):
         self.assertTrue(ng.table_errors(source.replace('workflow="ci.yml"', 'workflow=CI_YML')))
 
     def test_judged_split(self) -> None:
-        judged, introduced = ng.judged_producers((CI, EMIT), (CI, RETIRED))
-        self.assertEqual(judged, [(CI, False), (RETIRED, True)])
+        renamed_ci = dataclasses.replace(CI, gates=frozenset({"asan-all-v2"}))
+        judged, introduced = ng.judged_producers((renamed_ci, EMIT), (CI, RETIRED))
+        self.assertEqual(judged, [(CI, renamed_ci), (RETIRED, None)])
         self.assertEqual(introduced, [EMIT.workflow])
+
+    def test_kept_producer_cannot_narrow_away_a_red_main_nightly(self) -> None:
+        gate = "linux-cfree-gate (refusal is fail-closed)"
+        narrowed = dataclasses.replace(STATIC, gates=frozenset(), non_blocking=STATIC.non_blocking | {gate})
+        run = _prun(STATIC, conclusion="failure")
+        api = FakeApi(
+            _listing(_run()),
+            others={STATIC.workflow: _listing(run)},
+            jobs={STATIC_ID: [_jobs_page(STATIC_ID, (gate, "failure"))]},
+        )
+        with _patched(PRODUCERS=tuple(narrowed if p is STATIC else p for p in ng.PRODUCERS)):
+            reasons = _verdict(api)
+        self.assertTrue(any(gate in r and "main nightly" in r for r in reasons), reasons)
+
+    def test_kept_producer_renaming_a_gate_job_is_judged_on_mains_nightly_by_mains_jobs(self) -> None:
+        renamed = dataclasses.replace(STATIC, gates=frozenset({"linux-cfree-gate v2"}))
+        api = FakeApi(_listing(_run()))
+        with _patched(PRODUCERS=tuple(renamed if p is STATIC else p for p in ng.PRODUCERS)):
+            self.assertEqual(_verdict(api), [])
+
+    def test_change_cannot_grant_itself_a_recovery_main_refuses(self) -> None:
+        granted = dataclasses.replace(RULESET, events=("schedule", "workflow_dispatch"), recovery="workflow_dispatch")
+        own = _prun(RULESET, id=960, event="workflow_dispatch", head_sha=SHA, head_branch="fix")
+        api = FakeApi(
+            _listing(_run()),
+            others={RULESET.workflow: _red(RULESET, 961)},
+            others_own={RULESET.workflow: _listing(own)},
+        )
+        with _patched(PRODUCERS=tuple(granted if p is RULESET else p for p in ng.PRODUCERS)):
+            reasons = _verdict(api)
+        self.assertTrue(any(RULESET.workflow in r and "main only" in r for r in reasons), reasons)
+        self.assertFalse(any(f"/workflows/{RULESET.workflow}/" in c and "head_sha=" in c for c in api.calls))
 
 
 if __name__ == "__main__":

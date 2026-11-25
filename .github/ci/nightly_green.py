@@ -28,10 +28,12 @@ Absence is not a pass: no run, a missing gate job, an unreadable listing, an
 unexpected shape, a cancelled or stale nightly — each is a red.
 
 The producers judged are those main already has, read from main's own copy of
-this file at main's resolved commit (`main_producers`): a producer the change
-lists and main lists is judged by the change's definition; a producer main
-lists and the change drops (a rename or a retirement) is judged by main's
-definition, on main's nightly alone. A producer only the change lists is not
+this file at main's resolved commit (`main_producers`). Main's nightly ran
+main's workflows, so path 2 judges it by main's definition; the change's
+definition judges only path 1, a run on the change's own commit, and only for
+a producer main and the change both list and both let recover. A producer the
+change drops (a rename or a retirement) is judged on main's nightly alone. A
+producer only the change lists is not
 yet judged: it has never run as a nightly on main, so no red of it can exist
 there, and the first nightly after it lands is its proof. "Main lists it not"
 is proven from main's table, never inferred from a failed read: an unreadable
@@ -115,6 +117,7 @@ NIGHTLY_TRIGGERS = ("schedule", "workflow_dispatch")
 RECOVERY_TRIGGER = "workflow_dispatch"
 
 _SHA = re.compile(r"[0-9a-f]{40}")
+_WORKFLOW_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.ya?ml")
 _REPO = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*")
 _QUEUE_REF = re.compile(r"refs/heads/gh-readonly-queue/main/pr-([1-9][0-9]{0,9})-[0-9a-f]{40}")
 
@@ -604,35 +607,36 @@ def _proof_errors(
 
 
 def producer_errors(
-    repo: str, producer: Producer, change_sha: str | None, now: datetime, *, retired: bool = False
+    repo: str, on_main: Producer, change_sha: str | None, now: datetime, *, change: Producer | None = None
 ) -> list[str]:
-    """Return why `producer` is not proven green for a change at `change_sha` (None: main only), or [].
+    """Return why `on_main` is not proven green for a change at `change_sha` (None: main only), or [].
 
-    A `retired` producer (main lists it, the change does not) is judged on its
-    main nightly alone: the change holds no copy of it to dispatch.
+    Main's nightly ran main's workflow, so it is judged by main's definition
+    `on_main` alone; the change's definition `change` (None: the change drops
+    the producer) judges only a run dispatched on the change's own commit, and
+    only when both main and the change admit that recovery.
     """
     reasons: list[str] = []
-    if change_sha is not None and producer.recovery is not None and not retired:
+    if change_sha is not None and change is not None and on_main.recovery is not None and change.recovery is not None:
         own = _proof_errors(
-            repo, producer, (producer.recovery,), f"head_sha={change_sha}", branch=None, sha=change_sha, now=None
+            repo, change, (change.recovery,), f"head_sha={change_sha}", branch=None, sha=change_sha, now=None
         )
         if not own:
             return []
-        reasons += [f"{producer.workflow} at change commit {change_sha[:12]}: {e}" for e in own]
-    main = _proof_errors(repo, producer, producer.events, f"branch={MAIN}", branch=MAIN, sha=None, now=now)
+        reasons += [f"{change.workflow} at change commit {change_sha[:12]}: {e}" for e in own]
+    main = _proof_errors(repo, on_main, on_main.events, f"branch={MAIN}", branch=MAIN, sha=None, now=now)
     if not main:
         return []
-    if retired:
+    if change is None:
         hint = (
             " (this change drops it, so only its main nightly proves it: make that green, "
             "or follow the break-glass in .github/ci/RECONCILIATION.md)"
         )
-    elif producer.recovery is not None:
-        hint = f" (prove a fix with `gh workflow run {producer.workflow} --ref <branch>`)"
+    elif on_main.recovery is not None and change.recovery is not None:
+        hint = f" (prove a fix with `gh workflow run {on_main.workflow} --ref <branch>`)"
     else:
-        hint = ( " (it runs on main only: `gh run rerun` its run, or follow the break-glass in .github/ci/RECONCILIATION.md)"
-        )
-    return reasons + [f"{producer.workflow} main nightly: {e}{hint}" for e in main]
+        hint = " (it runs on main only: `gh run rerun` its run, or follow the break-glass in .github/ci/RECONCILIATION.md)"
+    return reasons + [f"{on_main.workflow} main nightly: {e}{hint}" for e in main]
 
 
 def verdict(env: dict[str, str], now: datetime) -> list[str]:
@@ -658,25 +662,23 @@ def verdict(env: dict[str, str], now: datetime) -> list[str]:
             f"and its first nightly on {MAIN} is its proof."
         )
     reasons: list[str] = []
-    for producer, retired in judged:
-        reasons += producer_errors(repo, producer, None if retired else sha, now, retired=retired)
+    for on_main, change in judged:
+        reasons += producer_errors(repo, on_main, sha, now, change=change)
     return reasons
 
 
 def judged_producers(
     change: tuple[Producer, ...], on_main: tuple[Producer, ...]
-) -> tuple[list[tuple[Producer, bool]], list[str]]:
-    """Split `change`'s and `on_main`'s producers into those judged and those the change introduces.
+) -> tuple[list[tuple[Producer, Producer | None]], list[str]]:
+    """Pair every producer `on_main` lists with the change's definition of it, and name those only the change lists.
 
-    Judged: every producer `on_main` lists, by the change's definition when the
-    change lists it too, else by main's (flagged retired). Introduced: every
-    producer only the change lists; returned by name, never judged.
+    Judged: each of main's producers, as `(main's definition, the change's or
+    None when the change drops it)`. Introduced: every producer only the change
+    lists; returned by name, never judged.
     """
+    kept = {p.workflow: p for p in change}
     main_names = {p.workflow for p in on_main}
-    change_names = {p.workflow for p in change}
-    judged = [(p, False) for p in change if p.workflow in main_names]
-    judged += [(p, True) for p in on_main if p.workflow not in change_names]
-    return judged, [p.workflow for p in change if p.workflow not in main_names]
+    return [(p, kept.get(p.workflow)) for p in on_main], [p.workflow for p in change if p.workflow not in main_names]
 
 
 def main_commit(repo: str) -> str:
@@ -756,6 +758,8 @@ def _literal_producer(node: ast.expr) -> Producer:
         raise NightlyError(f"PRODUCERS entry is not `Producer({', '.join(f + '=' for f in _PRODUCER_FIELDS)})`")
     fields = {k.arg: k.value for k in node.keywords}
     workflow = _literal_str(fields["workflow"], "workflow")
+    if not _WORKFLOW_NAME.fullmatch(workflow):
+        raise NightlyError(f"PRODUCERS workflow {workflow!r} is not a workflow file name")
     events_node = fields["events"]
     if not isinstance(events_node, ast.Tuple) or not events_node.elts:
         raise NightlyError(f"PRODUCERS {workflow} events is not a non-empty tuple")
@@ -765,13 +769,50 @@ def _literal_producer(node: ast.expr) -> Producer:
         if isinstance(recovery_node, ast.Constant) and recovery_node.value is None
         else _literal_str(recovery_node, f"{workflow} recovery")
     )
+    events = tuple(_literal_str(e, f"{workflow} event") for e in events_node.elts)
+    if len(set(events)) != len(events) or not set(events) <= set(NIGHTLY_TRIGGERS):
+        raise NightlyError(f"PRODUCERS {workflow} events {events!r} are not distinct nightly triggers {NIGHTLY_TRIGGERS}")
+    if recovery not in (None, RECOVERY_TRIGGER):
+        raise NightlyError(f"PRODUCERS {workflow} recovery {recovery!r} is not None or {RECOVERY_TRIGGER!r}")
     return Producer(
         workflow=workflow,
-        events=tuple(_literal_str(e, f"{workflow} event") for e in events_node.elts),
+        events=events,
         recovery=recovery,
         gates=_literal_names(fields["gates"], f"{workflow} gates"),
         non_blocking=_literal_names(fields["non_blocking"], f"{workflow} non_blocking"),
     )
+
+
+_NAMED_BINDERS = (
+    ast.FunctionDef,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.ExceptHandler,
+    ast.MatchAs,
+    ast.MatchStar,
+)
+
+
+def _binding_sites(module: ast.Module) -> int:
+    """Count every statement of `module` that binds the name `PRODUCERS`, nested or not.
+
+    A rebinding the literal read skips (in a block, a function's `global`, an
+    import, a `def`, an `except ... as`) would make the executed table diverge from the read one; the
+    reflective spellings (`globals()[...]`) are left to `table_errors`.
+    """
+    sites = 0
+    for node in ast.walk(module):
+        if isinstance(node, ast.Name) and node.id == "PRODUCERS" and not isinstance(node.ctx, ast.Load):
+            sites += 1
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and "PRODUCERS" in node.names:
+            sites += 1
+        elif isinstance(node, ast.alias) and (node.asname or node.name) in ("PRODUCERS", "*"):
+            sites += 1
+        elif isinstance(node, _NAMED_BINDERS) and getattr(node, "name", None) == "PRODUCERS":
+            sites += 1  # `def`/`class`, `except ... as`, `case ... as`
+        elif isinstance(node, ast.MatchMapping) and node.rest == "PRODUCERS":
+            sites += 1
+    return sites
 
 
 def parse_producers(source: str) -> tuple[Producer, ...]:
@@ -793,7 +834,7 @@ def parse_producers(source: str) -> tuple[Producer, ...]:
         if (isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) and binds(stmt.target))
         or (isinstance(stmt, ast.Assign) and any(binds(t) for t in stmt.targets))
     ]
-    if len(values) != 1 or not isinstance(values[0], ast.Tuple):
+    if len(values) != 1 or not isinstance(values[0], ast.Tuple) or _binding_sites(module) != 1:
         raise NightlyError(f"{SELF_PATH} at {MAIN} does not assign PRODUCERS one tuple literal")
     producers = tuple(_literal_producer(e) for e in values[0].elts)
     names = [p.workflow for p in producers]
