@@ -27,6 +27,16 @@ unknown job is never assumed harmless.
 Absence is not a pass: no run, a missing gate job, an unreadable listing, an
 unexpected shape, a cancelled or stale nightly — each is a red.
 
+The producers judged are those main already has, read from main's own copy of
+this file at main's resolved commit (`main_producers`): a producer the change
+lists and main lists is judged by the change's definition; a producer main
+lists and the change drops (a rename or a retirement) is judged by main's
+definition, on main's nightly alone. A producer only the change lists is not
+yet judged: it has never run as a nightly on main, so no red of it can exist
+there, and the first nightly after it lands is its proof. "Main lists it not"
+is proven from main's table, never inferred from a failed read: an unreadable
+or unparsable table is a red.
+
 Modes:
   --verdict  exit 0 iff the proof above holds for $EVENT_NAME / $HEAD_SHA in
              $REPO (a merge-group change is read from the runner's own
@@ -39,6 +49,9 @@ Modes:
 
 from __future__ import annotations
 
+import ast
+import base64
+import binascii
 import json
 import os
 import re
@@ -54,6 +67,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
 CONTEXT = "nightly-green"
 WORKFLOW_FILE = "nightly-green.yml"
 WORKFLOWS_DIR = ".github/workflows"
+SELF_PATH = ".github/ci/nightly_green.py"
+# Largest copy of this file read back from main; the contents API inlines at most 1 MiB.
+MAX_SOURCE_BYTES = 1 << 20
 MAIN = "main"
 MAX_AGE_H = 48
 # Runs fetched per listing; the newest matching run across all listings is judged.
@@ -459,6 +475,7 @@ def _gh_run(path: str) -> subprocess.CompletedProcess[str]:
 
 
 _pause = time.sleep
+_notice = print
 
 
 def _gh_json(path: str) -> object:
@@ -586,10 +603,16 @@ def _proof_errors(
     return job_errors(_jobs(repo, run), producer)
 
 
-def producer_errors(repo: str, producer: Producer, change_sha: str | None, now: datetime) -> list[str]:
-    """Return why `producer` is not proven green for a change at `change_sha` (None: main only), or []."""
+def producer_errors(
+    repo: str, producer: Producer, change_sha: str | None, now: datetime, *, retired: bool = False
+) -> list[str]:
+    """Return why `producer` is not proven green for a change at `change_sha` (None: main only), or [].
+
+    A `retired` producer (main lists it, the change does not) is judged on its
+    main nightly alone: the change holds no copy of it to dispatch.
+    """
     reasons: list[str] = []
-    if change_sha is not None and producer.recovery is not None:
+    if change_sha is not None and producer.recovery is not None and not retired:
         own = _proof_errors(
             repo, producer, (producer.recovery,), f"head_sha={change_sha}", branch=None, sha=change_sha, now=None
         )
@@ -599,11 +622,16 @@ def producer_errors(repo: str, producer: Producer, change_sha: str | None, now: 
     main = _proof_errors(repo, producer, producer.events, f"branch={MAIN}", branch=MAIN, sha=None, now=now)
     if not main:
         return []
-    hint = (
-        f" (prove a fix with `gh workflow run {producer.workflow} --ref <branch>`)"
-        if producer.recovery is not None
-        else " (it runs on main only: `gh run rerun` its run, or follow the break-glass in .github/ci/RECONCILIATION.md)"
-    )
+    if retired:
+        hint = (
+            " (this change drops it, so only its main nightly proves it: make that green, "
+            "or follow the break-glass in .github/ci/RECONCILIATION.md)"
+        )
+    elif producer.recovery is not None:
+        hint = f" (prove a fix with `gh workflow run {producer.workflow} --ref <branch>`)"
+    else:
+        hint = ( " (it runs on main only: `gh run rerun` its run, or follow the break-glass in .github/ci/RECONCILIATION.md)"
+        )
     return reasons + [f"{producer.workflow} main nightly: {e}{hint}" for e in main]
 
 
@@ -623,10 +651,155 @@ def verdict(env: dict[str, str], now: datetime) -> list[str]:
             if not isinstance(head_sha, str) or not _SHA.fullmatch(head_sha):
                 raise NightlyError(f"PR #{sha} has no 40-hex head sha")
             sha = head_sha
+    judged, introduced = judged_producers(PRODUCERS, main_producers(repo))
+    for workflow in introduced:
+        _notice(
+            f"nightly-green: {workflow} is not a producer on {MAIN} yet; this change introduces it, "
+            f"and its first nightly on {MAIN} is its proof."
+        )
     reasons: list[str] = []
-    for producer in PRODUCERS:
-        reasons += producer_errors(repo, producer, sha, now)
+    for producer, retired in judged:
+        reasons += producer_errors(repo, producer, None if retired else sha, now, retired=retired)
     return reasons
+
+
+def judged_producers(
+    change: tuple[Producer, ...], on_main: tuple[Producer, ...]
+) -> tuple[list[tuple[Producer, bool]], list[str]]:
+    """Split `change`'s and `on_main`'s producers into those judged and those the change introduces.
+
+    Judged: every producer `on_main` lists, by the change's definition when the
+    change lists it too, else by main's (flagged retired). Introduced: every
+    producer only the change lists; returned by name, never judged.
+    """
+    main_names = {p.workflow for p in on_main}
+    change_names = {p.workflow for p in change}
+    judged = [(p, False) for p in change if p.workflow in main_names]
+    judged += [(p, True) for p in on_main if p.workflow not in change_names]
+    return judged, [p.workflow for p in change if p.workflow not in main_names]
+
+
+def main_commit(repo: str) -> str:
+    """Return the commit `refs/heads/main` names, read from the exact-ref endpoint (a tag named `main` never answers)."""
+    ref = _gh_json(f"repos/{repo}/git/ref/heads/{MAIN}")
+    target = ref.get("object") if isinstance(ref, dict) else None
+    sha = target.get("sha") if isinstance(target, dict) else None
+    if (
+        not isinstance(ref, dict)
+        or ref.get("ref") != f"refs/heads/{MAIN}"
+        or not isinstance(target, dict)
+        or target.get("type") != "commit"
+        or not isinstance(sha, str)
+        or not _SHA.fullmatch(sha)
+    ):
+        raise NightlyError(f"refs/heads/{MAIN} does not name a 40-hex commit")
+    return sha
+
+
+def main_producers(repo: str) -> tuple[Producer, ...]:
+    """Return the `PRODUCERS` table of this file as main's resolved commit holds it."""
+    sha = main_commit(repo)
+    doc = _gh_json(f"repos/{repo}/contents/{SELF_PATH}?ref={sha}")
+    content = doc.get("content") if isinstance(doc, dict) else None
+    if (
+        not isinstance(doc, dict)
+        or doc.get("type") != "file"
+        or doc.get("path") != SELF_PATH
+        or doc.get("encoding") != "base64"
+        or not isinstance(content, str)
+    ):
+        raise NightlyError(f"{SELF_PATH} at {MAIN} ({sha[:12]}) is not an inlined base64 file")
+    packed = "".join(content.split())
+    if len(packed) > (MAX_SOURCE_BYTES + 2) // 3 * 4:
+        raise NightlyError(f"{SELF_PATH} at {MAIN} exceeds {MAX_SOURCE_BYTES} bytes")
+    try:
+        source = base64.b64decode(packed, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError) as exc:
+        raise NightlyError(f"{SELF_PATH} at {MAIN} ({sha[:12]}) is not base64 UTF-8: {exc}") from exc
+    return parse_producers(source)
+
+
+_PRODUCER_FIELDS = ("workflow", "events", "recovery", "gates", "non_blocking")
+
+
+def _literal_str(node: ast.expr, what: str) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    raise NightlyError(f"PRODUCERS {what} is not a string literal")
+
+
+def _literal_names(node: ast.expr, what: str) -> frozenset[str]:
+    """Read `frozenset()` or `frozenset({"a", ...})` of string literals."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "frozenset"
+        and not node.keywords
+    ):
+        if not node.args:
+            return frozenset()
+        if len(node.args) == 1 and isinstance(node.args[0], ast.Set):
+            names = [_literal_str(e, what) for e in node.args[0].elts]
+            if len(set(names)) == len(names):
+                return frozenset(names)
+    raise NightlyError(f"PRODUCERS {what} is not a frozenset of distinct string literals")
+
+
+def _literal_producer(node: ast.expr) -> Producer:
+    if not (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "Producer"
+        and not node.args
+        and sorted(k.arg or "" for k in node.keywords) == sorted(_PRODUCER_FIELDS)
+    ):
+        raise NightlyError(f"PRODUCERS entry is not `Producer({', '.join(f + '=' for f in _PRODUCER_FIELDS)})`")
+    fields = {k.arg: k.value for k in node.keywords}
+    workflow = _literal_str(fields["workflow"], "workflow")
+    events_node = fields["events"]
+    if not isinstance(events_node, ast.Tuple) or not events_node.elts:
+        raise NightlyError(f"PRODUCERS {workflow} events is not a non-empty tuple")
+    recovery_node = fields["recovery"]
+    recovery = (
+        None
+        if isinstance(recovery_node, ast.Constant) and recovery_node.value is None
+        else _literal_str(recovery_node, f"{workflow} recovery")
+    )
+    return Producer(
+        workflow=workflow,
+        events=tuple(_literal_str(e, f"{workflow} event") for e in events_node.elts),
+        recovery=recovery,
+        gates=_literal_names(fields["gates"], f"{workflow} gates"),
+        non_blocking=_literal_names(fields["non_blocking"], f"{workflow} non_blocking"),
+    )
+
+
+def parse_producers(source: str) -> tuple[Producer, ...]:
+    """Read the one module-level `PRODUCERS` assignment of `source` as literals, never executing it.
+
+    Any other shape (no table, two tables, a computed entry, a repeated
+    workflow) refuses: a table that cannot be read proves nothing.
+    """
+    try:
+        module = ast.parse(source)
+    except (SyntaxError, ValueError) as exc:
+        raise NightlyError(f"{SELF_PATH} at {MAIN} does not parse: {exc}") from exc
+    def binds(target: ast.expr) -> bool:
+        return isinstance(target, ast.Name) and target.id == "PRODUCERS"
+
+    values = [
+        stmt.value
+        for stmt in module.body
+        if (isinstance(stmt, (ast.AnnAssign, ast.AugAssign)) and binds(stmt.target))
+        or (isinstance(stmt, ast.Assign) and any(binds(t) for t in stmt.targets))
+    ]
+    if len(values) != 1 or not isinstance(values[0], ast.Tuple):
+        raise NightlyError(f"{SELF_PATH} at {MAIN} does not assign PRODUCERS one tuple literal")
+    producers = tuple(_literal_producer(e) for e in values[0].elts)
+    names = [p.workflow for p in producers]
+    if len(set(names)) != len(names):
+        raise NightlyError(f"{SELF_PATH} at {MAIN} lists a producer twice")
+    return producers
 
 
 def _strip_expr(text: str) -> str:
@@ -773,6 +946,17 @@ def wiring_errors(
     return errors + producers_errors(manifest, triggers, declared)
 
 
+def table_errors(source: str, declared: tuple[Producer, ...] = PRODUCERS) -> list[str]:
+    """Return why `parse_producers` (how the next change reads this file from main) does not read `declared`, or []."""
+    try:
+        parsed = parse_producers(source)
+    except NightlyError as exc:
+        return [f"PRODUCERS is not literal-readable, so the change after this one cannot read main's table: {exc}"]
+    if parsed != declared:
+        return ["PRODUCERS as read back literally differs from PRODUCERS as executed"]
+    return []
+
+
 def lint(root: str = REPO_ROOT) -> int:
     sys.path.insert(0, HERE)
     import strict_yaml  # noqa: PLC0415  # PyYAML-backed; only `lint` needs it
@@ -786,10 +970,12 @@ def lint(root: str = REPO_ROOT) -> int:
         workflow = load(*workflows, WORKFLOW_FILE)
         manifest = load(".github", "ci", "check-manifest.yml")
         triggers = {name: triggers_of(load(*workflows, name)) for name in nightly_workflows(manifest)}
+        with open(os.path.join(root, SELF_PATH), encoding="utf-8") as fh:
+            own = fh.read()
     except Exception as exc:  # noqa: BLE001  # any read or parse failure is a refusal
         print(f"nightly-green lint: unreadable input: {exc}", file=sys.stderr)
         return 1
-    errors = wiring_errors(workflow, manifest, triggers)
+    errors = wiring_errors(workflow, manifest, triggers) + table_errors(own)
     for err in errors:
         print(f"nightly-green lint: {err}", file=sys.stderr)
     if errors:
