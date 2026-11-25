@@ -2851,7 +2851,7 @@ impl SessionSlot {
     /// Reserve one driver slot under `cap`, or `None` while `cap` are held.
     fn reserve(count: &Arc<AtomicUsize>, cap: std::num::NonZeroUsize) -> Option<Self> {
         count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 (held < cap.get()).then(|| held.saturating_add(1))
             })
             .ok()

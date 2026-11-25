@@ -803,6 +803,9 @@ code! {
     /// the host is missing a toolchain component a build needs (a C compiler,
     /// a linker, or a target's Rust standard library)
     IPE_E0013 = "IPE-E0013", "host toolchain missing", "IPE-E0013";
+    /// the Rust toolchain a build would use is one the emitted crates do not
+    /// support: older than the pinned release, or one whose release cannot be read
+    IPE_E0014 = "IPE-E0014", "unsupported host Rust toolchain", "IPE-E0014";
 
     // -----------------------------------------------------------------------
     // Internal (IPE-I####)

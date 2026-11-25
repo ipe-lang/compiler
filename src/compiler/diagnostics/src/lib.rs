@@ -180,6 +180,9 @@ mod tests {
             IPE_E0013 => Diagnostic::HostToolchainMissing {
                 detail: "no `std` for target `aarch64-unknown-linux-musl`: run `rustup target add aarch64-unknown-linux-musl`".into(),
             },
+            IPE_E0014 => Diagnostic::HostToolchainUnsupported {
+                detail: "The build would use Rust 1.97.1, but Ipê's emitted crates need Rust 1.98.1 or newer.".into(),
+            },
             // Consent
             IPE_S0001 => Diagnostic::Consent {
                 msg: ConsentError::NonInteractive {

@@ -91,6 +91,8 @@ const HOST_NAMES: &[&str] = &[
     "SystemRoot",
     "DATABASE_URL",
     "CARGO",
+    // The compiler cargo runs, read to judge the build's own toolchain.
+    "RUSTC",
     // The host values an isolated git keeps, forwarded uninterpreted.
     "SSH_AUTH_SOCK",
     "LANG",
@@ -751,6 +753,26 @@ fn the_cargo_binary_variable_is_a_host_read_and_only_by_its_exact_name() {
         kinds(
             FIXTURE_PATH,
             "pub fn f() -> Option<std::ffi::OsString> { ipe_env::var_os(\"CARGOX\") }"
+        ),
+        [Kind::Accessor]
+    );
+}
+
+/// `RUSTC`, the compiler cargo runs, is a host variable; a name that only
+/// starts with it is not.
+#[test]
+fn the_cargo_compiler_variable_is_a_host_read_and_only_by_its_exact_name() {
+    assert_eq!(
+        kinds(
+            FIXTURE_PATH,
+            "pub fn f() -> Option<std::ffi::OsString> { ipe_env::var_os(\"RUSTC\") }"
+        ),
+        Vec::<Kind>::new()
+    );
+    assert_eq!(
+        kinds(
+            FIXTURE_PATH,
+            "pub fn f() -> Option<std::ffi::OsString> { ipe_env::var_os(\"RUSTC_WRAPPER\") }"
         ),
         [Kind::Accessor]
     );

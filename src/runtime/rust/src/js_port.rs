@@ -516,7 +516,7 @@ mod native {
         /// The next unused life, or `None` once lives are exhausted.
         fn next() -> Option<Self> {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            NEXT.fetch_update(
+            NEXT.try_update(
                 std::sync::atomic::Ordering::Relaxed,
                 std::sync::atomic::Ordering::Relaxed,
                 |n| n.checked_add(1),

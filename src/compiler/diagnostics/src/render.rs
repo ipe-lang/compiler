@@ -299,6 +299,17 @@ fn prose_band(d: &Diagnostic) -> String {
                  Run `{DOC_HINT_CMD} IPE-E0013` for more help."
             )
         }
+        Diagnostic::HostToolchainUnsupported { detail } => {
+            format!(
+                "The Rust toolchain your build would use is not one Ipê's emitted crates \
+                 support. This is a problem with what is installed on your machine — not a \
+                 mistake in your code.\n\
+                 \n\
+                 {detail}\n\
+                 \n\
+                 Run `{DOC_HINT_CMD} IPE-E0014` for more help."
+            )
+        }
     }
 }
 
@@ -1786,7 +1797,8 @@ fn primary_label(d: &Diagnostic) -> Option<String> {
         | Diagnostic::RegistryUnreachable { .. }
         | Diagnostic::TargetDirUnlinkable { .. }
         | Diagnostic::HostLinkerCannotOpenInput { .. }
-        | Diagnostic::HostToolchainMissing { .. } => None,
+        | Diagnostic::HostToolchainMissing { .. }
+        | Diagnostic::HostToolchainUnsupported { .. } => None,
     }
 }
 

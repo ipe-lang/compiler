@@ -308,7 +308,7 @@ impl Shutdown {
 fn count_work(work: &Arc<Work>, phase: watch::Receiver<Phase>) -> Result<WorkGuard, WorkFull> {
     let counted = work
         .state
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
             if state & CLOSING_BIT == 0 {
                 state.checked_add(1).filter(|_| state < WORK_CEILING)
             } else {
@@ -763,7 +763,7 @@ impl Drain {
             return Some(LiveGuard { live: None });
         };
         live.count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 n.checked_add(1).filter(|_| n < LIVE_CEILING)
             })
             .ok()
@@ -795,7 +795,7 @@ impl Drop for LiveGuard {
         };
         let before = live
             .count
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
                 Some(n.saturating_sub(1))
             });
         if matches!(before, Ok(1)) {

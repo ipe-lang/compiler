@@ -12,6 +12,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bin;
+pub mod fake_toolchain;
 pub mod ffi_app;
 pub mod live_page;
 pub mod scratch;

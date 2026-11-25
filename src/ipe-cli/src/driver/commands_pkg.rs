@@ -4853,7 +4853,8 @@ pub const fn diag_span(d: &Diagnostic) -> ipe_diagnostics::Span {
         | Diagnostic::RegistryUnreachable { .. }
         | Diagnostic::TargetDirUnlinkable { .. }
         | Diagnostic::HostLinkerCannotOpenInput { .. }
-        | Diagnostic::HostToolchainMissing { .. } => ipe_diagnostics::Span::DUMMY,
+        | Diagnostic::HostToolchainMissing { .. }
+        | Diagnostic::HostToolchainUnsupported { .. } => ipe_diagnostics::Span::DUMMY,
     }
 }
 

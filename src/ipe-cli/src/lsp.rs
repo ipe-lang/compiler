@@ -47,6 +47,7 @@ fn root_dir(workspace_roots: &[PathBuf], open_file: &Path) -> Option<PathBuf> {
 /// the load (single-file fallback, retried per edit) or refuses it. Every
 /// limit the driver hits counts the filesystem: the layout comes from disk
 /// alone, so no edit to the open buffer lifts it.
+#[allow(clippy::too_many_lines)] // one arm list per `CliError` variant; a split needs a fallback arm
 fn load_error(err: &CliError) -> LoadError {
     use crate::owner_trust::TrustSubject;
     let detail = err.to_string();
@@ -133,6 +134,7 @@ fn load_error(err: &CliError) -> LoadError {
         | CliError::TestFailed { .. }
         | CliError::UpgradeNoPrebuilt { .. }
         | CliError::ToolchainMissing(_)
+        | CliError::ToolchainBelowFloor(_)
         | CliError::HealthCritical
         | CliError::LintGateFailed
         | CliError::EjectUnsupported { .. }

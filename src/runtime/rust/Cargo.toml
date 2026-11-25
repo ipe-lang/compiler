@@ -2,6 +2,7 @@
 name = "ipe-runtime-rust"
 version.workspace = true
 edition = "2024"
+rust-version = "1.98.1"
 license = "Apache-2.0"
 description = "Ipe language runtime for Rust — primitives, collections, FFI"
 
@@ -738,6 +739,11 @@ wasm-bindgen-test = "0.3"
 [lints.rust]
 # Mirrors the workspace `unsafe_code` deny (this crate keeps its own `[lints]`).
 unsafe_code = "deny"
+# Mirrors the workspace `deprecated` / `deprecated_in_future` denies. A bundle
+# drops both (`runtime_embed::prepare_bundled_manifest`): there the runtime is a
+# path dependency built by the user's toolchain, whose lints cargo does not cap.
+deprecated = "deny"
+deprecated_in_future = "deny"
 
 [lints.clippy]
 # No-runtime-errors gate: a panic vector reached from well-typed code is a bug.

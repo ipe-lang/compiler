@@ -472,6 +472,13 @@ pub enum CliError {
     /// the typed [`toolchain::ToolchainMissing`] naming what the command was
     /// doing and whether the toolchain is uninstalled or merely off the `PATH`.
     ToolchainMissing(toolchain::ToolchainMissing),
+    /// The compiler cargo would run for an emitted build is older than the
+    /// release the emitted manifests require, or it or its version could not
+    /// be resolved. An environment failure judged before cargo runs, not a
+    /// miscompile: rendered as the unsupported-toolchain diagnostic
+    /// (`IPE-E0014`) naming the release found, the one required, where the
+    /// compiler comes from, and the fix.
+    ToolchainBelowFloor(toolchain::ToolchainFloorRefusal),
     /// `ipe health` found a critical prerequisite missing (no `rustc`/`cargo`,
     /// or an unresolvable runtime). This is a legitimate diagnostic verdict —
     /// the command ran correctly and reported the environment fully to stdout —
@@ -730,6 +737,12 @@ impl From<toolchain::ToolchainMissing> for CliError {
     }
 }
 
+impl From<toolchain::ToolchainFloorRefusal> for CliError {
+    fn from(refusal: toolchain::ToolchainFloorRefusal) -> Self {
+        Self::ToolchainBelowFloor(refusal)
+    }
+}
+
 impl From<api_surface::DiffError> for CliError {
     fn from(err: api_surface::DiffError) -> Self {
         match err {
@@ -913,6 +926,7 @@ impl CliError {
             Self::TestFailed { .. } => "test-failed",
             Self::UpgradeNoPrebuilt { .. } => "upgrade-no-prebuilt",
             Self::ToolchainMissing(_) => "toolchain-missing",
+            Self::ToolchainBelowFloor(_) => "toolchain-below-floor",
             Self::HealthCritical => "health-critical",
             Self::LintGateFailed => "lint-gate-failed",
             Self::EjectUnsupported { .. } => "eject-unsupported",
@@ -1018,6 +1032,7 @@ impl CliError {
             | Self::TestFailed { .. }
             | Self::UpgradeNoPrebuilt { .. }
             | Self::ToolchainMissing(_)
+            | Self::ToolchainBelowFloor(_)
             | Self::HealthCritical
             | Self::LintGateFailed
             | Self::EjectUnsupported { .. }
@@ -1085,6 +1100,7 @@ impl CliError {
                 | Self::TestFailed { .. }
                 | Self::UpgradeNoPrebuilt { .. }
                 | Self::ToolchainMissing(_)
+                | Self::ToolchainBelowFloor(_)
                 | Self::EmittedBuildFailed { .. }
                 | Self::TargetDirUnlinkable { .. }
                 | Self::HealthCritical
@@ -1303,6 +1319,12 @@ impl std::fmt::Display for CliError {
             // The toolchain-missing message gutters and frames itself; it owns
             // its rendering (see `toolchain::ToolchainMissing`'s `Display`).
             Self::ToolchainMissing(missing) => write!(f, "{missing}"),
+            Self::ToolchainBelowFloor(refusal) => {
+                let d = Diagnostic::HostToolchainUnsupported {
+                    detail: refusal.detail(),
+                };
+                f.write_str(&render(&d, "", ""))
+            }
             // The full diagnostic report already went to stdout; this stderr
             // line is only the one-line verdict that pairs with the non-zero
             // exit, self-guttered so the caller prints it as-is.
@@ -1682,6 +1704,19 @@ pub fn fmt_emitted_build_failed(
             let d = Diagnostic::RegistryUnreachable { detail };
             f.write_str(&render(&d, "", ""))
         }
+        // cargo's own `rust-version` check refused the toolchain: the
+        // machine's toolchain, not a miscompile. The driver judges the floor
+        // before cargo runs; this catches a toolchain that changed between
+        // the two, or a dependency declaring a later `rust-version`.
+        EmittedBuildCause::ToolchainBelowRustVersion => {
+            let detail = String::from(text::cli_cargo_compile_failed_detail(code, what, &trimmed));
+            let d = Diagnostic::HostToolchainUnsupported {
+                detail: format!(
+                    "{detail}\nUpdate the toolchain, then try again:\n    rustup update stable"
+                ),
+            };
+            f.write_str(&render(&d, "", ""))
+        }
         // The host linker could not open an input (a path its family cannot
         // open, a toolchain file under such a path): the machine's layout, not
         // a miscompile, so no bug-report invitation.
@@ -1728,6 +1763,8 @@ enum EmittedBuildCause {
     MissingRuntimeFeature(String),
     /// `cargo` could not reach the crate registry: DNS, offline, or a proxy.
     RegistryUnreachable,
+    /// `cargo` refused the toolchain as older than a package's `rust-version`.
+    ToolchainBelowRustVersion,
     /// The host linker could not open one of its input files.
     HostLinkerCannotOpenInput(LinkFailure),
     /// Any other failure: the emitted Rust is wrong, a miscompile in ipe.
@@ -1735,12 +1772,26 @@ enum EmittedBuildCause {
 }
 
 impl EmittedBuildCause {
+    /// Who the failure belongs to: the host's network, linker, or toolchain
+    /// are the user's to fix; a stale runtime or a miscompile is ipe's.
+    const fn fault(&self) -> crate::screen::Fault {
+        use crate::screen::Fault::{Internal, User};
+        match self {
+            Self::RegistryUnreachable
+            | Self::ToolchainBelowRustVersion
+            | Self::HostLinkerCannotOpenInput(_) => User,
+            Self::MissingRuntimeFeature(_) | Self::Miscompile => Internal,
+        }
+    }
+
     /// Classify `cargo`'s trimmed stderr.
     fn of(stderr: &str) -> Self {
         missing_runtime_feature(stderr).map_or_else(
             || {
                 if is_registry_unreachable(stderr) {
                     Self::RegistryUnreachable
+                } else if is_below_rust_version(stderr) {
+                    Self::ToolchainBelowRustVersion
                 } else {
                     LinkFailure::parse(stderr)
                         .map_or(Self::Miscompile, Self::HostLinkerCannotOpenInput)
@@ -1749,17 +1800,20 @@ impl EmittedBuildCause {
             Self::MissingRuntimeFeature,
         )
     }
+}
 
-    /// Who the failure belongs to: an unreachable registry or a host linker
-    /// input is the user's; a stale runtime crate or a miscompile is ipe's.
-    const fn fault(&self) -> crate::screen::Fault {
-        match self {
-            Self::RegistryUnreachable | Self::HostLinkerCannotOpenInput(_) => {
-                crate::screen::Fault::User
-            }
-            Self::MissingRuntimeFeature(_) | Self::Miscompile => crate::screen::Fault::Internal,
-        }
-    }
+/// Whether `cargo` refused its toolchain as older than a package's `rust-version`.
+///
+/// The text of cargo's own check: `error: rustc <found> is not supported by
+/// the following package` (or `packages`), each line after it naming a
+/// package and the release it `requires`.
+fn is_below_rust_version(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        line.trim_start()
+            .strip_prefix("error: rustc ")
+            .and_then(|rest| rest.split_once(" is not supported by the following package"))
+            .is_some()
+    })
 }
 
 /// A link step that failed because the host linker could not open one of its inputs.

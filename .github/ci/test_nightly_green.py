@@ -9,8 +9,10 @@ own test, per PRINCIPLES.md "Prove the refusals". Pure stdlib `unittest`.
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import copy
+import dataclasses
 import importlib.util
 import io
 import itertools
@@ -33,6 +35,28 @@ NOW = datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc)
 SHA = "a" * 40
 OTHER = "b" * 40
 REPO = "ipe-lang/compiler"
+MAIN_TIP = "c" * 40
+
+
+def _table_source(producers: tuple[ng.Producer, ...]) -> str:
+    """Render `producers` as main's copy of `nightly_green.py` spells its table."""
+
+    def names(values: frozenset[str]) -> str:
+        return f"frozenset({{{', '.join(repr(v) for v in sorted(values))}}})" if values else "frozenset()"
+
+    entries = "".join(
+        f"    Producer(workflow={p.workflow!r}, events={p.events!r}, recovery={p.recovery!r}, "
+        f"gates={names(p.gates)}, non_blocking={names(p.non_blocking)}),\n"
+        for p in producers
+    )
+    return f"PRODUCERS: tuple[Producer, ...] = (\n{entries})\n"
+
+
+def _contents(source: str) -> dict:
+    """The contents API document of `nightly_green.py` holding `source`, base64 wrapped at 60 columns as GitHub does."""
+    packed = base64.b64encode(source.encode()).decode()
+    wrapped = "\n".join(packed[i : i + 60] for i in range(0, len(packed), 60))
+    return {"type": "file", "path": ng.SELF_PATH, "encoding": "base64", "content": wrapped}
 
 
 def _stamp(delta: timedelta) -> str:
@@ -81,7 +105,7 @@ RULESET = _producer("ruleset-admin-read.yml")
 def _prun(producer: ng.Producer, **over: object) -> dict:
     """A green main nightly of `producer`, id 900 + its position in `PRODUCERS`."""
     run = _run(
-        id=900 + ng.PRODUCERS.index(producer),
+        id=over["id"] if "id" in over else 900 + ng.PRODUCERS.index(producer),
         event=producer.events[0],
         path=producer.path,
     )
@@ -137,8 +161,17 @@ class FakeApi:
         others: dict | None = None,
         others_own: dict | None = None,
         jobs: dict | None = None,
+        on_main: tuple[ng.Producer, ...] | None = None,
+        main_ref: object = None,
+        main_table: object = None,
     ) -> None:
         self.workflow = workflow
+        on_main = ng.PRODUCERS if on_main is None else on_main
+        self.known = {p.workflow: p for p in (*on_main, *ng.PRODUCERS)}
+        self.main_ref = (
+            {"ref": "refs/heads/main", "object": {"type": "commit", "sha": MAIN_TIP}} if main_ref is None else main_ref
+        )
+        self.main_table = _contents(_table_source(on_main)) if main_table is None else main_table
         self.by_id = by_id or {}
         self.jobs = jobs or {}
         self.served: list[object] = []
@@ -150,10 +183,15 @@ class FakeApi:
         self.repo_main = repo_main if repo_main is not None else _listing()
         self.repo_own = repo_own if repo_own is not None else _listing()
         self.compare = compare if compare is not None else {"status": "ahead"}
-        self.others = {p.workflow: _listing(_prun(p)) for p in ng.PRODUCERS if p.workflow != workflow}
+        self.others = {
+            w: _listing(_prun(p, id=800 + i) if p not in ng.PRODUCERS else _prun(p))
+            for i, (w, p) in enumerate(self.known.items())
+            if w != workflow
+        }
         self.others.update(others or {})
         self.others_own = others_own or {}
         self.calls: list[str] = []
+        self.notices: list[str] = []
         self.job_attempts: list[int] = []
 
     def __call__(self, path: str) -> object:
@@ -199,11 +237,21 @@ class FakeApi:
             pages = self.jobs[rid]
             return pages[page - 1] if page <= len(pages) else {"total_count": pages[0].get("total_count"), "jobs": []}
         run = self.judged[rid]
-        (producer,) = [p for p in ng.PRODUCERS if p.path == run.get("path")]
+        (producer,) = [p for p in self.known.values() if p.path == run.get("path")]
         gates = ((g, str(run.get("conclusion"))) for g in sorted(producer.gates))
         return _jobs_page(rid, *gates, attempt=ng._attempt(run))
 
     def _route(self, path: str) -> object:
+        if path == f"repos/{REPO}/git/ref/heads/main":
+            if isinstance(self.main_ref, Exception):
+                raise self.main_ref
+            return self.main_ref
+        if path.startswith(f"repos/{REPO}/contents/"):
+            if path != f"repos/{REPO}/contents/{ng.SELF_PATH}?ref={MAIN_TIP}":
+                raise AssertionError(f"main table read not pinned to main's commit: {path}")
+            if isinstance(self.main_table, Exception):
+                raise self.main_table
+            return self.main_table
         if "/pulls/" in path:
             if self.pr is None:
                 raise ng.NightlyError("no such PR")
@@ -223,7 +271,7 @@ class FakeApi:
                 return self.repo_own
             if "branch=main" in path:
                 return self.repo_main
-        for producer in ng.PRODUCERS:
+        for producer in self.known.values():
             if f"repos/{REPO}/actions/workflows/{producer.workflow}/runs?" not in path:
                 continue
             if producer.workflow != self.workflow:
@@ -260,12 +308,8 @@ def _patched(**seams: object) -> Iterator[None]:
 def _verdict(api: FakeApi, **env: str) -> list[str]:
     base = {"EVENT_NAME": "pull_request", "HEAD_SHA": SHA, "GITHUB_REF": "", "REPO": REPO}
     base.update(env)
-    saved = ng._gh_json
-    ng._gh_json = api
-    try:
+    with _patched(_gh_json=api, _notice=api.notices.append):
         return ng.verdict(base, NOW)
-    finally:
-        ng._gh_json = saved
 
 
 class RunErrorsTest(unittest.TestCase):
@@ -1176,6 +1220,206 @@ class ProducersTest(unittest.TestCase):
         manifest = {"checks": [*MANIFEST["checks"], *SYNTH_MANIFEST["checks"]]}
         self.assertEqual(ng.wiring_errors(WORKFLOW, manifest, SYNTH_TRIGGERS, (SYNTH,)), [])
         self.assertTrue(ng.wiring_errors(WORKFLOW, manifest, SYNTH_TRIGGERS, ()))
+
+
+EMIT = _producer("toolchain-emit.yml")
+WITHOUT_EMIT = tuple(p for p in ng.PRODUCERS if p is not EMIT)
+RETIRED = ng.Producer(
+    workflow="old-emit.yml",
+    events=("schedule", "workflow_dispatch"),
+    recovery="workflow_dispatch",
+    gates=frozenset({"old-emit"}),
+    non_blocking=frozenset(),
+)
+
+
+def _red(producer: ng.Producer, rid: int) -> dict:
+    return _listing(_prun(producer, id=rid, conclusion="failure"))
+
+
+class MainTableTest(unittest.TestCase):
+    """The producers judged are main's: a producer only the change lists waits for its first nightly on main."""
+
+    def test_producer_the_change_introduces_is_not_judged(self) -> None:
+        api = FakeApi(_listing(_run()), on_main=WITHOUT_EMIT, others={EMIT.workflow: _listing()})
+        self.assertEqual(_verdict(api), [])
+        self.assertTrue(any(EMIT.workflow in n for n in api.notices))
+        self.assertFalse(any(f"/workflows/{EMIT.workflow}/" in c for c in api.calls))
+
+    def test_introduced_producer_skipped_in_the_merge_queue_too(self) -> None:
+        api = FakeApi(_listing(_run()), pr={"head": {"sha": SHA}}, on_main=WITHOUT_EMIT, others={EMIT.workflow: _listing()})
+        ref = f"refs/heads/gh-readonly-queue/main/pr-7-{OTHER}"
+        self.assertEqual(_verdict(api, EVENT_NAME="merge_group", HEAD_SHA="", GITHUB_REF=ref), [])
+
+    def test_producer_on_main_without_a_run_stays_red(self) -> None:
+        api = FakeApi(_listing(_run()), others={EMIT.workflow: _listing()})
+        reasons = _verdict(api)
+        self.assertTrue(any(EMIT.workflow in r and "no completed" in r for r in reasons), reasons)
+        self.assertEqual(api.notices, [])
+
+    def test_producer_on_main_with_a_red_nightly_stays_red(self) -> None:
+        self.assertTrue(_verdict(FakeApi(_listing(_run()), others={EMIT.workflow: _red(EMIT, 950)})))
+
+    def test_renamed_producer_judged_by_mains_definition(self) -> None:
+        on_main = (*WITHOUT_EMIT, RETIRED)
+        red = FakeApi(_listing(_run()), on_main=on_main, others={RETIRED.workflow: _red(RETIRED, 951), EMIT.workflow: _listing()})
+        reasons = _verdict(red)
+        self.assertTrue(any(RETIRED.workflow in r and "drops it" in r for r in reasons), reasons)
+        self.assertFalse(any(f"/workflows/{RETIRED.workflow}/" in c and "head_sha=" in c for c in red.calls))
+        green = FakeApi(_listing(_run()), on_main=on_main, others={EMIT.workflow: _listing()})
+        self.assertEqual(_verdict(green), [])
+
+    def test_retired_producer_not_recovered_by_a_dispatch_on_the_change(self) -> None:
+        own = {RETIRED.workflow: _listing(_prun(RETIRED, id=952, head_sha=SHA, head_branch="fix"))}
+        api = FakeApi(
+            _listing(_run()),
+            on_main=(*ng.PRODUCERS, RETIRED),
+            others={RETIRED.workflow: _red(RETIRED, 953)},
+            others_own=own,
+        )
+        self.assertTrue(_verdict(api))
+
+    def test_deleted_producer_judged_by_mains_definition(self) -> None:
+        api = FakeApi(_listing(_run()), others={STATIC.workflow: _red(STATIC, 954)})
+        with _patched(PRODUCERS=tuple(p for p in ng.PRODUCERS if p is not STATIC)):
+            reasons = _verdict(api)
+        self.assertTrue(any(STATIC.workflow in r and "drops it" in r for r in reasons), reasons)
+
+    def test_unreadable_main_table_stays_red(self) -> None:
+        for failure in (
+            ng.NightlyError("`gh api ...` exited 1: gh: Not Found (HTTP 404)"),
+            ng.NightlyError("`gh api ...` exited 1: gh: Bad credentials (HTTP 401)"),
+            ng.GhTransient("`gh api ...` failed transiently 3 times"),
+        ):
+            for where in ("main_ref", "main_table"):
+                with self.subTest(where=where, failure=str(failure)), self.assertRaises(ng.NightlyError):
+                    _verdict(FakeApi(_listing(_run()), on_main=WITHOUT_EMIT, **{where: failure}))
+
+    def test_malformed_main_ref_refused(self) -> None:
+        good = {"ref": "refs/heads/main", "object": {"type": "commit", "sha": MAIN_TIP}}
+        bad = [
+            [],
+            {**good, "ref": "refs/tags/main"},
+            {**good, "object": {"type": "tag", "sha": MAIN_TIP}},
+            {**good, "object": {"type": "commit", "sha": "c" * 39}},
+            {**good, "object": None},
+            [good],
+        ]
+        for ref in bad:
+            with self.subTest(ref=ref), self.assertRaises(ng.NightlyError):
+                _verdict(FakeApi(_listing(_run()), main_ref=ref))
+
+    def test_malformed_main_table_document_refused(self) -> None:
+        good = _contents(_table_source(ng.PRODUCERS))
+        bad = [
+            "not a document",
+            {**good, "type": "dir"},
+            {**good, "type": "symlink"},
+            {**good, "path": "x/nightly_green.py"},
+            {**good, "encoding": "none", "content": ""},
+            {**good, "content": None},
+            {**good, "content": "@@not base64@@"},
+            {**good, "content": base64.b64encode(b"\xff\xfe").decode()},
+            {**good, "content": "A" * ((ng.MAX_SOURCE_BYTES + 2) // 3 * 4 + 4)},
+        ]
+        for doc in bad:
+            with self.subTest(doc=str(doc)[:60]), self.assertRaises(ng.NightlyError):
+                _verdict(FakeApi(_listing(_run()), main_table=doc))
+
+    def test_unreadable_main_table_source_refused(self) -> None:
+        entry = "Producer(workflow='a.yml', events=('schedule',), recovery=None, gates=frozenset({'a'}), non_blocking=frozenset())"
+        bad = [
+            "PRODUCERS = (",
+            "X = ()",
+            f"PRODUCERS = ({entry},)\nPRODUCERS = ({entry},)",
+            f"PRODUCERS = ({entry},)\nPRODUCERS += ({entry},)",
+            f"PRODUCERS = [{entry}]",
+            f"PRODUCERS = ({entry}, {entry})",
+            "PRODUCERS = (make(),)",
+            "PRODUCERS = (Producer('a.yml', ('schedule',), None, frozenset(), frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=None, gates=frozenset()),)",
+            f"PRODUCERS = ({entry[:-1]}, extra=1),)",
+            "PRODUCERS = (Producer(workflow=NAME, events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=(), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=None, gates={'a'}, non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=None, gates=frozenset({g for g in G}), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=None, gates=frozenset({'a', 'a'}), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery=1, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS: tuple",
+            "PRODUCERS = (Producer(workflow='../a.yml', events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml/runs?branch=x', events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.txt', events=('schedule',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('push',), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule', 'schedule'), recovery=None, gates=frozenset(), non_blocking=frozenset()),)",
+            "PRODUCERS = (Producer(workflow='a.yml', events=('schedule',), recovery='push', gates=frozenset(), non_blocking=frozenset()),)",
+            f"PRODUCERS = ({entry},)\nif True:\n    PRODUCERS = ()",
+            f"PRODUCERS = ({entry},)\ndef f():\n    global PRODUCERS\n    PRODUCERS = ()",
+            f"PRODUCERS = ({entry},)\nfrom m import PRODUCERS",
+            f"PRODUCERS = ({entry},)\nfrom m import x as PRODUCERS",
+            f"PRODUCERS = ({entry},)\nfrom m import *",
+            f"PRODUCERS = ({entry},)\n(PRODUCERS := ())",
+            f"PRODUCERS = ({entry},)\nPRODUCERS, X = ((), 1)",
+            f"PRODUCERS = ({entry},)\nfor PRODUCERS in ():\n    pass",
+            f"PRODUCERS = ({entry},)\ndel PRODUCERS",
+            f"PRODUCERS = ({entry},)\ndef PRODUCERS():\n    pass",
+            f"PRODUCERS = ({entry},)\nclass PRODUCERS:\n    pass",
+            f"PRODUCERS = ({entry},)\ntry:\n    pass\nexcept Exception as PRODUCERS:\n    pass",
+            f"PRODUCERS = ({entry},)\nmatch 0:\n    case _ as PRODUCERS:\n        pass",
+            f"PRODUCERS = ({entry},)\nwith open('x') as PRODUCERS:\n    pass",
+        ]
+        for source in bad:
+            with self.subTest(source=source[:70]), self.assertRaises(ng.NightlyError):
+                ng.parse_producers(source)
+            with self.subTest(verdict=source[:70]), self.assertRaises(ng.NightlyError):
+                _verdict(FakeApi(_listing(_run()), main_table=_contents(source)))
+
+    def test_rendered_table_reads_back(self) -> None:
+        self.assertEqual(ng.parse_producers(_table_source((*ng.PRODUCERS, RETIRED))), (*ng.PRODUCERS, RETIRED))
+
+    def test_own_table_is_literal_readable(self) -> None:
+        with open(os.path.join(HERE, "nightly_green.py"), encoding="utf-8") as fh:
+            source = fh.read()
+        self.assertEqual(ng.table_errors(source), [])
+        self.assertTrue(ng.table_errors(source, WITHOUT_EMIT))
+        self.assertTrue(ng.table_errors(source.replace('workflow="ci.yml"', 'workflow=CI_YML')))
+
+    def test_judged_split(self) -> None:
+        renamed_ci = dataclasses.replace(CI, gates=frozenset({"asan-all-v2"}))
+        judged, introduced = ng.judged_producers((renamed_ci, EMIT), (CI, RETIRED))
+        self.assertEqual(judged, [(CI, renamed_ci), (RETIRED, None)])
+        self.assertEqual(introduced, [EMIT.workflow])
+
+    def test_kept_producer_cannot_narrow_away_a_red_main_nightly(self) -> None:
+        gate = "linux-cfree-gate (refusal is fail-closed)"
+        narrowed = dataclasses.replace(STATIC, gates=frozenset(), non_blocking=STATIC.non_blocking | {gate})
+        run = _prun(STATIC, conclusion="failure")
+        api = FakeApi(
+            _listing(_run()),
+            others={STATIC.workflow: _listing(run)},
+            jobs={STATIC_ID: [_jobs_page(STATIC_ID, (gate, "failure"))]},
+        )
+        with _patched(PRODUCERS=tuple(narrowed if p is STATIC else p for p in ng.PRODUCERS)):
+            reasons = _verdict(api)
+        self.assertTrue(any(gate in r and "main nightly" in r for r in reasons), reasons)
+
+    def test_kept_producer_renaming_a_gate_job_is_judged_on_mains_nightly_by_mains_jobs(self) -> None:
+        renamed = dataclasses.replace(STATIC, gates=frozenset({"linux-cfree-gate v2"}))
+        api = FakeApi(_listing(_run()))
+        with _patched(PRODUCERS=tuple(renamed if p is STATIC else p for p in ng.PRODUCERS)):
+            self.assertEqual(_verdict(api), [])
+
+    def test_change_cannot_grant_itself_a_recovery_main_refuses(self) -> None:
+        granted = dataclasses.replace(RULESET, events=("schedule", "workflow_dispatch"), recovery="workflow_dispatch")
+        own = _prun(RULESET, id=960, event="workflow_dispatch", head_sha=SHA, head_branch="fix")
+        api = FakeApi(
+            _listing(_run()),
+            others={RULESET.workflow: _red(RULESET, 961)},
+            others_own={RULESET.workflow: _listing(own)},
+        )
+        with _patched(PRODUCERS=tuple(granted if p is RULESET else p for p in ng.PRODUCERS)):
+            reasons = _verdict(api)
+        self.assertTrue(any(RULESET.workflow in r and "main only" in r for r in reasons), reasons)
+        self.assertFalse(any(f"/workflows/{RULESET.workflow}/" in c and "head_sha=" in c for c in api.calls))
 
 
 if __name__ == "__main__":

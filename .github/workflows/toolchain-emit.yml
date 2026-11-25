@@ -1,0 +1,114 @@
+# The toolchains users actually build with.
+#
+# The repository pins one rustc (`rust-toolchain.toml`) for every other job,
+# while a user builds an emitted project with whatever rustup default they
+# have. Each leg builds `ipe` on the pin, then scaffolds the default app, emits
+# it and builds it on the CURRENT stable or beta channel with every rustc and
+# cargo warning denied,
+# once per runtime emit model (linked path dependency, the default; vendored
+# module tree), so a deprecation, a new lint or a removed API reaches this
+# surface before (beta) or with (stable) the users.
+#
+# A Rust release moves stable without a commit here, so no leg runs per
+# change: `stable-toolchain-emit` is a `nightly-gate` (a red blocks the next
+# merge through `nightly-green`); `beta-toolchain-emit` is an informational
+# early warning.
+name: Toolchain emit
+
+on:
+  schedule:
+    - cron: '17 5 * * *'      # nightly, offset from ci.yml / static.yml / security.yml
+  workflow_dispatch: {}
+
+concurrency:
+  group: toolchain-emit-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  toolchain-emit:
+    name: ${{ matrix.channel }}-toolchain-emit
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable, beta]
+
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/ipe-lang-target
+      IPE_NO_SCCACHE: '1'
+      CARGO_HTTP_MULTIPLEXING: 'false'
+      CARGO_NET_RETRY: '5'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+
+      - name: Restore cargo target
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ runner.os }}-toolchain-emit-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-toolchain-emit-
+            ${{ runner.os }}-cfree-
+
+      - name: Build ipe on the pinned toolchain
+        run: cargo build --release -p ipe
+
+      - name: Install the current ${{ matrix.channel }} toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ matrix.channel }}
+
+      # The work tree is a fresh `mktemp -d` under the runner scratch root,
+      # outside the checkout, so no ancestor `rust-toolchain.toml` pins the
+      # build; `RUSTUP_TOOLCHAIN` and every `cargo +<channel>` name the channel
+      # too. `ipe dev build` proves the SEAL on the channel (ipe accepts =>
+      # cargo builds); the direct `cargo build` proves it warning-free.
+      # `CARGO_BUILD_WARNINGS=deny` (cargo's `build.warnings`) fails on every
+      # warning a user would see: rustc's on the user crate and the path-
+      # dependency runtime, and cargo's own lints (a manifest or target-name
+      # warning `RUSTFLAGS=-D warnings` never reaches).
+      - name: Emit and build the default app on ${{ matrix.channel }}, warnings denied
+        env:
+          CHANNEL: ${{ matrix.channel }}
+          CARGO_BUILD_WARNINGS: deny
+        run: |
+          set -euo pipefail
+          IPE="$CARGO_TARGET_DIR/release/ipe"
+          export RUSTUP_TOOLCHAIN="$CHANNEL"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/toolchain-emit-target"
+          rustc "+$CHANNEL" --version
+          for vendored in 0 1; do
+            work="$(mktemp -d "$RUNNER_TEMP/toolchain-emit.XXXXXX")"
+            case "$work" in
+              "$GITHUB_WORKSPACE"/*) echo "::error::the work tree must lie outside the checkout"; exit 1 ;;
+            esac
+            echo "::group::IPE_RUNTIME_VENDORED=$vendored on $CHANNEL"
+            cd "$work"
+            IPE_RUNTIME_VENDORED="$vendored" "$IPE" init app web
+            cd app
+            IPE_RUNTIME_VENDORED="$vendored" "$IPE" dev build
+            cd out/rust
+            cargo "+$CHANNEL" build
+            echo "::endgroup::"
+          done
+
+      # Only `main` saves: a cache saved under any other ref is one no later run
+      # reads, and it evicts the ones `main` wrote (verify-manifest check 6).
+      # Both legs build the same pinned `ipe`, so whichever saves first serves both.
+      - name: Save cargo target
+        if: github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ${{ github.workspace }}/.cache/ipe-lang-target
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
