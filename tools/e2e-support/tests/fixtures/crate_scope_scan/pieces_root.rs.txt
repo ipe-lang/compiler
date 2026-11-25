@@ -1,0 +1,12 @@
+// Crate roots no single literal spells as a scope item: each must be refused.
+fn pieced(runtime: &str) -> String {
+    format!("pub use {runtime}::*;\nmod ffi;")
+}
+
+fn bytes() -> &'static [u8] {
+    b"pub use ipe_runtime::error::IpeError;"
+}
+
+fn inline_module() -> String {
+    String::from("mod ffi { include!(\"ffi.rs\"); }")
+}

@@ -1,5 +1,6 @@
 //! The `e2e-support` test harness: the resolver refusals and the
-//! workspace-wide source scans, one module each, in one test binary.
+//! workspace-wide source scans (the FFI crate-scope scan among them), one
+//! module each, in one test binary.
 //!
 //! A new test of this crate is a module here, never a new top-level
 //! `tests/<name>.rs`: `test_binaries` refuses a test target the committed
@@ -9,6 +10,7 @@
 mod common;
 
 mod build_warnings;
+mod crate_scope_scan;
 mod resolve;
 mod skip_scan;
 mod target_scan;

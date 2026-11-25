@@ -15,6 +15,9 @@ serde_json = "1"
 ipe_env = { path = "../../src/compiler/env" }
 # The test temp root an isolated build tree sits under when no shared target is set.
 ipe-test-temp = { path = "../test-temp" }
+# The FFI crate scope an `ffi_app` crate root opens with, the one the backend's
+# template is held to.
+ipe_intern = { path = "../../src/compiler/intern" }
 
 [dev-dependencies]
 # The `suite` harness's scans (`skip_scan`, `target_scan`, `test_binaries`) read

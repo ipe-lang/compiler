@@ -1,0 +1,12 @@
+// A probe root spelled by hand, three ways: each must be refused.
+fn plain() -> &'static str {
+    "pub use ipe_runtime::*;\nmod ffi;"
+}
+
+fn reflowed() -> &'static str {
+    "pub   use\n    ipe_runtime::error::IpeError;\nmod ffi;"
+}
+
+fn joined() -> &'static str {
+    concat!("pub type IpeTask<A> = ", "ipe_runtime::IpeTask<IpeError, A>;")
+}

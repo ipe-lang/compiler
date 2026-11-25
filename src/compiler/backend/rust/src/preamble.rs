@@ -45,6 +45,54 @@ const _: () = assert!(
     "templates/main.rs must declare RECURSION_LIMIT_ATTR on its own line",
 );
 
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the template stops carrying an FFI crate-scope item verbatim and ungated [ledger #boundary]
+const _: () = assert!(
+    has_every_scope_item(GOLDEN.as_bytes()),
+    "templates/main.rs must carry every `ipe_intern::FFI_SCOPE_ITEMS` entry, ungated",
+);
+
+/// Whether `text` carries every FFI crate-scope item as an ungated item.
+const fn has_every_scope_item(text: &[u8]) -> bool {
+    let mut items: &[&str] = &ipe_intern::FFI_SCOPE_ITEMS;
+    while let [item, tail @ ..] = items {
+        if !has_ungated_item(text, item.as_bytes()) {
+            return false;
+        }
+        items = tail;
+    }
+    true
+}
+
+/// Whether `item` occurs in `text` as whole lines no attribute governs.
+///
+/// An item under an outer attribute (`#[cfg(windows)]`), comment lines between
+/// them included, is gated: some crate built from the scope would lack it.
+const fn has_ungated_item(text: &[u8], item: &[u8]) -> bool {
+    let mut rest = text;
+    let mut under_attr = false;
+    loop {
+        if !under_attr && starts_with_line(rest, item) {
+            return true;
+        }
+        under_attr = match rest {
+            [b'#', b'[', ..] => true,
+            [b'/', b'/', ..] => under_attr,
+            _ => false,
+        };
+        // Advance past the next newline, to the start of the following line.
+        loop {
+            match rest {
+                [] => return false,
+                [b'\n', tail @ ..] => {
+                    rest = tail;
+                    break;
+                }
+                [_, tail @ ..] => rest = tail,
+            }
+        }
+    }
+}
+
 /// The number spelled by the decimal digits of `attr`, other bytes skipped.
 ///
 /// Saturates at `u64::MAX`, so an absurd literal still fails the equality check.
@@ -187,7 +235,9 @@ pub fn epilogue() -> DResult<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RECURSION_LIMIT_ATTR, attr_limit, epilogue, has_own_line, preamble};
+    use super::{
+        RECURSION_LIMIT_ATTR, attr_limit, epilogue, has_every_scope_item, has_own_line, preamble,
+    };
     use ipe_diagnostics::DResult;
     use ipe_diagnostics::nesting::EMITTED_RECURSION_LIMIT;
 
@@ -217,6 +267,92 @@ mod tests {
         ));
         assert!(!has_own_line(b"#![recursion_limit = \"102\"]\n", attr));
         assert_ne!(attr_limit(b"#![recursion_limit = \"128\"]"), 1024);
+    }
+
+    /// A template missing a scope item, or gating one, fails the scope check.
+    ///
+    /// The live `const` assertion is the build-time half; this drives the same
+    /// fn over a template with one item dropped and one item put under `cfg`.
+    #[test]
+    fn ffi_scope_item_missing_from_template_is_refused() {
+        assert!(has_every_scope_item(GOLDEN.as_bytes()));
+        for item in ipe_intern::FFI_SCOPE_ITEMS {
+            assert_eq!(GOLDEN.matches(item).count(), 1, "{item}");
+            let dropped = GOLDEN.replacen(item, "", 1);
+            assert!(!has_every_scope_item(dropped.as_bytes()), "dropped: {item}");
+            let gated = GOLDEN.replacen(item, &format!("#[cfg(windows)]\n{item}"), 1);
+            assert!(!has_every_scope_item(gated.as_bytes()), "gated: {item}");
+            let commented = GOLDEN.replacen(item, &format!("#[cfg(windows)]\n// note\n{item}"), 1);
+            assert!(
+                !has_every_scope_item(commented.as_bytes()),
+                "commented: {item}"
+            );
+        }
+    }
+
+    /// Whether `src` declares `item` as a crate-root item with no outer
+    /// attribute: the item's tokens at the top level of the lexed file, after
+    /// an item boundary (`;`, a `{ … }` body, an inner attribute, or the start).
+    ///
+    /// The lexer drops comments and keeps a string whole, and a nested module's
+    /// body is one group, so an item in any of them is never at the top level.
+    fn declares_at_root(src: &str, item: &str) -> bool {
+        use proc_macro2::{Delimiter, TokenStream, TokenTree};
+        let lex = |s: &str| -> Vec<String> {
+            s.parse::<TokenStream>()
+                .map(|ts| ts.into_iter().map(|tt| tt.to_string()).collect())
+                .unwrap_or_default()
+        };
+        let Ok(stream) = src.parse::<TokenStream>() else {
+            return false;
+        };
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        let texts: Vec<String> = trees.iter().map(ToString::to_string).collect();
+        let needle = lex(item);
+        if needle.is_empty() {
+            return false;
+        }
+        let boundary = |i: usize| -> bool {
+            let Some(before) = i.checked_sub(1) else {
+                return true;
+            };
+            match trees.get(before) {
+                Some(TokenTree::Punct(p)) => p.as_char() == ';',
+                Some(TokenTree::Group(g)) => match g.delimiter() {
+                    Delimiter::Brace => true,
+                    Delimiter::Bracket => before.checked_sub(1).is_some_and(
+                        |b| matches!(trees.get(b), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
+                    ),
+                    Delimiter::Parenthesis | Delimiter::None => false,
+                },
+                Some(TokenTree::Ident(_) | TokenTree::Literal(_)) | None => false,
+            }
+        };
+        texts
+            .windows(needle.len())
+            .enumerate()
+            .any(|(i, w)| w == needle.as_slice() && boundary(i))
+    }
+
+    /// Every scope item is a crate-root item of the template, which the
+    /// line-based `const` check cannot tell from one inside a block comment,
+    /// a raw string, or a gated nested module.
+    #[test]
+    fn ffi_scope_item_hidden_from_the_crate_root_is_refused() {
+        for item in ipe_intern::FFI_SCOPE_ITEMS {
+            assert!(declares_at_root(GOLDEN, item), "{item}");
+            let hidden = [
+                format!("/*\n{item}\n*/"),
+                format!("const _: &str = r#\"\n{item}\n\"#;"),
+                format!("#[cfg(windows)]\nmod gated {{\n{item}\n}}"),
+                format!("#[cfg(windows)]\n{item}"),
+                format!("/// note\n{item}"),
+            ];
+            for wrapped in hidden {
+                let src = GOLDEN.replacen(item, &wrapped, 1);
+                assert!(!declares_at_root(&src, item), "{wrapped}");
+            }
+        }
     }
 
     /// Independent copy of the template, reconstructed by 1-indexed line ranges
