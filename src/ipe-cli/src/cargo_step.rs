@@ -29,6 +29,7 @@
 //! name passes the stage's single-line parse. cargo's own terminal UI is never
 //! asked for.
 
+use std::ffi::OsStr;
 use std::io::{BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
@@ -37,12 +38,13 @@ use std::time::{Duration, Instant};
 
 use ipe_backend_rust::static_build::StaticTriple;
 
-use crate::output_dir::OwnedDir;
-use crate::output_dir::held::EntryKind;
+use crate::output_dir::held::{EntryKind, HeldDir};
+use crate::output_dir::{OutputRefusal, OwnedDir};
+use crate::pinned_deps::{Agrees, FfiPosture, LOCK_CAP, LockDrift, LockRefusal, PinnedSet};
 use crate::progress::{Door, Mode, Stage};
 use crate::remote_ingest::{
-    GroupedChild, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal, LocalSource,
-    LocalWall, METADATA_LIMITS, RunError, run_local,
+    Captured, GroupedChild, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal,
+    LocalSource, LocalWall, METADATA_LIMITS, RunError, run_local,
 };
 use crate::style::TerminalSafe;
 use crate::target_dir::LinkableTargetDir;
@@ -388,11 +390,12 @@ pub enum CargoCrate<'a> {
 #[derive(Debug, Clone, Copy)]
 enum LockPolicy<'a> {
     /// Replay the crate's own lock when the build's toolchain proves it
-    /// current, else resolve it afresh: ipe owns the emitted crate and its lock.
+    /// current and it agrees with the pinned set, else derive it afresh from
+    /// the pinned set: ipe owns the emitted crate and its lock.
     ReplayOrResolve(&'a OwnedDir),
-    /// Replay the lock the tree already commits; never rewrite it, since ipe
-    /// does not own that tree.
-    Committed,
+    /// Replay the lock the tree already commits, only when its bytes are the
+    /// pinned set's; never rewrite it, since ipe does not own that tree.
+    Committed(&'a crate::wrapper_source::WrapperSource),
 }
 
 impl<'a> CargoCrate<'a> {
@@ -408,7 +411,7 @@ impl<'a> CargoCrate<'a> {
     const fn lock_policy(&self) -> LockPolicy<'a> {
         match *self {
             Self::Emitted(dir) | Self::TestRunner { dir, .. } => LockPolicy::ReplayOrResolve(dir),
-            Self::ReleaseWrapper { .. } => LockPolicy::Committed,
+            Self::ReleaseWrapper { source, .. } => LockPolicy::Committed(source),
         }
     }
 }
@@ -425,7 +428,7 @@ impl Locked {
     const fn settled(&self) -> &'static str {
         match self.0 {
             LockOrigin::Replayed => "dependencies unchanged",
-            LockOrigin::Resolved => "dependencies resolved",
+            LockOrigin::Seeded => "dependencies seeded from the tested set",
         }
     }
 }
@@ -433,10 +436,12 @@ impl Locked {
 /// Where a [`Locked`] lock came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LockOrigin {
-    /// The lock on disk passed the offline `--locked` probe; nothing was resolved.
+    /// The lock on disk passed the offline `--locked` probe and agrees with
+    /// the pinned set; nothing was rewritten.
     Replayed,
-    /// The lock was resolved afresh by `cargo generate-lockfile`.
-    Resolved,
+    /// The pinned set was written as the lock and narrowed to the crate by
+    /// `cargo update --workspace`, then judged to agree with the set.
+    Seeded,
 }
 
 /// What the offline lock probe found.
@@ -569,7 +574,7 @@ impl CargoBuild<'_> {
             LockPolicy::ReplayOrResolve(owned) => {
                 let _locked: Locked = establish_lock(&cmd, owned, self.output.verbosity())?;
             }
-            LockPolicy::Committed => {}
+            LockPolicy::Committed(source) => committed_lock_agrees(source)?,
         }
         cmd.arg("--locked");
         let stderr = std::io::stderr();
@@ -912,22 +917,29 @@ fn rendered_diagnostics(cargo_json_stdout: &str) -> String {
     rendered
 }
 
-/// Prove the emitted crate's `Cargo.lock` replays, or resolve it afresh.
+/// Prove the emitted crate's `Cargo.lock` replays and agrees with the pinned set, or derive it from the set.
 ///
 /// The offline probe ([`probe_lock_within`]) runs first, under
-/// [`LOCK_RESOLVE_LIMITS`]; only a lock it finds drifted is resolved again by
-/// `cargo generate-lockfile` under [`LOCK_FETCH_LIMITS`], which may fetch the
-/// registry index. Both are the one silent gap before cargo's own progress
-/// starts, so a [`Verbosity::Progress`] build covers them with one stage,
-/// settled before the relay starts.
+/// [`LOCK_RESOLVE_LIMITS`], and a lock it holds is judged against the pinned
+/// set ([`crate::pinned_deps::pinned_set`]). Every other lock (absent,
+/// drifted, or disagreeing) is replaced by the set's own bytes and narrowed
+/// to this crate by `cargo update --workspace`, offline first under
+/// [`LOCK_RESOLVE_LIMITS`] and online once only if that fails, under
+/// [`LOCK_FETCH_LIMITS`]; the result is judged again. Both steps are the one silent gap before cargo's own
+/// progress starts, so a [`Verbosity::Progress`] build covers them with one
+/// stage, settled before the relay starts.
 ///
 /// # Errors
-/// - [`CliError::OutputRefused`] if `Cargo.lock` is a symlink or reparse point.
-/// - [`CliError::LocalLimitExceeded`] if the probe or the resolve crosses a ceiling.
+/// - [`CliError::OutputRefused`] if `Cargo.lock` is a symlink or reparse
+///   point, or the crate directory was replaced.
+/// - [`CliError::LockDrift`] if the derived lock disagrees with the pinned
+///   set, or the set embedded in `ipe` cannot be read; the derived lock is
+///   left in place and nothing is built.
+/// - [`CliError::LocalLimitExceeded`] if the probe or an update crosses a ceiling.
 /// - [`CliError::Io`] if either cannot be spawned or waited on.
 /// - [`CliError::ChildPipeHeld`] if a process either started holds a pipe open.
-/// - [`CliError::EmittedBuildFailed`] if the resolve exits non-zero (the
-///   registry unreachable, for one).
+/// - [`CliError::EmittedBuildFailed`] if the online update exits non-zero
+///   (the registry unreachable, for one).
 fn establish_lock(
     build: &Command,
     crate_dir: &OwnedDir,
@@ -939,14 +951,7 @@ fn establish_lock(
             "resolving the emitted crate's dependencies…",
         )
     });
-    let locked =
-        probe_lock_within(build, crate_dir, LOCK_RESOLVE_LIMITS).and_then(|probe| match probe {
-            LockProbe::Holds => Ok(Locked(LockOrigin::Replayed)),
-            LockProbe::Drifted => {
-                lock_dependencies_within(build, crate_dir.path(), LOCK_FETCH_LIMITS)
-                    .map(|()| Locked(LockOrigin::Resolved))
-            }
-        });
+    let locked = derive_lock(build, crate_dir);
     if let Some(stage) = stage {
         match &locked {
             Ok(locked) => stage.success(locked.settled()),
@@ -954,6 +959,131 @@ fn establish_lock(
         }
     }
     locked
+}
+
+/// The verdict of [`establish_lock`], without its stage.
+fn derive_lock(build: &Command, crate_dir: &OwnedDir) -> Result<Locked, CliError> {
+    let dir = crate_dir.path();
+    let set = crate::pinned_deps::pinned_set()
+        .map_err(|drift| lock_drift(dir, FfiPosture::FfiFree, drift))?;
+    let held = held_crate(crate_dir)?;
+    let posture = ffi_posture(&held)?;
+    if probe_lock_within(build, crate_dir, LOCK_RESOLVE_LIMITS)? == LockProbe::Holds
+        && judge_lock(&held, set, posture)?.is_ok()
+    {
+        return Ok(Locked(LockOrigin::Replayed));
+    }
+    seed_lock(&held, set)?;
+    let env = LockEnv::Build(build);
+    let offline = update_lock_offline_within(env, dir, LOCK_RESOLVE_LIMITS)?;
+    let updated = if offline.status.success() {
+        offline
+    } else {
+        update_lock_online_within(env, dir, LOCK_FETCH_LIMITS)?
+    };
+    if !updated.status.success() {
+        return Err(CliError::EmittedBuildFailed {
+            what: "the emitted crate's dependency lock",
+            code: updated.status.code().unwrap_or(1),
+            stderr: updated.stderr.to_terminal(),
+            runtime: None,
+        });
+    }
+    judge_lock(&held, set, posture)?
+        .map(|Agrees { .. }| Locked(LockOrigin::Seeded))
+        .map_err(|drift| lock_drift(dir, posture, drift))
+}
+
+/// The file name of every lock ipe reads or writes.
+const LOCK_NAME: &str = "Cargo.lock";
+
+/// The refusal of the lock in `dir`, judged under `posture`.
+fn lock_drift(dir: &Path, posture: FfiPosture, drift: LockDrift) -> CliError {
+    CliError::LockDrift(Box::new(refusal_of(dir, posture, drift)))
+}
+
+/// The typed refusal of the lock in `dir`, judged under `posture`.
+fn refusal_of(dir: &Path, posture: FfiPosture, drift: LockDrift) -> LockRefusal {
+    LockRefusal {
+        lock: dir.join(LOCK_NAME),
+        posture,
+        drift,
+    }
+}
+
+/// The claimed crate directory, held and proven to be the one claimed.
+///
+/// # Errors
+/// [`OutputRefusal::Replaced`] when the path is absent or names another
+/// directory; as [`HeldDir::open`] otherwise.
+fn held_crate(crate_dir: &OwnedDir) -> Result<HeldDir, CliError> {
+    match HeldDir::open(crate_dir.path())? {
+        Some(held) if held.id()? == crate_dir.id() => Ok(held),
+        Some(_) | None => Err(OutputRefusal::Replaced(crate_dir.path().to_path_buf()).into()),
+    }
+}
+
+/// The FFI posture of the crate held at `dir`: FFI-bearing exactly when it emits `src/ffi.rs`.
+///
+/// # Errors
+/// [`CliError::OutputRefused`] when `src` is a link or not a directory;
+/// [`CliError::Io`] on a filesystem failure.
+fn ffi_posture(dir: &HeldDir) -> Result<FfiPosture, CliError> {
+    let Some(src) = dir.child(OsStr::new("src"))? else {
+        return Ok(FfiPosture::FfiFree);
+    };
+    Ok(match src.kind_of(&src.entry(OsStr::new("ffi.rs"))?)? {
+        EntryKind::Other => FfiPosture::FfiBearing,
+        EntryKind::Absent | EntryKind::Directory | EntryKind::Symlink => FfiPosture::FfiFree,
+    })
+}
+
+/// Replace the lock of the crate held at `dir` with the pinned set's own bytes.
+///
+/// # Errors
+/// [`OutputRefusal::Symlink`] for a link at the lock; [`CliError::Io`] on a
+/// filesystem failure.
+fn seed_lock(dir: &HeldDir, set: &PinnedSet) -> Result<(), CliError> {
+    dir.write_file(OsStr::new(LOCK_NAME), None, |file| {
+        file.write_all(set.seed_bytes())
+    })
+}
+
+/// Judge the lock of the crate held at `dir` against `set` under `posture`.
+///
+/// # Errors
+/// As [`HeldDir::read_file_capped`] under [`LOCK_CAP`]: the lock absent, a
+/// link, not a regular file, past the cap, or not UTF-8.
+fn judge_lock(
+    dir: &HeldDir,
+    set: &PinnedSet,
+    posture: FfiPosture,
+) -> Result<Result<Agrees, LockDrift>, CliError> {
+    let text = dir.read_file_capped(&dir.entry(OsStr::new(LOCK_NAME))?, LOCK_CAP)?;
+    Ok(set.judge_text(&text, posture))
+}
+
+/// Refuse a release wrapper whose committed lock is not the pinned set, byte for byte.
+///
+/// The bytes judged are the ones [`crate::wrapper_source::WrapperSource`]
+/// read through its held root, so no second read is trusted.
+///
+/// # Errors
+/// [`CliError::LockDrift`] with [`LockDrift::WrapperDiffers`] when the bytes
+/// differ, or [`LockDrift::SetUnreadable`] when the embedded set does not parse.
+fn committed_lock_agrees(source: &crate::wrapper_source::WrapperSource) -> Result<(), CliError> {
+    let root = source.root();
+    let set = crate::pinned_deps::pinned_set()
+        .map_err(|drift| lock_drift(root, FfiPosture::FfiFree, drift))?;
+    if source.lock_bytes() == set.seed_bytes() {
+        Ok(())
+    } else {
+        Err(lock_drift(
+            root,
+            FfiPosture::FfiFree,
+            LockDrift::WrapperDiffers,
+        ))
+    }
 }
 
 /// Whether the toolchain of `build` replays `crate_dir`'s `Cargo.lock` unchanged, offline.
@@ -1017,85 +1147,128 @@ fn forward_build_env(build: &Command, child: &mut Command) {
     }
 }
 
-/// Resolve the crate's dependency graph afresh into its own `Cargo.lock`.
-///
-/// It runs with the build command's program, directory and environment, so
-/// the lock comes from the toolchain that consumes it, held to `ceiling`
-/// ([`LOCK_FETCH_LIMITS`] in production: the resolve may fetch the registry
-/// index). Its stderr is kept for the failure diagnostic, never relayed.
-///
-/// # Errors
-/// - [`CliError::LocalLimitExceeded`] if the resolve crosses a ceiling.
-/// - [`CliError::Io`] if the resolve cannot be spawned or waited on.
-/// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
-/// - [`CliError::EmittedBuildFailed`] if it exits non-zero (the registry
-///   unreachable, for one).
-fn lock_dependencies_within(
-    build: &Command,
-    dir: &Path,
-    ceiling: LocalCeiling,
-) -> Result<(), CliError> {
-    let mut lock = Command::new(build.get_program());
-    lock.arg("generate-lockfile").current_dir(dir);
-    forward_build_env(build, &mut lock);
-    match run_local(lock, ceiling, LocalSource::LockFetch) {
-        Ok(captured) if captured.status.success() => Ok(()),
-        Ok(captured) => Err(CliError::EmittedBuildFailed {
-            what: "the emitted crate's dependency lockfile",
-            code: captured.status.code().unwrap_or(1),
-            stderr: captured.stderr.to_terminal(),
-            runtime: None,
-        }),
-        Err(e) => Err(local_run_error(dir, e)),
+/// The program and environment a lock update runs with.
+#[derive(Debug, Clone, Copy)]
+enum LockEnv<'a> {
+    /// The build command's program and environment, so the lock comes from
+    /// the toolchain that consumes it.
+    Build(&'a Command),
+    /// A bare `cargo` with the ambient environment.
+    Bare(&'a Path),
+}
+
+impl LockEnv<'_> {
+    /// The `cargo` the update runs.
+    fn program(&self) -> &OsStr {
+        match self {
+            Self::Build(build) => build.get_program(),
+            Self::Bare(cargo) => cargo.as_os_str(),
+        }
+    }
+
+    /// Give `update` the build's environment; a bare `cargo` adds none.
+    fn forward_into(self, update: &mut Command) {
+        match self {
+            Self::Build(build) => forward_build_env(build, update),
+            Self::Bare(_) => {}
+        }
     }
 }
 
-/// How an offline `cargo generate-lockfile` that ran within its ceilings ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Narrow the lock in `dir` to its crate with `cargo update --workspace --offline`.
+///
+/// `--workspace` keeps every non-member pin of the seeded lock: cargo adds
+/// the crate's own packages and prunes the ones it does not reach. Only the
+/// local registry cache is read, so it is held to `ceiling`
+/// ([`LOCK_RESOLVE_LIMITS`] in production), the probe's. Its stderr is kept
+/// for the failure diagnostic, never relayed; its exit is the caller's to judge.
+///
+/// # Errors
+/// - [`CliError::LocalLimitExceeded`] if the update crosses a ceiling.
+/// - [`CliError::Io`] if it cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
+fn update_lock_offline_within(
+    env: LockEnv<'_>,
+    dir: &Path,
+    ceiling: LocalCeiling,
+) -> Result<Captured, CliError> {
+    let mut update = Command::new(env.program());
+    update
+        .args(["update", "--workspace", "--offline"])
+        .current_dir(dir);
+    env.forward_into(&mut update);
+    run_local(update, ceiling, LocalSource::LockResolve).map_err(|e| local_run_error(dir, e))
+}
+
+/// Narrow the lock in `dir` to its crate with `cargo update --workspace`, fetching the index.
+///
+/// The online twin of [`update_lock_offline_within`], held to `ceiling`
+/// ([`LOCK_FETCH_LIMITS`] in production): the index fetch is the one step
+/// that may take the wall of a registry clone.
+///
+/// # Errors
+/// - [`CliError::LocalLimitExceeded`] if the update crosses a ceiling.
+/// - [`CliError::Io`] if it cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process it started holds a pipe open.
+fn update_lock_online_within(
+    env: LockEnv<'_>,
+    dir: &Path,
+    ceiling: LocalCeiling,
+) -> Result<Captured, CliError> {
+    let mut update = Command::new(env.program());
+    update.args(["update", "--workspace"]).current_dir(dir);
+    env.forward_into(&mut update);
+    run_local(update, ceiling, LocalSource::LockFetch).map_err(|e| local_run_error(dir, e))
+}
+
+/// How an offline lock derivation that ran within its ceilings ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LockOutcome {
-    /// cargo exited zero: the lock is written.
-    Resolved,
+    /// The lock was seeded from the pinned set, narrowed, and agrees with it.
+    Seeded,
     /// cargo exited non-zero, or was ended by a signal (`code` is `None`).
     Unresolved {
         /// cargo's exit code, when it exited.
         code: Option<i32>,
     },
+    /// The narrowed lock disagrees with the pinned set, or the set cannot be read.
+    Drift(LockRefusal),
 }
 
-/// Resolve `manifest`'s dependency graph into its `Cargo.lock` offline, from the local registry cache.
+/// Derive the `Cargo.lock` of the crate at `crate_dir` from the pinned set, offline.
 ///
-/// The child runs under [`LOCK_RESOLVE_LIMITS`] with stdin closed. A
-/// non-zero exit is a [`LockOutcome::Unresolved`], not an error: the caller
-/// decides whether an unresolved lock is fatal.
+/// The set's bytes are written as the lock through a held handle, narrowed
+/// by an offline `cargo update --workspace` under [`LOCK_RESOLVE_LIMITS`] with
+/// stdin closed, and judged FFI-bearing: user crates may add names, never
+/// move a pin. A non-zero exit is a [`LockOutcome::Unresolved`] and a
+/// disagreement a [`LockOutcome::Drift`], not errors: the caller decides
+/// whether either is fatal.
 ///
 /// # Errors
+/// - [`CliError::OutputRefused`] if `crate_dir` or its lock is a link.
 /// - [`CliError::LocalLimitExceeded`] if cargo crosses a ceiling; its process
 ///   group is killed.
-/// - [`CliError::Io`] (naming `manifest`) if cargo cannot be spawned or waited on.
+/// - [`CliError::Io`] (naming `crate_dir`) if cargo cannot be spawned or
+///   waited on, or the lock cannot be written or read back.
 /// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
-pub fn lock_offline(cargo: &Path, manifest: &Path) -> Result<LockOutcome, CliError> {
-    lock_offline_within(cargo, manifest, LOCK_RESOLVE_LIMITS)
-}
-
-/// [`lock_offline`] held to `ceiling`.
-fn lock_offline_within(
-    cargo: &Path,
-    manifest: &Path,
-    ceiling: LocalCeiling,
-) -> Result<LockOutcome, CliError> {
-    let mut lock = Command::new(cargo);
-    lock.arg("generate-lockfile")
-        .arg("--offline")
-        .arg("--manifest-path")
-        .arg(manifest);
-    let captured = run_local(lock, ceiling, LocalSource::LockResolve)
-        .map_err(|e| local_run_error(manifest, e))?;
-    Ok(if captured.status.success() {
-        LockOutcome::Resolved
-    } else {
-        LockOutcome::Unresolved {
-            code: captured.status.code(),
-        }
+pub fn lock_offline(cargo: &Path, crate_dir: &Path) -> Result<LockOutcome, CliError> {
+    let posture = FfiPosture::FfiBearing;
+    let set = match crate::pinned_deps::pinned_set() {
+        Ok(set) => set,
+        Err(drift) => return Ok(LockOutcome::Drift(refusal_of(crate_dir, posture, drift))),
+    };
+    let held = HeldDir::open(crate_dir)?
+        .ok_or_else(|| CliError::from(OutputRefusal::Replaced(crate_dir.to_path_buf())))?;
+    seed_lock(&held, set)?;
+    let updated = update_lock_offline_within(LockEnv::Bare(cargo), crate_dir, LOCK_RESOLVE_LIMITS)?;
+    if !updated.status.success() {
+        return Ok(LockOutcome::Unresolved {
+            code: updated.status.code(),
+        });
+    }
+    Ok(match judge_lock(&held, set, posture)? {
+        Ok(Agrees { .. }) => LockOutcome::Seeded,
+        Err(drift) => LockOutcome::Drift(refusal_of(crate_dir, posture, drift)),
     })
 }
 
@@ -2257,9 +2430,9 @@ mod tests {
         //! Builds driven through a stub `cargo` that logs every invocation.
 
         use super::super::{
-            BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, LockOutcome, LockProbe,
-            Verbosity, WatchBuild, lock_dependencies_within, lock_offline, lock_offline_within,
-            probe_lock_within, target_directory, target_directory_within,
+            BuildPosture, CargoBuild, CargoCrate, CargoOutput, CargoTarget, LockEnv, LockOutcome,
+            LockProbe, Verbosity, WatchBuild, lock_offline, probe_lock_within, target_directory,
+            target_directory_within, update_lock_offline_within, update_lock_online_within,
         };
         use super::TARGET;
         use crate::CliError;
@@ -2366,9 +2539,9 @@ mod tests {
             let base = scratch("lock-wall");
             let cargo = sleeping_stub(&base);
             let started = std::time::Instant::now();
-            let locked = lock_offline_within(
-                cargo.path(),
-                &base.join("Cargo.toml"),
+            let locked = update_lock_offline_within(
+                LockEnv::Bare(cargo.path()),
+                &base,
                 LOCK_RESOLVE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );
             assert!(
@@ -2380,7 +2553,7 @@ mod tests {
                         ..
                     }))
                 ),
-                "a resolve past its wall is a typed refusal, got {locked:?}"
+                "an offline update past its wall is a typed refusal, got {locked:?}"
             );
             assert!(
                 started.elapsed() < Duration::from_secs(20),
@@ -2401,7 +2574,7 @@ mod tests {
         fn an_offline_lock_flooding_stdout_is_refused() {
             let base = scratch("lock-stdout");
             let cargo = stub(&base, "head -c 1048576 /dev/zero");
-            let locked = lock_offline(cargo.path(), &base.join("Cargo.toml"));
+            let locked = lock_offline(cargo.path(), &base);
             assert!(
                 matches!(
                     &locked,
@@ -2420,31 +2593,30 @@ mod tests {
         fn an_offline_lock_that_fails_is_unresolved_not_an_error() {
             let base = scratch("lock-fail");
             let cargo = stub(&base, "exit 101");
-            let manifest = base.join("Cargo.toml");
-            let locked = lock_offline(cargo.path(), &manifest);
+            let locked = lock_offline(cargo.path(), &base);
             assert_eq!(
                 locked.ok(),
                 Some(LockOutcome::Unresolved { code: Some(101) })
             );
             assert_eq!(
-                invocations(&base).first().map(String::as_str),
-                Some(
-                    format!(
-                        "generate-lockfile --offline --manifest-path {}",
-                        manifest.display()
-                    )
-                    .as_str()
-                )
+                invocations(&base),
+                ["update --workspace --offline"],
+                "the lock is narrowed offline, never resolved afresh"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
 
         #[test]
-        fn an_offline_lock_that_succeeds_is_resolved() {
+        fn an_offline_lock_that_succeeds_is_seeded_from_the_pinned_set() {
             let base = scratch("lock-ok");
             let cargo = stub(&base, "true");
-            let locked = lock_offline(cargo.path(), &base.join("Cargo.toml"));
-            assert_eq!(locked.ok(), Some(LockOutcome::Resolved));
+            let locked = lock_offline(cargo.path(), &base);
+            assert_eq!(locked.ok(), Some(LockOutcome::Seeded));
+            assert_eq!(
+                std::fs::read(base.join("Cargo.lock")).ok().as_deref(),
+                Some(seed()),
+                "the lock is the pinned set's own bytes"
+            );
             let _ = std::fs::remove_dir_all(&base);
         }
 
@@ -2454,8 +2626,8 @@ mod tests {
             let cargo = sleeping_stub(&base);
             let build = std::process::Command::new(cargo.path());
             let started = std::time::Instant::now();
-            let locked = lock_dependencies_within(
-                &build,
+            let locked = update_lock_online_within(
+                LockEnv::Build(&build),
                 &base,
                 LOCK_FETCH_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );
@@ -2468,7 +2640,7 @@ mod tests {
                         ..
                     }))
                 ),
-                "a networked resolve past its wall is a typed refusal, got {locked:?}"
+                "a networked update past its wall is a typed refusal, got {locked:?}"
             );
             assert!(
                 started.elapsed() < Duration::from_secs(20),
@@ -2500,10 +2672,8 @@ mod tests {
             assert!(built.is_ok(), "{built:?}");
             let calls = invocations(&base);
             assert!(
-                calls
-                    .iter()
-                    .all(|c| !c.contains("generate-lockfile") && !c.starts_with("update ")),
-                "the wrapper's committed lock is never probed nor regenerated, got {calls:?}"
+                calls.iter().all(|c| !c.starts_with("update ")),
+                "the wrapper's committed lock is never probed nor rewritten, got {calls:?}"
             );
             assert!(
                 calls
@@ -2537,7 +2707,7 @@ mod tests {
         const PROBE: &str = "update --workspace --locked --offline";
 
         #[test]
-        fn an_emitted_build_with_no_lock_resolves_then_replays() {
+        fn an_emitted_build_with_no_lock_is_seeded_then_replays() {
             let base = scratch("no-lock");
             let cargo = stub(&base, "true");
             let crate_dir = emitted_crate(&base, false);
@@ -2546,12 +2716,17 @@ mod tests {
             let calls = invocations(&base);
             assert_eq!(
                 subcommands(&base),
-                ["generate-lockfile", "build"],
-                "an absent lock is resolved without a probe, got {calls:?}"
+                ["update", "build"],
+                "an absent lock is seeded and narrowed without a probe, got {calls:?}"
+            );
+            assert_eq!(
+                calls.first().map(String::as_str),
+                Some("update --workspace --offline"),
+                "the seeded lock is narrowed offline first, got {calls:?}"
             );
             assert!(
                 calls.get(1).is_some_and(|c| c.contains("--locked")),
-                "the build replays the fresh lock, got {calls:?}"
+                "the build replays the derived lock, got {calls:?}"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2578,31 +2753,37 @@ mod tests {
         }
 
         #[test]
-        fn a_lock_the_probe_rejects_is_resolved_afresh() {
+        fn a_lock_the_probe_rejects_is_seeded_afresh() {
             let base = scratch("probe-drifted");
-            let cargo = stub(&base, "[ \"$1\" = update ] && exit 101\nexit 0");
+            let cargo = stub(
+                &base,
+                "case \"$*\" in update*--locked*) exit 101;; esac\nexit 0",
+            );
             let crate_dir = emitted_crate(&base, true);
             let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
             assert!(built.is_ok(), "{built:?}");
             assert_eq!(
                 subcommands(&base),
-                ["update", "generate-lockfile", "build"],
-                "a drifted lock is resolved afresh before the build"
+                ["update", "update", "build"],
+                "a drifted lock is seeded from the pinned set before the build"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
 
         #[test]
-        fn a_probe_ended_by_a_signal_resolves() {
+        fn a_probe_ended_by_a_signal_is_seeded() {
             let base = scratch("probe-signal");
-            let cargo = stub(&base, "[ \"$1\" = update ] && kill -9 $$\nexit 0");
+            let cargo = stub(
+                &base,
+                "case \"$*\" in update*--locked*) kill -9 $$;; esac\nexit 0",
+            );
             let crate_dir = emitted_crate(&base, true);
             let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
             assert!(built.is_ok(), "{built:?}");
             assert_eq!(
                 subcommands(&base),
-                ["update", "generate-lockfile", "build"],
-                "a probe with no exit code never proves the lock, so it is resolved"
+                ["update", "update", "build"],
+                "a probe with no exit code never proves the lock, so it is seeded"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2645,7 +2826,7 @@ mod tests {
             assert_eq!(
                 subcommands(&base),
                 ["update"],
-                "a refused probe is never followed by a resolve"
+                "a refused probe is never followed by an update"
             );
             let _ = std::fs::remove_dir_all(&base);
         }
@@ -2717,6 +2898,138 @@ mod tests {
             let _ = std::fs::remove_dir_all(&base);
         }
 
+        /// The pinned set's seed bytes, empty when the embedded set does not parse.
+        fn seed() -> &'static [u8] {
+            crate::pinned_deps::pinned_set().map_or(&[][..], |set| set.seed_bytes())
+        }
+
+        /// The version `ipe` pins for `serde_json`, read from the seed.
+        fn pinned_serde_json() -> Option<String> {
+            let text = std::str::from_utf8(seed()).ok()?;
+            let at = text.find("name = \"serde_json\"\nversion = \"")?;
+            let rest = text.get(at..)?.split_once("version = \"")?.1;
+            Some(rest.split_once('"')?.0.to_owned())
+        }
+
+        /// A version of `serde_json` compatible with the pin yet not it.
+        fn moved_serde_json() -> &'static str {
+            if pinned_serde_json().as_deref() == Some("1.0.0") {
+                "1.0.1"
+            } else {
+                "1.0.0"
+            }
+        }
+
+        /// A lock whose root `app` reaches `serde_json` at a moved version
+        /// through the user crate `user_crate`.
+        fn moved_lock() -> String {
+            let registry = "source = \"registry+https://github.com/rust-lang/crates.io-index\"";
+            let sum = "a".repeat(64);
+            format!(
+                "version = 4\n\n\
+                 [[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\"user_crate\"]\n\n\
+                 [[package]]\nname = \"serde_json\"\nversion = \"{moved}\"\n{registry}\nchecksum = \"{sum}\"\n\n\
+                 [[package]]\nname = \"user_crate\"\nversion = \"3.1.0\"\n{registry}\nchecksum = \"{sum}\"\n\
+                 dependencies = [\"serde_json\"]\n",
+                moved = moved_serde_json(),
+            )
+        }
+
+        #[test]
+        fn a_planted_lock_moving_a_pin_is_reseeded_from_the_pinned_set() {
+            let base = scratch("planted-moved");
+            let cargo = stub(&base, "exit 0");
+            let crate_dir = emitted_crate(&base, false);
+            let lock = crate_dir.path().join("Cargo.lock");
+            std::fs::write(&lock, moved_lock()).expect("plant the lock");
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(built.is_ok(), "{built:?}");
+            assert_eq!(
+                subcommands(&base),
+                ["update", "update", "build"],
+                "a lock the probe holds but the pinned set refuses is seeded again"
+            );
+            assert_eq!(
+                std::fs::read(&lock).ok().as_deref(),
+                Some(seed()),
+                "the planted lock is replaced by the pinned set's own bytes"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn an_update_moving_a_pin_is_refused_naming_the_requester_and_the_fix() {
+            let base = scratch("update-moved");
+            let moved = base.join("moved.lock");
+            std::fs::write(&moved, moved_lock()).expect("write the moved lock");
+            let cargo = stub(
+                &base,
+                &format!(
+                    "case \"$*\" in *--locked*) exit 0;; update*) cat '{}' > Cargo.lock;; esac\nexit 0",
+                    moved.display()
+                ),
+            );
+            let crate_dir = emitted_crate(&base, false);
+            // FFI-bearing: a user crate beside ipe's graph is the user's to relax.
+            std::fs::create_dir(crate_dir.path().join("src")).expect("create src");
+            std::fs::write(crate_dir.path().join("src").join("ffi.rs"), "").expect("write ffi");
+            let built = build(&cargo, CargoCrate::Emitted(&crate_dir));
+            assert!(
+                matches!(
+                    &built,
+                    Err(CliError::LockDrift(refusal))
+                        if matches!(&refusal.drift, crate::pinned_deps::LockDrift::Moved { .. })
+                            && refusal.posture == crate::pinned_deps::FfiPosture::FfiBearing
+                ),
+                "a lock the update moves off its pin is refused, got {built:?}"
+            );
+            assert_eq!(
+                subcommands(&base),
+                ["update"],
+                "nothing is built against a refused lock"
+            );
+            let Err(refused) = built else { return };
+            let shown = refused.to_string();
+            let pinned = pinned_serde_json().unwrap_or_default();
+            assert!(
+                shown.contains(&format!("serde_json {pinned}")) && shown.contains("user_crate"),
+                "names the pin and the requester: {shown}"
+            );
+            assert!(
+                shown.contains("relax user_crate's `serde_json` requirement"),
+                "names the fix: {shown}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn a_wrapper_whose_committed_lock_is_not_the_pinned_set_is_refused() {
+            let base = scratch("wrapper-drift");
+            let cargo = stub(&base, "exit 0");
+            let source =
+                crate::wrapper_source::WrapperSource::unverified_with_lock(&base, "version = 4\n");
+            let built = build(
+                &cargo,
+                CargoCrate::ReleaseWrapper {
+                    source: &source,
+                    embed: None,
+                },
+            );
+            assert!(
+                matches!(
+                    &built,
+                    Err(CliError::LockDrift(refusal))
+                        if matches!(refusal.drift, crate::pinned_deps::LockDrift::WrapperDiffers)
+                ),
+                "a committed lock other than the pinned set is refused, got {built:?}"
+            );
+            assert!(
+                invocations(&base).is_empty(),
+                "no cargo runs against a wrapper lock that differs"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
         /// Write a library package `name` at `dir` whose `[dependencies]` are `deps`.
         fn package(dir: &Path, name: &str, deps: &str) {
             std::fs::create_dir_all(dir.join("src")).expect("package dir");
@@ -2745,10 +3058,10 @@ mod tests {
             assert!(!lock.exists(), "the probe never writes a lock");
 
             let resolved = std::process::Command::new("cargo")
-                .args(["generate-lockfile", "--offline"])
+                .args(["update", "--workspace", "--offline"])
                 .current_dir(crate_dir.path())
                 .status()
-                .expect("run cargo generate-lockfile");
+                .expect("run cargo update");
             assert!(resolved.success(), "the test lock resolves offline");
             let current = std::fs::read(&lock).expect("read the lock");
             assert_eq!(probe(), Some(LockProbe::Holds), "a current lock holds");
@@ -2771,10 +3084,10 @@ mod tests {
             );
 
             let resolved = std::process::Command::new("cargo")
-                .args(["generate-lockfile", "--offline"])
+                .args(["update", "--workspace", "--offline"])
                 .current_dir(crate_dir.path())
                 .status()
-                .expect("run cargo generate-lockfile");
+                .expect("run cargo update");
             assert!(resolved.success(), "the path dependency resolves offline");
             assert_eq!(probe(), Some(LockProbe::Holds), "the resolved lock holds");
             package(
@@ -3293,7 +3606,7 @@ mod tests {
                 ),
             );
             let started = std::time::Instant::now();
-            let locked = lock_offline(cargo.path(), &base.join("Cargo.toml"));
+            let locked = lock_offline(cargo.path(), &base);
             assert!(
                 matches!(
                     &locked,
@@ -3303,7 +3616,7 @@ mod tests {
                         ..
                     }))
                 ),
-                "a resolve past its stdout ceiling is a typed refusal, got {locked:?}"
+                "an update past its stdout ceiling is a typed refusal, got {locked:?}"
             );
             assert!(
                 started.elapsed() < Duration::from_secs(10),

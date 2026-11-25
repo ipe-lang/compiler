@@ -91,7 +91,9 @@ pub use ipe_kernels::AppSurface;
 /// The security-capability vocabulary — re-exported so lowering/CLI consumers
 /// reach it through the IR crate like `KernelFn`. [`WebCapability`] is the closed
 /// per-Web-API sub-axis a [`Capability::JsPort`] discloses.
-pub use ipe_kernels::{Capability, WebCapability};
+pub use ipe_kernels::{
+    Capability, ServedListener, ServedListenerKind, ServedPort, SourcePortLiteral, WebCapability,
+};
 
 /// The user function name of the wasm-hydration island projection.
 ///

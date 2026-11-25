@@ -9,7 +9,7 @@
 
 use std::collections::BTreeSet;
 
-use ipe_ir::{Capability, Program};
+use ipe_ir::{Capability, Program, ServedListener};
 
 pub use crate::lower::{ReachedCapabilities, capabilities_reached_from};
 
@@ -23,12 +23,94 @@ pub fn program_capabilities(program: &Program) -> BTreeSet<Capability> {
     crate::lower::program_capabilities_scan(program)
 }
 
+/// The inbound listener a program opens, folded over its reachable serving
+/// kernels.
+///
+/// Read from the built entry's lowered program, which is pruned to what its
+/// `main` reaches: a serving kernel only an unreached function names leaves the
+/// program unserved.
+#[must_use]
+pub fn program_served_listener(program: &Program) -> ServedListener {
+    crate::lower::program_served_scan(program)
+}
+
 #[cfg(test)]
 mod tests {
     use ipe_intern::Interner;
-    use ipe_ir::{Capability, Program};
+    use ipe_ir::{Capability, Program, ServedListener, ServedPort, SourcePortLiteral};
 
-    use super::program_capabilities;
+    use super::{program_capabilities, program_served_listener};
+
+    /// Lower a single-module program and fold its served listener, or `None`
+    /// if any pipeline stage rejects it.
+    fn served_of(source: &str) -> Option<ServedListener> {
+        let mut i = Interner::new();
+        let src = ipe_parse::parse_module(source, &mut i).ok()?;
+        let m = ipe_canon::canonicalise(&src, &mut i).ok()?;
+        let types = ipe_types::infer(&m, &mut i).ok()?;
+        let program: Program =
+            crate::lower(&m, &types, &mut i, "", "", crate::Roots::Entry).ok()?;
+        Some(program_served_listener(&program))
+    }
+
+    fn served_literal(n: i64) -> ServedListener {
+        ServedListener::Serves(ServedPort::ServerLiteral(SourcePortLiteral::new(n)))
+    }
+
+    #[test]
+    fn server_literal_port_folds_to_literal() {
+        let served = served_of(
+            "module Lib exposing (serve)\nimport Ipe.Server.Http as Server\nserve =\n    Server.listen 8000 []\n",
+        );
+        assert_eq!(served, Some(served_literal(8000)));
+    }
+
+    #[test]
+    fn computed_port_folds_to_dynamic() {
+        let served = served_of(
+            "module Lib exposing (serve)\nimport Ipe.Server.Http as Server\nserve base =\n    Server.listen (base + 1) []\n",
+        );
+        assert_eq!(
+            served,
+            Some(ServedListener::Serves(ServedPort::ServerDynamic))
+        );
+    }
+
+    #[test]
+    fn two_literals_fold_to_dynamic() {
+        let served = served_of(
+            "module Lib exposing (a, b)\nimport Ipe.Server.Http as Server\na =\n    Server.listen 8000 []\nb =\n    Server.listen 9000 []\n",
+        );
+        assert_eq!(
+            served,
+            Some(ServedListener::Serves(ServedPort::ServerDynamic))
+        );
+    }
+
+    #[test]
+    fn eta_listen_folds_to_dynamic() {
+        let served = served_of(
+            "module Lib exposing (start)\nimport Ipe.Server.Http as Server\nstart =\n    Server.listen\n",
+        );
+        assert_eq!(
+            served,
+            Some(ServedListener::Serves(ServedPort::ServerDynamic))
+        );
+    }
+
+    /// A `Server.listen` only an unreached function names leaves the entry
+    /// unserved; the same call from `main` serves.
+    #[test]
+    fn unreached_listen_is_not_served() {
+        let unreached = served_of(
+            "module Main exposing (main)\nimport Ipe.System as System\nimport Ipe.Server.Http as Server\n\nmain =\n    System.setenv \"HOME\" \"x\"\n\nserve =\n    Server.listen 8000 []\n",
+        );
+        assert_eq!(unreached, Some(ServedListener::NotServed));
+        let reached = served_of(
+            "module Main exposing (main)\nimport Ipe.Server.Http as Server\n\nmain =\n    Server.listen 8000 []\n",
+        );
+        assert_eq!(reached, Some(served_literal(8000)));
+    }
 
     /// Lower a free-standing single-module program, or `None` if any pipeline
     /// stage rejects it (the caller's assertions then fail, per the no-panic

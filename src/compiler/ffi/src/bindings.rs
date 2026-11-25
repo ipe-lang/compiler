@@ -176,7 +176,7 @@ fn ipe_type_to_rust(st: &str) -> String {
         return format!("HashMap<String, {}>", ipe_type_to_rust(rest));
     }
     if let Some(rest) = st.strip_prefix("Task Error ") {
-        return format!("IpeTask<IpeError, {}>", ipe_type_to_rust(rest));
+        return ipe_intern::ffi_task_type(&ipe_type_to_rust(rest));
     }
     match st {
         "Int" => "i64",
@@ -396,6 +396,10 @@ pub enum Uncoercible {
     BorrowedOrArrayOwned,
     /// `&mut` over a scalar: the foreign write would land on a temporary.
     MutableScalarBorrow,
+    /// A future parameter, or one whose Ipê surface carries a task: an Ipê
+    /// task resolves to a result, never the bare output the foreign future
+    /// yields, and no foreign parameter type accepts the task carrier.
+    FutureParam,
 }
 
 impl Uncoercible {
@@ -416,6 +420,7 @@ impl Uncoercible {
             Self::MutableScalarBorrow => {
                 "mutable borrow of a scalar parameter has no Ipê lowering (the write is lost)"
             }
+            Self::FutureParam => "future parameter has no Ipê lowering",
         }
     }
 }
@@ -514,6 +519,9 @@ fn seq_param_coercion(j: usize, base: &str, raw: &str) -> Result<Option<SeqArg>,
     if NumWidth::parse(raw).is_some() {
         return Ok(None);
     }
+    if is_future_param(raw) {
+        return Err(Uncoercible::FutureParam);
+    }
     if let Some(arg) = scalar_ref_coercion(base, raw)? {
         return Ok(Some(arg));
     }
@@ -553,6 +561,38 @@ fn seq_param_coercion(j: usize, base: &str, raw: &str) -> Result<Option<SeqArg>,
         return Err(Uncoercible::NestedNumeric);
     }
     Ok(None)
+}
+
+/// Whether the outermost type of `raw` is a future.
+///
+/// Borrows, `impl`/`dyn`, path prefixes and `Pin`/`Box` wrappers are peeled, so
+/// `Pin<Box<dyn std::future::Future<Output = T> + Send>>` is a future while a
+/// closure returning one (`Box<dyn Fn(i64) -> Fut>`) is not.
+fn is_future_param(raw: &str) -> bool {
+    let mut t = raw;
+    loop {
+        t = strip_ref(t);
+        t = t
+            .strip_prefix("impl ")
+            .or_else(|| t.strip_prefix("dyn "))
+            .unwrap_or(t)
+            .trim_start();
+        let head_end = t
+            .find(|c: char| c == '<' || c == '+' || c.is_whitespace())
+            .unwrap_or(t.len());
+        let path = t.get(..head_end).unwrap_or(t);
+        let head = path.rsplit("::").next().unwrap_or(path);
+        match head {
+            "Future" | "IntoFuture" | "BoxFuture" | "LocalBoxFuture" => return true,
+            "Pin" | "Box" => {
+                let Some(rest) = t.get(head_end..).and_then(|r| r.strip_prefix('<')) else {
+                    return false;
+                };
+                t = first_type_arg(rest);
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// A borrowed scalar parameter (`&u16`, `&i64`, `&bool`): the wrapper takes the
@@ -648,6 +688,38 @@ fn split_top_level(inner: &str) -> Vec<&str> {
 /// The [`Uncoercible`] shape the renderer refuses.
 pub fn foreign_param_coercion(raw: &str) -> Result<(), Uncoercible> {
     seq_param_coercion(0, "arg0", raw).map(|_| ())
+}
+
+/// The interface admission predicate over one foreign parameter: its Ipê
+/// surface first, then its raw Rust type through [`foreign_param_coercion`].
+///
+/// The emitter's `WrapperCx::uncoercible_param` applies the same surface
+/// rule, so a parameter refused here is never rendered either.
+///
+/// # Errors
+///
+/// The [`Uncoercible`] shape that over-drops the binding.
+pub fn param_coercion(p: &Param) -> Result<(), Uncoercible> {
+    if surface_carries_task(&param_ipe_type(p)) {
+        return Err(Uncoercible::FutureParam);
+    }
+    foreign_param_coercion(p.rust_type_str())
+}
+
+/// Whether an Ipê parameter surface carries a task as a value
+/// (`Task Error Int`, `Maybe (Task Error Int)`).
+///
+/// The wrapper would declare the runtime's task carrier, which no foreign
+/// parameter type accepts: the inspector writes `Task` for every `Pin<…>`,
+/// every `Future` and every local alias of one, whatever the raw spelling.
+/// Judged on the surface, never the raw type, so an alias the raw spelling
+/// hides is refused too. A function surface (`Int -> Task Error Int`) is a
+/// closure, which the closure adapters own.
+fn surface_carries_task(st: &str) -> bool {
+    !st.contains("->")
+        && st
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|word| word == "Task")
 }
 
 /// The text [`seq_param_coercion`] renders for parameter `arg0` of raw type
@@ -1325,6 +1397,14 @@ impl<'a> WrapperCx<'a> {
     /// over-dropped rather than emitted with a raw carrier argument.
     fn uncoercible_param(&self) -> Option<Uncoercible> {
         (0..self.n_params()).find_map(|j| {
+            if self
+                .f
+                .params()
+                .get(j)
+                .is_some_and(|p| surface_carries_task(&param_ipe_type(p)))
+            {
+                return Some(Uncoercible::FutureParam);
+            }
             if self.own_ref_idx.contains(&j) {
                 return None;
             }
@@ -2160,7 +2240,7 @@ fn plain_lines(cx: &WrapperCx<'_>) -> Vec<String> {
         ret_inner
     };
     let ret_type = if f.effect() == Effect::Effectful {
-        format!("IpeTask<{ret_inner}>")
+        ipe_intern::ffi_task_type(&ret_inner)
     } else {
         format!("IpeResult<IpeError, {ret_inner}>")
     };
@@ -2761,6 +2841,25 @@ mod tests {
             ("HashMap<String, u32>", Uncoercible::NestedNumeric),
             ("Option<&[i32; 3]>", Uncoercible::OptionalArray),
             ("Option<[u8; 4]>", Uncoercible::OptionalArray),
+            (
+                "Pin<Box<dyn Future<Output = String> + Send>>",
+                Uncoercible::FutureParam,
+            ),
+            (
+                "std::pin::Pin<Box<dyn core::future::Future<Output = i64> + Send + 'static>>",
+                Uncoercible::FutureParam,
+            ),
+            (
+                "Pin<&mut dyn Future<Output = ()>>",
+                Uncoercible::FutureParam,
+            ),
+            ("impl Future<Output = String>", Uncoercible::FutureParam),
+            ("impl IntoFuture<Output = u8>", Uncoercible::FutureParam),
+            ("BoxFuture<'static, String>", Uncoercible::FutureParam),
+            (
+                "&mut Box<dyn Future<Output = i64> + Unpin>",
+                Uncoercible::FutureParam,
+            ),
         ] {
             assert_eq!(seq_param_coercion(0, "arg0", raw), Err(why), "{raw}");
             assert_eq!(foreign_param_coercion(raw), Err(why), "{raw}");
@@ -2774,6 +2873,9 @@ mod tests {
             "Vec<i64>",
             "Matrix<f32>",
             "&str",
+            "Box<Point>",
+            "Box<dyn Fn(i64) -> Pin<Box<dyn Future<Output = i64> + Send>> + Send + Sync>",
+            "FutureConfig",
         ] {
             assert!(seq_param_coercion(0, "arg0", raw).is_ok(), "{raw}");
             assert!(foreign_param_is_coercible(raw), "{raw}");
@@ -3593,6 +3695,120 @@ pub fn semver_major_field_from_version(arg0: ::semver::Version) -> i64 {
             ),
             "{out}"
         );
+    }
+
+    /// Every task carrier the emitter spells names the crate scope's one-argument alias.
+    ///
+    /// The scope declares `IpeTask<A>`; a two-argument spelling fails E0107 in
+    /// every crate built from it, so neither the type mapping nor any emitted
+    /// wrapper may write one. A future-typed parameter has no lowering and is
+    /// over-dropped rather than declared as a task.
+    #[test]
+    fn every_task_carrier_names_the_scope_alias() {
+        assert_eq!(ipe_type_to_rust("Task Error Int"), "IpeTask<i64>");
+        assert_eq!(
+            ipe_type_to_rust("Task Error String"),
+            ipe_intern::ffi_task_type("String")
+        );
+        let pkg = decode(&json!({
+            "pkg": "svc",
+            "name": "svc",
+            "functions": [
+                {
+                    "name": "ping",
+                    "params": [],
+                    "results": [{"name": "", "type": "String", "rustType": "String"}],
+                    "effect": "effectful"
+                },
+                {
+                    "name": "fetch",
+                    "params": [
+                        {"name": "key", "type": "String", "ipeType": "String", "rustType": "String"}
+                    ],
+                    "results": [{"name": "", "type": "Result Error Int", "rustType": "Result<i64, Error>"}],
+                    "effect": "effectful"
+                },
+                {
+                    "name": "drive",
+                    "params": [{
+                        "name": "fut",
+                        "type": "Task Error String",
+                        "ipeType": "Task Error String",
+                        "rustType": "Pin<Box<dyn Future<Output = String> + Send>>"
+                    }],
+                    "results": [{"name": "", "type": "String", "rustType": "String"}],
+                    "effect": "pure"
+                }
+            ],
+            "errors": []
+        }));
+        let out = emit_bindings(&pkg);
+        assert!(!out.contains("IpeTask<IpeError"), "{out}");
+        assert!(
+            out.contains("pub fn svc_ping(_: ()) -> IpeTask<String> {"),
+            "{out}"
+        );
+        assert!(
+            out.contains("pub fn svc_fetch(") && out.contains(") -> IpeTask<i64> {"),
+            "{out}"
+        );
+        assert!(!out.contains("pub fn svc_drive"), "{out}");
+    }
+
+    /// A parameter whose Ipê surface carries a task over-drops whatever its raw
+    /// spelling, in admission and emission alike.
+    ///
+    /// The inspector writes `Task` for a local alias of a boxed future (raw
+    /// `MyFut`) and for any `Pin<…>` (raw `Pin<Box<String>>`), so the raw-type
+    /// check alone admits them; the wrapper would then declare the task carrier
+    /// and hand it to a foreign parameter of another type (E0308).
+    #[test]
+    fn a_task_surface_param_over_drops_whatever_its_raw_spelling() {
+        let task_param = |name: &str, ty: &str, raw: &str| {
+            json!({
+                "name": name,
+                "params": [{"name": "fut", "type": ty, "ipeType": ty, "rustType": raw}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
+                "effect": "pure"
+            })
+        };
+        let pkg = decode(&json!({
+            "pkg": "svc",
+            "name": "svc",
+            "functions": [
+                task_param("alias", "Task Error Int", "MyFut"),
+                task_param("pinned", "Task Error String", "Pin<Box<String>>"),
+                task_param("maybe", "Maybe (Task Error Int)", "Option<MyFut>"),
+                task_param("plain", "Int", "i64"),
+            ],
+            "errors": []
+        }));
+        let out = emit_bindings(&pkg);
+        for name in ["alias", "pinned", "maybe"] {
+            assert!(
+                !out.contains(&format!("pub fn svc_{name}(")),
+                "{name}:\n{out}"
+            );
+        }
+        assert!(out.contains("pub fn svc_plain("), "{out}");
+        let iface = crate::interface::crate_interface(&pkg);
+        for name in ["alias", "pinned", "maybe"] {
+            assert!(
+                iface
+                    .skipped
+                    .iter()
+                    .any(|s| s.ref_name == name && s.reason == Uncoercible::FutureParam.reason()),
+                "{name}: {:?}",
+                iface.skipped
+            );
+        }
+        assert!(
+            iface.skipped.iter().all(|s| s.ref_name != "plain"),
+            "{:?}",
+            iface.skipped
+        );
+        assert!(!surface_carries_task("Int -> Task Error Int"));
+        assert!(!surface_carries_task("TaskQueue"));
     }
 
     #[test]

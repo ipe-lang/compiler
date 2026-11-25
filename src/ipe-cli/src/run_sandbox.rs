@@ -21,8 +21,10 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use ipe_diagnostics::Diagnostic as SharedDiag;
-use ipe_ir::Capability;
-use ipe_sandbox::run_jail::{self, DatabaseAxis, FloorIntent, RunJailDefect, SandboxProfile};
+use ipe_ir::{Capability, ServedListener};
+use ipe_sandbox::run_jail::{
+    self, DatabaseAxis, FloorIntent, ListenGrant, RunJailDefect, SandboxProfile,
+};
 
 use crate::CliError;
 use crate::project::ProjectManifest;
@@ -51,6 +53,8 @@ pub struct ResolvedCapabilities {
     pub inferred: BTreeSet<Capability>,
     /// The manifest-declared set (empty for a single-file program).
     pub declared: BTreeSet<Capability>,
+    /// The listener the built entry serves, read from its lowered program.
+    pub served: ServedListener,
 }
 
 impl ResolvedCapabilities {
@@ -92,8 +96,9 @@ pub const OPERATOR_DB_ENV: &str = "DATABASE_URL";
 ///
 /// # Errors
 ///
-/// [`CliError::Usage`] wrapping the [`RunJailDefect`] display when the
-/// profile cannot be lowered (an unknown database driver — fail-closed).
+/// [`CliError::Pipeline`] carrying the [`RunJailDefect`] when the profile
+/// cannot be lowered: an unknown database driver, a served port outside
+/// `1..=65535`, or two served listeners (fail-closed).
 pub fn build_profile(
     caps: &ResolvedCapabilities,
     driver: ipe_backend_rust::DbDriver,
@@ -103,17 +108,18 @@ pub fn build_profile(
     let axis = axis_for_driver(driver, has_database);
     // The env allowlist the `env` axis re-exports is empty: the manifest
     // declares the axis (on/off), not per-variable names.
+    let profile_refused = |e| {
+        let shared: SharedDiag = RunJailDefect::Profile(e).into();
+        CliError::Pipeline {
+            file: std::path::PathBuf::new(),
+            src: String::new(),
+            diag: Box::new(shared),
+        }
+    };
     let mut profile =
-        run_jail::profile_from_capabilities(&caps.inferred, &caps.declared, axis, &[]).map_err(
-            |e| {
-                let shared: SharedDiag = RunJailDefect::Profile(e).into();
-                CliError::Pipeline {
-                    file: std::path::PathBuf::new(),
-                    src: String::new(),
-                    diag: Box::new(shared),
-                }
-            },
-        )?;
+        run_jail::profile_from_capabilities(&caps.inferred, &caps.declared, axis, &[])
+            .map_err(profile_refused)?;
+    profile.listen = ListenGrant::from_served(&caps.served).map_err(profile_refused)?;
     // A program granted `Database` sees the operator URL whatever its `env`
     // axis: the runtime's `Db.connect` reads it, and an unjailed run reads the
     // same variable. Every other variable stays outside the jail.
@@ -634,9 +640,11 @@ pub fn resolve_for_run(
     front: &crate::PackageFrontEnd,
 ) -> Result<ResolvedCapabilities, CliError> {
     let inferred = front.infer_capabilities()?;
+    let served = front.infer_served(&manifest.resolved_entry()?)?;
     Ok(ResolvedCapabilities {
         inferred,
         declared: manifest.capabilities.clone(),
+        served,
     })
 }
 
@@ -648,7 +656,64 @@ mod tests {
         ResolvedCapabilities {
             inferred: inferred.iter().copied().collect(),
             declared: declared.iter().copied().collect(),
+            served: ServedListener::NotServed,
         }
+    }
+
+    /// The capabilities a release resolves for the project `tree` describes.
+    #[allow(clippy::expect_used)] // a failed fixture setup is the test failure
+    fn resolve_tree(tree: &crate::project_root::SourceTree) -> ResolvedCapabilities {
+        use crate::project_root::{ProjectRoot, RootArg};
+        let fixture = crate::RootFixture::from_tree(tree).expect("fixture");
+        let root = ProjectRoot::resolve(RootArg::at(fixture.path())).expect("root");
+        let held = crate::driver::HeldBuild::read(root).expect("the fixture is read");
+        let front = crate::PackageFrontEnd::cold(held.sources());
+        resolve_for_run(held.root().manifest(), &front).expect("resolves")
+    }
+
+    const SERVE_MODULE: &str = "module Serve exposing (serve)\n\nimport Ipe.Server.Http as Server\n\n\nserve =\n    Server.listen 8000 []\n";
+
+    /// The package-wide union says a sibling serves; the built entry's lowered
+    /// program says it does not, and only that fact grants a listener.
+    #[test]
+    #[allow(clippy::expect_used)] // a refused profile is the test failure
+    fn a_non_serving_entry_of_a_package_with_a_served_sibling_gets_no_listener() {
+        let tree = crate::project_root::SourceTree::main(
+            "module Main exposing (main)\n\nimport Ipe.Io as Io\n\n\nmain =\n    Io.println \"hi\"\n",
+        )
+        .module("Serve", SERVE_MODULE);
+        let resolved = resolve_tree(&tree);
+        assert!(
+            resolved.inferred.contains(&Capability::Network),
+            "the package-wide union discloses the sibling's listener: {:?}",
+            resolved.inferred
+        );
+        assert_eq!(resolved.served, ServedListener::NotServed);
+        let profile =
+            build_profile(&resolved, ipe_backend_rust::DbDriver::Sqlite).expect("profile");
+        assert_eq!(profile.listen, None);
+    }
+
+    /// A built entry that calls `Server.listen` with a literal is granted that port.
+    #[test]
+    #[allow(clippy::expect_used)] // a refused profile is the test failure
+    fn a_serving_entry_is_granted_its_literal_port() {
+        let tree = crate::project_root::SourceTree::main(
+            "module Main exposing (main)\n\nimport Ipe.Server.Http as Server\n\n\nmain =\n    Server.listen 8000 []\n",
+        );
+        let resolved = resolve_tree(&tree);
+        assert_eq!(
+            resolved.served,
+            ServedListener::NotServed.with(ipe_ir::ServedPort::ServerLiteral(
+                ipe_kernels::SourcePortLiteral::new(8000)
+            ))
+        );
+        let profile =
+            build_profile(&resolved, ipe_backend_rust::DbDriver::Sqlite).expect("profile");
+        assert!(matches!(
+            profile.listen.map(run_jail::ListenGrant::port),
+            Some(run_jail::GrantPort::Source(port)) if port.get() == 8000
+        ));
     }
 
     #[test]

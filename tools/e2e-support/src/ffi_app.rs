@@ -1,7 +1,7 @@
 //! The app crate an FFI SEAL fixture builds its emitted bindings into.
 //!
 //! The crate has the shape the backend emits for a program with a foreign
-//! package: `main.rs` opens with the crate-root runtime prelude and `mod ffi;`,
+//! package: `main.rs` opens with the FFI crate scope and `mod ffi;`,
 //! `src/ffi.rs` wraps each package's bindings in `pub mod <slug>` and re-exports
 //! it, and the manifest depends on the real runtime crate. The bindings'
 //! `use crate::*;` therefore resolves the runtime's own items, so a fixture
@@ -11,9 +11,12 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
-/// The crate-root lines the backend emits ahead of a program's own items.
-pub const CRATE_PRELUDE: &str =
-    "pub use ipe_runtime::*;\npub use ipe_runtime::error::IpeError;\nmod ffi;\n";
+/// The crate-root lines ahead of a program's own items: the FFI crate scope
+/// the backend's template carries, then `mod ffi;`.
+#[must_use]
+pub fn crate_prelude() -> String {
+    ipe_intern::ffi_crate_root()
+}
 
 /// The `src/ffi.rs` module the backend wraps one package's `bindings` in.
 #[must_use]
@@ -32,7 +35,7 @@ pub struct FfiApp<'a> {
     pub dependencies: &'a [String],
     /// The whole of `src/ffi.rs`.
     pub ffi_rs: &'a str,
-    /// The program's items, written after [`CRATE_PRELUDE`] in `src/main.rs`.
+    /// The program's items, written after [`crate_prelude`] in `src/main.rs`.
     pub main_rs: &'a str,
 }
 
@@ -67,7 +70,7 @@ impl FfiApp<'_> {
 
         let src = dir.join("src");
         std::fs::create_dir_all(&src).map_err(|e| format!("mkdir {}: {e}", src.display()))?;
-        let main_rs = format!("{CRATE_PRELUDE}\n{}", self.main_rs);
+        let main_rs = format!("{}\n{}", crate_prelude(), self.main_rs);
         for (path, text) in [
             (dir.join("Cargo.toml"), manifest.as_str()),
             (src.join("main.rs"), main_rs.as_str()),

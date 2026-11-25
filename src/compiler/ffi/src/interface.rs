@@ -734,7 +734,7 @@ pub fn crate_interface(pkg: &PkgInfo) -> CrateInterface {
             && let Some(refusal) = f
                 .params()
                 .iter()
-                .find_map(|p| crate::bindings::foreign_param_coercion(p.rust_type_str()).err())
+                .find_map(|p| crate::bindings::param_coercion(p).err())
         {
             skip(refusal.reason(), &mut skipped);
             continue;

@@ -1979,6 +1979,7 @@ mod tests {
             env_allowlist: vec!["A".to_owned(), "B".to_owned()],
             subprocess: false,
             limits: RunResourceLimits::default(),
+            listen: None,
         };
         // Simulate a binary: arbitrary bytes, the floor line in .rodata, more bytes.
         let mut buf: Vec<u8> = vec![0xde, 0xad, 0xbe, 0xef];
@@ -2056,6 +2057,7 @@ mod tests {
             env_allowlist: vec!["DATABASE_URL".to_owned(), "API_KEY".to_owned()],
             subprocess: true,
             limits: RunResourceLimits::default(),
+            listen: None,
         };
         let text = p.to_profile_string();
         let parsed = parse_profile(&text).expect("round-trips");
@@ -2087,11 +2089,12 @@ mod tests {
             env_allowlist: vec!["B".to_owned(), "A".to_owned()],
             subprocess: false,
             limits: RunResourceLimits::default(),
+            listen: None,
         };
         let line = p.to_capfloor_line(FloorIntent::Release);
         assert_eq!(
             line,
-            "ipe-capfloor 1 net=true fs=rw sub=false env=A,B intent=release"
+            "ipe-capfloor 1 net=true fs=rw sub=false env=A,B listen=none intent=release"
         );
         let floor = parse_capfloor(&line).expect("round-trips").axes;
         assert!(floor.network);
@@ -2107,7 +2110,7 @@ mod tests {
         let line = p.to_capfloor_line(FloorIntent::Release);
         assert_eq!(
             line,
-            "ipe-capfloor 1 net=false fs=isolated sub=false env= intent=release"
+            "ipe-capfloor 1 net=false fs=isolated sub=false env= listen=none intent=release"
         );
         let floor = parse_capfloor(&line).expect("round-trips").axes;
         assert!(floor.env_allowlist.is_empty());

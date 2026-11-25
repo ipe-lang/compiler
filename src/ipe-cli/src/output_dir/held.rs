@@ -38,7 +38,7 @@ use super::{
     CLAIM_FILE, CLAIM_POLL, MARKER_HEADER, MARKER_READ_CAP, MARKER_TEXT, MAX_CLAIM_POLLS,
     OWNERSHIP_MARKER, OutputRefusal, Tolerated, temp_suffix, tolerated_entry,
 };
-use crate::io_bounded::{read_proven, refusal_error};
+use crate::io_bounded::{SourceRefusal, read_proven, refusal_error};
 use crate::{CliError, io_err};
 
 #[cfg(unix)]
@@ -2050,7 +2050,6 @@ pub enum ReadMiss {
 /// Classify a failed capped read by its typed variant, never by message text.
 #[must_use]
 pub fn read_miss(err: &CliError) -> ReadMiss {
-    use crate::io_bounded::SourceRefusal;
     match err {
         CliError::Io { source, .. } => io_read_miss(source.kind()),
         CliError::SourceRefused { reason, .. } => ReadMiss::Unread(match reason {
@@ -2107,6 +2106,7 @@ pub fn read_miss(err: &CliError) -> ReadMiss {
         | CliError::GroupRequired { .. }
         | CliError::NoRunForm { .. }
         | CliError::WrapperSourceRefused(..)
+        | CliError::LockDrift(..)
         | CliError::AgentsGuideRefused(..)
         | CliError::VerifyFailed { .. }
         | CliError::TestFailed { .. }

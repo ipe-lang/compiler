@@ -1,0 +1,8 @@
+//! The emitted crate root re-exports the runtime (`pub use ipe_runtime::*;`).
+
+/// Resolved through `pub use ipe_runtime::error::IpeError;` at the root.
+#[doc = "pub use ipe_runtime::*;"]
+fn unrelated() -> &'static str {
+    // pub use ipe_runtime::*;
+    "use ipe_runtime::core::ok_res;"
+}

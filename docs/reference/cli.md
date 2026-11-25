@@ -250,7 +250,7 @@ Report the security capabilities a program exercises, inferred from its code.
 ipe capabilities [<path>]
 ```
 
-**Arguments:** A project directory, its package.ipe, or one of its entry files under `src/`; a file must lie in the current directory's project. Defaults to the current directory's project, every entry.
+**Arguments:** A project directory, its package.ipe, or one of its entry files under `src/`; a file must lie in the current directory's project. Defaults to the current directory's project, every entry. A built program that serves also reports the one inbound port it listens on.
 
 **Flags:**
 

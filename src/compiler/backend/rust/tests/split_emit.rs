@@ -195,7 +195,7 @@ fn emit_spine_holds_program_wide_content_not_module_items() -> DResult<()> {
         "spine must carry the entry point `fn main()`"
     );
     assert!(
-        spine.contains("pub use ipe_runtime::error::IpeError;"),
+        spine.contains(ipe_intern::ERROR_USE_ITEM),
         "spine must carry the fixed kernel-wrapper prelude"
     );
 

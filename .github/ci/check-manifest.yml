@@ -531,7 +531,7 @@ checks:
     local:
       tier: affected
       run:
-        - cargo deny check advisories bans licenses sources
+        - cargo deny check -D advisory-not-detected -D yanked-not-detected -D unknown-advisory -D unmatched-skip -D unnecessary-skip -D unused-wrapper -D unmatched-wrapper -D unmatched-skip-root -D unmatched-bypass -D unmatched-path-bypass -D unmatched-glob -D unmatched-replacement-ignore -D license-not-encountered -D license-exception-not-encountered -D unmatched-source -D unmatched-organization advisories bans licenses sources
     guards: Security
   - context: playground-jail
     disposition: gate

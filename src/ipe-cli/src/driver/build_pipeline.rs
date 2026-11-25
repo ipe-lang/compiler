@@ -1582,6 +1582,19 @@ impl PackageFrontEnd {
         crate::threads::run_compile(move || super::infer_on(&front.db, front.root, front.set))?
     }
 
+    /// The listener the built program entry `entry` serves, read on a compile
+    /// thread from the lowered program the emit compiles.
+    ///
+    /// # Errors
+    /// [`CliError::ThreadRefused`] when the OS refused the compile thread;
+    /// every refusal of [`super::served_on`].
+    pub fn infer_served(&self, entry: &[String]) -> Result<ipe_ir::ServedListener, CliError> {
+        let front = self.on_compile_thread();
+        crate::threads::run_compile(move || {
+            super::served_on(&front.db, front.root, front.set, entry)
+        })?
+    }
+
     /// A handle to this front end that a compile thread can own.
     fn on_compile_thread(&self) -> CompileThreadFront<'_> {
         CompileThreadFront {

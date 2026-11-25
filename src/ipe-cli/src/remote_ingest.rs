@@ -486,7 +486,8 @@ const QUERY_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<60>(),
 });
 
-/// The ceilings of an offline `cargo generate-lockfile`, which reads only the local registry cache.
+/// The ceilings of an offline cargo lock step (the lock probe and the offline
+/// `cargo update`), which reads only the local registry cache.
 ///
 /// Its stdout is held to 64 KiB and its run to two minutes, so a held
 /// `.package-cache` lock or a wedged resolve cannot hold the CLI.
@@ -495,7 +496,7 @@ pub const LOCK_RESOLVE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<120>(),
 });
 
-/// The ceilings of a networked `cargo generate-lockfile`, which may fetch the registry index.
+/// The ceilings of an online cargo lock update, which fetches the registry index.
 ///
 /// Its stdout is held to 64 KiB and its run to ten minutes, the wall of
 /// [`INDEX_CLONE`].
@@ -1348,9 +1349,9 @@ pub enum LocalSource {
     PackageTree,
     /// A `git` query on a local repository.
     GitQuery,
-    /// An offline `cargo generate-lockfile` resolving from the local registry cache.
+    /// An offline `cargo update --workspace` narrowing a seeded lock from the local registry cache.
     LockResolve,
-    /// A networked `cargo generate-lockfile` resolving an emitted crate's graph.
+    /// A networked `cargo update --workspace` narrowing a seeded lock, fetching the registry index.
     LockFetch,
     /// An offline `cargo update --workspace --locked` proving an emitted crate's lock replays.
     LockProbe,

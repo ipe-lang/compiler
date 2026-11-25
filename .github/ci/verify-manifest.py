@@ -607,11 +607,18 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `[graph]` key outside `all-features`, `no-default-features`,
       `features` and `exclude-dev`.  The graph-level proof that every crate the release links
       is judged is `supply_chain_scope.py`.
-  29. One advisory ignore set: the `RUSTSEC-` ids of `deny.toml
-      [advisories].ignore` (each a string or a `{ id = .. }` table) equal
-      those of `.cargo/audit.toml [advisories].ignore`, compared both ways
-      and each side's extra ids named.  An entry of either list that is not
-      a `RUSTSEC-YYYY-NNNN` id is refused, never skipped.
+  29. One advisory ignore set: the `RUSTSEC-` ids of `.cargo/audit.toml
+      [advisories].ignore` equal those of `deny.toml [advisories].ignore`
+      (each a string or a `{ id = .. }` table) plus `AUDIT_LOCKFILE_ONLY_
+      IGNORES`, compared both ways and each side's extra ids named.
+      cargo-audit judges every package a lockfile records, unactivated
+      optional ones included, while cargo-deny judges the activated graph
+      and (check 31) fails on an ignore it never meets; a lockfile-only id
+      is therefore named once, with its package, and refused when
+      `deny.toml` also ignores it or when its package is absent from the
+      root `Cargo.lock` (the exemption outlived its package).  An entry of
+      either list that is not a `RUSTSEC-YYYY-NNNN` id is refused, never
+      skipped.
   30. The release feature spelling is live: every feature of
       `release_build.RELEASE_FEATURE` is a bare feature name (cargo's
       `[A-Za-z0-9_][A-Za-z0-9_+.-]*`, no `/`, `dep:` or `?`) that exactly
@@ -625,6 +632,19 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       member or a release package that is no member is refused.  The
       graph-level proof is `supply_chain_scope.py`'s sentinel: `cargo tree
       -e normal,build` with the release features must list the engine.
+  31. Every `cargo deny check` fails on a stale exemption: each such
+      command a workflow `run:` or a manifest `local.run` names (`cargo
+      deny` or `cargo-deny`, `check` among its words) carries `-D <code>`
+      (or `--deny`, spaced or `=`) for every code of
+      `DENY_STALE_EXEMPTION_CODES` — the cargo-deny diagnostics an ignore,
+      skip, wrapper, bypass, license allowance or exception, or source
+      allowance the judged graph never meets raises, a warning by default —
+      and no `-A`/`--allow`/`-W`/`--warn` (which would re-level one).  At
+      least one workflow runs such a command; a line naming `cargo deny`
+      or `cargo-deny` that `shlex` cannot split is refused.  The
+      `deny.toml` policy keeps these codes at warn level because `ipe
+      audit` embeds it for a package's narrower graph, where most
+      exemptions legitimately go unmet.
   LIMIT (checks 15, 16, 20, 22): a cargo line is read as run, not proven
   to reach its step's exit status — `cargo .. || true`, an `exit 0` before
   it, `set +e`, `if ! cargo ..` or a pipeline without `pipefail` are not
@@ -9265,8 +9285,37 @@ def _advisory_ignores(doc: dict[str, object], name: str, errors: list[str]) -> s
     return ids if ok else None
 
 
-def check_audit_ignores_equal(errors: list[str], root: str = REPO_ROOT) -> None:
+# Check 29: the advisory ids cargo-audit alone ignores, each with the package
+# it names. cargo-audit reads every package the lockfile records; cargo-deny
+# reads the activated graph, so an advisory against an optional dependency no
+# crate activates is met by the first and never by the second.
+AUDIT_LOCKFILE_ONLY_IGNORES: dict[str, str] = {
+    # rkyv: rust_decimal's optional archive backend, recorded in every lockfile
+    # that holds rust_decimal and activated by none.
+    "RUSTSEC-2026-0235": "rkyv",
+}
+
+
+def _lockfile_packages(repo: str, errors: list[str]) -> set[str] | None:
+    """The package names of `repo`'s root `Cargo.lock`, or None (refused)."""
+    doc = _load_toml(os.path.join(repo, "Cargo.lock"))
+    if isinstance(doc, str):
+        errors.append(f"check 29: Cargo.lock {doc}; refused")
+        return None
+    packages = doc.get("package")
+    if not isinstance(packages, list):
+        errors.append("check 29: Cargo.lock has no `[[package]]` list; refused")
+        return None
+    return {p["name"] for p in packages if isinstance(p, dict) and isinstance(p.get("name"), str)}
+
+
+def check_audit_ignores_equal(
+    errors: list[str],
+    root: str = REPO_ROOT,
+    lockfile_only: dict[str, str] | None = None,
+) -> None:
     """Check 29 (see the module docstring)."""
+    only = AUDIT_LOCKFILE_ONLY_IGNORES if lockfile_only is None else lockfile_only
     repo = os.path.dirname(root)
     sides: list[set[str]] = []
     for name in ("deny.toml", ".cargo/audit.toml"):
@@ -9279,16 +9328,174 @@ def check_audit_ignores_equal(errors: list[str], root: str = REPO_ROOT) -> None:
             return
         sides.append(ids)
     deny, audit = sides
-    if deny - audit:
+    for rid in sorted(only):
+        if not _RUSTSEC_ID_RE.fullmatch(rid):
+            errors.append(f"check 29: lockfile-only id {rid!r} is not a RUSTSEC id; refused")
+    both = deny.intersection(only)
+    if both:
         errors.append(
-            f"check 29: deny.toml ignores {sorted(deny - audit)} that .cargo/audit.toml does not; "
-            "the two ignore lists must be one set; refused"
+            f"check 29: deny.toml ignores {sorted(both)}, which AUDIT_LOCKFILE_ONLY_IGNORES names as "
+            "met only in the lockfile; an id is cargo-deny's or lockfile-only, never both; refused"
         )
-    if audit - deny:
+    want = deny.union(only)
+    if want - audit:
         errors.append(
-            f"check 29: .cargo/audit.toml ignores {sorted(audit - deny)} that deny.toml does not; "
-            "the two ignore lists must be one set; refused"
+            f"check 29: .cargo/audit.toml does not ignore {sorted(want - audit)}, which deny.toml or "
+            "AUDIT_LOCKFILE_ONLY_IGNORES accepts; the ignore lists must be one set; refused"
         )
+    if audit - want:
+        errors.append(
+            f"check 29: .cargo/audit.toml ignores {sorted(audit - want)} that neither deny.toml nor "
+            "AUDIT_LOCKFILE_ONLY_IGNORES accepts; the ignore lists must be one set; refused"
+        )
+    if not only:
+        return
+    packages = _lockfile_packages(repo, errors)
+    if packages is None:
+        return
+    for rid, package in sorted(only.items()):
+        if package not in packages:
+            errors.append(
+                f"check 29: lockfile-only {rid} names `{package}`, which Cargo.lock no longer "
+                "records; the exemption is stale, so drop it from .cargo/audit.toml and "
+                "AUDIT_LOCKFILE_ONLY_IGNORES; refused"
+            )
+
+
+# Check 31: the cargo-deny diagnostic codes a stale exemption raises — an
+# advisory or yanked ignore, a bans skip, skip-tree, wrapper, bypass, glob or
+# replacement ignore, a license allowance or exception, a source or org
+# allowance the judged graph never meets. cargo-deny warns on each by default.
+DENY_STALE_EXEMPTION_CODES = (
+    "advisory-not-detected",
+    "yanked-not-detected",
+    "unknown-advisory",
+    "unmatched-skip",
+    "unnecessary-skip",
+    "unused-wrapper",
+    "unmatched-wrapper",
+    "unmatched-skip-root",
+    "unmatched-bypass",
+    "unmatched-path-bypass",
+    "unmatched-glob",
+    "unmatched-replacement-ignore",
+    "license-not-encountered",
+    "license-exception-not-encountered",
+    "unmatched-source",
+    "unmatched-organization",
+)
+# The lint re-levelling options; a short one also takes its value glued on.
+_DENY_RELEVEL_LONG = ("--allow", "--warn")
+_DENY_RELEVEL_SHORT = ("-A", "-W")
+
+
+def _deny_check_args(words: list[str]) -> list[str] | None:
+    """The words after `check` when `words` runs `cargo deny check`, else None.
+
+    Read wherever the command sits in `words` — behind an env assignment,
+    `env`, `timeout` or another wrapper — and through a `+toolchain` or cargo
+    global options before `deny`: any `deny` word after a `cargo` word, or any
+    `cargo-deny` word, followed by `check`. A non-deny line that matches is
+    refused, never a deny line that slips past."""
+    for at, word in enumerate(words):
+        rest: list[str] | None = None
+        if posixpath.basename(word) == "cargo-deny":
+            rest = words[at + 1 :]
+        elif posixpath.basename(word) == "cargo" and "deny" in words[at + 1 :]:
+            after = words[at + 1 :]
+            rest = after[after.index("deny") + 1 :]
+        if rest is not None and "check" in rest:
+            return rest[rest.index("check") + 1 :]
+    return None
+
+
+def _is_relevel(word: str) -> bool:
+    """`word` re-levels a cargo-deny lint (`-A`/`-W`, `--allow`/`--warn`)."""
+    return any(word == f or word.startswith(f + "=") for f in _DENY_RELEVEL_LONG) or any(
+        word.startswith(f) for f in _DENY_RELEVEL_SHORT
+    )
+
+
+def _denied_codes(args: list[str]) -> tuple[set[str], list[str]]:
+    """The codes `args` denies, and the re-levelling words it holds."""
+    denied: set[str] = set()
+    relevel: list[str] = []
+    it = iter(args)
+    for word in it:
+        if word in ("-D", "--deny"):
+            denied.add(next(it, ""))
+        elif word.startswith("--deny="):
+            denied.add(word[len("--deny=") :])
+        elif word.startswith("-D"):
+            denied.add(word[2:])
+        elif _is_relevel(word):
+            relevel.append(word)
+    return denied, relevel
+
+
+def _deny_stale_refusal(line: str, where: str) -> str | None:
+    """Check 31's refusal of one shell line, or None."""
+    commands = _shell_commands(line)
+    if commands is None:
+        if "cargo deny" not in line and "cargo-deny" not in line:
+            return None
+        return (
+            f"check 31: {where}: `{line.strip()}` names cargo-deny but cannot be split, "
+            "so its lint levels are unread; refused"
+        )
+    for words in commands:
+        args = _deny_check_args(words)
+        if args is None:
+            continue
+        denied, relevel = _denied_codes(args)
+        if relevel:
+            return (
+                f"check 31: {where}: `{line.strip()}` re-levels cargo-deny lints with {relevel}, "
+                "so a stale exemption may pass; refused"
+            )
+        missing = [c for c in DENY_STALE_EXEMPTION_CODES if c not in denied]
+        if missing:
+            return (
+                f"check 31: {where}: `{line.strip()}` does not deny {missing}, so an exemption the "
+                "judged graph never meets passes as a warning; refused"
+            )
+    return None
+
+
+def _runs_deny_check(line: str) -> bool:
+    """`line` runs `cargo deny check` (an unsplittable line never counts)."""
+    commands = _shell_commands(line)
+    return commands is not None and any(_deny_check_args(w) is not None for w in commands)
+
+
+def check_deny_refuses_stale_exemptions(wfs: WorkflowSet, entries: object, errors: list[str]) -> None:
+    """Check 31 (see the module docstring)."""
+    runs = 0
+    for wf in wfs.workflows:
+        for job in wf.jobs:
+            steps = job.raw.get("steps")
+            for n, step in enumerate(steps if isinstance(steps, list) else []):
+                run = step.get("run") if isinstance(step, dict) else None
+                if not isinstance(run, str):
+                    continue
+                for line in _joined_lines(run):
+                    runs += _runs_deny_check(line)
+                    why = _deny_stale_refusal(line, f"{wf.fname} job `{job.job_id}` step {n}")
+                    if why is not None:
+                        errors.append(why)
+    if runs == 0:
+        errors.append("check 31: no workflow runs `cargo deny check`, so no stale exemption is ever refused; refused")
+    for entry in entries if isinstance(entries, list) else []:
+        local = entry.get("local") if isinstance(entry, dict) else None
+        lines = local.get("run") if isinstance(local, dict) else None
+        for line in lines if isinstance(lines, list) else []:
+            text = line.get("cmd") if isinstance(line, dict) else line
+            if not isinstance(text, str):
+                continue
+            for joined in _joined_lines(text):
+                why = _deny_stale_refusal(joined, f"manifest `{entry.get('context')}` local.run")
+                if why is not None:
+                    errors.append(why)
 
 
 def main() -> int:
@@ -9462,11 +9669,14 @@ def main() -> int:
     # ---- 28. the dependency scan's graph covers the release feature set ----
     check_deny_graph_covers_release(errors)
 
-    # ---- 29. deny.toml and .cargo/audit.toml ignore one advisory set ----
+    # ---- 29. audit.toml ignores deny.toml's ids plus the lockfile-only ones ----
     check_audit_ignores_equal(errors)
 
     # ---- 30. the release feature spelling reaches the release graph ----
     check_release_feature_live(errors)
+
+    # ---- 31. every `cargo deny check` fails on a stale exemption ----
+    check_deny_refuses_stale_exemptions(workflows, entries, errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

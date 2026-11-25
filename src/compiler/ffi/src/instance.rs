@@ -744,7 +744,7 @@ fn render_generic_wrapper(base_name: &str, g: &GenericFn) -> String {
         .map(|j| format!("let arg{j} = ipe_maybe_to_option(arg{j});"))
         .collect();
     let wrapper_ret = if is_async {
-        format!("IpeTask<{ret_inner}>")
+        ipe_intern::ffi_task_type(&ret_inner)
     } else {
         format!("IpeResult<IpeError, {ret_inner}>")
     };

@@ -6507,6 +6507,7 @@ fn release_desktop_bundle_gates_debug() {
     let consented = crate::run_sandbox::ResolvedCapabilities {
         inferred: std::collections::BTreeSet::new(),
         declared: std::collections::BTreeSet::new(),
+        served: ipe_ir::ServedListener::NotServed,
     };
     let (result, left_release) = bundle_debug_desktop(Some(consented), "release-desktop-debug");
     assert!(

@@ -25,6 +25,21 @@ ryu = "1"
 # ships. No server feature is enabled.
 ipe-runtime-rust = { path = "../../../runtime/rust", default-features = false, features = ["encoding", "widget-assets"] }
 
+# The emitter closure: every registry crate an emitted manifest template can
+# name that no other member depends on, spelled exactly as the templates spell
+# it. `cfg(all(unix, not(unix)))` is a contradiction, never true for any target,
+# feature combination or `--cfg` flag, so nothing here is compiled — the entries
+# exist only so the workspace `Cargo.lock`, the pinned set every emitted crate's
+# lock derives from, holds them, and so `cargo deny` judges them: its graph
+# drops predicate-free `cfg(any())` edges, so that spelling would leave these
+# crates unjudged (`.github/ci/supply_chain_scope.py` refuses it). The `ipe`
+# test `the_embedded_set_holds_the_emitter_closure` derives the closure from
+# the templates and fails when an entry is missing here.
+[target.'cfg(all(unix, not(unix)))'.dependencies]
+dlmalloc = { version = "0.2", features = ["global"] }
+mimalloc = { version = "0.1", default-features = false }
+rust_decimal = { version = "1", features = ["serde"] }
+
 [dev-dependencies]
 ipe-test-temp = { path = "../../../../tools/test-temp" }
 ipe_env = { path = "../../env" }
