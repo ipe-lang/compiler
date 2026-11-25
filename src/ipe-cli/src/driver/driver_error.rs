@@ -1800,17 +1800,6 @@ impl EmittedBuildCause {
             Self::MissingRuntimeFeature,
         )
     }
-
-    /// Who the failure belongs to: an unreachable registry or a host linker
-    /// input is the user's; a stale runtime crate or a miscompile is ipe's.
-    const fn fault(&self) -> crate::screen::Fault {
-        match self {
-            Self::RegistryUnreachable | Self::HostLinkerCannotOpenInput(_) => {
-                crate::screen::Fault::User
-            }
-            Self::MissingRuntimeFeature(_) | Self::Miscompile => crate::screen::Fault::Internal,
-        }
-    }
 }
 
 /// Whether `cargo` refused its toolchain as older than a package's `rust-version`.
