@@ -77,4 +77,9 @@ jobs:
       # Every registry crate the release build links is in the graph judged
       # below (`.github/ci/release_build.py` names that build once).
       - run: python3 .github/ci/supply_chain_scope.py
-      - run: cargo deny check advisories bans licenses sources
+      # Every exemption deny.toml grants must be one the judged graph meets:
+      # each `-D` turns a code cargo-deny raises for an ignore, skip, wrapper,
+      # bypass or allowance nothing matches from a warning into a failure, so
+      # an exemption outlives its cause only until the next run
+      # (verify-manifest.py check 31 names the codes).
+      - run: cargo deny check -D advisory-not-detected -D yanked-not-detected -D unknown-advisory -D unmatched-skip -D unnecessary-skip -D unused-wrapper -D unmatched-wrapper -D unmatched-skip-root -D unmatched-bypass -D unmatched-path-bypass -D unmatched-glob -D unmatched-replacement-ignore -D license-not-encountered -D license-exception-not-encountered -D unmatched-source -D unmatched-organization advisories bans licenses sources

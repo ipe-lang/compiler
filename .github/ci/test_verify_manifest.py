@@ -10314,23 +10314,82 @@ class TestDenyGraphCoversRelease(unittest.TestCase):
 
 
 class TestAuditIgnoresEqual(unittest.TestCase):
-    """Check 29: deny.toml and .cargo/audit.toml ignore one RUSTSEC id set."""
+    """Check 29: .cargo/audit.toml ignores deny.toml's RUSTSEC ids plus the
+    lockfile-only ones, each lockfile-only id's package still locked."""
 
-    def errors(self, deny: str, audit: str) -> list[str]:
+    def errors(
+        self,
+        deny: str,
+        audit: str,
+        lockfile_only: dict[str, str] | None = None,
+        lock: str | None = None,
+    ) -> list[str]:
         with tempfile.TemporaryDirectory() as repo:
             _write(os.path.join(repo, "deny.toml"), deny)
             _write(os.path.join(repo, ".cargo", "audit.toml"), audit)
+            if lock is not None:
+                _write(os.path.join(repo, "Cargo.lock"), lock)
             errors: list[str] = []
-            verify_manifest.check_audit_ignores_equal(errors, root=os.path.join(repo, ".github"))
+            verify_manifest.check_audit_ignores_equal(
+                errors, root=os.path.join(repo, ".github"), lockfile_only=lockfile_only or {}
+            )
             return errors
 
     @staticmethod
     def ignores(*entries: str) -> str:
         return "[advisories]\nignore = [\n" + "".join(f"    {e},\n" for e in entries) + "]\n"
 
-    def assertRefused(self, deny: str, audit: str, needle: str) -> None:
-        errors = self.errors(deny, audit)
+    def assertRefused(
+        self,
+        deny: str,
+        audit: str,
+        needle: str,
+        lockfile_only: dict[str, str] | None = None,
+        lock: str | None = None,
+    ) -> None:
+        errors = self.errors(deny, audit, lockfile_only, lock)
         self.assertTrue(any(needle in e for e in errors), f"expected {needle!r} in {errors}")
+
+    _LOCK = 'version = 4\n\n[[package]]\nname = "rkyv"\nversion = "0.7.46"\n'
+    _ONLY = {"RUSTSEC-2026-0235": "rkyv"}
+
+    def test_lockfile_only_id_in_audit_alone_passes(self) -> None:
+        deny = self.ignores('"RUSTSEC-2023-0071"')
+        audit = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0235"')
+        self.assertEqual(self.errors(deny, audit, self._ONLY, self._LOCK), [])
+
+    def test_lockfile_only_id_missing_from_audit_refused(self) -> None:
+        deny = self.ignores('"RUSTSEC-2023-0071"')
+        self.assertRefused(
+            deny, deny, ".cargo/audit.toml does not ignore ['RUSTSEC-2026-0235']", self._ONLY, self._LOCK
+        )
+
+    def test_lockfile_only_id_also_in_deny_refused(self) -> None:
+        both = self.ignores('"RUSTSEC-2026-0235"')
+        self.assertRefused(both, both, "never both", self._ONLY, self._LOCK)
+
+    def test_lockfile_only_id_whose_package_left_the_lock_refused(self) -> None:
+        audit = self.ignores('"RUSTSEC-2026-0235"')
+        lock = 'version = 4\n\n[[package]]\nname = "rust_decimal"\nversion = "1.42.1"\n'
+        self.assertRefused(self.ignores(), audit, "names `rkyv`, which Cargo.lock no longer records", self._ONLY, lock)
+
+    def test_lockfile_only_with_unreadable_lock_refused(self) -> None:
+        audit = self.ignores('"RUSTSEC-2026-0235"')
+        self.assertRefused(self.ignores(), audit, "Cargo.lock is missing", self._ONLY, None)
+        self.assertRefused(self.ignores(), audit, "Cargo.lock is unreadable", self._ONLY, "[[package\n")
+        self.assertRefused(self.ignores(), audit, "no `[[package]]` list", self._ONLY, "version = 4\n")
+
+    def test_lockfile_only_key_not_a_rustsec_id_refused(self) -> None:
+        audit = self.ignores('"RUSTSEC-2026-0235"')
+        only = {"RUSTSEC-2026-0235": "rkyv", "GHSA-xxxx": "rkyv"}
+        self.assertRefused(self.ignores(), audit, "lockfile-only id 'GHSA-xxxx' is not a RUSTSEC id", only, self._LOCK)
+
+    def test_repo_lockfile_only_ids_stay_out_of_deny(self) -> None:
+        """The repo's lockfile-only set is disjoint from deny.toml and live."""
+        self.assertTrue(verify_manifest.AUDIT_LOCKFILE_ONLY_IGNORES)
+        errors: list[str] = []
+        verify_manifest.check_audit_ignores_equal(errors, lockfile_only=dict(verify_manifest.AUDIT_LOCKFILE_ONLY_IGNORES))
+        self.assertEqual(errors, [])
 
     def test_equal_sets_pass(self) -> None:
         a, b = '"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0543"'
@@ -10347,7 +10406,9 @@ class TestAuditIgnoresEqual(unittest.TestCase):
 
     def test_id_only_in_deny_refused(self) -> None:
         deny = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2025-0141"')
-        self.assertRefused(deny, self.ignores('"RUSTSEC-2023-0071"'), "deny.toml ignores ['RUSTSEC-2025-0141']")
+        self.assertRefused(
+            deny, self.ignores('"RUSTSEC-2023-0071"'), ".cargo/audit.toml does not ignore ['RUSTSEC-2025-0141']"
+        )
 
     def test_id_only_in_audit_refused(self) -> None:
         audit = self.ignores('"RUSTSEC-2023-0071"', '"RUSTSEC-2026-0459"')
@@ -10370,6 +10431,107 @@ class TestAuditIgnoresEqual(unittest.TestCase):
 
     def test_unreadable_side_refused(self) -> None:
         self.assertRefused("[advisories\n", self.ignores(), "deny.toml is unreadable")
+
+
+_STALE_FLAGS = " ".join(f"-D {c}" for c in verify_manifest.DENY_STALE_EXEMPTION_CODES)
+_DENY_LINE = f"cargo deny check {_STALE_FLAGS} advisories bans licenses sources"
+
+
+class TestDenyRefusesStaleExemptions(unittest.TestCase):
+    """Check 31: every `cargo deny check` denies each stale-exemption code."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def errors(self, run: str, local: list[object]) -> list[str]:
+        step = "\n".join(f"          {line}" for line in run.split("\n"))
+        _write(
+            os.path.join(self.root, "workflows", "security.yml"),
+            "on: push\njobs:\n  cargo-deny:\n    runs-on: ubuntu-latest\n    steps:\n"
+            f"      - run: |\n{step}\n",
+        )
+        errors: list[str] = []
+        wfs = _load(self.root, errors)
+        found: list[str] = []
+        verify_manifest.check_deny_refuses_stale_exemptions(wfs, [{"context": "cargo-deny", "local": {"run": local}}], found)
+        return found
+
+    def test_every_code_denied_passes(self) -> None:
+        self.assertEqual(self.errors(_DENY_LINE, [_DENY_LINE]), [])
+
+    def test_glued_and_long_spellings_pass(self) -> None:
+        codes = verify_manifest.DENY_STALE_EXEMPTION_CODES
+        spelled = " ".join(
+            (f"-D{c}", f"--deny {c}", f"--deny={c}")[i % 3] for i, c in enumerate(codes)
+        )
+        line = f"cargo-deny check {spelled} advisories"
+        self.assertEqual(self.errors(line, [{"cmd": line, "differs": "x"}]), [])
+
+    def test_bare_check_refused_in_workflow_and_manifest(self) -> None:
+        bare = "cargo deny check advisories bans licenses sources"
+        for run, local, where in ((bare, [], "security.yml job `cargo-deny`"), (_DENY_LINE, [bare], "manifest `cargo-deny`")):
+            with self.subTest(where=where):
+                errors = self.errors(run, local)
+                self.assertEqual(len(errors), 1, errors)
+                self.assertTrue(errors[0].startswith(f"check 31: {where}"), errors)
+                self.assertIn("advisory-not-detected", errors[0])
+
+    def test_each_code_dropped_alone_refused(self) -> None:
+        for code in verify_manifest.DENY_STALE_EXEMPTION_CODES:
+            with self.subTest(code=code):
+                line = _DENY_LINE.replace(f"-D {code} ", "")
+                self.assertNotEqual(line, _DENY_LINE)
+                errors = self.errors(line, [])
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn(f"['{code}']", errors[0])
+
+    def test_relevel_refused(self) -> None:
+        for extra in ("-A advisory-not-detected", "-Wunused-wrapper", "--allow=denied", "--warn warnings"):
+            with self.subTest(extra=extra):
+                errors = self.errors(f"{_DENY_LINE} {extra}", [])
+                self.assertEqual(len(errors), 1, errors)
+                self.assertIn("re-levels", errors[0])
+
+    def test_chained_and_path_spellings_refused(self) -> None:
+        for run in (
+            "true && cargo deny check advisories",
+            "/usr/local/bin/cargo-deny check bans",
+            "cargo deny --log-level warn check sources",
+            "cargo +1.95 deny check advisories",
+            "cargo --locked deny check bans",
+            "RUST_LOG=warn cargo deny check licenses",
+            "env FOO=1 cargo-deny check sources",
+            "timeout 600 ~/.cargo/bin/cargo deny check advisories",
+        ):
+            with self.subTest(run=run):
+                self.assertEqual(len(self.errors(f"{_DENY_LINE}\n{run}", [])), 1)
+
+    def test_non_check_deny_lines_pass(self) -> None:
+        for run in ("cargo deny fetch", "cargo install --locked cargo-deny", "cargo deny list"):
+            with self.subTest(run=run):
+                self.assertEqual(self.errors(f"{_DENY_LINE}\n{run}", []), [])
+
+    def test_unsplittable_deny_line_refused(self) -> None:
+        errors = self.errors(_DENY_LINE, ["cargo deny check 'advisories"])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("cannot be split", errors[0])
+
+    def test_no_workflow_deny_check_refused(self) -> None:
+        errors = self.errors("cargo deny fetch", [_DENY_LINE])
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn("no workflow runs `cargo deny check`", errors[0])
+
+    def test_current_tree_passes(self) -> None:
+        errors: list[str] = []
+        wfs = _load(verify_manifest.REPO_ROOT, errors)
+        manifest = verify_manifest.read_manifest(verify_manifest.MANIFEST)
+        entries = manifest.get("checks") if isinstance(manifest, dict) else None
+        verify_manifest.check_deny_refuses_stale_exemptions(wfs, entries, errors)
+        self.assertEqual(errors, [])
 
 
 _REAL_REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

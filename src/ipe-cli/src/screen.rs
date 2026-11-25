@@ -31,6 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::CliError;
 use crate::doc_search::DocMiss;
+use crate::doc_terminal::{DocText, Width};
 use crate::progress;
 use crate::style::{self, GUTTER, Palette, REPORT_BUGS_PHRASE, TerminalSafe};
 
@@ -101,6 +102,14 @@ impl Stream {
         match self {
             Self::Stdout => style::use_color(&std::io::stdout()),
             Self::Stderr => style::use_color(&std::io::stderr()),
+        }
+    }
+
+    /// The column budget of the terminal this stream writes to, read from that same descriptor.
+    fn width(self) -> Width {
+        match self {
+            Self::Stdout => Width::of_terminal(&std::io::stdout()),
+            Self::Stderr => Width::of_terminal(&std::io::stderr()),
         }
     }
 
@@ -261,6 +270,19 @@ impl Screen {
             self.body.push('\n');
         }
         self
+    }
+
+    /// The width a doc page for this screen wraps at: the terminal of the screen's own stream.
+    #[must_use]
+    pub fn doc_width(&self) -> Width {
+        self.stream.width()
+    }
+
+    /// Append a doc page [`crate::doc_terminal::render`] laid out.
+    ///
+    /// Every line gains the gutter; edge newlines are dropped.
+    pub fn doc(&mut self, page: &DocText) -> &mut Self {
+        self.styled(page.as_str())
     }
 
     /// Append a block whose renderer guttered some or all of its own lines (a self-rendering

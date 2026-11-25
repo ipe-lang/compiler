@@ -201,8 +201,7 @@ pub const ASYNC_TRAIT: CrateSpec = CrateSpec {
 // `rustix` is declared directly in the base `Cargo.toml` template (under
 // `[target.'cfg(unix)'.dependencies]`, for the vendored runtime's termios / pty /
 // parent-death syscalls), not by a surgery function — so this spec is consulted
-// only by the drift guard, which walks `ALL` under `cfg(test)`.
-#[cfg(test)]
+// only by the drift guard, which walks `ALL`.
 pub const RUSTIX: CrateSpec = CrateSpec {
     name: "rustix",
     version: "1",
@@ -326,9 +325,7 @@ pub const SERDE_JSON: PinnedCrate = PinnedCrate {
     features: &["preserve_order"],
 };
 // The map behind the runtime's `JsonMap`. Not surgery-emitted (the vendored and
-// wasm templates spell it); consulted only by the drift guards under
-// `cfg(test)`.
-#[cfg(test)]
+// wasm templates spell it); consulted only by the drift guards.
 pub const INDEXMAP: CrateSpec = CrateSpec {
     name: "indexmap",
     version: "2",
@@ -387,10 +384,9 @@ pub const FUTURES_UTIL: CrateSpec = CrateSpec {
 };
 // Base `chrono` is not surgery-emitted (the dep-model manifest names only the
 // `ipe_runtime` path dep; its version lives in the runtime crate). This spec is
-// consulted only by the drift guard, which walks `ALL` under `cfg(test)`.
+// consulted only by the drift guard, which walks `ALL`.
 // Pinned exact to the one version the whole workspace graph reconciles to, so a
 // newer patch cannot climb its transitive `wasm-bindgen` floor past the runtime.
-#[cfg(test)]
 pub const CHRONO: CrateSpec = CrateSpec {
     name: "chrono",
     version: "=0.4.45",
@@ -398,23 +394,21 @@ pub const CHRONO: CrateSpec = CrateSpec {
 // Like `CHRONO`, these are not surgery-emitted: the dependency-model manifest
 // names only the `ipe_runtime` path dep, and their versions live in the runtime
 // crate (behind the `decimal` / `char-category` features). Consulted only by the
-// drift guard, which walks `ALL` under `cfg(test)`.
-#[cfg(test)]
+// drift guard, which walks `ALL`.
 pub const RUST_DECIMAL: CrateSpec = CrateSpec {
     name: "rust_decimal",
     version: "1",
 };
-#[cfg(test)]
 pub const UNICODE_GENERAL_CATEGORY: CrateSpec = CrateSpec {
     name: "unicode-general-category",
     version: "1",
 };
 
-/// Every spec emitted by the surgery functions, for drift-test iteration.
+/// Every crate an emitted manifest can name by registry version.
 ///
-/// Test-only: the shipping emitter reads the individual `const`s by name; this
-/// aggregate exists solely so the drift tripwire can walk the full set.
-#[cfg(test)]
+/// The shipping emitter reads the individual `const`s by name; this aggregate
+/// exists so the drift tripwires walk the full set: the manifest tripwire here,
+/// and the `ipe` test proving the pinned dependency set holds each one.
 pub const ALL: &[CrateSpec] = &[
     TOKIO,
     SQLX.spec,

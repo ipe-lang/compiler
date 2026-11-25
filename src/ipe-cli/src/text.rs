@@ -1981,6 +1981,46 @@ messages! {
     cargo_metadata_unparsable(detail) = "cargo-metadata-unparsable";
     /// `cargo metadata` reported no target directory.
     cargo_metadata_no_target_dir = "cargo-metadata-no-target-dir";
+    /// An emitted crate's `Cargo.lock` disagrees with the pinned dependency set.
+    cli_lock_drift(lock, drift) = "cli-lock-drift";
+    /// A lock locks a registry crate the pinned set does not hold.
+    lock_drift_unpinned(name, version) = "lock-drift-unpinned";
+    /// The project's own requirement moved a pinned crate.
+    lock_drift_moved_by_project(name, locked, pinned, project) = "lock-drift-moved-by-project";
+    /// A user crate's requirement moved a pinned crate.
+    lock_drift_moved_by_crate(name, locked, pinned, requester, version) = "lock-drift-moved-by-crate";
+    /// A pinned crate moved, with no requester found in the lock.
+    lock_drift_moved_unrequested(name, locked, pinned) = "lock-drift-moved-unrequested";
+    /// ipe's own emitted graph moved a pinned crate.
+    lock_drift_moved_internal(name, locked, pinned) = "lock-drift-moved-internal";
+    /// A crates.io crate locked without a checksum.
+    lock_drift_unchecksummed(name, version) = "lock-drift-unchecksummed";
+    /// ipe's own emitted graph locked a crates.io crate without a checksum.
+    lock_drift_unchecksummed_internal(name, version) = "lock-drift-unchecksummed-internal";
+    /// A pinned version locked with another checksum.
+    lock_drift_checksum(name, version) = "lock-drift-checksum";
+    /// A lock takes a crate from a source other than crates.io.
+    lock_drift_foreign_source(name, source) = "lock-drift-foreign-source";
+    /// A lock the closed lockfile grammar does not read.
+    lock_drift_unparsable(reason) = "lock-drift-unparsable";
+    /// The wrapper workspace lock is not the embedded pinned set.
+    lock_drift_wrapper_differs = "lock-drift-wrapper-differs";
+    /// The pinned set embedded in `ipe` does not parse.
+    lock_drift_set_unreadable(reason) = "lock-drift-set-unreadable";
+    /// A lock that is not UTF-8.
+    lock_parse_not_utf8 = "lock-parse-not-utf8";
+    /// A lock that is not TOML.
+    lock_parse_not_toml = "lock-parse-not-toml";
+    /// A lock of another format version.
+    lock_parse_format_version(expected) = "lock-parse-format-version";
+    /// A lock key the grammar does not know.
+    lock_parse_unknown_key(key) = "lock-parse-unknown-key";
+    /// A lock key holding a value of the wrong shape.
+    lock_parse_malformed(field) = "lock-parse-malformed";
+    /// The pinned set names a source other than crates.io.
+    pinned_set_foreign_source(name, source) = "pinned-set-foreign-source";
+    /// The pinned set locks a registry crate without a checksum.
+    pinned_set_missing_checksum(name, version) = "pinned-set-missing-checksum";
     /// `ipe explain` moved to `ipe doc`.
     explain_moved = "explain-moved";
     /// No app binary after a successful `cargo build`.
