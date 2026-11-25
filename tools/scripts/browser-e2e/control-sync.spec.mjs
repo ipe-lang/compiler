@@ -20,6 +20,10 @@
  *   6. Order — an event reaches the server only after every edit the user made
  *      before it: one event is in flight at a time, and a send first posts the
  *      edits still waiting on their debounce.
+ *   7. Channel — a post with no answer is retried in order past its bound, a
+ *      burst of edits to one field queues one event, an accept whose handling
+ *      throws is never posted again, and leaving the page sends a pending edit
+ *      through the same ordered queue.
  *
  * Runs against the control-sync example (`examples/shapes/web/control-sync`).
  *
@@ -193,4 +197,139 @@ test("an answered edit rides on no later event", async ({ page }) => {
   await clickAnswered(page, "#tick0");
   const sent = JSON.parse((await next).postData() ?? "{}");
   expect(sent.inputState?.[draftId]).toBeUndefined();
+});
+
+/** The handler id the element `selector` raises its events with. */
+async function hidOf(page, selector) {
+  const handlerId = await page.locator(selector).getAttribute("data-ipe-hid");
+  expect(handlerId, `${selector} raises an event`).toBeTruthy();
+  return handlerId;
+}
+
+test("a post that is never answered is retried in order past its bound", async ({ page }) => {
+  await open(page);
+  await page.evaluate(() => {
+    window.__ipeEventAnswerBoundMs = 1000;
+  });
+  const draftHid = await hidOf(page, "#draft");
+  const posted = [];
+  let hung = false;
+  await page.route("**/_ipe/event", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}");
+    posted.push(body.handlerId);
+    // The draft's first post never gets an answer.
+    if (!hung && body.handlerId === draftHid) {
+      hung = true;
+      return;
+    }
+    await route.continue();
+  });
+  await page.fill("#draft", "first");
+  await clickAnswered(page, "#add");
+  await expect(page.locator("#text0")).toHaveText("first", { timeout: 10000 });
+  const addHid = await hidOf(page, "#add");
+  expect(posted.indexOf(addHid), "the click went after the edit's retry").toBeGreaterThan(
+    posted.lastIndexOf(draftHid),
+  );
+  expect(posted.filter((h) => h === draftHid).length, "the hung edit was posted again").toBe(2);
+});
+
+test("typing while an event is unanswered queues one event per field", async ({ page }) => {
+  await open(page);
+  const warnings = [];
+  page.on("console", (m) => {
+    if (m.type() === "warning") warnings.push(m.text());
+  });
+  let release = () => {};
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  let held = false;
+  await page.route("**/_ipe/event", async (route) => {
+    if (!held) {
+      held = true;
+      await released;
+    }
+    await route.continue();
+  });
+  // Each edit is sent at once by the blur that follows it, while the first
+  // edit's post is held unanswered.
+  const depth = await page.evaluate(() => {
+    const draft = document.getElementById("draft");
+    let deepest = 0;
+    for (let i = 0; i < 80; i += 1) {
+      draft.value = `burst ${i}`;
+      draft.dispatchEvent(new Event("input", { bubbles: true }));
+      draft.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+      deepest = Math.max(deepest, window.__ipeEventQueue.length);
+    }
+    return deepest;
+  });
+  expect(depth, "queued edits of one field coalesce").toBeLessThanOrEqual(1);
+  release();
+  await clickAnswered(page, "#add");
+  await expect(page.locator("#text0")).toHaveText("burst 79", { timeout: 10000 });
+  expect(warnings.filter((w) => w.includes("event queue at cap"))).toEqual([]);
+});
+
+test("an accepted event whose handling throws is never sent again", async ({ page }) => {
+  await open(page);
+  const seqs = [];
+  page.on("request", (request) => {
+    if (isEventPost(request)) seqs.push(JSON.parse(request.postData() ?? "{}").seq);
+  });
+  // The first accept's handling throws after the answer was read.
+  await page.evaluate(() => {
+    const success = window.__ipeOnPostSuccess;
+    let thrown = false;
+    window.__ipeOnPostSuccess = function () {
+      if (!thrown) {
+        thrown = true;
+        throw new Error("e2e: handling an accept throws");
+      }
+      return success();
+    };
+  });
+  await page.fill("#draft", "first");
+  await clickAnswered(page, "#add");
+  await expect(page.locator("#text0")).toHaveText("first", { timeout: 10000 });
+  await page.waitForTimeout(1500);
+  expect(seqs.length).toBeGreaterThan(1);
+  expect(new Set(seqs).size, `each event was posted once: ${seqs}`).toBe(seqs.length);
+});
+
+test("leaving the page sends the pending edit through the ordered channel", async ({ page }) => {
+  await open(page);
+  const draftHid = await hidOf(page, "#draft");
+  const clearHid = await hidOf(page, "#clear");
+  const posted = [];
+  let release = () => {};
+  const released = new Promise((resolve) => {
+    release = resolve;
+  });
+  await page.route("**/_ipe/event", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}");
+    posted.push(body);
+    if (body.handlerId === clearHid) await released;
+    await route.continue();
+  });
+  // The clear is in flight and unanswered when the edit is typed and the page
+  // starts to leave.
+  await page.locator("#clear").dispatchEvent("click");
+  await expect.poll(() => posted.length).toBe(1);
+  await page.locator("#draft").evaluate((draft) => {
+    draft.value = "typed before leaving";
+    draft.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+  await page.evaluate(() => window.dispatchEvent(new Event("pagehide")));
+  await page.waitForTimeout(300);
+  expect(await page.evaluate(() => window.__ipeEventQueue.length), "the edit waits its turn").toBe(1);
+  expect(posted.length, "nothing overtook the unanswered clear").toBe(1);
+  release();
+  await expect.poll(() => posted.length, { timeout: 10000 }).toBe(2);
+  const edit = posted[1];
+  expect(edit.handlerId).toBe(draftHid);
+  expect(edit.epoch, "the edit carries its render epoch").toBeTruthy();
+  expect(edit.batch).toBeUndefined();
+  expect(edit.seq).toBeGreaterThan(posted[0].seq);
 });

@@ -1612,23 +1612,23 @@ var __ipeInputPending = {};
 function __ipeDebouncedSend(msgName, args, hid, delay, epoch, focus) {
   var key = hid || msgName;
   clearTimeout(__ipeInputTimers[key]);
+  // Re-inserted, so the pending map lists its keys by their latest edit.
+  delete __ipeInputPending[key];
   __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch, focus: focus };
-  __ipeInputTimers[key] = setTimeout(function() {
-    delete __ipeInputPending[key];
-    __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch, focus: focus });
-  }, delay);
+  __ipeInputTimers[key] = setTimeout(function() { __ipeSendPendingInput(key); }, delay);
 }
-// Send the pending debounced input of `key` now, if any.
+// Send the pending debounced input of `key` now, if any. Its event coalesces
+// under `key`: queued behind another event of the same key, it replaces it.
 function __ipeSendPendingInput(key) {
   var p = __ipeInputPending[key];
   if (!p) return;
   clearTimeout(__ipeInputTimers[key]);
   delete __ipeInputPending[key];
-  __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus });
+  __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus, coalesce: key });
 }
-// Send every pending debounced input now. Each was typed before the event
-// about to be sent, so each is posted ahead of it: an event never reaches the
-// server before an edit the user made first.
+// Send every pending debounced input now, in the order of their latest edits.
+// Each was typed before the event about to be sent, so each is posted ahead of
+// it: an event never reaches the server before an edit the user made first.
 function __ipeSendAllPendingInput() {
   var keys = Object.keys(__ipeInputPending);
   for (var i = 0; i < keys.length; i++) __ipeSendPendingInput(keys[i]);
@@ -1645,128 +1645,39 @@ __ipeDoc.on("focusout", function(ev) {
   if (key) __ipeSendPendingInput(key);
 }, true);
 
-// ── I3: flush on unmount ─────────────────────────────────────
-// Any pending debounce that hasn't fired by the time the user
-// navigates or closes the tab would normally be discarded — the
-// setTimeout is torn down with the page. These handlers flush
-// synchronously so the final keystroke always reaches the server.
-// See docs/internals/web/input-authority-protocol.md §I3.
-
-// __ipeCollectPendingBatch — snapshot every pending-debounce entry
-// into a batch array, bumping __ipeClientSeq per entry so each gets
-// its own order in the batch processed server-side. Clears the
-// pending map as a side effect so the regular debounce callback
-// can't double-fire after a beacon.
-function __ipeCollectPendingBatch() {
-  var keys = Object.keys(__ipeInputPending);
-  if (keys.length === 0) return null;
-  var batch = [];
-  for (var i = 0; i < keys.length; i++) {
-    var k = keys[i];
-    clearTimeout(__ipeInputTimers[k]);
-    var p = __ipeInputPending[k];
-    delete __ipeInputPending[k];
-    __ipeClientSeq++;
-    batch.push({
-      seq: __ipeClientSeq,
-      msg: p.msgName || "",
-      args: p.args || [],
-      handlerId: p.hid || "",
-      epoch: p.epoch
-    });
-  }
-  return batch;
-}
-
-// __ipeFlushPendingBeacon — POST pending debounces on page unload so
-// the request survives. Single payload carries the whole batch + the
-// latest inputState snapshot so the server ingests the final DOM
-// values before dispatching. Silent no-op when there's nothing
-// pending.
-//
-// Uses a keepalive fetch (not navigator.sendBeacon) because the CSRF
-// middleware rejects POSTs to /_ipe/event without a matching
-// X-Ipe-Csrf header — and sendBeacon cannot set request headers, so a
-// beacon would be silently dropped whenever CSRF is enabled. keepalive
-// fetch survives unload AND carries the header. sendBeacon remains a
-// best-effort fallback only when CSRF is disabled (empty token) or
-// keepalive is unsupported.
-function __ipeFlushPendingBeacon() {
+// ── Flush on leaving ─────────────────────────────────────────
+// An edit still waiting on its debounce when the user follows a link or
+// leaves the page is sent at once, through the one ordered channel: it joins
+// the queue behind every event sent before it, never ahead. Its post asks the
+// browser to keep it alive past the page (__ipeKeepAlive), so an edit posted
+// while no event is in flight reaches the server; one queued behind an
+// unanswered event goes only if the page stays.
+function __ipeFlushOnLeave() {
   if (__ipeEnded) return;
-  var batch = __ipeCollectPendingBatch();
-  if (batch) __ipeStampEdited(__ipeClientSeq);
-  var snapshot = __ipeInputsSnapshot();
-  if (!batch && !snapshot) return;
-  var body = { sessionId: __ipeSid };
-  if (batch)    body.batch = batch;
-  if (snapshot) body.inputState = snapshot;
-  var json = JSON.stringify(body);
-  try {
-    var headers = {"Content-Type":"application/json"};
-    if (__ipeCsrfToken) headers["X-Ipe-Csrf"] = __ipeCsrfToken;
-    fetch(__ipeBase + "/_ipe/event", {
-      method: "POST",
-      headers: headers,
-      body: json,
-      credentials: "same-origin",
-      keepalive: true
-    }).catch(function(_){});
-    return;
-  } catch (_) {}
-  // Legacy fallback: keepalive fetch unsupported. sendBeacon cannot
-  // carry the CSRF header, so this only reaches the server when CSRF
-  // is disabled; otherwise it is dropped (no worse than no flush).
-  if (navigator && typeof navigator.sendBeacon === "function") {
-    try {
-      var blob = new Blob([json], {type: "application/json"});
-      navigator.sendBeacon(__ipeBase + "/_ipe/event", blob);
-    } catch (_) {}
-  }
+  __ipeLeaving = true;
+  try { __ipeSendAllPendingInput(); } finally { __ipeLeaving = false; }
 }
+// True only while __ipeFlushOnLeave sends: the bodies sent then are kept alive.
+var __ipeLeaving = false;
+// The bodies whose posts the browser keeps alive past the page.
+var __ipeKeepAlive = new WeakSet();
 
-// __ipeFlushPendingSync — synchronous variant for same-page
-// transitions where sendBeacon is overkill. Calls __ipeSend for
-// each pending entry; the fetch requests are fire-and-forget and
-// the browser keeps them alive across same-origin navigation.
-// A flushed entry keeps no focus record: the link activation that flushes it
-// is a later act than its keystroke.
-function __ipeFlushPendingSync() {
-  var batch = __ipeCollectPendingBatch();
-  if (!batch) return;
-  for (var i = 0; i < batch.length; i++) {
-    var b = batch[i];
-    __ipeSend(b.msg, b.args, b.handlerId, {noLoader: true, epoch: b.epoch});
-  }
-}
-
-// Capture-phase click listener inside ipe-root: before a link click
-// leaves the current page, drain any pending debounce so the final
-// typed value reaches the server in the same origin as the
-// outgoing navigation. Beacon path handles cross-page; sync path
-// handles SPA-style internal routing.
+// Capture-phase click listener inside ipe-root: before a link click leaves
+// the current page, send any pending debounce so the final typed value reaches
+// the server ahead of whatever the navigation sends.
 __ipeDoc.on("click", function(ev) {
   // The target may be a `<form>`, whose control named `closest` would answer.
   var a = ev.target instanceof Element ? __ipeNode.closest(ev.target, "a[href]") : null;
   if (!a) return;
   var root = __ipeDoc.byId("ipe-root");
   if (!root || !root.contains(a)) return;
-  var href = a.getAttribute("href") || "";
-  // External or cross-origin → beacon (browser will tear down the
-  // page, fetch would be cancelled). Same-origin navigation inside
-  // SPA-style routing → sync flush (fetch survives).
-  var isExternal = /^(https?:)?\/\//.test(href) && a.host !== location.host;
-  if (isExternal || href === "") {
-    __ipeFlushPendingBeacon();
-  } else {
-    __ipeFlushPendingSync();
-  }
+  __ipeFlushOnLeave();
 }, true);
 
-// Tab close / navigate away: sendBeacon is the only path that
-// survives the teardown. Listen on both events because iOS Safari
+// Tab close / navigate away. Listen on both events because iOS Safari
 // + bfcache fire pagehide instead of beforeunload.
-window.addEventListener("beforeunload", __ipeFlushPendingBeacon);
-window.addEventListener("pagehide", __ipeFlushPendingBeacon);
+window.addEventListener("beforeunload", __ipeFlushOnLeave);
+window.addEventListener("pagehide", __ipeFlushOnLeave);
 
 // ── Core send ────────────────────────────────────────────────
 // Wire format (see docs/internals/web/input-authority-protocol.md §Request):
@@ -1803,6 +1714,8 @@ function __ipeSend(msgName, args, handlerId, opts) {
   if (__ipeTabId) body.tab = __ipeTabId;
   if (snapshot) body.inputState = snapshot;
   __ipeFocusSent(mySeq, opts.focus);
+  if (typeof opts.coalesce === "string") __ipeCoalesceKey.set(body, opts.coalesce);
+  if (__ipeLeaving) __ipeKeepAlive.add(body);
   __ipePostEvent(body);
 }
 
@@ -1812,9 +1725,7 @@ function __ipeSend(msgName, args, handlerId, opts) {
 // shouldn't lose the click. Failures push the body onto __ipeEventQueue;
 // retries fire on exponential backoff (500ms, 1s, 2s, … cap 16s);
 // the SSE 'open' handler drains the queue eagerly when the server
-// comes back. Cap at 50 entries — beyond that the user has been
-// offline so long that replay isn't useful, drop oldest with a
-// console warn so the page doesn't accumulate megabytes of state.
+// comes back.
 var __ipeEventQueue = [];
 var __ipeRetryTimer = null;
 var __ipeRetryAttempts = 0;
@@ -1824,8 +1735,23 @@ var __ipeReconnectSince = 0;
 // __ipeRetryBaseMs / __ipeRetryMaxMs / __ipeRetryMaxAttempts /
 // __ipeEventQueueMax are templated at the top of this script from
 // the IPE_WEB_RETRY_* / IPE_WEB_QUEUE_MAX env vars.
+// The debounce key of an input event, by its body. A queued input event is
+// replaced by a later one of the same key queued right behind it: the later
+// one carries the field's newer value and every pending value the first
+// carried, and its answer ends them all.
+var __ipeCoalesceKey = new WeakMap();
+// How long a posted event waits for its answer before it is retried. The
+// server ends a request it cannot answer within its own request timeout (30 s
+// by default), so a post past this bound is lost on the way: it goes back to
+// the head of the queue, and a re-post the server already dispatched is
+// answered without a second dispatch.
+var __ipeEventAnswerBoundMs = 40000;
+// A post the browser keeps alive past the page carries at most 64 KiB, shared
+// by every such post in flight. A body of at most this many UTF-16 units is
+// at most 48 KiB of UTF-8.
+var __IPE_KEEPALIVE_BODY_MAX = 16384;
 // The outcomes an answer to an event POST can have. Each has one handler in
-// __ipePostEvent; a network failure is TRANSIENT through its `.catch`.
+// __ipeOnEventAnswer; a network failure or a post past its bound is TRANSIENT.
 var __IPE_EVENT_ANSWER = Object.freeze({
   ACCEPTED: "accepted", STALE: "stale", SESSION_LOST: "session-lost",
   TRANSIENT: "transient", TOO_LARGE: "too-large", REFUSED: "refused"
@@ -1844,12 +1770,35 @@ function __ipeEventAnswer(r) {
   if (status === 413 || status === 414 || status === 431) return __IPE_EVENT_ANSWER.TOO_LARGE;
   return __IPE_EVENT_ANSWER.REFUSED;
 }
-// The event posted and still unanswered, or null. Events go one at a time, so
+// How a post ends: its event is ANSWERED (accepted, stale, or refused, and
+// never sent again) or goes back to the head of the queue to RETRY.
+var __IPE_POST_SETTLED = Object.freeze({ ANSWERED: "answered", RETRY: "retry" });
+// The attempt posted and still unsettled, or null. Events go one at a time, so
 // a later one never reaches the server before an earlier one: two posts in
 // flight at once race for the session, and the later act could be dispatched
-// first. Only the post holding it releases it: a late answer to an earlier
-// post never frees the slot a later one holds.
+// first. Each post is its own attempt, so a late answer to an attempt already
+// settled (past its bound, say) never settles the retry of the same event.
 var __ipeEventInFlight = null;
+// The one place a post ends: it frees the slot, then sends the next event
+// (ANSWERED) or puts this one back at the head of the queue (RETRY; anything
+// else too, failing closed onto the path that loses nothing). True only for
+// the attempt holding the slot, the first time: every later settle of it is a
+// no-op, so an answer is acted on once and an event is never queued twice.
+function __ipeSettle(attempt, outcome) {
+  if (__ipeEventInFlight !== attempt) return false;
+  __ipeEventInFlight = null;
+  clearTimeout(attempt.bound);
+  __ipeLoaderEnd();
+  if (__ipeEnded) return true;
+  if (outcome === __IPE_POST_SETTLED.ANSWERED) {
+    __ipeDrainQueue();
+    return true;
+  }
+  __ipeEnqueue(attempt.body, true);
+  __ipeShowReconnecting();
+  __ipeScheduleRetry();
+  return true;
+}
 // `fromQueue` marks the head of the retry queue. An event posted while the
 // queue holds events or an event is in flight joins its tail, so it never
 // overtakes them.
@@ -1860,7 +1809,13 @@ function __ipePostEvent(body, fromQueue) {
     if (__ipeRetryTimer === null && !__ipeEventInFlight) __ipeDrainQueue();
     return;
   }
-  __ipeEventInFlight = body;
+  var controller = typeof AbortController === "function" ? new AbortController() : null;
+  var attempt = { body: body, bound: null };
+  __ipeEventInFlight = attempt;
+  attempt.bound = setTimeout(function() {
+    __ipeSettle(attempt, __IPE_POST_SETTLED.RETRY);
+    if (controller) controller.abort();
+  }, __ipeEventAnswerBoundMs);
   // Phase 1.2 — attach the per-session CSRF token. The server-side
   // middleware () rejects POSTs
   // without a matching X-Ipe-Csrf / __ipe_csrf cookie pair. Empty
@@ -1868,110 +1823,116 @@ function __ipePostEvent(body, fromQueue) {
   // [security] csrf = false) — header omitted, middleware skipped.
   var headers = {"Content-Type":"application/json"};
   if (__ipeCsrfToken) headers["X-Ipe-Csrf"] = __ipeCsrfToken;
-  fetch(__ipeBase + "/_ipe/event", {
+  var json = JSON.stringify(body);
+  var init = {
     method: "POST",
     headers: headers,
-    body: JSON.stringify(body),
+    body: json,
     credentials: "same-origin"
-  }).then(function(r){
-    if (__ipeEventInFlight === body) __ipeEventInFlight = null;
-    var kind = __ipeEventAnswer(r);
-    switch (kind) {
-      case __IPE_EVENT_ANSWER.STALE:
-        // The server refused the event's render epoch and sent the current
-        // render. Apply it and end here: the refused event is never re-sent,
-        // since its handler id may now name another handler.
-        return r.json().then(function(data) {
-          __ipeLoaderEnd();
-          __ipeOnPostSuccess();
-          // The server answered the event: its values are no longer the
-          // user's alone, and the render it sent is the view's.
-          __ipeRetirePending(body.seq);
-          if (!data || typeof data.body !== "string") return;
-          // The epoch gate orders this render against the DOM on screen; the
-          // seq it carries is the session's, which an earlier frame may equal.
-          __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, data.route);
-        }).catch(function() {
-          // An unreadable refusal still answers the event: the events queued
-          // behind it go.
-          __ipeLoaderEnd();
-          __ipeDrainQueue();
-        });
-      case __IPE_EVENT_ANSWER.SESSION_LOST:
-        // The marked 404 no DOM may show. The probe confirms it and reloads,
-        // and the event waits in the retry queue meanwhile.
-        __ipeProbeSessionLost();
-        throw new Error("session lost");
-      case __IPE_EVENT_ANSWER.TRANSIENT:
-        // A timeout, a full queue, or a server or deploying edge that is up
-        // but not answering: the same retry path as a network failure.
-        __ipeLoaderEnd();
-        __ipeOnPostFailure(body);
-        return;
-      case __IPE_EVENT_ANSWER.TOO_LARGE:
-        __ipeOnPostRefused(body, __IPE_EVENT_ANSWER.TOO_LARGE);
-        return;
-      case __IPE_EVENT_ANSWER.REFUSED:
-        __ipeOnPostRefused(body, __IPE_EVENT_ANSWER.REFUSED);
-        return;
-      case __IPE_EVENT_ANSWER.ACCEPTED:
-        break;
-      default:
-        throw new Error("unclassified event answer");
+  };
+  if (controller) init.signal = controller.signal;
+  if (__ipeKeepAlive.has(body) && json.length <= __IPE_KEEPALIVE_BODY_MAX) init.keepalive = true;
+  // An answer arm settles the attempt itself; one that throws, or a network
+  // failure, ends at the RETRY below, a no-op once an arm has settled it.
+  fetch(__ipeBase + "/_ipe/event", init)
+    .then(function(r) { return __ipeOnEventAnswer(attempt, r); })
+    .then(function() { __ipeSettle(attempt, __IPE_POST_SETTLED.RETRY); },
+          function() { __ipeSettle(attempt, __IPE_POST_SETTLED.RETRY); });
+}
+// Act on the answer to `attempt`. Every arm settles it before acting, so the
+// next event is sent and nothing the arm does afterwards can re-queue it.
+function __ipeOnEventAnswer(attempt, r) {
+  var body = attempt.body;
+  var kind = __ipeEventAnswer(r);
+  switch (kind) {
+    case __IPE_EVENT_ANSWER.STALE:
+      // The server refused the event's render epoch and sent the current
+      // render. Apply it and end here: the refused event is never re-sent,
+      // since its handler id may now name another handler. An unreadable
+      // refusal still answers the event: the events queued behind it go.
+      return r.json().then(function(data) {
+        if (!__ipeSettle(attempt, __IPE_POST_SETTLED.ANSWERED)) return;
+        __ipeOnPostSuccess();
+        // The server answered the event: its values are no longer the
+        // user's alone, and the render it sent is the view's.
+        __ipeRetirePending(body.seq);
+        if (!data || typeof data.body !== "string") return;
+        // The epoch gate orders this render against the DOM on screen; the
+        // seq it carries is the session's, which an earlier frame may equal.
+        __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, data.route);
+      }, function() {
+        __ipeSettle(attempt, __IPE_POST_SETTLED.ANSWERED);
+      });
+    case __IPE_EVENT_ANSWER.SESSION_LOST:
+      // The marked 404 no DOM may show. The probe confirms it and reloads,
+      // and the event waits in the retry queue meanwhile.
+      __ipeProbeSessionLost();
+      __ipeSettle(attempt, __IPE_POST_SETTLED.RETRY);
+      return;
+    case __IPE_EVENT_ANSWER.TRANSIENT:
+      // A timeout, a full queue, or a server or deploying edge that is up
+      // but not answering: the same retry path as a network failure.
+      __ipeSettle(attempt, __IPE_POST_SETTLED.RETRY);
+      return;
+    case __IPE_EVENT_ANSWER.TOO_LARGE:
+      __ipeOnPostRefused(attempt, __IPE_EVENT_ANSWER.TOO_LARGE);
+      return;
+    case __IPE_EVENT_ANSWER.REFUSED:
+      __ipeOnPostRefused(attempt, __IPE_EVENT_ANSWER.REFUSED);
+      return;
+    case __IPE_EVENT_ANSWER.ACCEPTED:
+      break;
+    default:
+      throw new Error("unclassified event answer");
+  }
+  // Reverse-proxy wedge detection: a real Ipe.Web response always
+  // carries X-Ipe-Web: 1. Without it, we're looking at a proxy-
+  // rewritten response (e.g. some edges turn upstream 502 into 200
+  // OK with an HTML error page). Applying that as a "patch" would
+  // replace the user's DOM with the proxy's error page, so we refuse
+  // it and route through the failure path instead.
+  //
+  // For JSON content-type we keep a backwards-compat shim during
+  // rolling deploys: a pre-marker server still returns valid JSON
+  // with seq + patches, structurally indistinguishable from the
+  // marked form, so accept it. HTML / text responses without the
+  // marker are always rejected — those are the proxy-wedge shape.
+  var ipeMark = r.headers.get("X-Ipe-Web");
+  var ct = r.headers.get("Content-Type") || "";
+  var isJson = ct.indexOf("application/json") >= 0;
+  if (ipeMark !== "1" && !isJson) {
+    throw new Error("non-ipe response");
+  }
+  if (!isJson) {
+    // An accepted event is answered in JSON.
+    throw new Error("non-json event response");
+  }
+  return r.json().then(function(data) {
+    // Even JSON is rejected if it lacks the protocol shape (no
+    // seq field): some proxies (Cloudflare access denied, fly.io
+    // edge errors) return JSON error envelopes with 200 OK.
+    if (ipeMark !== "1" && (!data || typeof data.seq === "undefined")) {
+      throw new Error("non-ipe json response");
     }
-    // Reverse-proxy wedge detection: a real Ipe.Web response always
-    // carries X-Ipe-Web: 1. Without it, we're looking at a proxy-
-    // rewritten response (e.g. some edges turn upstream 502 into 200
-    // OK with an HTML error page). Applying that as a "patch" would
-    // replace the user's DOM with the proxy's error page, so we refuse
-    // it and route through the failure path instead.
-    //
-    // For JSON content-type we keep a backwards-compat shim during
-    // rolling deploys: a pre-marker server still returns valid JSON
-    // with seq + patches, structurally indistinguishable from the
-    // marked form, so accept it. HTML / text responses without the
-    // marker are always rejected — those are the proxy-wedge shape.
-    var ipeMark = r.headers.get("X-Ipe-Web");
-    var ct = r.headers.get("Content-Type") || "";
-    var isJson = ct.indexOf("application/json") >= 0;
-    if (ipeMark !== "1" && !isJson) {
-      throw new Error("non-ipe response");
-    }
-    if (!isJson) {
-      // An accepted event is answered in JSON.
-      throw new Error("non-json event response");
-    }
-    return r.json().then(function(data) {
-      // Even JSON is rejected if it lacks the protocol shape (no
-      // seq field): some proxies (Cloudflare access denied, fly.io
-      // edge errors) return JSON error envelopes with 200 OK.
-      if (ipeMark !== "1" && (!data || typeof data.seq === "undefined")) {
-        throw new Error("non-ipe json response");
-      }
-      __ipeLoaderEnd();
-      __ipeOnPostSuccess();
-      if (!data) return;
-      // An accepted event's render arrives over the stream, whose frames
-      // name the epochs they move between. Any patches an answer carries
-      // have no epoch to gate on: they never apply. The answer's `seq` is
-      // the session's commit count, not this tab's event seq, so it neither
-      // retires a value nor moves the frame gate: folded there, it would drop
-      // a `patch` frame (a reconnect's resync) of an equal or lower count.
-      // The marked accept of this event ends every value it carries.
-      if (ipeMark === "1" && typeof data.seq === "number") __ipeRetirePending(body.seq);
-    });
-  }).catch(function() {
-    if (__ipeEventInFlight === body) __ipeEventInFlight = null;
-    __ipeLoaderEnd();
-    __ipeOnPostFailure(body);
+    if (!__ipeSettle(attempt, __IPE_POST_SETTLED.ANSWERED)) return;
+    __ipeOnPostSuccess();
+    if (!data) return;
+    // An accepted event's render arrives over the stream, whose frames
+    // name the epochs they move between. Any patches an answer carries
+    // have no epoch to gate on: they never apply. The answer's `seq` is
+    // the session's commit count, not this tab's event seq, so it neither
+    // retires a value nor moves the frame gate: folded there, it would drop
+    // a `patch` frame (a reconnect's resync) of an equal or lower count.
+    // The marked accept of this event ends every value it carries.
+    if (ipeMark === "1" && typeof data.seq === "number") __ipeRetirePending(body.seq);
   });
 }
 // A refused event is never sent again. The values it carried are left out of
 // every later event until the user edits them, the refusal is said, and the
 // events queued behind it still go.
-function __ipeOnPostRefused(body, kind) {
-  __ipeLoaderEnd();
-  var sent = body.inputState;
+function __ipeOnPostRefused(attempt, kind) {
+  if (!__ipeSettle(attempt, __IPE_POST_SETTLED.ANSWERED)) return;
+  var sent = attempt.body.inputState;
   if (sent) {
     var ids = Object.keys(sent);
     for (var i = 0; i < ids.length; i++) {
@@ -1982,7 +1943,6 @@ function __ipeOnPostRefused(body, kind) {
     __ipeRefusedBare = true;
   }
   __ipeShowRefused(kind);
-  __ipeDrainQueue();
 }
 // True once an event that carried no input was refused, until an event is
 // accepted.
@@ -2007,8 +1967,7 @@ function __ipeRefusalStands() {
 }
 function __ipeOnPostSuccess() {
   // A successful POST proves the server reachable — clear any
-  // backoff state and drain queued events behind this one. If the
-  // SSE was the trigger that drained the queue, this is a no-op.
+  // backoff state. Its settle already sent the next event.
   __ipeRetryAttempts = 0;
   __ipeReconnectSince = 0;  // reopen the fast-reconnect window for the next drop
   __ipeRefusedBare = false;
@@ -2032,12 +1991,19 @@ function __ipeOnPostSuccess() {
     }
     __ipeOpenSSE();
   }
-  __ipeDrainQueue();
 }
 // Queue `body` for a retry: at the head for the queue's own head, which keeps
-// its place, else at the tail. At the cap the oldest event behind the head is
-// dropped, so the user's most recent intent is preserved.
+// its place, else at the tail. An input event appended right behind one of
+// the same key replaces it (__ipeCoalesceKey), so typing while an event is
+// in flight queues one event per field. At the cap the oldest event behind
+// the head is dropped, so the user's most recent intent is preserved.
 function __ipeEnqueue(body, atHead) {
+  var key = __ipeCoalesceKey.get(body);
+  var tail = __ipeEventQueue.length > 0 ? __ipeEventQueue[__ipeEventQueue.length - 1] : null;
+  if (!atHead && key !== undefined && tail !== null && __ipeCoalesceKey.get(tail) === key) {
+    __ipeEventQueue.pop();
+    __ipeFocusTakeSent(tail.seq);
+  }
   if (__ipeEventQueue.length >= __ipeEventQueueMax) {
     var dropped = __ipeEventQueue.shift();
     if (window.console && console.warn) {
@@ -2046,13 +2012,6 @@ function __ipeEnqueue(body, atHead) {
   }
   if (atHead) __ipeEventQueue.unshift(body);
   else __ipeEventQueue.push(body);
-}
-// A failed event goes back to the head of the queue: every event queued since
-// was sent after it.
-function __ipeOnPostFailure(body) {
-  __ipeEnqueue(body, true);
-  __ipeShowReconnecting();
-  __ipeScheduleRetry();
 }
 function __ipeShowReconnecting() {
   if (__ipeStatus === "offline") return;
@@ -2106,8 +2065,8 @@ function __ipeDrainQueue() {
   if (__ipeEnded) return;
   if (__ipeEventInFlight) return;
   if (__ipeEventQueue.length === 0) return;
-  // Send the head of the queue. If it succeeds, __ipeOnPostSuccess
-  // recurses into __ipeDrainQueue to send the next one. If it fails,
+  // Send the head of the queue. Its settle sends the next one once it is
+  // answered. If it fails,
   // the body re-enters the queue at its head and the retry loop kicks
   // back in. Order is preserved (FIFO): one queued event is in flight
   // at a time, and a live send waits behind the queue.
