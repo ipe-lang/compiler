@@ -851,14 +851,48 @@ mod real_jail {
     /// A directory under `~/.cache/ipe/` (never `/tmp`, which the jail masks with
     /// a tmpfs): the emitted app crate, the bound crate, and the runtime copy the
     /// jailed probe build reads must all live where `--ro-bind / /` can see them.
-    fn non_tmp_base(tag: &str) -> PathBuf {
+    ///
+    /// The directory is removed when the returned [`E2eBase`] drops, so a
+    /// failing assertion does not leave the staged trees behind.
+    fn non_tmp_base(tag: &str) -> E2eBase {
         let base = dirs_cache_root()
             .join("ipe")
             .join("tier2-e2e")
             .join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create non-tmp e2e base");
-        base
+        E2eBase(base)
+    }
+
+    /// A [`non_tmp_base`] directory, removed with everything under it on drop
+    /// (a panicking test included).
+    #[derive(Debug)]
+    struct E2eBase(PathBuf);
+
+    impl std::ops::Deref for E2eBase {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for E2eBase {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for E2eBase {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.0.as_os_str()
+        }
+    }
+
+    impl Drop for E2eBase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// `$XDG_CACHE_HOME` or `~/.cache` — the write-boundary root the project
@@ -1142,7 +1176,6 @@ mod real_jail {
             String::from_utf8_lossy(&unprovisioned.stderr)
         );
         provision_into(provisioned.dir(), Some(&empty_home));
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1187,7 +1220,6 @@ mod real_jail {
             // a benign package, never an environment gap to pass over.
             Err(e) => panic!("a benign native package must certify on this host's jail: {e}"),
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A cargo home at `staged` holding the invoker's registry index (copied),
@@ -1348,7 +1380,6 @@ mod real_jail {
             staged.join("registry").join("src").is_dir(),
             "the locked sources were unpacked into the staged cargo home, outside the jail"
         );
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1432,7 +1463,6 @@ mod real_jail {
             "a package reaching a withheld axis must never certify: {msg}"
         );
         eprintln!("audit_native e2e: undeclared-axis native package REJECTED end-to-end: {msg}");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Write a `package.ipe` for a `Rust.Csum`-crossing app whose `declares`
@@ -1496,7 +1526,6 @@ mod real_jail {
         );
         // The refusal fires before the output root is claimed: nothing is written.
         assert!(!out.exists(), "a refused build must write nothing");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The mirror admit path: with `declares = [ NativeFfi ]` the SAME crossing is
@@ -1530,7 +1559,6 @@ mod real_jail {
                 "a granted native crossing must pass the consent gate, got: {msg}"
             );
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A development build asks no consent: the SAME ungranted crossing the
@@ -1559,7 +1587,6 @@ mod real_jail {
                 "a dev build never runs the consent gate, got: {msg}"
             );
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── `ipe release run`: every run is confined ────────────────────────────
@@ -1716,7 +1743,6 @@ mod real_jail {
                 base.join("out").into_os_string(),
             ],
         );
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             stdout.contains("started"),
             "the program must have run:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1761,7 +1787,6 @@ mod real_jail {
 
         std::fs::remove_file(dir.join("ipe.profile")).expect("drop the profile");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started") && stderr.contains("ipe.profile"),
             "a bundle with no profile refuses before running:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1810,7 +1835,6 @@ mod real_jail {
         let (ok, stdout, stderr) =
             release_run_with_tmpdir(&work, &[dir.into_os_string()], Some(&tmpdir));
         let left = floor_bearing_files(&tmpdir);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             ok && stdout.contains("started")
                 && stdout.contains(&format!("tmpdir={}", tmpdir.display())),
@@ -1848,7 +1872,6 @@ mod real_jail {
                 inside.into_os_string(),
             ],
         );
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             ok && stdout.contains("started") && stdout.contains("granted-working-tree-read"),
             "the granted working tree is readable (control):\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1879,7 +1902,6 @@ mod real_jail {
         let (granted_ok, granted_stdout, granted_stderr) =
             release_run(&work, &[granted.into_os_string()]);
         let (ok, stdout, stderr) = release_run(&work, &[withheld.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             granted_ok && granted_stdout.contains("started") && granted_stdout.contains("forked"),
             "an app granted Subprocess forks (control):\n\
@@ -1918,7 +1940,6 @@ mod real_jail {
         let (dir, _) = floor_bundle(&base.join("stripped"), &[]);
         std::fs::write(dir.join("ipe-app"), "#!/bin/sh\necho started\n").expect("strip the floor");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started"),
             "an app with no embedded floor refuses:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1946,7 +1967,6 @@ mod real_jail {
         )
         .expect("a development build's app");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started"),
             "a development build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -2023,7 +2043,6 @@ mod real_jail {
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started"),
             "a dev build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -2059,7 +2078,6 @@ mod real_jail {
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("ipe-capfloor"),
             "a forged release literal never runs a dev build:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -2184,7 +2202,6 @@ mod real_jail {
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("ipe-capfloor"),
             "a forged release literal never runs a dev run binary:\nstdout:\n{stdout}\nstderr:\n{stderr}"
