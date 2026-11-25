@@ -1275,6 +1275,7 @@ pub static EXCLUDED_NAMES: &[&str] = &[
     "IPE_TEST_PG_URL",
     "IPE_TEST_REDIS_URL",
     "IPE_TEST_RUN_KEY", // `ipe test`: the run key handed to the test runner crate at compile time
+    "IPE_TIER2_STAGED_HOME_BASE", // Tier-2 audit e2e: hands the re-exec child its staged cargo home
     "IPE_TIME_STRING_TZ_CHILD", // runtime time test: marks the non-UTC `TZ` re-exec
     "IPE_TMP",          // temp-root refusal tests: a neighbouring key that must not be refused
     "IPE_WASI_SEAL_CHILD", // WASI seal e2e: marks the cargo-env re-exec
