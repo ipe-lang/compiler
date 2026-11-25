@@ -313,7 +313,7 @@ fn a_transient_answer_keeps_the_queue_order() {
     let source = code();
     let poster = body_of(&source, THE_POSTER);
     let answer = body_of(&source, THE_ANSWER);
-    let retries = answer.matches(RETRY).count();
+    let retries = answer.matches(RETRY.trim_end_matches(";")).count();
     assert!(
         retries == 2,
         "`{THE_ANSWER}` queues the event again from {retries} arms; `SESSION_LOST` and `TRANSIENT` are the two"
@@ -364,15 +364,52 @@ fn an_event_is_posted_after_every_edit_typed_before_it() {
         send.contains("if (__ipeEnded) return; __ipeSendAllPendingInput();"),
         "`__ipeSend` must post every pending debounced input before its own event"
     );
+    assert!(
+        send.contains(
+            "__ipeSendAllPendingInput(); __ipeSendEvent(msgName, args, handlerId, opts); }"
+        ),
+        "`__ipeSend` must post its own event through `__ipeSendEvent` after the flush"
+    );
+    let event = body_of(&source, "__ipeSendEvent");
+    assert!(
+        !event.contains("PendingInput("),
+        "`__ipeSendEvent` must flush nothing: a pending input's sender orders the flush"
+    );
     let all = body_of(&source, "__ipeSendAllPendingInput");
     assert!(
-        all.contains("__ipeSendPendingInput(keys[i]);"),
+        all.contains("__ipeSendOnePendingInput(keys[i]);"),
         "`__ipeSendAllPendingInput` must send each pending input"
     );
-    let one = body_of(&source, "__ipeSendPendingInput");
+    let one = body_of(&source, "__ipeSendOnePendingInput");
     assert!(
         one.contains("clearTimeout(__ipeInputTimers[key]); delete __ipeInputPending[key];"),
-        "`__ipeSendPendingInput` must retire the debounce it sends, so it is never sent twice"
+        "`__ipeSendOnePendingInput` must retire the debounce it sends, so it is never sent twice"
+    );
+}
+
+/// Pending edits reach the server in the order of their latest edits (CI job
+/// `test`). A pending input's own send that flushed every other pending input
+/// first would post an edit the user made later ahead of it, and a flush loop
+/// whose send flushed again would post the pending inputs in reverse.
+#[test]
+fn pending_edits_are_posted_in_the_order_they_were_made() {
+    let source = code();
+    let one = body_of(&source, "__ipeSendOnePendingInput");
+    assert!(
+        one.contains("__ipeSendEvent(p.msgName,") && !one.contains("__ipeSend("),
+        "a pending input's own event must go through `__ipeSendEvent`, which flushes nothing"
+    );
+    let keyed = body_of(&source, "__ipeSendPendingInput");
+    assert!(
+        keyed.contains(
+            "if (!__ipeInputPending[key]) return; var keys = Object.keys(__ipeInputPending); for (var i = 0; i < keys.length; i++) { __ipeSendOnePendingInput(keys[i]); if (keys[i] === key) return; }"
+        ),
+        "`__ipeSendPendingInput` must send every input edited before `key`, then `key`, and none edited after it"
+    );
+    let debounce = body_of(&source, "__ipeDebouncedSend");
+    assert!(
+        debounce.contains("delete __ipeInputPending[key]; __ipeInputPending[key] = {"),
+        "a new edit must move its key to the end of the pending order"
     );
 }
 
@@ -518,6 +555,12 @@ fn every_answer_settles_its_post_once_before_acting_on_it() {
         answer.contains(&format!("}}, function() {{ {ANSWERED}; }});")),
         "an unreadable stale answer still answers its event"
     );
+    assert!(
+        answer.contains(
+            "case __IPE_EVENT_ANSWER.SESSION_LOST: if (!__ipeSettle(attempt, __IPE_POST_SETTLED.RETRY)) return; __ipeProbeSessionLost(); return;"
+        ),
+        "a lost-session answer settles before it probes, so a late answer to a settled post acts on nothing"
+    );
 }
 
 /// A post that gets no answer within `__ipeEventAnswerBoundMs` is aborted and
@@ -550,10 +593,10 @@ fn an_unanswered_post_is_retried_past_its_bound() {
 #[test]
 fn queued_input_coalesces_by_its_debounce_key() {
     let source = code();
-    let one = body_of(&source, "__ipeSendPendingInput");
+    let one = body_of(&source, "__ipeSendOnePendingInput");
     assert!(
         one.contains("coalesce: key"),
-        "`__ipeSendPendingInput` must name the debounce key its event coalesces under"
+        "`__ipeSendOnePendingInput` must name the debounce key its event coalesces under"
     );
     let enqueue = body_of(&source, "__ipeEnqueue");
     assert!(
@@ -671,10 +714,10 @@ fn a_pending_field_value_ends_on_a_message_the_server_sends() {
         stamp.contains("if (!e.edited) continue; e.pendingSeq = seq; e.edited = false;"),
         "an event stamps the fields edited since the last event, never by their value"
     );
-    let send = body_of(&source, "__ipeSend");
+    let send = body_of(&source, "__ipeSendEvent");
     assert!(
         send.contains("__ipeStampEdited(mySeq); var snapshot = __ipeInputsSnapshot();"),
-        "`__ipeSend` stamps the edited fields before it reads the snapshot"
+        "`__ipeSendEvent` stamps the edited fields before it reads the snapshot"
     );
     let snapshot = body_of(&source, "__ipeInputsSnapshot");
     assert!(

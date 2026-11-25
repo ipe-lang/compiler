@@ -1617,21 +1617,33 @@ function __ipeDebouncedSend(msgName, args, hid, delay, epoch, focus) {
   __ipeInputPending[key] = { msgName: msgName, args: args, hid: hid, epoch: epoch, focus: focus };
   __ipeInputTimers[key] = setTimeout(function() { __ipeSendPendingInput(key); }, delay);
 }
-// Send the pending debounced input of `key` now, if any. Its event coalesces
-// under `key`: queued behind another event of the same key, it replaces it.
+// Send the pending debounced input of `key` now, if any, after every pending
+// input edited before it: an edit never reaches the server behind one the user
+// made later.
 function __ipeSendPendingInput(key) {
+  if (!__ipeInputPending[key]) return;
+  var keys = Object.keys(__ipeInputPending);
+  for (var i = 0; i < keys.length; i++) {
+    __ipeSendOnePendingInput(keys[i]);
+    if (keys[i] === key) return;
+  }
+}
+// Send the pending debounced input of `key` alone. Its event coalesces under
+// `key`: queued behind another event of the same key, it replaces it. It goes
+// through __ipeSendEvent, which flushes nothing, so the caller's order holds.
+function __ipeSendOnePendingInput(key) {
   var p = __ipeInputPending[key];
   if (!p) return;
   clearTimeout(__ipeInputTimers[key]);
   delete __ipeInputPending[key];
-  __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus, coalesce: key });
+  __ipeSendEvent(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus, coalesce: key });
 }
 // Send every pending debounced input now, in the order of their latest edits.
 // Each was typed before the event about to be sent, so each is posted ahead of
 // it: an event never reaches the server before an edit the user made first.
 function __ipeSendAllPendingInput() {
   var keys = Object.keys(__ipeInputPending);
-  for (var i = 0; i < keys.length; i++) __ipeSendPendingInput(keys[i]);
+  for (var i = 0; i < keys.length; i++) __ipeSendOnePendingInput(keys[i]);
 }
 // Flush pending debounced input on blur (tab away / click elsewhere).
 // Without this, typing fast then tabbing loses the last keystrokes
@@ -1692,6 +1704,13 @@ window.addEventListener("pagehide", __ipeFlushOnLeave);
 function __ipeSend(msgName, args, handlerId, opts) {
   if (__ipeEnded) return;
   __ipeSendAllPendingInput();
+  __ipeSendEvent(msgName, args, handlerId, opts);
+}
+// Post one event, behind every event already sent and never ahead of one. It
+// flushes no pending input: __ipeSend does that for every event but a pending
+// input's own, whose sender orders the flush.
+function __ipeSendEvent(msgName, args, handlerId, opts) {
+  if (__ipeEnded) return;
   opts = opts || {};
   if (!opts.noLoader) __ipeLoaderStart();
   __ipeClientSeq++;
@@ -1866,8 +1885,8 @@ function __ipeOnEventAnswer(attempt, r) {
     case __IPE_EVENT_ANSWER.SESSION_LOST:
       // The marked 404 no DOM may show. The probe confirms it and reloads,
       // and the event waits in the retry queue meanwhile.
+      if (!__ipeSettle(attempt, __IPE_POST_SETTLED.RETRY)) return;
       __ipeProbeSessionLost();
-      __ipeSettle(attempt, __IPE_POST_SETTLED.RETRY);
       return;
     case __IPE_EVENT_ANSWER.TRANSIENT:
       // A timeout, a full queue, or a server or deploying edge that is up

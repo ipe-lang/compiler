@@ -9709,6 +9709,7 @@ mod base_path_tests {
             "__ipeDrainQueue",
             "__ipeWatchdog",
             "__ipeSend",
+            "__ipeSendEvent",
             "__ipeFlushOnLeave",
             "__ipeReloadDocument",
         ] {
