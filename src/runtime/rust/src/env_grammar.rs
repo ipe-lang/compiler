@@ -40,6 +40,11 @@ pub enum Grammar {
         /// The variable that replaced it, if any.
         use_instead: Option<&'static str>,
     },
+    /// A jail launcher's attested roots, never refused.
+    ///
+    /// A value [`crate::scratch_core::JailAttestation::parse`] cannot read
+    /// attests nothing, so it narrows trust rather than refusing startup.
+    JailRoots,
 }
 
 impl Grammar {
@@ -58,6 +63,10 @@ impl Grammar {
             Self::Retired { use_instead } => use_instead.map_or_else(
                 || "unset (it is no longer read)".to_owned(),
                 |name| format!("unset (it is no longer read; use {name})"),
+            ),
+            Self::JailRoots => format!(
+                "a comma-separated list of at most {} decimal dev:ino pairs",
+                crate::scratch_core::JAIL_ATTESTATION_MAX_ROOTS
             ),
         }
     }
@@ -87,6 +96,7 @@ impl Grammar {
                     Err(EnvRefusal::Retired { name, use_instead })
                 }
             },
+            Self::JailRoots => Ok(()),
         }
     }
 }

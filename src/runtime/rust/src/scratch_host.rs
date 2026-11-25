@@ -11,6 +11,9 @@ pub use super::home_core::{HomeDir, HomeRefusal};
 /// The variable naming the current user's profile directory on Windows.
 pub const PROFILE_VAR: &str = super::home_core::WINDOWS_HOME_VAR;
 
+/// The variable a jail launcher sets to the roots it proved trusted on the host.
+pub const JAIL_TRUSTED_ROOTS_VAR: &str = super::env_registry::data::JAIL_TRUSTED_ROOTS.name();
+
 /// Fill `buf` from the runtime's one OS random source.
 ///
 /// # Errors

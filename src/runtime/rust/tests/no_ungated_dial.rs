@@ -140,21 +140,7 @@ impl AllowedDial {
 }
 
 /// Every raw dial admitted outside `db.rs`; each must match exactly one dial.
-const ALLOWED_DIALS: [AllowedDial; 6] = [
-    AllowedDial {
-        file: "web/hub.rs",
-        func: "open_spill",
-        dial: "SqlitePool::connect_with",
-        method: None,
-        why: "opens the console's local SQLite spill file from a filesystem path, not a URL",
-    },
-    AllowedDial {
-        file: "telemetry_spill.rs",
-        func: "open_spill_pool",
-        dial: "SqlitePool::connect_with",
-        method: None,
-        why: "opens the local SQLite spill file the runtime's own environment names",
-    },
+const ALLOWED_DIALS: [AllowedDial; 4] = [
     AllowedDial {
         file: "ws_client.rs",
         func: "do_connect",

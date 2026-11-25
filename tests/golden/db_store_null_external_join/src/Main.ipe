@@ -379,12 +379,14 @@ toPath raw =
 
 
 -- One SQLite file: written through the app connection, then read through both
--- the app connection and an external `Dsn` connection to the same file.
+-- the app connection and an external `Dsn` connection to the same file. The
+-- file sits in the working directory: a database opens only in a directory no
+-- other user can write to, so a shared temp directory such as `/tmp` is refused.
 run : Stores -> String -> Task Error ()
 run s file =
     do
         path <- toPath file
-        location <- Task.fromResult (Location.file WriteExisting path)
+        location <- Task.fromResult (Location.file CreateIfMissing path)
         app <- Db.open location
         seed app s
         dsn <- Task.fromResult (Dsn.parse (String.concat [ "sqlite:", file ]))
@@ -401,4 +403,4 @@ main =
             Io.println (Error.toString e)
 
         Ok s ->
-            Task.andThen (run s) (File.tempFile "ipe-null-join")
+            run s "ipe_null_join.db"

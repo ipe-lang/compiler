@@ -34,6 +34,10 @@ mod scratch_host {
     /// The variable naming the current user's profile directory on Windows.
     pub const PROFILE_VAR: &str = crate::home::WINDOWS_HOME_VAR;
 
+    /// The variable a jail launcher sets to the roots it proved trusted on the host.
+    pub const JAIL_TRUSTED_ROOTS_VAR: &str =
+        ipe_runtime_rust::env_registry::data::JAIL_TRUSTED_ROOTS.name();
+
     /// Fill `buf` from the OS CSPRNG.
     ///
     /// # Errors

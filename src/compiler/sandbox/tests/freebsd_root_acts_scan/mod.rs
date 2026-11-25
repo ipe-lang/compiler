@@ -116,7 +116,7 @@ const OWNERSHIP_WORDS: [&str; 2] = ["fchown_held", "fchown"];
 type Admission = (&'static str, &'static str, &'static str);
 
 /// Every root act of the launcher module, with the reason it is sound.
-const ADMITTED: [Admission; 74] = [
+const ADMITTED: [Admission; 75] = [
     ("", "use crate::JailMounts", "the mount set type; no act"),
     (
         "",
@@ -277,6 +277,11 @@ const ADMITTED: [Admission; 74] = [
         "build_in_jail",
         "crate::host_env::granted",
         "the env allowlist the scrub keeps",
+    ),
+    (
+        "macos_scrubbed_env",
+        "crate::host_env::reexported_names",
+        "the env allowlist without the launcher-owned names; a pure filter, no act",
     ),
     (
         "build_in_jail",

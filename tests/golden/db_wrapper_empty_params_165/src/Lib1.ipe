@@ -28,9 +28,11 @@ exec conn queryStr args =
         |> Task.andThen (\_ -> Task.succeed ())
 
 
--- Open a connection, run `f conn`, then close it.
+-- Open a connection, run `f conn`, then close it. The file sits in the working
+-- directory: a database opens only in a directory no other user can write to,
+-- so a shared temp directory such as `/tmp` is refused.
 withConn f =
-    Path.fromString "/tmp/ipe_db_wrapper_empty_params_165_golden.db"
+    Path.fromString "ipe_db_wrapper_empty_params_165_golden.db"
         |> Result.andThen (Location.file CreateIfMissing)
         |> Task.fromResult
         |> Task.andThen (\loc -> Db.open loc)

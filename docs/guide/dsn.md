@@ -41,6 +41,27 @@ Four knots.
   program that only calls `Db.open` never reads `DATABASE_URL`. Under
   `ipe release run`, a program granted `database` sees the variable inside its
   jail, exactly as an unjailed run does.
+- **A SQLite file opens only from a directory no other local user can
+  write.** Before the default `ipe.db` or any `Db.open` file opens, every
+  directory from the root down to the one holding it must be owned by you or
+  root and refuse write access to anyone else; a sticky world-writable
+  directory such as `/tmp` is accepted as an ancestor but refused as the
+  holding directory itself — fix it with `mkdir -m 700 /tmp/app`, or use the
+  project directory. An existing database file must be a regular file owned
+  by you or root and not writable by others; a shared group's write access is
+  accepted in `ipe dev`, but under `ipe release run` the group must be your
+  own private one (`egid == euid`). Neither the file nor its
+  `-wal`/`-shm`/`-journal` siblings may be a symlink. A `file:<path>` or
+  `file:///<absolute path>` URL gets the same proof; any other `file:` form
+  is refused. The in-memory spellings (`:memory:`, `sqlite::memory:`,
+  `file::memory:`, and a named shared-cache `file:` URI) skip the walk, but a
+  decoded name carrying a `?`, `#`, `%`, or a repeated query key is refused
+  rather than risk reopening the same name on disk. Under `ipe release run`
+  the jail opens the database using directories the host already proved
+  trusted, so a jailed program needs no extra step. A filesystem that reports
+  every owner as `nobody` (NFS with root-squash) is refused the same way; use
+  a local directory or Postgres. Anything that fails is a typed refusal
+  naming the directory and the fix, never the URL.
 - **The app database URL verifies a remote server too.** The URL the app's own
   pool dials is not a `Dsn`, but its transport follows the same rule. With no `sslmode`, a remote server is dialled with
   `sslmode=verify-full`. `sslmode=disable`, `allow`, `prefer` and `require` are

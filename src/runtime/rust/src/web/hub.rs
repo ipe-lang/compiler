@@ -28,7 +28,6 @@ use crate::json::{JsonSource, json_failure_text};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Row, SqlitePool};
 use std::collections::HashMap;
 use std::future::Future;
@@ -979,7 +978,10 @@ where
     }
 }
 
-/// Open the telemetry spill read-only. `None` (never an error) when the path is
+/// The most connections one console read of the spill holds.
+const SPILL_READ_MAX_CONNECTIONS: u32 = 4;
+
+/// Open the telemetry spill for reading. `None` (never an error) when the path is
 /// empty or the file can't be opened — callers map that to an empty result so a
 /// fresh/absent DB renders as "no telemetry yet" — a graceful empty result.
 async fn open_spill(db_path: &str) -> Option<SqlitePool> {
@@ -993,20 +995,21 @@ async fn open_spill(db_path: &str) -> Option<SqlitePool> {
     // console only ever SELECTs, so rw grants no real write. A missing file fails
     // to connect → None → empty result (no panic, no surfaced error).
     //
-    // Use SqliteConnectOptions::from_path (not a format!-built URL) so that
-    // special characters in db_path (spaces, '?', '#', etc.) can't corrupt the
-    // connection string.
-    let opts = SqliteConnectOptions::new()
-        .filename(db_path)
-        .create_if_missing(false)
-        // Wait on a WAL writer's lock instead of returning SQLITE_BUSY at once
-        // (a spurious empty result), bounded so a wedged writer cannot block the
-        // task indefinitely.
-        .busy_timeout(crate::system::SQLITE_BUSY_TIMEOUT);
-    match SqlitePool::connect_with(opts).await {
+    // The path is a literal file name, never a URL, so special characters in it
+    // (spaces, '?', '#') cannot corrupt the connection; the pool proves the file
+    // trusted before it opens. Every connection waits on a WAL writer's lock for
+    // the bounded busy timeout instead of returning SQLITE_BUSY at once.
+    let opened = match crate::db::DbUrl::sqlite_path(db_path, crate::db::FileMode::WriteExisting) {
+        Ok(url) => crate::db::VettedPool::<sqlx::Sqlite>::connect(&url, SPILL_READ_MAX_CONNECTIONS)
+            .await
+            .map(crate::db::VettedPool::into_pool),
+        Err(refused) => Err(refused),
+    };
+    match opened {
         Ok(pool) => Some(pool),
         Err(e) => {
-            crate::system::emit_runtime_log("hub", &format!("open_spill {db_path}: {e}"));
+            let shown = crate::error::shown_path(db_path);
+            crate::system::emit_runtime_log("hub", &format!("open_spill {shown}: {e}"));
             None
         }
     }
@@ -1120,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_services_distinct_sorted() {
-        let dir = crate::scratch_core::test_temp_root()
+        let dir = crate::scratch_core::test_private_root()
             .join(format!("hub-svc-{}.db", std::process::id()));
         let path = dir.to_string_lossy().to_string();
         let _ = std::fs::remove_file(&path);
@@ -1181,7 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_logs_maps_attrs_and_filters_level() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-logs-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1240,7 +1243,7 @@ mod tests {
 
     #[tokio::test]
     async fn filtered_logs_scopes_to_service() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-flogs-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1280,7 +1283,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_metrics_joins_sorted_labels() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-met-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1310,7 +1313,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_traces_computes_duration() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tr-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1342,7 +1345,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_errors_groups_by_message() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-err-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1447,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     async fn overview_splices_counts() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-ov-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1493,7 +1496,7 @@ mod tests {
 
     #[tokio::test]
     async fn service_stats_aggregates_recent() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-stats-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1560,7 +1563,7 @@ mod tests {
     /// `hub_read_logs` / no-explicit-service shape).
     #[tokio::test]
     async fn hub_read_filtered_logs_two_tenants_no_cross_read() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-2t-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1600,7 +1603,7 @@ mod tests {
     /// `hub_read_filtered_logs`'s gate simply by calling the no-service kernel.
     #[tokio::test]
     async fn hub_read_logs_no_service_still_tenant_scoped() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-noservice-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1640,7 +1643,7 @@ mod tests {
     /// read, and never leak a cross-tenant row even in the Err path.
     #[tokio::test]
     async fn hub_read_filtered_logs_rejects_explicit_cross_tenant_svc() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-reject-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1674,7 +1677,7 @@ mod tests {
     /// builders, not just logs.
     #[tokio::test]
     async fn hub_read_filtered_metrics_traces_errors_scope_to_tenant() {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("hub-tenant-mte-{}.db", std::process::id()))
             .to_string_lossy()
             .to_string();
@@ -1744,7 +1747,7 @@ mod tests {
 
         /// Create a spill holding one log, error log, metric and span per service.
         async fn seed_spill(name: &str) -> String {
-            let path = crate::scratch_core::test_temp_root()
+            let path = crate::scratch_core::test_private_root()
                 .join(format!("hub-tenant-{name}-{}.db", std::process::id()))
                 .to_string_lossy()
                 .to_string();

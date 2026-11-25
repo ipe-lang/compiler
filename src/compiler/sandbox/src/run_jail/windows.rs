@@ -308,7 +308,8 @@ pub fn windows_scrubbed_env(
     // actually sets them. An empty name can never form a valid `NAME=VALUE` entry
     // (Windows rejects a block containing one), so a granted-but-empty name is
     // dropped fail-closed rather than emitted as a malformed entry.
-    for name in &profile.env_allowlist {
+    // A launcher-owned name never re-enters: this arm attests no root.
+    for name in crate::host_env::reexported_names(profile) {
         if name.is_empty() {
             continue;
         }
@@ -1801,6 +1802,24 @@ mod tests {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect()
+    }
+
+    /// The Windows arm attests no root, so a granted launcher-owned name never
+    /// carries a host value into the jail, in any letter case.
+    #[test]
+    fn scrubbed_env_never_re_exports_a_launcher_owned_name() {
+        let owned = crate::scratch::JAIL_TRUSTED_ROOTS_VAR;
+        let lower = owned.to_ascii_lowercase();
+        let profile = env_profile(&[owned, &lower, "ALLOWED"]);
+        let host = |_: &str| Some(OsString::from("1:1"));
+        let pairs = windows_scrubbed_env(&profile, Path::new("C:\\scratch"), &host);
+        assert!(
+            pairs
+                .iter()
+                .all(|(name, _)| !crate::host_env::is_launcher_owned(&name.to_string_lossy())),
+            "{pairs:?}"
+        );
+        assert!(pairs.iter().any(|(name, _)| name == "ALLOWED"), "{pairs:?}");
     }
 
     #[test]

@@ -1754,17 +1754,23 @@ mod pinned_relay {
     }
 }
 
-/// A relay stands in for no platform without Unix sockets; a TLS dial there
-/// that needs one is refused instead.
 #[cfg(all(feature = "db", not(unix)))]
-#[derive(Debug)]
-pub(crate) enum PinnedRelay {}
+pub(crate) use no_relay::PinnedRelay;
 
+/// The relay a platform without Unix sockets cannot open, sealed as the Unix
+/// relay is: public only inside this private module.
 #[cfg(all(feature = "db", not(unix)))]
-impl PinnedRelay {
-    /// Keep the relay running until `closed` completes.
-    pub(crate) fn hold_until<F>(self, _closed: F) {
-        match self {}
+mod no_relay {
+    /// A relay stands in for no platform without Unix sockets; a TLS dial
+    /// there that needs one is refused instead.
+    #[derive(Debug)]
+    pub enum PinnedRelay {}
+
+    impl PinnedRelay {
+        /// Keep the relay running until `closed` completes.
+        pub(crate) fn hold_until<F>(self, _closed: F) {
+            match self {}
+        }
     }
 }
 

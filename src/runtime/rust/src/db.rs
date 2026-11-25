@@ -217,7 +217,10 @@ fn ipe_err<E: crate::FromIpeError>(engine: DbEngine, e: &sqlx::Error) -> E {
 /// `LimitExceeded` refusal; a malformed or mismatched location, or one whose
 /// TLS mode does not verify a remote server, is `InvalidInput`, a dial policy
 /// refusal `PermissionDenied`, and a missing
-/// relay `Unavailable`. `context` prefixes the message.
+/// relay `Unavailable`; an untrusted SQLite location is `AccessDenied`, a
+/// missing directory or non-file `CannotOpen`, both carrying their
+/// `DbFailure` (a malformed `file:` name `InvalidInput`). `context` prefixes
+/// the message.
 pub(crate) fn connect_refusal<E: crate::FromIpeError>(
     context: &str,
     engine: DbEngine,
@@ -250,6 +253,9 @@ pub(crate) fn connect_refusal<E: crate::FromIpeError>(
         ),
         DbConnectError::RelayUnavailable => {
             E::from_ipe_error(IpeError::unavailable(format!("{context}{refused}")))
+        }
+        DbConnectError::UntrustedLocation(location) => {
+            E::from_ipe_error(location.error_with(format!("{context}{refused}")))
         }
     }
 }
@@ -1349,53 +1355,198 @@ fn pool_cache() -> &'static std::sync::Mutex<HashMap<PoolKey, Db>> {
     C.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
-/// `:memory:` SQLite URLs (bare, or with a scheme prefix like `sqlite://` or
-/// `sqlite:`, optionally further wrapped in a `file:` sub-scheme per
-/// SQLite's own documented idiom — `sqlite.org/inmemorydb.html`) and
-/// URI-mode `mode=memory` must NOT be pooled unless `cache=shared` is
-/// present: each connection to a private in-memory database is a DISTINCT
-/// database, so sharing a pool would silently merge what callers expect to
-/// be isolated DBs (soundness — verified empirically against sqlx 0.8.6:
-/// two independently-built pools to `"file::memory:"` do NOT see each
-/// other's rows, but two pools to `"file::memory:?cache=shared"` DO).
-/// Matching on the exact SQLite special-string / query parameter — not a
-/// raw substring match on "memory" anywhere in the URL — so a legitimate
-/// file path like `sqlite://data/memory_bank.db` is correctly treated as
-/// cacheable.
-fn url_is_cacheable(url: &str) -> bool {
-    // Strip a `sqlite:` / `sqlite://` scheme prefix if present, then compare
-    // the remainder (path + query) — mirrors how sqlx/libsqlite3 parse the
-    // connection string.
-    let rest = url
-        .strip_prefix("sqlite://")
-        .or_else(|| url.strip_prefix("sqlite:"))
-        .unwrap_or(url);
+/// What a SQLite connection URL opens, read once from its text and its parsed options.
+///
+/// An in-memory database never touches disk; every other URL names exactly
+/// one file, which is proven trusted before the driver opens it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SqliteLocation {
+    /// An in-memory database, by the name the driver is handed.
+    Memory(InMemory),
+    /// A file, by the path the driver is handed once it is proven trusted.
+    File(std::path::PathBuf),
+}
 
-    // Split off the query string (everything after the first `?`) so
-    // `mode=memory` can be checked independently of the path.
-    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-    let has_cache_shared = query.split('&').any(|kv| kv.starts_with("cache=shared"));
+/// Whether separately opened pools of one in-memory URL reach one database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MemorySharing {
+    /// Each pool opens a database of its own (SQLite's bare `:memory:`, or a
+    /// URI without `cache=shared`).
+    Private,
+    /// A `file:` URI naming `cache=shared`: every pool of the same URL shares one database.
+    SharedCache,
+}
 
-    // SQLite's own documented idiom wraps the special `:memory:` name in a
-    // `file:` sub-scheme (e.g. `sqlite3_open("file::memory:?cache=shared",
-    // &db)`). Strip that sub-scheme too before comparing — otherwise
-    // `"file::memory:"` falls through both checks below and is misclassified
-    // as a plain (cacheable) file path, silently merging distinct private
-    // in-memory databases behind one pooled connection.
-    let file_wrapped = path.starts_with("file:");
-    let path = path.strip_prefix("file:").unwrap_or(path);
+/// An in-memory database: the name the driver opens it by and whether pools share it.
+///
+/// Constructed only by [`InMemory::parse`], so every in-memory open hands
+/// SQLite a [`MemoryName`] and no URI parameter that could reopen it on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InMemory {
+    name: MemoryName,
+    sharing: MemorySharing,
+}
 
-    if path == ":memory:" {
-        // A BARE `:memory:` (no `file:` sub-scheme) is not parsed as a URI
-        // by SQLite at all — `cache=shared` has no effect on it and it is
-        // unconditionally a private, per-connection database. Only the
-        // `file:`-wrapped URI form honours `cache=shared`.
-        return file_wrapped && has_cache_shared;
+/// The name of an in-memory database: text SQLite can never read as a URI
+/// query, a fragment, or an escape.
+///
+/// Under `SQLITE_OPEN_URI` SQLite reads a `file:` name's own `?mode=` over the
+/// in-memory open flag (`mode=rw` and `mode=rwc` reopen the named path on
+/// disk), so a name carrying `?` is unrepresentable here, as are `#` and `%`,
+/// which SQLite would decode a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryName(std::path::PathBuf);
+
+impl MemoryName {
+    /// The driver's decoded `name`, when it is non-empty and carries no `?`, `#` or `%`.
+    ///
+    /// An empty name is SQLite's private temporary on-disk database, so it is
+    /// refused too.
+    fn parse(name: &std::path::Path) -> Option<Self> {
+        let bytes = name.as_os_str().as_encoded_bytes();
+        let inert = !bytes.is_empty() && !bytes.iter().any(|b| matches!(b, b'?' | b'#' | b'%'));
+        inert.then(|| Self(name.to_path_buf()))
     }
-    if query.split('&').any(|kv| kv == "mode=memory") && !has_cache_shared {
-        return false;
+}
+
+impl InMemory {
+    /// The in-memory database the driver-decoded `name` opens, shared as `sharing`.
+    ///
+    /// `vfs` and `immutable` name nothing an in-memory database uses, so a URL
+    /// carrying either is refused rather than handed through.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::InvalidUrl`] when [`MemoryName::parse`] refuses
+    /// `name`, or the URL names `vfs` or `immutable`.
+    fn parse(
+        name: &std::path::Path,
+        pairs: &HashMap<String, String>,
+        sharing: MemorySharing,
+    ) -> Result<Self, DbConnectError> {
+        if pairs.contains_key("vfs") || pairs.contains_key("immutable") {
+            return Err(DbConnectError::InvalidUrl);
+        }
+        let name = MemoryName::parse(name).ok_or(DbConnectError::InvalidUrl)?;
+        Ok(Self { name, sharing })
     }
-    true
+
+    /// Whether separately opened pools reach one database.
+    #[must_use]
+    pub const fn sharing(&self) -> MemorySharing {
+        self.sharing
+    }
+
+    /// `options` rewritten to open this database in memory by its parsed name.
+    #[allow(clippy::disallowed_methods)] // names no file: a parsed in-memory name, forced in memory
+    fn apply(
+        &self,
+        options: sqlx::sqlite::SqliteConnectOptions,
+    ) -> sqlx::sqlite::SqliteConnectOptions {
+        options
+            .filename(&self.name.0)
+            .immutable(false)
+            .in_memory(true)
+    }
+}
+
+impl SqliteLocation {
+    /// Whether every pool opened from the same URL reaches the same database.
+    #[must_use]
+    pub const fn is_shared(&self) -> bool {
+        matches!(
+            self,
+            Self::File(_)
+                | Self::Memory(InMemory {
+                    sharing: MemorySharing::SharedCache,
+                    ..
+                })
+        )
+    }
+
+    /// Classify `url`, whose driver-parsed options are `options`.
+    ///
+    /// The URL is split as the driver splits it (its `sqlite://` and `sqlite:`
+    /// prefixes trimmed, then cut at the first `?`) and its parameters read
+    /// strictly. A database whose parameters name `mode=memory`, or SQLite's
+    /// `file::memory:`, is in memory; it shares a cache only when it names
+    /// `cache=shared` and is not the bare `:memory:`, which SQLite never reads
+    /// as a URI; its name is the driver's decoded one, parsed by
+    /// [`InMemory::parse`]. Every other database is a file: a `file:` spelling is mapped
+    /// once by [`file_uri_path`], any other is the driver's decoded name. The
+    /// gated options are rewritten to this reading, so the driver opens what
+    /// was classified, never a second reading of the URL.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::UntrustedLocation`] with [`DbPathRefusal::FileUriName`]
+    /// for a `file:` spelling [`file_uri_path`] refuses, and
+    /// [`DbConnectError::InvalidUrl`] for malformed or repeated parameters, an
+    /// empty file name, or an in-memory database [`InMemory::parse`] refuses.
+    fn classify(
+        url: &str,
+        options: &sqlx::sqlite::SqliteConnectOptions,
+    ) -> Result<Self, DbConnectError> {
+        let rest = url
+            .trim_start_matches("sqlite://")
+            .trim_start_matches("sqlite:");
+        let (database, params) = rest.split_once('?').unwrap_or((rest, ""));
+        let pairs =
+            crate::encoding::decode_form_query(params).map_err(|_| DbConnectError::InvalidUrl)?;
+        // The driver reads every repeated key in turn where this reading keeps
+        // the first, so a repeat would let the two readings disagree.
+        if params.split('&').filter(|p| !p.is_empty()).count() != pairs.len() {
+            return Err(DbConnectError::InvalidUrl);
+        }
+        let named = |key: &str, value: &str| pairs.get(key).is_some_and(|v| v == value);
+        let cache_shared = named("cache", "shared");
+        let mode_memory = named("mode", "memory");
+        let name = options.get_filename();
+        if database == ":memory:" {
+            return InMemory::parse(name, &pairs, MemorySharing::Private).map(Self::Memory);
+        }
+        if mode_memory || database == "file::memory:" {
+            let sharing = if cache_shared {
+                MemorySharing::SharedCache
+            } else {
+                MemorySharing::Private
+            };
+            return InMemory::parse(name, &pairs, sharing).map(Self::Memory);
+        }
+        let path = match database.strip_prefix("file:") {
+            Some(uri) => file_uri_path(uri).ok_or(DbConnectError::UntrustedLocation(
+                DbPathRefusal::FileUriName,
+            ))?,
+            None => name.to_path_buf(),
+        };
+        if path.as_os_str().is_empty() {
+            return Err(DbConnectError::InvalidUrl);
+        }
+        Ok(Self::File(path))
+    }
+}
+
+/// The file path a `file:` SQLite URL names, given the text after `file:`.
+///
+/// Only two spellings map: `file:<path>` and `file:///<absolute path>`, each
+/// read verbatim. A `%` escape, a `#`, or a `//` authority maps to nothing,
+/// so the path proven trusted is never a second reading of the text.
+fn file_uri_path(uri: &str) -> Option<std::path::PathBuf> {
+    if uri.contains(['%', '#']) {
+        return None;
+    }
+    let path = match uri.strip_prefix("//") {
+        Some(after_authority) => after_authority
+            .starts_with('/')
+            .then_some(after_authority)?,
+        None => uri,
+    };
+    #[cfg(windows)]
+    let path = path
+        .strip_prefix('/')
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+        .unwrap_or(path);
+    Some(std::path::PathBuf::from(path))
 }
 
 use crate::system::SQLITE_BUSY_TIMEOUT;
@@ -1804,6 +1955,8 @@ pub enum DbConnectError {
     VersionUnreadable(DriverFailure),
     /// The engine is unsupported, or its version is unparseable or too old.
     EngineRefused(EngineVersionError),
+    /// A SQLite file's location cannot be proven safe from other local users.
+    UntrustedLocation(DbPathRefusal),
 }
 
 impl std::fmt::Display for DbConnectError {
@@ -1845,6 +1998,7 @@ impl std::fmt::Display for DbConnectError {
             Self::RelayUnavailable => f.write_str(
                 "db: the local relay to the pinned database address could not be opened",
             ),
+            Self::UntrustedLocation(refused) => write!(f, "{refused}"),
         }
     }
 }
@@ -1972,8 +2126,36 @@ fn url_scheme(url: &str) -> Option<&str> {
 #[derive(Clone)]
 pub struct SqliteUrl {
     options: sqlx::sqlite::SqliteConnectOptions,
-    /// A file every pool connection shares, as opposed to a private in-memory database.
-    shared_file: bool,
+    /// What the options open, read once from the URL.
+    location: SqliteLocation,
+}
+
+impl SqliteUrl {
+    /// The options the driver opens with, its location proven trusted first.
+    ///
+    /// An in-memory database is forced in memory, so no disk file opens; a
+    /// file is proven by [`TrustedDbPath::prove`] off the async worker and
+    /// handed to the driver by the canonical path that proof judged.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::UntrustedLocation`] when the proof refuses the file.
+    async fn gated(&self) -> Result<sqlx::sqlite::SqliteConnectOptions, DbConnectError> {
+        match &self.location {
+            SqliteLocation::Memory(memory) => Ok(memory.apply(self.options.clone())),
+            SqliteLocation::File(path) => {
+                let path = path.clone();
+                let proven = crate::threads::join_blocking("db.sqlite_location", move || {
+                    TrustedDbPath::prove(&path)
+                })
+                .await
+                .map_err(|_| DbPathRefusal::ProofUnavailable)
+                .and_then(|proof| proof)
+                .map_err(DbConnectError::UntrustedLocation)?;
+                Ok(proven.apply(self.options.clone()))
+            }
+        }
+    }
 }
 
 /// How a PostgreSQL connection protects its transport, read once from its URL.
@@ -2025,6 +2207,7 @@ impl PgTransport {
     }
 
     /// Whether the driver may negotiate TLS under this posture.
+    #[cfg(unix)]
     const fn negotiates_tls(self) -> bool {
         use crate::dsn::UnverifiedSslMode;
         match self {
@@ -2153,13 +2336,14 @@ impl DbUrl {
     /// `sslmode` does not verify a server it dials beyond this host.
     pub fn parse(url: &str) -> Result<Self, DbConnectError> {
         match url_scheme(url) {
-            None | Some("sqlite" | "file") => Ok(Self::Sqlite(SqliteUrl {
-                options: url
+            None | Some("sqlite" | "file") => {
+                let options = url
                     .parse::<sqlx::sqlite::SqliteConnectOptions>()
                     .map_err(|_| DbConnectError::InvalidUrl)?
-                    .busy_timeout(SQLITE_BUSY_TIMEOUT),
-                shared_file: url_is_cacheable(url),
-            })),
+                    .busy_timeout(SQLITE_BUSY_TIMEOUT);
+                let location = SqliteLocation::classify(url, &options)?;
+                Ok(Self::Sqlite(SqliteUrl { options, location }))
+            }
             Some("postgres" | "postgresql") => PostgresUrl::parse(url).map(Self::Postgres),
             Some(_) => Err(DbConnectError::UnsupportedScheme),
         }
@@ -2174,16 +2358,25 @@ impl DbUrl {
         }
     }
 
-    /// Whether the URL names a SQLite file every pool connection shares.
+    /// Whether the URL names a SQLite database every pool connection shares.
     #[must_use]
     pub const fn is_shared_sqlite_file(&self) -> bool {
-        matches!(
-            self,
-            Self::Sqlite(SqliteUrl {
-                shared_file: true,
-                ..
-            })
-        )
+        match self {
+            Self::Sqlite(sqlite) => sqlite.location.is_shared(),
+            Self::Postgres(_) => false,
+        }
+    }
+
+    /// Whether every pool opened from this URL reaches the same database, so one pool may serve them all.
+    ///
+    /// A private in-memory SQLite database is a distinct database per pool,
+    /// so pooling it under its URL would merge databases callers expect apart.
+    #[must_use]
+    pub const fn is_poolable(&self) -> bool {
+        match self {
+            Self::Sqlite(sqlite) => sqlite.location.is_shared(),
+            Self::Postgres(_) => true,
+        }
     }
 
     /// The refusal for a driver that speaks `driver` but was handed this URL.
@@ -2381,14 +2574,14 @@ pub trait GatedDial: sqlx::Database {
 }
 
 impl GatedDial for sqlx::Sqlite {
-    /// SQLite opens a local file and dials no host.
+    /// SQLite dials no host; a file opens only once its location is proven trusted.
     async fn gated_connect_options(
         url: &DbUrl,
         _max_connections: u32,
         _relay: &mut Option<crate::ssrf::PinnedRelay>,
     ) -> Result<sqlx::sqlite::SqliteConnectOptions, DbConnectError> {
         match url {
-            DbUrl::Sqlite(sqlite) => Ok(sqlite.options.clone()),
+            DbUrl::Sqlite(sqlite) => sqlite.gated().await,
             DbUrl::Postgres(_) => Err(url.mismatch(DbEngine::Sqlite)),
         }
     }
@@ -2422,19 +2615,20 @@ impl GatedDial for sqlx::Postgres {
 /// A database pool that passed every connect-time gate.
 ///
 /// [`VettedPool::connect`] is its only constructor and the runtime's only way
-/// to open a pool from a caller-supplied connection URL: the `Ipe.Db` pool, an
-/// `Ipe.Db.Connection`, and the persistent session stores all go through it.
+/// to open a pool: the `Ipe.Db` pool, an `Ipe.Db.Connection`, the persistent
+/// session stores, and the telemetry spill all go through it.
 /// It runs, in order: the driver's [`GatedDial`] gate (for PostgreSQL, the
 /// SSRF gate on every target the URL dials, with the dial pinned to the vetted
-/// address), a bounded connection cap, and the engine-version floor before any
+/// address; for SQLite, the trusted-location proof of a file), a bounded
+/// connection cap, and the engine-version floor before any
 /// other statement. A relay the gate opened is held until the pool closes.
 /// Every failure is a [`DbConnectError`], which holds no driver payload, so no
 /// caller can log or return a connection URL a driver echoed. Its options come
 /// from [`vetted_pool_options`]: a connection handed out again first re-reads
 /// a schema another connection changed, and one returned inside a transaction
-/// is closed. The runtime's own telemetry spill (`telemetry_spill.rs`, and the hub reading it) is not a
-/// caller-supplied URL: it opens a local SQLite file named by operator config,
-/// carrying no credential, directly.
+/// is closed. A SQLite file opens only once [`TrustedDbPath::prove`] shows no
+/// other local user can create, replace, or redirect it; the runtime's own
+/// telemetry spill and the hub reading it open through here too.
 pub struct VettedPool<DB: sqlx::Database>(sqlx::Pool<DB>);
 
 impl<DB> VettedPool<DB>
@@ -3034,7 +3228,8 @@ impl DbUrlRefusalKind {
             | DbConnectError::Unreachable(_)
             | DbConnectError::RelayUnavailable
             | DbConnectError::VersionUnreadable(_)
-            | DbConnectError::EngineRefused(_) => Self::InvalidUrl,
+            | DbConnectError::EngineRefused(_)
+            | DbConnectError::UntrustedLocation(_) => Self::InvalidUrl,
         }
     }
 }
@@ -3443,7 +3638,10 @@ pub(crate) fn check_operator_url_at_start() -> Result<(), OperatorUrlRefusal> {
 async fn connect_configured<E: Send + crate::FromIpeError + 'static>(
     url: &ConfiguredUrl,
 ) -> IpeResult<E, Db> {
-    let key = url_is_cacheable(&url.key).then(|| PoolKey::Operator(url.key.clone()));
+    let key = url
+        .url
+        .is_poolable()
+        .then(|| PoolKey::Operator(url.key.clone()));
     connect_cached(key, &url.url, Journal::WalIfShared).await
 }
 
@@ -3757,13 +3955,12 @@ impl DbUrl {
     fn sqlite_file(name: &SqliteFileName, mode: FileMode) -> Result<Self, DbConnectError> {
         assert_sqlite_sink(name.as_str())?;
         let options = sqlx::sqlite::SqliteConnectOptions::new()
-            .filename(name.as_str())
             .read_only(matches!(mode, FileMode::ReadExisting))
             .create_if_missing(matches!(mode, FileMode::CreateIfMissing))
             .busy_timeout(SQLITE_BUSY_TIMEOUT);
         Ok(Self::Sqlite(SqliteUrl {
             options,
-            shared_file: true,
+            location: SqliteLocation::File(std::path::PathBuf::from(name.as_str())),
         }))
     }
 
@@ -3778,11 +3975,438 @@ impl DbUrl {
             .parse::<sqlx::sqlite::SqliteConnectOptions>()
             .map_err(|_| DbConnectError::InvalidUrl)?
             .busy_timeout(SQLITE_BUSY_TIMEOUT);
-        Ok(Self::Sqlite(SqliteUrl {
-            options,
-            shared_file: false,
-        }))
+        let location = SqliteLocation::classify(SQLITE_MEMORY_URL, &options)?;
+        Ok(Self::Sqlite(SqliteUrl { options, location }))
     }
+}
+
+impl DbUrl {
+    /// The SQLite options that open the file at `text` under `mode`, read as a literal path.
+    ///
+    /// For runtime-owned files named by configuration (the telemetry spill, the
+    /// session store): the text is sealed as a file name, never parsed as a
+    /// URL, so a `?` or `#` in it is part of the name. The file is proven
+    /// trusted when a pool opens it.
+    ///
+    /// # Errors
+    ///
+    /// [`DbConnectError::InvalidUrl`] when `text` names no file SQLite would
+    /// read as one (see [`SqliteFileName`]).
+    pub fn sqlite_path(text: &str, mode: FileMode) -> Result<Self, DbConnectError> {
+        let name = SqliteFileName::parse_under(text, super::path_core::HOST)
+            .map_err(|_| DbConnectError::InvalidUrl)?;
+        Self::sqlite_file(&name, mode)
+    }
+}
+
+/// The group-write rule a SQLite file's directories and the file itself are judged under.
+///
+/// A development build keeps the owner's own group; every release build
+/// also requires that group to be a user-private one.
+#[cfg(unix)]
+const DB_POSTURE: crate::scratch_core::GroupWritePosture = if cfg!(feature = "dev-posture") {
+    crate::scratch_core::GroupWritePosture::OwnGroup
+} else {
+    crate::scratch_core::GroupWritePosture::PrivateGroup
+};
+
+/// A file SQLite keeps beside a database and opens by the database's name plus a suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SqliteSibling {
+    /// The rollback journal, `-journal`.
+    Journal,
+    /// The write-ahead log, `-wal`.
+    Wal,
+    /// The WAL shared-memory index, `-shm`.
+    Shm,
+}
+
+impl SqliteSibling {
+    /// Every sibling SQLite may open.
+    const ALL: [Self; 3] = [Self::Journal, Self::Wal, Self::Shm];
+
+    /// The suffix SQLite appends to the database's name.
+    #[must_use]
+    pub const fn suffix(self) -> &'static str {
+        match self {
+            Self::Journal => "-journal",
+            Self::Wal => "-wal",
+            Self::Shm => "-shm",
+        }
+    }
+}
+
+/// A directory as a refusal shows it: scrubbed, capped and quoted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownDir(String);
+
+impl ShownDir {
+    /// `dir`, scrubbed of control characters and capped.
+    fn of(dir: &std::path::Path) -> Self {
+        Self(crate::error::shown_path(&dir.display().to_string()))
+    }
+}
+
+impl std::fmt::Display for ShownDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why a SQLite file's location cannot be trusted.
+///
+/// A file is trusted only when no other local user can create, replace, or
+/// redirect it: every directory above it, and the file itself when it exists,
+/// is writable only by the effective user or root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DbPathRefusal {
+    /// A `file:` URL in a spelling other than `file:<path>` or `file:///<absolute path>`.
+    FileUriName,
+    /// The path names no file.
+    NoFileName,
+    /// The directory that would hold the file does not exist.
+    HoldingDirMissing,
+    /// A directory on the path could not be read.
+    ChainUnreadable {
+        /// The directory.
+        shown: ShownDir,
+    },
+    /// The file lies deeper than the trusted-chain walk visits.
+    ChainTooDeep,
+    /// A directory on the path is not private to the effective user or root.
+    Untrusted {
+        /// Whether it holds the file or lies above it.
+        role: crate::scratch_core::ChainRole,
+        /// The first violated condition.
+        cause: crate::scratch_core::ScratchRefusal,
+        /// The directory.
+        shown: ShownDir,
+    },
+    /// The file is a symbolic link.
+    FinalIsSymlink,
+    /// The file is not a regular file.
+    FinalNotRegular,
+    /// The file could not be read.
+    FinalUnreadable,
+    /// The file is owned by another user or writable by one.
+    FinalUntrusted {
+        /// The first violated condition.
+        cause: crate::scratch_core::ScratchRefusal,
+    },
+    /// A journal, WAL or shared-memory file beside the database is a symbolic link.
+    SiblingIsSymlink {
+        /// Which sibling.
+        sibling: SqliteSibling,
+    },
+    /// The file lies outside the user's profile directory, the only tree off
+    /// Unix proven private.
+    OutsideProfile,
+    /// No worker thread could run the proof.
+    ProofUnavailable,
+}
+
+impl DbPathRefusal {
+    /// The refusal of a chain walk.
+    #[cfg(unix)]
+    fn of_chain(refused: crate::scratch_core::ChainRefusal) -> Self {
+        use crate::scratch_core::ChainRefusal;
+        match refused {
+            ChainRefusal::HoldingDirMissing => Self::HoldingDirMissing,
+            ChainRefusal::Unreadable { dir } => Self::ChainUnreadable {
+                shown: ShownDir::of(&dir),
+            },
+            ChainRefusal::TooDeep => Self::ChainTooDeep,
+            ChainRefusal::Untrusted { role, dir, cause } => Self::Untrusted {
+                role,
+                cause,
+                shown: ShownDir::of(&dir),
+            },
+        }
+    }
+
+    /// The Ipê error for this refusal, carrying `message`.
+    ///
+    /// A malformed name is the caller's input error; a missing worker is
+    /// unavailable; a missing directory or a non-file is the driver's own
+    /// `CannotOpen`; every location an attacker could reach is `AccessDenied`.
+    fn error_with(&self, message: String) -> IpeError {
+        match self {
+            Self::FileUriName | Self::NoFileName => IpeError::invalid_input(message),
+            Self::ProofUnavailable => IpeError::unavailable(message),
+            // Nothing openable is there: the failure the driver itself reports
+            // for a missing directory or a non-file, so `Db.open`'s
+            // classification does not hinge on which check saw it first.
+            Self::HoldingDirMissing | Self::FinalNotRegular => {
+                IpeError::database(IpeDbFailure::CannotOpen, message)
+            }
+            Self::ChainUnreadable { .. }
+            | Self::ChainTooDeep
+            | Self::Untrusted { .. }
+            | Self::FinalIsSymlink
+            | Self::FinalUnreadable
+            | Self::FinalUntrusted { .. }
+            | Self::SiblingIsSymlink { .. }
+            | Self::OutsideProfile => IpeError::database(IpeDbFailure::AccessDenied, message),
+        }
+    }
+}
+
+/// What a trust verdict's refusal means for a SQLite file, and how to fix it.
+fn trust_cause_text(cause: crate::scratch_core::ScratchRefusal) -> &'static str {
+    use crate::scratch_core::ScratchRefusal;
+    match cause {
+        ScratchRefusal::NotADirectory => "is not a real directory",
+        ScratchRefusal::NotARegularFile => "is not a regular file",
+        ScratchRefusal::ForeignOwner => {
+            "is owned by another user; keep the database under a directory you own"
+        }
+        ScratchRefusal::WritableByOthers | ScratchRefusal::NotPrivate => {
+            "is writable by other users; remove their write access (`chmod go-w`) or keep the \
+             database in a directory only you can write (`mkdir -m 700 <dir>`)"
+        }
+    }
+}
+
+impl std::fmt::Display for DbPathRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::scratch_core::ChainRole;
+        match self {
+            Self::FileUriName => f.write_str(
+                "db: a `file:` SQLite URL must be `file:<path>` or `file:///<absolute path>`, \
+                 with no `%` escape, `#` or host",
+            ),
+            Self::NoFileName => f.write_str("db: the SQLite path names no file"),
+            Self::HoldingDirMissing => f.write_str(
+                "db: the directory that would hold the SQLite file does not exist; create it \
+                 private to you (`mkdir -m 700 <dir>`)",
+            ),
+            Self::ChainUnreadable { shown } => write!(
+                f,
+                "db: the directory {shown} on the SQLite file's path cannot be read, so the \
+                 file cannot be proven private"
+            ),
+            Self::ChainTooDeep => write!(
+                f,
+                "db: the SQLite file lies more than {} directories deep",
+                crate::scratch_core::TRUSTED_CHAIN_MAX_COMPONENTS
+            ),
+            Self::Untrusted { role, cause, shown } => {
+                let place = match role {
+                    ChainRole::Holding => "holding the SQLite file",
+                    ChainRole::Ancestor => "above the SQLite file",
+                };
+                write!(
+                    f,
+                    "db: the directory {shown} {place} {}; inside `ipe release run`, keep the \
+                     database under the project directory",
+                    trust_cause_text(*cause)
+                )
+            }
+            Self::FinalIsSymlink => f.write_str(
+                "db: the SQLite file is a symbolic link; open the file it points to by its own \
+                 path",
+            ),
+            Self::FinalNotRegular => {
+                f.write_str("db: the SQLite path names something other than a regular file")
+            }
+            Self::FinalUnreadable => {
+                f.write_str("db: the SQLite file cannot be read, so it cannot be proven private")
+            }
+            Self::FinalUntrusted { cause } => {
+                write!(f, "db: the SQLite file {}", trust_cause_text(*cause))
+            }
+            Self::SiblingIsSymlink { sibling } => write!(
+                f,
+                "db: the SQLite `{}` file beside the database is a symbolic link; remove it",
+                sibling.suffix()
+            ),
+            Self::OutsideProfile => f.write_str(
+                "db: the SQLite file lies outside your user profile; keep the database under \
+                 your profile directory",
+            ),
+            Self::ProofUnavailable => f.write_str(
+                "db: no worker thread could check the SQLite file's location; retry when the \
+                 process has threads to spare",
+            ),
+        }
+    }
+}
+
+/// A SQLite file path no other local user can create, replace, or redirect.
+///
+/// Built only by [`TrustedDbPath::prove`]; the only value that writes a file
+/// name into the driver's options ([`TrustedDbPath::apply`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedDbPath(std::path::PathBuf);
+
+impl TrustedDbPath {
+    /// Prove `path` a trusted SQLite file location.
+    ///
+    /// The holding directory is resolved (following links, so a linked
+    /// directory is judged at its target), then judged with every directory
+    /// above it; the file, when it exists, must be a regular file only the
+    /// effective user or root can rewrite, and no journal, WAL or
+    /// shared-memory sibling may be a link. A relative path resolves against
+    /// the working directory.
+    ///
+    /// # Errors
+    ///
+    /// The [`DbPathRefusal`] naming the first condition that fails.
+    pub fn prove(path: &std::path::Path) -> Result<Self, DbPathRefusal> {
+        Self::prove_attested(path, crate::env_registry::data::jail_attestation())
+    }
+
+    /// Prove `path` as [`TrustedDbPath::prove`] does, the chain walk stopping at a root `attested` names.
+    ///
+    /// An attested root still takes its own verdict before the walk stops
+    /// there; the file and sibling checks never consult `attested`.
+    ///
+    /// # Errors
+    ///
+    /// The [`DbPathRefusal`] naming the first condition that fails.
+    pub fn prove_attested(
+        path: &std::path::Path,
+        attested: &crate::scratch_core::JailAttestation,
+    ) -> Result<Self, DbPathRefusal> {
+        let name = path.file_name().ok_or(DbPathRefusal::NoFileName)?;
+        let dir = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let canonical_dir = std::fs::canonicalize(dir).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                DbPathRefusal::HoldingDirMissing
+            } else {
+                DbPathRefusal::ChainUnreadable {
+                    shown: ShownDir::of(dir),
+                }
+            }
+        })?;
+        judge_holding_dir(&canonical_dir, attested)?;
+        let file = canonical_dir.join(name);
+        judge_final_file(&file)?;
+        for sibling in SqliteSibling::ALL {
+            let mut named = file.clone().into_os_string();
+            named.push(sibling.suffix());
+            if std::fs::symlink_metadata(&named).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Err(DbPathRefusal::SiblingIsSymlink { sibling });
+            }
+        }
+        Ok(Self(spelled_for_driver(file)))
+    }
+
+    /// The proven path.
+    #[must_use]
+    pub fn as_path(&self) -> &std::path::Path {
+        &self.0
+    }
+
+    /// `options` opening this file, and never an in-memory database.
+    #[allow(clippy::disallowed_methods)] // the one seam that names a SQLite file: a proven path
+    fn apply(
+        self,
+        options: sqlx::sqlite::SqliteConnectOptions,
+    ) -> sqlx::sqlite::SqliteConnectOptions {
+        options.in_memory(false).filename(self.0)
+    }
+}
+
+/// Judge `canonical_dir` and every directory above it to the filesystem root, or to a root `attested` names.
+///
+/// Inside the run jail, directories above the bind roots read as the
+/// overflow id; the launcher names the roots it proved with real ids.
+#[cfg(unix)]
+fn judge_holding_dir(
+    canonical_dir: &std::path::Path,
+    attested: &crate::scratch_core::JailAttestation,
+) -> Result<(), DbPathRefusal> {
+    use crate::scratch_core::{chain_entry, current_identity, judge_chain};
+    judge_chain(
+        canonical_dir,
+        current_identity(),
+        DB_POSTURE,
+        attested,
+        chain_entry,
+    )
+    .map_err(DbPathRefusal::of_chain)
+}
+
+/// Require `canonical_dir` inside the user's profile, the only tree proven private off Unix.
+///
+/// The directory is already resolved, so a link or junction on its path is
+/// judged at its target. No jail attests a root off Unix, so `_attested` is
+/// never consulted.
+#[cfg(not(unix))]
+fn judge_holding_dir(
+    canonical_dir: &std::path::Path,
+    _attested: &crate::scratch_core::JailAttestation,
+) -> Result<(), DbPathRefusal> {
+    let home = crate::scratch_host::profile_dir();
+    let profile = home.as_ref().map_err(|refusal| *refusal);
+    crate::scratch_core::verify_root_within_profile(canonical_dir, profile)
+        .map(drop)
+        .map_err(|_| DbPathRefusal::OutsideProfile)
+}
+
+/// Judge `file`, read without following a final link: absent, or a regular file only the effective user or root can rewrite.
+#[cfg(unix)]
+fn judge_final_file(file: &std::path::Path) -> Result<(), DbPathRefusal> {
+    use crate::scratch_core::{
+        EntryKind, ScratchRefusal, current_identity, entry_facts, file_verdict,
+    };
+    let facts = match entry_facts(file) {
+        Ok(facts) => facts,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(DbPathRefusal::FinalUnreadable),
+    };
+    if matches!(facts.kind, EntryKind::Other)
+        && std::fs::symlink_metadata(file).is_ok_and(|meta| meta.file_type().is_symlink())
+    {
+        return Err(DbPathRefusal::FinalIsSymlink);
+    }
+    file_verdict(facts, current_identity(), DB_POSTURE).map_err(|cause| match cause {
+        ScratchRefusal::NotARegularFile | ScratchRefusal::NotADirectory => {
+            DbPathRefusal::FinalNotRegular
+        }
+        ScratchRefusal::ForeignOwner
+        | ScratchRefusal::WritableByOthers
+        | ScratchRefusal::NotPrivate => DbPathRefusal::FinalUntrusted { cause },
+    })
+}
+
+/// Judge `file`, read without following a final link: absent, or a regular file that is no reparse point.
+#[cfg(not(unix))]
+fn judge_final_file(file: &std::path::Path) -> Result<(), DbPathRefusal> {
+    match std::fs::symlink_metadata(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(DbPathRefusal::FinalUnreadable),
+        Ok(meta) if meta.file_type().is_symlink() => Err(DbPathRefusal::FinalIsSymlink),
+        Ok(meta) if !meta.is_file() => Err(DbPathRefusal::FinalNotRegular),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// `path` as the driver is handed it.
+///
+/// Off Unix a resolved path carries the `\\?\` verbatim prefix; a drive path
+/// drops it, so SQLite reads the plain drive spelling of the same file.
+#[cfg(unix)]
+const fn spelled_for_driver(path: std::path::PathBuf) -> std::path::PathBuf {
+    path
+}
+
+/// `path` as the driver is handed it.
+///
+/// Off Unix a resolved path carries the `\\?\` verbatim prefix; a drive path
+/// drops it, so SQLite reads the plain drive spelling of the same file.
+#[cfg(not(unix))]
+fn spelled_for_driver(path: std::path::PathBuf) -> std::path::PathBuf {
+    let drive = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+        .map(std::path::PathBuf::from);
+    drive.unwrap_or(path)
 }
 
 /// Which database a [`DbLocation`] names.
@@ -7793,47 +8417,52 @@ mod tests {
         PostgresUrl::parse(url).map(|url| url.targets)
     }
 
-    #[test]
-    fn url_is_cacheable_mode_memory_without_shared_cache_is_not_cacheable() {
-        assert!(!url_is_cacheable("file:foo.db?mode=memory"));
+    /// Whether `url` parses and every pool opened from it reaches one database.
+    fn poolable(url: &str) -> bool {
+        DbUrl::parse(url).is_ok_and(|url| url.is_poolable())
     }
 
     #[test]
-    fn url_is_cacheable_mode_memory_with_shared_cache_is_cacheable() {
+    fn is_poolable_mode_memory_without_shared_cache_is_not_poolable() {
+        assert!(!poolable("file:foo.db?mode=memory"));
+    }
+
+    #[test]
+    fn is_poolable_mode_memory_with_shared_cache_is_poolable() {
         // `cache=shared` mode=memory URLs are a shared named in-memory DB —
         // multiple connections to the SAME url ARE the same database, so
         // pooling is correct here (this is the regression this fix must NOT
         // break: don't overcorrect to "any mode=memory is uncacheable").
-        assert!(url_is_cacheable("file:foo.db?mode=memory&cache=shared"));
+        assert!(poolable("file:foo.db?mode=memory&cache=shared"));
     }
 
     #[test]
-    fn url_is_cacheable_filename_containing_memory_substring_is_cacheable() {
+    fn is_poolable_filename_containing_memory_substring_is_poolable() {
         // The DoS-reopen regression: a legitimate file path containing the
         // substring "memory" must NOT be excluded from pooling.
-        assert!(url_is_cacheable("sqlite://data/memory_bank.db?mode=rwc"));
-        assert!(url_is_cacheable("sqlite:./memory_backup.sqlite"));
+        assert!(poolable("sqlite://data/memory_bank.db?mode=rwc"));
+        assert!(poolable("sqlite:./memory_backup.sqlite"));
     }
 
     // Soundness: SQLite's own documented idiom wraps `:memory:` in a `file:`
     // sub-scheme (sqlite.org/inmemorydb.html —
     // `sqlite3_open("file::memory:?cache=shared", ...)`). Stripping only the
     // outer `sqlite:`/`sqlite://` scheme and not the inner `file:` one would
-    // let `"file::memory:"` fall through to the default `true` (cacheable)
+    // let `"file::memory:"` fall through to the file (poolable)
     // branch — silently pooling what SQLite treats as two DISTINCT private
     // databases. Per sqlite.org's documented semantics: a bare `:memory:` name
     // is unconditionally private (not URI-parsed, so `cache=shared` has no
     // effect on it even if present); only the `file:`-wrapped URI form honours
     // `cache=shared`.
     #[test]
-    fn url_is_cacheable_file_wrapped_memory_without_shared_cache_is_not_cacheable() {
-        assert!(!url_is_cacheable("file::memory:"));
-        assert!(!url_is_cacheable("sqlite://file::memory:"));
+    fn is_poolable_file_wrapped_memory_without_shared_cache_is_not_poolable() {
+        assert!(!poolable("file::memory:"));
+        assert!(!poolable("sqlite://file::memory:"));
     }
 
     #[test]
-    fn url_is_cacheable_file_wrapped_memory_with_shared_cache_is_cacheable() {
-        assert!(url_is_cacheable("file::memory:?cache=shared"));
+    fn is_poolable_file_wrapped_memory_with_shared_cache_is_poolable() {
+        assert!(poolable("file::memory:?cache=shared"));
     }
 
     // the IpeRow accessor is total over a Dict-shaped row — present field
@@ -8385,7 +9014,7 @@ mod tests {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let mut path = crate::scratch_core::test_temp_root();
+        let mut path = crate::scratch_core::test_private_root();
         path.push(format!("ipe_{name}_{}_{nanos}", std::process::id()));
         path
     }
@@ -9560,17 +10189,10 @@ mod tests {
                 }
             }
         }
-        // The spill pools hold a runtime-owned fixed schema, created once with
-        // `CREATE TABLE`; no program DDL reaches them.
-        let admitted = [
-            ("db.rs", "vetted_pool_options"),
-            ("db.rs", "connect"),
-            ("telemetry_spill.rs", "open_spill_pool"),
-            ("web/hub.rs", "open_spill"),
-        ]
-        .map(|(file, function)| (file.to_owned(), function.to_owned()))
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
+        let admitted = [("db.rs", "vetted_pool_options"), ("db.rs", "connect")]
+            .map(|(file, function)| (file.to_owned(), function.to_owned()))
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             sites, admitted,
             "a pool built outside `vetted_pool_options` hands out connections without the schema refresh"
@@ -12191,10 +12813,11 @@ mod tests {
         }
 
         #[test]
-        fn url_is_cacheable_bare_memory_is_not_cacheable() {
-            assert!(!url_is_cacheable(":memory:"));
-            assert!(!url_is_cacheable("sqlite::memory:"));
-            assert!(!url_is_cacheable("sqlite://:memory:"));
+        fn is_poolable_bare_memory_is_not_poolable() {
+            let poolable = |url: &str| DbUrl::parse(url).is_ok_and(|url| url.is_poolable());
+            assert!(!poolable(":memory:"));
+            assert!(!poolable("sqlite::memory:"));
+            assert!(!poolable("sqlite://:memory:"));
         }
 
         async fn fresh_db() -> Db {
@@ -12366,7 +12989,8 @@ mod tests {
             }
         }
 
-        /// `Db.open` on a directory fails as `CannotOpen`.
+        /// `Db.open` on a directory fails as `CannotOpen`, refused before the
+        /// driver sees it, with the message naming the non-file.
         #[tokio::test]
         async fn open_on_a_directory_is_cannot_open() {
             let dir = scratch_path("dir_db");
@@ -12376,7 +13000,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&dir);
             assert!(
                 matches!(&failure, Some(IpeError::Error(IpeErrorKind::NotFound, info))
-                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))),
+                    if info.details == IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen))
+                        && info.message.contains("other than a regular file")),
                 "{failure:?}"
             );
         }
@@ -13432,7 +14057,7 @@ mod tests {
         // with `max_connections > 1` and WAL. Returns (pool, tempdir-guard); the
         // guard must outlive the pool so the file isn't deleted early.
         async fn fresh_file_db(max_conns: u32) -> (Db, std::path::PathBuf) {
-            let mut path = crate::scratch_core::test_temp_root();
+            let mut path = crate::scratch_core::test_private_root();
             // Unique per test run to avoid cross-test contamination.
             let unique = format!(
                 "ipe_txn_test_{}_{}.db",
@@ -13470,10 +14095,11 @@ mod tests {
         const STALE_CHECKED_INSERT: &str = "INSERT INTO v (x) VALUES (1) RETURNING (1)";
 
         /// Connect options for a fresh rollback-journal temp SQLite file.
+        #[allow(clippy::expect_used)] // test: a private store root the location proof refuses is a broken test environment
         fn schema_test_file() -> (sqlx::sqlite::SqliteConnectOptions, std::path::PathBuf) {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut path = crate::scratch_core::test_temp_root();
+            let mut path = crate::scratch_core::test_private_root();
             path.push(format!(
                 "ipe_schema_test_{}_{n}_{}.db",
                 std::process::id(),
@@ -13482,8 +14108,9 @@ mod tests {
                     .map_or(0, |d| d.as_nanos())
             ));
             let _ = std::fs::remove_file(&path);
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
+            let options = TrustedDbPath::prove(&path)
+                .expect("the private test root holds a trusted store")
+                .apply(sqlx::sqlite::SqliteConnectOptions::new())
                 .create_if_missing(true)
                 .busy_timeout(SQLITE_BUSY_TIMEOUT);
             (options, path)
@@ -16057,7 +16684,7 @@ mod tests {
         /// so data written through one is visible through the other.
         #[tokio::test]
         async fn operator_store_shared_pool_sees_same_data() {
-            let tmp = crate::scratch_core::test_temp_root()
+            let tmp = crate::scratch_core::test_private_root()
                 .join(format!("ipe_operator_shared_{}.db", std::process::id()));
             let url = format!("sqlite://{}?mode=rwc", tmp.display());
             let choice = choose_store(parse_env(Ok(url), DbEngine::Sqlite), &Ok(None), || {
@@ -16096,7 +16723,7 @@ mod tests {
         /// the pool `Db.open` caches for the same file.
         #[tokio::test]
         async fn default_store_creates_its_file_and_shares_the_db_open_pool() {
-            let dir = crate::scratch_core::test_temp_root()
+            let dir = crate::scratch_core::test_private_root()
                 .join(format!("ipe_operator_default_{}", std::process::id()));
             std::fs::create_dir_all(&dir).expect("scratch dir");
             let cwd = dir.to_str().map(str::to_owned);
@@ -16481,7 +17108,7 @@ mod tests {
         /// busy timeout, not only the one a pool-level PRAGMA happened to reach.
         #[tokio::test]
         async fn every_pooled_sqlite_connection_carries_the_declared_busy_timeout() {
-            let path = crate::scratch_core::test_temp_root().join(format!(
+            let path = crate::scratch_core::test_private_root().join(format!(
                 "ipe_busy_timeout_{}_{}.db",
                 std::process::id(),
                 std::time::SystemTime::now()
@@ -16809,8 +17436,9 @@ mod tests {
         /// connection holds the owned-pool close until that connection has closed:
         /// the close returns with no `-wal` left behind.
         #[tokio::test]
+        #[allow(clippy::expect_used)] // test: a private store root the location proof refuses is a broken test environment
         async fn a_checkout_cut_mid_hook_closes_its_connection_before_the_pools_close() {
-            let mut path = crate::scratch_core::test_temp_root();
+            let mut path = crate::scratch_core::test_private_root();
             path.push(format!(
                 "ipe_cut_checkout_{}_{}.db",
                 std::process::id(),
@@ -16820,8 +17448,9 @@ mod tests {
                     .unwrap_or(0)
             ));
             let _ = std::fs::remove_file(&path);
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
+            let options = TrustedDbPath::prove(&path)
+                .expect("the private test root holds a trusted store")
+                .apply(sqlx::sqlite::SqliteConnectOptions::new())
                 .create_if_missing(true)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
                 .busy_timeout(SQLITE_BUSY_TIMEOUT);
@@ -17659,5 +18288,655 @@ mod like_prefix_tests {
                 ])
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trusted_db_path_tests {
+    use super::{
+        DbConnectError, DbPathRefusal, DbUrl, MemorySharing, SqliteLocation, TrustedDbPath,
+        file_uri_path,
+    };
+    #[cfg(unix)]
+    use super::{SqliteSibling, VettedPool};
+    use crate::scratch_core::{ChainRole, ScratchDir, ScratchRefusal};
+    use std::path::{Path, PathBuf};
+
+    /// A fresh private directory for one test's files.
+    #[allow(clippy::expect_used)] // a test with no private directory cannot run
+    fn private_dir(label: &str) -> ScratchDir {
+        ScratchDir::new(label).expect("a private test directory")
+    }
+
+    /// Set `path`'s permission bits to `mode`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a test whose fixture mode cannot be set cannot run
+    fn chmod(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    }
+
+    /// Create the directory `path` with permission bits `mode`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a test whose fixture directory cannot be made cannot run
+    fn mkdir(path: &Path, mode: u32) {
+        std::fs::create_dir(path).expect("mkdir");
+        chmod(path, mode);
+    }
+
+    /// The attestation naming `dir`'s real `dev:ino`.
+    #[cfg(unix)]
+    #[allow(clippy::expect_used)] // a test whose fixture directory cannot be read cannot run
+    fn attesting(dir: &Path) -> crate::scratch_core::JailAttestation {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(dir).expect("fixture metadata");
+        crate::scratch_core::JailAttestation::parse(&format!("{}:{}", meta.dev(), meta.ino()))
+    }
+
+    /// An attested root cuts the walk above it, but only after it passes its
+    /// own verdict, and never relaxes the holding, file or sibling checks.
+    #[cfg(unix)]
+    #[test]
+    fn a_jail_attestation_cuts_only_the_walk_above_a_passing_root() {
+        let dir = private_dir("trusted-db-attested");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let root = shared.join("root");
+        mkdir(&root, 0o700);
+        let attested = attesting(&root);
+        let none = crate::scratch_core::JailAttestation::none();
+
+        let whole = TrustedDbPath::prove_attested(&root.join("app.db"), &none);
+        assert!(
+            matches!(
+                whole,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Ancestor,
+                    ..
+                })
+            ),
+            "unattested, the shared ancestor refuses: {whole:?}"
+        );
+        let cut = TrustedDbPath::prove_attested(&root.join("app.db"), &attested);
+        assert!(cut.is_ok(), "the attested root cuts the walk: {cut:?}");
+
+        let open = root.join("open");
+        mkdir(&open, 0o777);
+        let holding = TrustedDbPath::prove_attested(&open.join("app.db"), &attested);
+        assert!(
+            matches!(
+                holding,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    cause: ScratchRefusal::WritableByOthers,
+                    ..
+                })
+            ),
+            "a shared holding dir under an attested root: {holding:?}"
+        );
+
+        let file = root.join("shared.db");
+        let _ = std::fs::write(&file, b"");
+        chmod(&file, 0o666);
+        let final_file = TrustedDbPath::prove_attested(&file, &attested);
+        assert!(
+            matches!(final_file, Err(DbPathRefusal::FinalUntrusted { .. })),
+            "a shared file under an attested root: {final_file:?}"
+        );
+
+        let _ =
+            std::os::unix::fs::symlink(dir.path().join("elsewhere"), root.join("linked.db-wal"));
+        let sibling = TrustedDbPath::prove_attested(&root.join("linked.db"), &attested);
+        assert!(
+            matches!(sibling, Err(DbPathRefusal::SiblingIsSymlink { .. })),
+            "a linked sibling under an attested root: {sibling:?}"
+        );
+
+        chmod(&root, 0o777);
+        let failing = TrustedDbPath::prove_attested(&root.join("app.db"), &attested);
+        chmod(&root, 0o700);
+        assert!(
+            matches!(
+                failing,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    cause: ScratchRefusal::WritableByOthers,
+                    ..
+                })
+            ),
+            "an attested root that fails its own verdict is no cut: {failing:?}"
+        );
+    }
+
+    /// The location `url` classifies to.
+    fn location(url: &str) -> Result<SqliteLocation, DbConnectError> {
+        match DbUrl::parse(url)? {
+            DbUrl::Sqlite(sqlite) => Ok(sqlite.location),
+            DbUrl::Postgres(_) => Err(DbConnectError::InvalidUrl),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_proves_a_file_in_a_private_directory() {
+        let dir = private_dir("trusted-db-happy");
+        let proven = TrustedDbPath::prove(&dir.path().join("app.db"));
+        let Ok(proven) = proven else {
+            assert!(proven.is_ok(), "{proven:?}");
+            return;
+        };
+        assert_eq!(proven.as_path().file_name(), Some("app.db".as_ref()));
+        assert!(proven.as_path().is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_world_writable_holding_directory() {
+        let dir = private_dir("trusted-db-shared-holding");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let refused = TrustedDbPath::prove(&shared.join("app.db"));
+        assert!(
+            matches!(
+                refused,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    cause: ScratchRefusal::WritableByOthers,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_link_planted_in_a_world_writable_directory() {
+        let dir = private_dir("trusted-db-planted-link");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let target = dir.path().join("victim.db");
+        let _ = std::os::unix::fs::symlink(&target, shared.join("app.db"));
+        let refused = TrustedDbPath::prove(&shared.join("app.db"));
+        assert!(
+            matches!(
+                refused,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_world_writable_ancestor() {
+        let dir = private_dir("trusted-db-shared-ancestor");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let inner = shared.join("inner");
+        mkdir(&inner, 0o700);
+        let refused = TrustedDbPath::prove(&inner.join("app.db"));
+        assert!(
+            matches!(
+                refused,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Ancestor,
+                    cause: ScratchRefusal::WritableByOthers,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_sticky_holding_directory_and_admits_a_sticky_ancestor() {
+        let dir = private_dir("trusted-db-sticky");
+        let sticky = dir.path().join("sticky");
+        mkdir(&sticky, 0o1777);
+        let refused = TrustedDbPath::prove(&sticky.join("app.db"));
+        assert!(
+            matches!(
+                refused,
+                Err(DbPathRefusal::Untrusted {
+                    role: ChainRole::Holding,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        let inner = sticky.join("inner");
+        mkdir(&inner, 0o700);
+        let proven = TrustedDbPath::prove(&inner.join("app.db"));
+        assert!(proven.is_ok(), "{proven:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_judges_a_linked_directory_at_its_target() {
+        let dir = private_dir("trusted-db-linked-dir");
+        let real = dir.path().join("real");
+        mkdir(&real, 0o700);
+        let link = dir.path().join("link");
+        let _ = std::os::unix::fs::symlink(&real, &link);
+        let proven = TrustedDbPath::prove(&link.join("app.db"));
+        let Ok(proven) = proven else {
+            assert!(proven.is_ok(), "{proven:?}");
+            return;
+        };
+        let real = std::fs::canonicalize(&real).unwrap_or(real);
+        assert_eq!(proven.as_path(), real.join("app.db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_resolves_a_parent_step_once() {
+        let dir = private_dir("trusted-db-dotdot");
+        let sub = dir.path().join("sub");
+        mkdir(&sub, 0o700);
+        let proven = TrustedDbPath::prove(&sub.join("..").join("app.db"));
+        let Ok(proven) = proven else {
+            assert!(proven.is_ok(), "{proven:?}");
+            return;
+        };
+        let root = std::fs::canonicalize(dir.path()).unwrap_or_else(|_| dir.path().to_path_buf());
+        assert_eq!(proven.as_path(), root.join("app.db"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_final_link_live_or_dangling() {
+        let dir = private_dir("trusted-db-final-link");
+        let real = dir.path().join("real.db");
+        let _ = std::fs::write(&real, b"");
+        let live = dir.path().join("live.db");
+        let _ = std::os::unix::fs::symlink(&real, &live);
+        let dangling = dir.path().join("dangling.db");
+        let _ = std::os::unix::fs::symlink(dir.path().join("absent.db"), &dangling);
+        for link in [live, dangling] {
+            let refused = TrustedDbPath::prove(&link);
+            assert!(
+                matches!(refused, Err(DbPathRefusal::FinalIsSymlink)),
+                "{refused:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_file_that_is_not_regular() {
+        let dir = private_dir("trusted-db-socket");
+        let socket = dir.path().join("app.db");
+        let listener = std::os::unix::net::UnixListener::bind(&socket);
+        assert!(listener.is_ok(), "{listener:?}");
+        let refused = TrustedDbPath::prove(&socket);
+        assert!(
+            matches!(refused, Err(DbPathRefusal::FinalNotRegular)),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_world_writable_file() {
+        let dir = private_dir("trusted-db-shared-file");
+        let file = dir.path().join("app.db");
+        let _ = std::fs::write(&file, b"");
+        chmod(&file, 0o666);
+        let refused = TrustedDbPath::prove(&file);
+        assert!(
+            matches!(
+                refused,
+                Err(DbPathRefusal::FinalUntrusted {
+                    cause: ScratchRefusal::WritableByOthers
+                })
+            ),
+            "{refused:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_refuses_a_linked_journal_wal_or_shm_sibling() {
+        for sibling in [
+            SqliteSibling::Journal,
+            SqliteSibling::Wal,
+            SqliteSibling::Shm,
+        ] {
+            let dir = private_dir("trusted-db-sibling");
+            let file = dir.path().join("app.db");
+            let named = dir.path().join(format!("app.db{}", sibling.suffix()));
+            let _ = std::os::unix::fs::symlink(dir.path().join("elsewhere"), &named);
+            let refused = TrustedDbPath::prove(&file);
+            assert_eq!(refused, Err(DbPathRefusal::SiblingIsSymlink { sibling }));
+        }
+    }
+
+    /// Every refused location reaches Ipê classified like the driver's own
+    /// open failures: an attacker-reachable location is `AccessDenied`, a
+    /// missing directory or non-file `CannotOpen`.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::panic)] // a fixture location that is not refused cannot be classified
+    fn a_refused_location_carries_its_db_failure() {
+        use super::{IpeDbFailure, IpeError, IpeErrorDetails, IpeErrorKind, IpeMaybe};
+        let dir = private_dir("trusted-db-failure");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let untrusted = TrustedDbPath::prove(&shared.join("app.db"));
+        let missing = TrustedDbPath::prove(&dir.path().join("absent").join("app.db"));
+        let (Err(untrusted), Err(missing)) = (untrusted, missing) else {
+            panic!("both locations must refuse");
+        };
+        let classified = |refusal: &DbPathRefusal| {
+            let IpeError::Error(kind, info) = refusal.error_with(String::new());
+            Some((kind, info.details))
+        };
+        let denied = Some((
+            IpeErrorKind::PermissionDenied,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::AccessDenied)),
+        ));
+        let cannot_open = Some((
+            IpeErrorKind::NotFound,
+            IpeMaybe::Just(IpeErrorDetails::Database(IpeDbFailure::CannotOpen)),
+        ));
+        for refusal in [
+            untrusted,
+            DbPathRefusal::ChainTooDeep,
+            DbPathRefusal::FinalIsSymlink,
+            DbPathRefusal::FinalUnreadable,
+            DbPathRefusal::FinalUntrusted {
+                cause: ScratchRefusal::WritableByOthers,
+            },
+            DbPathRefusal::SiblingIsSymlink {
+                sibling: SqliteSibling::Wal,
+            },
+            DbPathRefusal::OutsideProfile,
+        ] {
+            assert_eq!(classified(&refusal), denied, "{refusal:?}");
+        }
+        for refusal in [missing, DbPathRefusal::FinalNotRegular] {
+            assert_eq!(classified(&refusal), cannot_open, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_db_path_refuses_a_missing_holding_directory() {
+        let dir = private_dir("trusted-db-missing");
+        let refused = TrustedDbPath::prove(&dir.path().join("absent").join("app.db"));
+        assert_eq!(refused, Err(DbPathRefusal::HoldingDirMissing));
+    }
+
+    #[test]
+    fn trusted_db_path_reads_every_memory_spelling_as_memory() {
+        for (url, sharing) in [
+            (":memory:", MemorySharing::Private),
+            ("sqlite::memory:", MemorySharing::Private),
+            ("sqlite://:memory:", MemorySharing::Private),
+            ("sqlite::memory:?cache=shared", MemorySharing::Private),
+            ("file::memory:", MemorySharing::Private),
+            ("file::memory:?cache=shared", MemorySharing::SharedCache),
+            ("sqlite:file:x.db?mode=memory", MemorySharing::Private),
+            (
+                "sqlite:x.db?mode=memory&cache=shared",
+                MemorySharing::SharedCache,
+            ),
+        ] {
+            let got = location(url);
+            assert!(
+                matches!(&got, Ok(SqliteLocation::Memory(memory)) if memory.sharing() == sharing),
+                "{url}: {got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_db_path_maps_each_file_uri_spelling_once() {
+        assert_eq!(file_uri_path("x.db"), Some(PathBuf::from("x.db")));
+        assert_eq!(file_uri_path("/abs/x.db"), Some(PathBuf::from("/abs/x.db")));
+        assert_eq!(
+            file_uri_path("///abs/x.db"),
+            Some(PathBuf::from("/abs/x.db"))
+        );
+        for refused in ["//host/x.db", "//", "x%2Fy.db", "x.db#frag", "//host"] {
+            assert_eq!(file_uri_path(refused), None, "{refused}");
+        }
+        assert_eq!(
+            location("file://host/x.db"),
+            Err(DbConnectError::UntrustedLocation(
+                DbPathRefusal::FileUriName
+            ))
+        );
+        assert_eq!(
+            location("sqlite:file:x%2Fy.db"),
+            Err(DbConnectError::UntrustedLocation(
+                DbPathRefusal::FileUriName
+            ))
+        );
+        assert_eq!(
+            location("sqlite:file:///abs/x.db?mode=rwc"),
+            Ok(SqliteLocation::File(PathBuf::from("/abs/x.db")))
+        );
+        assert_eq!(
+            location("sqlite://data/app.db?mode=rwc"),
+            Ok(SqliteLocation::File(PathBuf::from("data/app.db")))
+        );
+    }
+
+    /// Every in-memory spelling whose name SQLite could read as a URI query, a
+    /// fragment, or a second escape, or whose parameters name nothing memory
+    /// uses, is refused as an invalid URL; a repeated key, which the driver
+    /// reads differently from this reading, is refused on every URL.
+    #[test]
+    fn trusted_db_path_refuses_every_memory_name_sqlite_could_reopen_on_disk() {
+        for url in [
+            "sqlite:file:d/evil%3Fmode=rwc?mode=memory",
+            "sqlite:file%3Ad/evil%3Fmode=rwc?mode=memory",
+            "sqlite:file:d/evil%3Fmode=rw?mode=memory&cache=shared",
+            "sqlite:file:d/evil%3Fvfs=unix?mode=memory",
+            "sqlite:file:d/evil%3Fimmutable=1?mode=memory",
+            "sqlite:file:d/evil%3Fnolock=1%26mode=rwc?mode=memory",
+            "sqlite:FILE:d/evil%3Fmode=rwc?mode=memory",
+            "sqlite:File:d/evil%3Fmode=rwc?mode=memory",
+            "sqlite:file:d/evil%253Fmode=rwc?mode=memory",
+            "sqlite:file:d/evil%2525mode?mode=memory",
+            "sqlite:file:d/evil%23x?mode=memory",
+            "sqlite:file::memory:%3Fmode=rwc?mode=memory",
+            "sqlite:?mode=memory",
+            "sqlite://?mode=memory",
+            "?mode=memory",
+            "sqlite:file::memory:?vfs=unix",
+            "sqlite:file::memory:?immutable=true",
+            "sqlite::memory:?vfs=unix",
+            "sqlite::memory:?immutable=1",
+            "sqlite:d/evil?mode=memory&vfs=unix",
+            "sqlite:d/evil?mode=memory&nolock=1",
+            "sqlite:d/evil?mode=memory&mode=rw",
+            "sqlite:d/evil?mode=rw&mode=memory",
+            "sqlite:d/evil?cache=shared&cache=private&mode=memory",
+            "sqlite:d/evil.db?mode=rwc&mode=rwc",
+        ] {
+            assert_eq!(location(url), Err(DbConnectError::InvalidUrl), "{url}");
+        }
+    }
+
+    /// A memory spelling with anything after it, or with its parameters inside
+    /// an escaped `file:` name, is no in-memory database: it is a file, so it
+    /// opens only once the trusted-directory proof judges it.
+    #[test]
+    fn trusted_db_path_reads_a_suffixed_memory_spelling_as_a_file() {
+        assert_eq!(
+            location("sqlite::memory:x"),
+            Ok(SqliteLocation::File(PathBuf::from(":memory:x")))
+        );
+        assert_eq!(
+            location("sqlite:%3Amemory%3A"),
+            Ok(SqliteLocation::File(PathBuf::from(":memory:")))
+        );
+        for url in [
+            "sqlite:file::memory:%3Fmode=rwc",
+            "sqlite:file::memory:#x",
+            "file::memory:x%3Fmode=rw",
+        ] {
+            assert_eq!(
+                location(url),
+                Err(DbConnectError::UntrustedLocation(
+                    DbPathRefusal::FileUriName
+                )),
+                "{url}"
+            );
+        }
+    }
+
+    /// An in-memory URL never opens a disk file: a name SQLite could read as a
+    /// URI query is refused before any open, and a refused or admitted URL
+    /// alike leaves the world-writable directory it names untouched.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_db_path_refuses_a_memory_name_that_carries_a_query() {
+        let dir = private_dir("trusted-db-memory-query");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let base = shared.display();
+        for (url, refused) in [
+            (
+                format!("sqlite:file:{base}/evil%3Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file%3A{base}/evil%3Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil%3Fmode=rw?mode=memory&cache=shared"),
+                true,
+            ),
+            (
+                format!("sqlite:FILE:{base}/evil%3Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil%253Fmode=rwc?mode=memory"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil?mode=memory&mode=rwc"),
+                true,
+            ),
+            (
+                format!("sqlite:file:{base}/evil?mode=memory&vfs=unix"),
+                true,
+            ),
+            (format!("sqlite:file:{base}/evil?mode=memory"), false),
+            (
+                format!("sqlite:{base}/evil?mode=memory&cache=shared"),
+                false,
+            ),
+        ] {
+            let parsed = DbUrl::parse(&url);
+            if let Ok(url) = &parsed
+                && let Ok(pool) = VettedPool::<sqlx::Sqlite>::connect(url, 1).await
+            {
+                pool.into_pool().close().await;
+            }
+            let created = std::fs::read_dir(&shared).map(|mut d| d.next().is_some());
+            assert!(
+                matches!(created, Ok(false)),
+                "an in-memory URL opened a disk file unproven: {url}"
+            );
+            assert_eq!(
+                matches!(parsed, Err(DbConnectError::InvalidUrl)),
+                refused,
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_db_path_refuses_a_malformed_query() {
+        assert_eq!(
+            location("sqlite:x.db?mode=%zz"),
+            Err(DbConnectError::InvalidUrl)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_db_path_reads_a_store_path_with_a_query_as_a_literal_file_name() {
+        let url = DbUrl::sqlite_path("dir/a?mode=memory.db", super::FileMode::CreateIfMissing);
+        let Ok(DbUrl::Sqlite(sqlite)) = url else {
+            assert!(
+                matches!(url, Ok(DbUrl::Sqlite(_))),
+                "a store path is a SQLite file"
+            );
+            return;
+        };
+        assert_eq!(
+            sqlite.location,
+            SqliteLocation::File(PathBuf::from("./dir/a?mode=memory.db"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn trusted_db_path_gates_a_pool_open_and_names_the_proven_file() {
+        let dir = private_dir("trusted-db-gate");
+        let shared = dir.path().join("shared");
+        mkdir(&shared, 0o777);
+        let refused_url = DbUrl::parse(&format!("sqlite://{}/app.db?mode=rwc", shared.display()));
+        let Ok(refused_url) = refused_url else {
+            assert!(refused_url.is_ok(), "the URL parses");
+            return;
+        };
+        let refused = VettedPool::<sqlx::Sqlite>::connect(&refused_url, 1).await;
+        assert!(
+            matches!(
+                refused,
+                Err(DbConnectError::UntrustedLocation(
+                    DbPathRefusal::Untrusted { .. }
+                ))
+            ),
+            "a world-writable directory was opened"
+        );
+        assert!(
+            !shared.join("app.db").exists(),
+            "the refused file was created"
+        );
+        let url = DbUrl::parse(&format!(
+            "sqlite://{}/app.db?mode=rwc",
+            dir.path().display()
+        ));
+        let Ok(url) = url else {
+            assert!(url.is_ok(), "the URL parses");
+            return;
+        };
+        let opened = VettedPool::<sqlx::Sqlite>::connect(&url, 1).await;
+        assert!(opened.is_ok(), "the private file was refused");
+        if let Ok(pool) = opened {
+            pool.into_pool().close().await;
+        }
+        assert!(dir.path().join("app.db").exists());
+    }
+
+    #[test]
+    fn trusted_db_path_refusals_name_their_fix() {
+        let shown = DbPathRefusal::Untrusted {
+            role: ChainRole::Holding,
+            cause: ScratchRefusal::WritableByOthers,
+            shown: super::ShownDir::of(Path::new("/srv/shared")),
+        }
+        .to_string();
+        assert!(shown.contains("chmod go-w"), "{shown}");
+        assert!(shown.contains("mkdir -m 700"), "{shown}");
+        assert!(
+            DbPathRefusal::FinalIsSymlink
+                .to_string()
+                .contains("symbolic link"),
+            "a final link refusal names the link"
+        );
     }
 }
