@@ -367,7 +367,7 @@ pub fn test_temp_root() -> PathBuf {
 ///
 /// # Panics
 /// When the private directory cannot be created.
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used)] // a test process with no private directory cannot open a file store
 pub fn test_private_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<ScratchDir> = std::sync::OnceLock::new();

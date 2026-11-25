@@ -376,6 +376,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/ipe-cli/tests/audit_native.rs",
+        "a_jailed_app_opens_its_default_database",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
         "release_run_accepts_artifact_dir",
         JAIL_ABSENT,
     ),

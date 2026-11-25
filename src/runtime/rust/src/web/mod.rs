@@ -20791,7 +20791,7 @@ mod web_revocation_tests {
 
     /// A per-test scratch path for a store file named `name`.
     fn scratch_path(name: &str) -> std::path::PathBuf {
-        let path = crate::scratch_core::test_temp_root()
+        let path = crate::scratch_core::test_private_root()
             .join(format!("ipetest_webrev_{name}_{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path

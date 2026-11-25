@@ -14095,7 +14095,7 @@ mod tests {
         const STALE_CHECKED_INSERT: &str = "INSERT INTO v (x) VALUES (1) RETURNING (1)";
 
         /// Connect options for a fresh rollback-journal temp SQLite file.
-        #[allow(clippy::disallowed_methods)] // raw driver options for pools built without the gate
+        #[allow(clippy::expect_used)] // test: a private store root the location proof refuses is a broken test environment
         fn schema_test_file() -> (sqlx::sqlite::SqliteConnectOptions, std::path::PathBuf) {
             static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -14108,8 +14108,9 @@ mod tests {
                     .map_or(0, |d| d.as_nanos())
             ));
             let _ = std::fs::remove_file(&path);
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
+            let options = TrustedDbPath::prove(&path)
+                .expect("the private test root holds a trusted store")
+                .apply(sqlx::sqlite::SqliteConnectOptions::new())
                 .create_if_missing(true)
                 .busy_timeout(SQLITE_BUSY_TIMEOUT);
             (options, path)
@@ -17435,7 +17436,7 @@ mod tests {
         /// connection holds the owned-pool close until that connection has closed:
         /// the close returns with no `-wal` left behind.
         #[tokio::test]
-        #[allow(clippy::disallowed_methods)] // raw driver options for a pool with a test checkout hook
+        #[allow(clippy::expect_used)] // test: a private store root the location proof refuses is a broken test environment
         async fn a_checkout_cut_mid_hook_closes_its_connection_before_the_pools_close() {
             let mut path = crate::scratch_core::test_private_root();
             path.push(format!(
@@ -17447,8 +17448,9 @@ mod tests {
                     .unwrap_or(0)
             ));
             let _ = std::fs::remove_file(&path);
-            let options = sqlx::sqlite::SqliteConnectOptions::new()
-                .filename(&path)
+            let options = TrustedDbPath::prove(&path)
+                .expect("the private test root holds a trusted store")
+                .apply(sqlx::sqlite::SqliteConnectOptions::new())
                 .create_if_missing(true)
                 .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
                 .busy_timeout(SQLITE_BUSY_TIMEOUT);
