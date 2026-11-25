@@ -16,24 +16,27 @@
 use std::fs;
 use std::path::Path;
 
+/// The `rustc` a real toolchain carries beside its `cargo`: the pinned release.
+#[cfg(unix)]
+fn pinned_rustc() -> e2e_support::fake_toolchain::FakeRustc {
+    e2e_support::fake_toolchain::FakeRustc::Reporting(ipe::toolchain::PINNED_RELEASE.to_string())
+}
+
 /// Write an executable fake `cargo` at `dir/cargo` that prints an `E0609`-shaped
 /// error to stderr and exits 1 for a `build` invocation, and prints a minimal
 /// valid `cargo metadata` JSON for a `metadata` invocation (so any metadata
 /// probe on the path does not itself spawn-fail before the build is reached).
 #[cfg(unix)]
-fn write_failing_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
+fn write_failing_cargo(
+    dir: &Path,
+    rustc: &e2e_support::fake_toolchain::FakeRustc,
+) -> std::io::Result<std::path::PathBuf> {
     let script = "#!/bin/sh\n\
          case \"$1\" in\n\
          metadata) echo '{\"target_directory\":\"/tmp/ipe-fake-target\"}'; exit 0 ;;\n\
          *) echo 'error[E0609]: no field `nope` on type `Foo`' 1>&2; exit 1 ;;\n\
          esac\n";
-    let path = dir.join("cargo");
-    fs::write(&path, script)?;
-    let mut perms = fs::metadata(&path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms)?;
-    Ok(path)
+    e2e_support::fake_toolchain::stage(dir, script, rustc)
 }
 
 /// The failing-cargo propagation gate. Unix-only: it relies on a shell fake
@@ -61,7 +64,7 @@ fn build_propagates_a_failed_emitted_cargo_build() {
         panic!("write project: {fixture:?}")
     };
 
-    let fake_cargo = write_failing_cargo(&bin_dir);
+    let fake_cargo = write_failing_cargo(&bin_dir, &pinned_rustc());
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
     // `ipe dev build` emits the fixed package `ipe-app`: an exclusive tree

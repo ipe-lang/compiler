@@ -15,6 +15,32 @@
 use std::fs;
 use std::path::Path;
 
+/// The `rustc` a real toolchain carries beside its `cargo`: the pinned release.
+#[cfg(unix)]
+fn pinned_rustc() -> e2e_support::fake_toolchain::FakeRustc {
+    e2e_support::fake_toolchain::FakeRustc::Reporting(ipe::toolchain::PINNED_RELEASE.to_string())
+}
+
+/// The release one step below the pin: the newest `rustc` the floor refuses.
+#[cfg(unix)]
+fn just_below_pin() -> e2e_support::fake_toolchain::FakeRustc {
+    let pin = ipe::toolchain::PINNED_RELEASE.to_string();
+    let parts: Vec<u32> = pin.split('.').filter_map(|n| n.parse().ok()).collect();
+    let below = match parts.as_slice() {
+        [major, minor, patch] => match (patch.checked_sub(1), minor.checked_sub(1)) {
+            (Some(patch), _) => format!("{major}.{minor}.{patch}"),
+            (None, Some(minor)) => format!("{major}.{minor}.999"),
+            (None, None) => format!("{}.999.999", major.saturating_sub(1)),
+        },
+        _ => String::from("0.0.0"),
+    };
+    e2e_support::fake_toolchain::FakeRustc::Reporting(below)
+}
+
+/// The header `ipe` renders when it refuses the build's compiler.
+#[cfg(unix)]
+const FLOOR_HEADER: &str = "UNSUPPORTED HOST RUST TOOLCHAIN";
+
 /// `assert!(false_marker())` fails a test without tripping
 /// `clippy::assertions_on_constants` (a plain `assert!(false)` would).
 #[allow(clippy::missing_const_for_fn)]
@@ -31,8 +57,10 @@ const PROGRESS_MARKER: &str = "Compiling ipe-app v0.0.0 (fake-cargo-progress-mar
 /// invocation, prints a minimal valid JSON so any metadata probe on the path
 /// does not spawn-fail before the build is reached.
 #[cfg(unix)]
-fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
+fn write_progress_cargo(
+    dir: &Path,
+    rustc: &e2e_support::fake_toolchain::FakeRustc,
+) -> std::io::Result<std::path::PathBuf> {
     // The `build` arm writes the marker to stderr (fd 2), exactly where a real
     // `cargo build` writes its `Compiling…`/`Finished` status.
     let script = format!(
@@ -42,12 +70,7 @@ fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
          *) echo '{PROGRESS_MARKER}' 1>&2; exit 0 ;;\n\
          esac\n"
     );
-    let path = dir.join("cargo");
-    fs::write(&path, script)?;
-    let mut perms = fs::metadata(&path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms)?;
-    Ok(path)
+    e2e_support::fake_toolchain::stage(dir, &script, rustc)
 }
 
 /// `ipe dev build <dir>` must relay the emitted crate's `cargo build` stderr to
@@ -56,6 +79,44 @@ fn write_progress_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
 #[test]
 fn build_streams_the_emitted_cargo_progress() {
     assert_relays_cargo_progress("build");
+}
+
+/// A fake `cargo` whose `rustc` is one release below the pin is refused before
+/// cargo builds: the floor header renders and no cargo progress is relayed.
+#[cfg(unix)]
+#[test]
+fn build_refuses_a_rustc_below_the_pin_before_cargo_builds() {
+    assert_floor_refuses("below_pin", &just_below_pin());
+}
+
+/// A fake `cargo` with no `rustc` beside it is refused before cargo builds:
+/// the compiler the build would run cannot be found, so its version cannot be
+/// confirmed.
+#[cfg(unix)]
+#[test]
+fn build_refuses_a_missing_rustc_before_cargo_builds() {
+    assert_floor_refuses("absent", &e2e_support::fake_toolchain::FakeRustc::Absent);
+}
+
+/// `ipe dev build` with `rustc` must exit non-zero with the floor header, and
+/// the fake cargo's progress marker must never appear: `cargo build` never ran.
+#[cfg(unix)]
+fn assert_floor_refuses(tag: &str, rustc: &e2e_support::fake_toolchain::FakeRustc) {
+    let Some((success, stderr)) = dev_with_fake_cargo("build", tag, rustc) else {
+        return;
+    };
+    assert!(
+        !success,
+        "ipe dev build must refuse the build's compiler ({rustc:?}); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(FLOOR_HEADER),
+        "the refusal must render {FLOOR_HEADER} ({rustc:?}); stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains(PROGRESS_MARKER),
+        "cargo build must not run once the compiler is refused ({rustc:?}); stderr:\n{stderr}"
+    );
 }
 
 /// `ipe dev run <dir>` builds the same way before it execs the binary, so it must
@@ -73,6 +134,28 @@ fn run_streams_the_emitted_cargo_progress() {
 /// `PATH` and assert the fake's stderr marker is relayed to `ipe`'s stderr.
 #[cfg(unix)]
 fn assert_relays_cargo_progress(subcommand: &str) {
+    let Some((_, stderr)) = dev_with_fake_cargo(subcommand, "pinned", &pinned_rustc()) else {
+        return;
+    };
+    // The core assertion: cargo's progress line reached `ipe`'s stderr. Before
+    // the fix, `ipe` buffered cargo's stderr and only replayed it after cargo
+    // exited (or, for `run`, dropped it entirely into a captured error), so the
+    // user saw nothing while cargo ran.
+    assert!(
+        stderr.contains(PROGRESS_MARKER),
+        "ipe {subcommand} must relay the emitted cargo build's progress to stderr; got:\n{stderr}"
+    );
+}
+
+/// Spawn `ipe dev <subcommand> <dir>` under a `PATH` holding only a fake
+/// progress-printing `cargo` and the `rustc` named by `rustc`; return whether
+/// it succeeded and its stderr. `None` after a failed setup assertion.
+#[cfg(unix)]
+fn dev_with_fake_cargo(
+    subcommand: &str,
+    tag: &str,
+    rustc: &e2e_support::fake_toolchain::FakeRustc,
+) -> Option<(bool, String)> {
     const SRC: &str = "module Main exposing (main)\n\nimport Ipe.Io\n\nmain = Io.println \"hi\"\n";
 
     // The runtime dir must resolve for the emit to reach the cargo step.
@@ -81,7 +164,7 @@ fn assert_relays_cargo_progress(subcommand: &str) {
     let ipe_bin = e2e_support::cargo_bin!("ipe");
 
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("ipe_{subcommand}_stream_progress_e2e"));
+        .join(format!("ipe_{subcommand}_{tag}_stream_progress_e2e"));
     e2e_support::scratch::fresh(&dir);
     let bin_dir = dir.join("fakebin");
     let out_dir = dir.join("out");
@@ -90,10 +173,10 @@ fn assert_relays_cargo_progress(subcommand: &str) {
     let fixture = ipe::RootFixture::main(SRC);
     let Ok(fixture) = fixture else {
         assert!(false_marker(), "write project: {fixture:?}");
-        return;
+        return None;
     };
 
-    let fake_cargo = write_progress_cargo(&bin_dir);
+    let fake_cargo = write_progress_cargo(&bin_dir, rustc);
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
     // `ipe dev build`/`ipe dev run` emit the fixed package `ipe-app`: an
@@ -103,7 +186,7 @@ fn assert_relays_cargo_progress(subcommand: &str) {
         e2e_support::target::isolated(e2e_support::target::IsolationReason::FixedPackageName);
     let Ok(isolated) = isolated else {
         assert!(false_marker(), "isolated build target: {isolated:?}");
-        return;
+        return None;
     };
     let target = e2e_support::target::BuildTarget::Isolated(isolated);
 
@@ -122,18 +205,12 @@ fn assert_relays_cargo_progress(subcommand: &str) {
         .output();
     let Ok(out) = out else {
         assert!(false_marker(), "failed to spawn ipe {subcommand}: {out:?}");
-        return;
+        return None;
     };
 
-    // The core assertion: cargo's progress line reached `ipe`'s stderr. Before
-    // the fix, `ipe` buffered cargo's stderr and only replayed it after cargo
-    // exited (or, for `run`, dropped it entirely into a captured error), so the
-    // user saw nothing while cargo ran.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains(PROGRESS_MARKER),
-        "ipe {subcommand} must relay the emitted cargo build's progress to stderr; got:\n{stderr}"
-    );
-
     let _ = fs::remove_dir_all(&dir);
+    Some((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }

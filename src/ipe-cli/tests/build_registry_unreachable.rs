@@ -11,12 +11,20 @@
 use std::fs;
 use std::path::Path;
 
+/// The `rustc` a real toolchain carries beside its `cargo`: the pinned release.
+#[cfg(unix)]
+fn pinned_rustc() -> e2e_support::fake_toolchain::FakeRustc {
+    e2e_support::fake_toolchain::FakeRustc::Reporting(ipe::toolchain::PINNED_RELEASE.to_string())
+}
+
 /// Write an executable fake `cargo` at `dir/cargo` that exits non-zero with
 /// the DNS/registry-error patterns cargo emits when offline or when the
 /// registry is unreachable.
 #[cfg(unix)]
-fn write_offline_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
+fn write_offline_cargo(
+    dir: &Path,
+    rustc: &e2e_support::fake_toolchain::FakeRustc,
+) -> std::io::Result<std::path::PathBuf> {
     // The stderr lines mirror what cargo actually emits on a DNS failure:
     //   "Could not resolve host: index.crates.io"
     //   "failed to load source for dependency dlmalloc"
@@ -27,12 +35,7 @@ fn write_offline_cargo(dir: &Path) -> std::io::Result<std::path::PathBuf> {
             printf 'Caused by:\\n  Could not resolve host: index.crates.io\\n' 1>&2;\
             exit 101 ;;\n\
          esac\n";
-    let path = dir.join("cargo");
-    fs::write(&path, script)?;
-    let mut perms = fs::metadata(&path)?.permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&path, perms)?;
-    Ok(path)
+    e2e_support::fake_toolchain::stage(dir, script, rustc)
 }
 
 /// Registry-unreachable classification gate. Unix-only: relies on a shell fake
@@ -59,7 +62,7 @@ fn build_registry_unreachable_renders_ipe_e0001_not_ice() {
         panic!("write project: {fixture:?}")
     };
 
-    let fake_cargo = write_offline_cargo(&bin_dir);
+    let fake_cargo = write_offline_cargo(&bin_dir, &pinned_rustc());
     assert!(fake_cargo.is_ok(), "write fake cargo: {fake_cargo:?}");
 
     // `ipe dev build` emits the fixed package `ipe-app`: an exclusive tree
