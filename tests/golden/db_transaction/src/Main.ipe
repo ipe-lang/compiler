@@ -13,9 +13,11 @@ import Ipe.String
 import Ipe.Task
 
 -- M5b-db golden: withTransaction COMMIT path and ROLLBACK-on-error path.
--- Uses a file-backed SQLite DB (/tmp/ipe_txn_golden.db) so all pool connections
--- share the same persisted database — independent sequential transactions can
--- therefore observe each other's commits and non-committed rollbacks.
+-- Uses a file-backed SQLite DB (`ipe_txn_golden.db` in the working directory)
+-- so all pool connections share the same persisted database — independent
+-- sequential transactions can therefore observe each other's commits and
+-- non-committed rollbacks. A database opens only in a directory no other user
+-- can write to, so a shared temp directory such as `/tmp` is refused.
 -- CREATE TABLE IF NOT EXISTS + DELETE FROM ensures idempotent test runs.
 
 main =
@@ -64,7 +66,7 @@ main =
                         )
                     )
         )
-        (Path.fromString "/tmp/ipe_txn_golden.db"
+        (Path.fromString "ipe_txn_golden.db"
             |> Result.andThen (Location.file CreateIfMissing)
             |> Task.fromResult
             |> Task.andThen (\loc -> Db.open loc)
