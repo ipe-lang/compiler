@@ -422,10 +422,7 @@ fn the_tier2_probe_builds_an_effectful_surface() {
     let pkg = write_async_app(&root, "async_wrap_probe", "fn main() {}\n");
     let paths = surviving_wrapper_paths(&pkg, ASYNC_WRAP);
     assert!(!paths.is_empty(), "the effectful wrapper survives");
-    let probe = emit_probe_main(
-        &paths,
-        &format!("{}\nmod ffi;", ipe_intern::ffi_crate_scope()),
-    );
+    let probe = emit_probe_main(&paths, &ipe_intern::ffi_crate_root());
     std::fs::write(root.join("src").join("main.rs"), probe).expect("the probe root is written");
 
     let built = e2e_support::build_rust_binary("ffi_async_wrapper_probe", &root);

@@ -8,13 +8,16 @@
 //! gains an item, and a binding that builds under the hand root then fails in
 //! the shipped crate (or the reverse).
 //!
-//! The scan walks every `.rs` file under `src/` and `tools/` and refuses a
-//! string literal, or a `concat!`-joined one, whose text holds a scope item.
-//! Text is compared with its whitespace removed, so neither reflowing nor
-//! re-indenting a copy hides it. Attribute content (a doc comment included)
-//! is prose, not a crate root, so it is not scanned. A file the lexer turns
-//! away is checked over its raw text, so what the scan cannot read is never
-//! a pass by default.
+//! The scan walks every file under `src/` and `tools/` and refuses a string
+//! or byte-string literal, or a `concat!`-joined one, whose text holds a
+//! scope item or declares the bindings module (`mod ffi`): a root assembled
+//! from `format!` pieces still has to declare the module it compiles. Text is
+//! compared with its whitespace removed, so neither reflowing nor re-indenting
+//! a copy hides it. Attribute content (a doc comment included) is prose, not a
+//! crate root, so it is not scanned. A `.rs` file the lexer turns away is
+//! checked over its raw text, and so is every other non-Markdown file (a
+//! template an `include_str!` reads), so what the scan cannot read is never a
+//! pass by default.
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -24,12 +27,22 @@ use proc_macro2::{Delimiter, TokenStream, TokenTree};
 /// The crate-scope-scan fixtures, relative to this crate's manifest directory.
 const FIXTURES: &str = "tests/fixtures/crate_scope_scan";
 
+/// The same fixtures, workspace-relative: planted roots this scan owns.
+const FIXTURES_REL: &str = "tools/e2e-support/tests/fixtures/crate_scope_scan/";
+
+/// The bindings module every crate root that compiles emitted `src/ffi.rs`
+/// declares. Kept apart from the keyword so this file spells no declaration.
+const BINDINGS_MODULE: &str = "ffi";
+
+/// What may follow a module declaration's name: `;` or an inline body.
+const DECLARATION_ENDS: [char; 2] = [';', '{'];
+
 /// The trees the scan walks, relative to the workspace root.
 const ROOTS: &[&str] = &["src", "tools"];
 
-/// Paths that own the scope's text: the SSOT and the template it is asserted
-/// against.
-const OWNERS: &[&str] = &[SSOT, "src/compiler/backend/rust/templates/"];
+/// Paths that own the scope's text: the SSOT, the template it is asserted
+/// against, and this scan's planted fixtures.
+const OWNERS: &[&str] = &[SSOT, "src/compiler/backend/rust/templates/", FIXTURES_REL];
 
 /// The crate-scope SSOT, workspace-relative.
 const SSOT: &str = "src/compiler/intern/src/ffi_scope.rs";
@@ -53,12 +66,18 @@ const ALLOWLIST: &[(&str, &str)] = &[
 /// One refused literal: its 1-based line, or 0 for an unlexable file.
 type Finding = usize;
 
-/// The scope items as the scan compares them: whitespace removed, the
-/// closing `;` trimmed so a copy without it still matches.
+/// The scope items as the scan compares them (whitespace removed, the
+/// closing `;` trimmed so a copy without it still matches), then the
+/// bindings-module declarations.
 fn needles() -> Vec<String> {
     ipe_intern::FFI_SCOPE_ITEMS
         .iter()
         .map(|item| squash(item.trim_end_matches(';')))
+        .chain(
+            DECLARATION_ENDS
+                .iter()
+                .map(|end| format!("mod{BINDINGS_MODULE}{end}")),
+        )
         .collect()
 }
 
@@ -141,9 +160,12 @@ fn scan_tokens(tokens: TokenStream, needles: &[String], out: &mut Vec<Finding>) 
     }
 }
 
+/// The text of a string, byte-string or C-string literal.
 fn str_value(lit: &proc_macro2::Literal) -> Option<String> {
     match syn::Lit::new(lit.clone()) {
         syn::Lit::Str(s) => Some(s.value()),
+        syn::Lit::ByteStr(b) => Some(String::from_utf8_lossy(&b.value()).into_owned()),
+        syn::Lit::CStr(c) => Some(c.value().to_string_lossy().into_owned()),
         _ => None,
     }
 }
@@ -156,8 +178,8 @@ fn workspace_root() -> PathBuf {
         .map_or_else(|| dir.clone(), Path::to_path_buf)
 }
 
-/// Every `.rs` file under `dir`, workspace-relative, skipping build output
-/// and hidden directories. Links are not followed.
+/// Every file under `dir`, workspace-relative, skipping build output and
+/// hidden directories. Links are not followed.
 fn rust_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -175,11 +197,32 @@ fn rust_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
             }
             rust_files(root, &path, out);
         } else if kind.is_file()
-            && path.extension().is_some_and(|e| e == "rs")
             && let Ok(rel) = path.strip_prefix(root)
         {
             out.push(rel.to_string_lossy().replace('\\', "/"));
         }
+    }
+}
+
+/// The findings in one file: a `.rs` file is lexed, Markdown is prose, and
+/// any other text is judged raw. The extensions match exactly, so an
+/// odd-case one is judged raw, the stricter reading. A file that is not
+/// UTF-8 can be neither compiled as Rust nor read by `include_str!`, so it
+/// holds no crate root.
+fn scan_file(rel: &str, path: &Path, needles: &[String]) -> Vec<Finding> {
+    let extension = Path::new(rel).extension().and_then(|e| e.to_str());
+    if extension == Some("md") {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    if extension == Some("rs") {
+        scan_source(&text, needles)
+    } else if holds_item(&text, needles) {
+        vec![0]
+    } else {
+        Vec::new()
     }
 }
 
@@ -208,8 +251,7 @@ fn tree_findings() -> Vec<(String, Vec<Finding>)> {
         .into_iter()
         .filter(|rel| !is_owner(rel))
         .filter_map(|rel| {
-            let text = std::fs::read_to_string(root.join(&rel)).ok()?;
-            let found = scan_source(&text, &needles);
+            let found = scan_file(&rel, &root.join(&rel), &needles);
             (!found.is_empty()).then_some((rel, found))
         })
         .collect()
@@ -238,6 +280,32 @@ fn prose_and_unrelated_literals_pass() {
 }
 
 #[test]
+fn a_root_assembled_from_pieces_or_bytes_is_refused() {
+    let found = fixture("pieces_root.rs.txt");
+    assert_eq!(
+        found.len(),
+        3,
+        "the format!-built, byte-string and inline-module roots must each be refused: {found:?}"
+    );
+}
+
+#[test]
+fn a_template_outside_rust_source_is_refused() {
+    let root = workspace_root();
+    let rel = format!("{FIXTURES_REL}template_root.txt");
+    assert_eq!(
+        scan_file(&rel, &root.join(&rel), &needles()),
+        vec![0],
+        "a non-Rust template holding a crate root is judged raw"
+    );
+    let md = format!("{FIXTURES_REL}prose.md");
+    assert!(
+        scan_file(&md, &root.join(&md), &needles()).is_empty(),
+        "Markdown is prose, never a crate root"
+    );
+}
+
+#[test]
 fn an_unlexable_file_holding_a_root_is_refused() {
     let text = format!("\"unterminated {}", ipe_intern::RUNTIME_GLOB_ITEM);
     assert_eq!(scan_source(&text, &needles()), vec![0]);
@@ -253,7 +321,7 @@ fn every_crate_root_takes_the_scope_from_its_ssot() {
         .collect();
     assert!(
         unexpected.is_empty(),
-        "hand-written FFI crate roots; render them from `ipe_intern::ffi_crate_scope()`:\n{}",
+        "hand-written FFI crate roots; render them from `ipe_intern::ffi_crate_root()` or `ffi_crate_scope()`:\n{}",
         unexpected.join("\n")
     );
     let stale: Vec<&str> = ALLOWLIST

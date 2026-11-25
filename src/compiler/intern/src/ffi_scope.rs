@@ -40,6 +40,13 @@ pub fn ffi_crate_scope() -> String {
     FFI_SCOPE_ITEMS.join("\n")
 }
 
+/// The whole crate root a crate that compiles emitted `src/ffi.rs` opens
+/// with: the FFI crate scope, then the bindings module's declaration.
+#[must_use]
+pub fn ffi_crate_root() -> String {
+    format!("{}\nmod ffi;\n", ffi_crate_scope())
+}
+
 /// The task type carrying `inner`, spelled through the scope's one-argument alias.
 #[must_use]
 pub fn ffi_task_type(inner: &str) -> String {
@@ -48,7 +55,10 @@ pub fn ffi_task_type(inner: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FFI_SCOPE_ITEMS, FFI_TASK_ALIAS, TASK_ALIAS_ITEM, ffi_crate_scope, ffi_task_type};
+    use super::{
+        FFI_SCOPE_ITEMS, FFI_TASK_ALIAS, TASK_ALIAS_ITEM, ffi_crate_root, ffi_crate_scope,
+        ffi_task_type,
+    };
 
     #[test]
     fn the_scope_carries_every_item_once() {
@@ -56,6 +66,13 @@ mod tests {
         for item in FFI_SCOPE_ITEMS {
             assert_eq!(scope.matches(item).count(), 1, "{item}");
         }
+    }
+
+    #[test]
+    fn the_crate_root_is_the_scope_then_the_bindings_module() {
+        let root = ffi_crate_root();
+        assert!(root.starts_with(&ffi_crate_scope()));
+        assert_eq!(root.matches("mod ffi;").count(), 1);
     }
 
     #[test]

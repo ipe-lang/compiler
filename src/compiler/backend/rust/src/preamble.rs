@@ -290,6 +290,71 @@ mod tests {
         }
     }
 
+    /// Whether `src` declares `item` as a crate-root item with no outer
+    /// attribute: the item's tokens at the top level of the lexed file, after
+    /// an item boundary (`;`, a `{ … }` body, an inner attribute, or the start).
+    ///
+    /// The lexer drops comments and keeps a string whole, and a nested module's
+    /// body is one group, so an item in any of them is never at the top level.
+    fn declares_at_root(src: &str, item: &str) -> bool {
+        use proc_macro2::{Delimiter, TokenStream, TokenTree};
+        let lex = |s: &str| -> Vec<String> {
+            s.parse::<TokenStream>()
+                .map(|ts| ts.into_iter().map(|tt| tt.to_string()).collect())
+                .unwrap_or_default()
+        };
+        let Ok(stream) = src.parse::<TokenStream>() else {
+            return false;
+        };
+        let trees: Vec<TokenTree> = stream.into_iter().collect();
+        let texts: Vec<String> = trees.iter().map(ToString::to_string).collect();
+        let needle = lex(item);
+        if needle.is_empty() {
+            return false;
+        }
+        let boundary = |i: usize| -> bool {
+            let Some(before) = i.checked_sub(1) else {
+                return true;
+            };
+            match trees.get(before) {
+                Some(TokenTree::Punct(p)) => p.as_char() == ';',
+                Some(TokenTree::Group(g)) => match g.delimiter() {
+                    Delimiter::Brace => true,
+                    Delimiter::Bracket => before.checked_sub(1).is_some_and(
+                        |b| matches!(trees.get(b), Some(TokenTree::Punct(p)) if p.as_char() == '!'),
+                    ),
+                    Delimiter::Parenthesis | Delimiter::None => false,
+                },
+                Some(TokenTree::Ident(_) | TokenTree::Literal(_)) | None => false,
+            }
+        };
+        texts
+            .windows(needle.len())
+            .enumerate()
+            .any(|(i, w)| w == needle.as_slice() && boundary(i))
+    }
+
+    /// Every scope item is a crate-root item of the template, which the
+    /// line-based `const` check cannot tell from one inside a block comment,
+    /// a raw string, or a gated nested module.
+    #[test]
+    fn ffi_scope_item_hidden_from_the_crate_root_is_refused() {
+        for item in ipe_intern::FFI_SCOPE_ITEMS {
+            assert!(declares_at_root(GOLDEN, item), "{item}");
+            let hidden = [
+                format!("/*\n{item}\n*/"),
+                format!("const _: &str = r#\"\n{item}\n\"#;"),
+                format!("#[cfg(windows)]\nmod gated {{\n{item}\n}}"),
+                format!("#[cfg(windows)]\n{item}"),
+                format!("/// note\n{item}"),
+            ];
+            for wrapped in hidden {
+                let src = GOLDEN.replacen(item, &wrapped, 1);
+                assert!(!declares_at_root(&src, item), "{wrapped}");
+            }
+        }
+    }
+
     /// Independent copy of the template, reconstructed by 1-indexed line ranges
     /// so the assertions don't merely echo the implementation's anchor logic.
     const GOLDEN: &str = include_str!("../templates/main.rs");

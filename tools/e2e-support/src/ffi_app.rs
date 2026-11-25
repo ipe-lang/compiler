@@ -15,7 +15,7 @@ use std::path::Path;
 /// the backend's template carries, then `mod ffi;`.
 #[must_use]
 pub fn crate_prelude() -> String {
-    format!("{}\nmod ffi;\n", ipe_intern::ffi_crate_scope())
+    ipe_intern::ffi_crate_root()
 }
 
 /// The `src/ffi.rs` module the backend wraps one package's `bindings` in.
