@@ -17,6 +17,9 @@
  *      timer renders land.
  *   5. Settled — once the `add` click is answered, the next event carries no
  *      value for the field.
+ *   6. Order — an event reaches the server only after every edit the user made
+ *      before it: one event is in flight at a time, and a send first posts the
+ *      edits still waiting on their debounce.
  *
  * Runs against the control-sync example (`examples/shapes/web/control-sync`).
  *
@@ -45,10 +48,22 @@ async function open(page, path = "/") {
   await waitReady(page);
 }
 
-/** Click the element `selector` and wait for the answer to the event it sends. */
-async function clickAnswered(page, selector) {
-  const answered = page.waitForResponse((r) => isEventPost(r.request()), { timeout: 10000 });
-  await page.click(selector);
+/** Whether `request` is an event POST that `handlerId` raised. */
+function isEventOf(request, handlerId) {
+  return isEventPost(request) && JSON.parse(request.postData() ?? "{}").handlerId === handlerId;
+}
+
+/**
+ * Click the element `selector` and wait for the answer to the event it sends,
+ * never to an earlier event's, such as the edit the click flushes ahead of it.
+ */
+async function clickAnswered(page, selector, click = () => page.click(selector)) {
+  const handlerId = await page.locator(selector).getAttribute("data-ipe-hid");
+  expect(handlerId, `${selector} raises an event`).toBeTruthy();
+  const answered = page.waitForResponse((r) => isEventOf(r.request(), handlerId), {
+    timeout: 10000,
+  });
+  await click();
   expect((await answered).status()).toBe(200);
 }
 
@@ -105,6 +120,66 @@ test("a focused field keeps every typed character while renders land", async ({ 
   }
   expect(await ticks.textContent(), "timer renders landed while typing").not.toBe(before);
   await expect(page.locator("#draft")).toBeFocused();
+});
+
+test("a click never reaches the server before the edit posted ahead of it", async ({ page }) => {
+  await open(page);
+  // Hold the draft's input event at the network for a window. A client that
+  // posts the click meanwhile has the click answered first, and only then is
+  // the input event let through.
+  let clickFirst = null;
+  let releaseInput = () => {};
+  const clickLanded = new Promise((resolve) => {
+    releaseInput = resolve;
+  });
+  await page.route("**/_ipe/event", async (route) => {
+    const body = JSON.parse(route.request().postData() ?? "{}");
+    if (body.msg === "input") {
+      await Promise.race([clickLanded, new Promise((resolve) => setTimeout(resolve, 1000))]);
+      clickFirst ??= false;
+      await route.continue();
+      return;
+    }
+    clickFirst ??= true;
+    const response = await route.fetch();
+    releaseInput();
+    await route.fulfill({ response });
+  });
+  await page.fill("#draft", "first");
+  await clickAnswered(page, "#add");
+  expect(clickFirst, "the click was posted while the input event was unanswered").toBe(false);
+  await expect(page.locator("#text0")).toHaveText("first", { timeout: 10000 });
+});
+
+test("a click the field keeps focus through still follows the edit typed before it", async ({
+  page,
+}) => {
+  await open(page);
+  await page.fill("#draft", "first");
+  // A synthetic click moves no focus, so no blur sends the edit ahead of it.
+  await clickAnswered(page, "#add", () => page.locator("#add").dispatchEvent("click"));
+  await expect(page.locator("#text0")).toHaveText("first", { timeout: 10000 });
+});
+
+test("a click queued behind an unreadable stale answer still goes", async ({ page }) => {
+  await open(page);
+  // The draft's input event is answered, once the click is queued behind it,
+  // by a stale-render refusal whose body is no JSON.
+  await page.route(
+    "**/_ipe/event",
+    async (route) => {
+      await page.waitForFunction(() => window.__ipeEventQueue.length > 0, null, { timeout: 5000 });
+      await route.fulfill({
+        status: 409,
+        headers: { "X-Ipe-Web": "1", "Content-Type": "application/json" },
+        body: "{",
+      });
+    },
+    { times: 1 },
+  );
+  await page.fill("#draft", "first");
+  await clickAnswered(page, "#add");
+  await expect(page.locator("#text0")).toHaveCount(1, { timeout: 10000 });
 });
 
 test("an answered edit rides on no later event", async ({ page }) => {

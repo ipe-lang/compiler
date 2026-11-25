@@ -295,21 +295,19 @@ fn the_table_returns_only_named_outcomes_and_ends_refused() {
 fn a_transient_answer_keeps_the_queue_order() {
     let source = code();
     let poster = body_of(&source, THE_POSTER);
-    let failures = poster
-        .matches("__ipeOnPostFailure(body, fromQueue);")
-        .count();
+    let failures = poster.matches("__ipeOnPostFailure(body);").count();
     assert!(
         failures == 2,
         "`{THE_POSTER}` reaches the retry path from {failures} sites; the `TRANSIENT` arm and the network failure are the two"
     );
     assert!(
         poster.matches("__ipeOnPostFailure(").count() == failures,
-        "every retry in `{THE_POSTER}` must carry whether the body is the queue's head"
+        "every retry in `{THE_POSTER}` must hand back the body it posted"
     );
     let failure = body_of(&source, "__ipeOnPostFailure");
     assert!(
-        failure.contains("__ipeEnqueue(body, fromQueue);"),
-        "`__ipeOnPostFailure` must put the queue's own head back at the head"
+        failure.contains("__ipeEnqueue(body, true);"),
+        "`__ipeOnPostFailure` must put the failed event back at the head: every queued event was sent after it"
     );
     let enqueue = body_of(&source, "__ipeEnqueue");
     assert!(
@@ -320,8 +318,8 @@ fn a_transient_answer_keeps_the_queue_order() {
     );
     let drain = body_of(&source, "__ipeDrainQueue");
     assert!(
-        drain.contains("if (__ipeQueueInFlight) return;"),
-        "`__ipeDrainQueue` must post one queued event at a time"
+        drain.contains("if (__ipeEventInFlight) return;"),
+        "`__ipeDrainQueue` must post one event at a time"
     );
     assert!(
         drain.contains("__ipePostEvent(head, true);"),
@@ -329,9 +327,29 @@ fn a_transient_answer_keeps_the_queue_order() {
     );
     assert!(
         poster.contains(
-            "if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeQueueInFlight)) { __ipeEnqueue(body, false);"
+            "if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeEventInFlight)) { __ipeEnqueue(body, false);"
         ),
-        "a live event posted while the queue holds or posts events must join its tail"
+        "an event posted while the queue holds events or an event is in flight must join its tail"
+    );
+}
+
+#[test]
+fn an_event_is_posted_after_every_edit_typed_before_it() {
+    let source = code();
+    let send = body_of(&source, "__ipeSend");
+    assert!(
+        send.contains("if (__ipeEnded) return; __ipeSendAllPendingInput();"),
+        "`__ipeSend` must post every pending debounced input before its own event"
+    );
+    let all = body_of(&source, "__ipeSendAllPendingInput");
+    assert!(
+        all.contains("__ipeSendPendingInput(keys[i]);"),
+        "`__ipeSendAllPendingInput` must send each pending input"
+    );
+    let one = body_of(&source, "__ipeSendPendingInput");
+    assert!(
+        one.contains("clearTimeout(__ipeInputTimers[key]); delete __ipeInputPending[key];"),
+        "`__ipeSendPendingInput` must retire the debounce it sends, so it is never sent twice"
     );
 }
 
@@ -406,27 +424,27 @@ fn no_answer_field_is_read_by_name() {
 }
 
 #[test]
-fn the_queue_slot_is_released_only_by_the_post_holding_it() {
+fn the_event_slot_is_released_only_by_the_post_holding_it() {
     let source = code();
     let poster = body_of(&source, THE_POSTER);
     assert!(
-        source.contains("var __ipeQueueInFlight = null;"),
-        "`__ipeQueueInFlight` must hold the posted body or null"
+        source.contains("var __ipeEventInFlight = null;"),
+        "`__ipeEventInFlight` must hold the posted body or null"
     );
     assert!(
-        poster.contains("if (fromQueue) __ipeQueueInFlight = body;"),
-        "`{THE_POSTER}` must hold the queue slot with the body it posts"
+        poster.contains("return; } __ipeEventInFlight = body;"),
+        "`{THE_POSTER}` must hold the event slot with every body it posts, live or queued"
     );
-    let release = "if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;";
+    let release = "if (__ipeEventInFlight === body) __ipeEventInFlight = null;";
     let releases = poster.matches(release).count();
     assert!(
         releases == 2,
-        "`{THE_POSTER}` releases the queue slot from {releases} sites; the answer and the network failure are the two"
+        "`{THE_POSTER}` releases the event slot from {releases} sites; the answer and the network failure are the two"
     );
-    let writes = source.matches("__ipeQueueInFlight = ").count();
+    let writes = source.matches("__ipeEventInFlight = ").count();
     assert!(
         writes == releases + 2,
-        "client.js writes `__ipeQueueInFlight` {writes} times; only its declaration, the post holding it and that post's two releases do"
+        "client.js writes `__ipeEventInFlight` {writes} times; only its declaration, the post holding it and that post's two releases do"
     );
 }
 

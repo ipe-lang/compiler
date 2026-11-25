@@ -1618,6 +1618,21 @@ function __ipeDebouncedSend(msgName, args, hid, delay, epoch, focus) {
     __ipeSend(msgName, args, hid, { noLoader: true, epoch: epoch, focus: focus });
   }, delay);
 }
+// Send the pending debounced input of `key` now, if any.
+function __ipeSendPendingInput(key) {
+  var p = __ipeInputPending[key];
+  if (!p) return;
+  clearTimeout(__ipeInputTimers[key]);
+  delete __ipeInputPending[key];
+  __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus });
+}
+// Send every pending debounced input now. Each was typed before the event
+// about to be sent, so each is posted ahead of it: an event never reaches the
+// server before an edit the user made first.
+function __ipeSendAllPendingInput() {
+  var keys = Object.keys(__ipeInputPending);
+  for (var i = 0; i < keys.length; i++) __ipeSendPendingInput(keys[i]);
+}
 // Flush pending debounced input on blur (tab away / click elsewhere).
 // Without this, typing fast then tabbing loses the last keystrokes
 // because the debounce hasn't fired yet.
@@ -1627,12 +1642,7 @@ __ipeDoc.on("focusout", function(ev) {
   if (!(t instanceof Element)) return;
   var hid = __ipeNode.attr(t, "data-ipe-hid");
   var key = hid || __ipeNode.attr(t, "ipe-input");
-  if (key && __ipeInputPending[key]) {
-    clearTimeout(__ipeInputTimers[key]);
-    var p = __ipeInputPending[key];
-    delete __ipeInputPending[key];
-    __ipeSend(p.msgName, p.args, p.hid, { noLoader: true, epoch: p.epoch, focus: p.focus });
-  }
+  if (key) __ipeSendPendingInput(key);
 }, true);
 
 // ── I3: flush on unmount ─────────────────────────────────────
@@ -1770,6 +1780,7 @@ window.addEventListener("pagehide", __ipeFlushPendingBeacon);
 //   * inputState carries the user's value of every pending field.
 function __ipeSend(msgName, args, handlerId, opts) {
   if (__ipeEnded) return;
+  __ipeSendAllPendingInput();
   opts = opts || {};
   if (!opts.noLoader) __ipeLoaderStart();
   __ipeClientSeq++;
@@ -1833,21 +1844,23 @@ function __ipeEventAnswer(r) {
   if (status === 413 || status === 414 || status === 431) return __IPE_EVENT_ANSWER.TOO_LARGE;
   return __IPE_EVENT_ANSWER.REFUSED;
 }
-// The queued event posted and still unanswered, or null. Queued events go one
-// at a time, so a later one never reaches the server before an earlier one.
-// Only the post holding it releases it: a late answer to an earlier post never
-// frees the slot a later one holds.
-var __ipeQueueInFlight = null;
-// `fromQueue` marks the head of the retry queue. A live event posted while
-// the queue holds or posts events joins its tail, so it never overtakes them.
+// The event posted and still unanswered, or null. Events go one at a time, so
+// a later one never reaches the server before an earlier one: two posts in
+// flight at once race for the session, and the later act could be dispatched
+// first. Only the post holding it releases it: a late answer to an earlier
+// post never frees the slot a later one holds.
+var __ipeEventInFlight = null;
+// `fromQueue` marks the head of the retry queue. An event posted while the
+// queue holds events or an event is in flight joins its tail, so it never
+// overtakes them.
 function __ipePostEvent(body, fromQueue) {
   if (__ipeEnded) return;
-  if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeQueueInFlight)) {
+  if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeEventInFlight)) {
     __ipeEnqueue(body, false);
-    if (__ipeRetryTimer === null && !__ipeQueueInFlight) __ipeDrainQueue();
+    if (__ipeRetryTimer === null && !__ipeEventInFlight) __ipeDrainQueue();
     return;
   }
-  if (fromQueue) __ipeQueueInFlight = body;
+  __ipeEventInFlight = body;
   // Phase 1.2 — attach the per-session CSRF token. The server-side
   // middleware () rejects POSTs
   // without a matching X-Ipe-Csrf / __ipe_csrf cookie pair. Empty
@@ -1861,7 +1874,7 @@ function __ipePostEvent(body, fromQueue) {
     body: JSON.stringify(body),
     credentials: "same-origin"
   }).then(function(r){
-    if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;
+    if (__ipeEventInFlight === body) __ipeEventInFlight = null;
     var kind = __ipeEventAnswer(r);
     switch (kind) {
       case __IPE_EVENT_ANSWER.STALE:
@@ -1878,7 +1891,12 @@ function __ipePostEvent(body, fromQueue) {
           // The epoch gate orders this render against the DOM on screen; the
           // seq it carries is the session's, which an earlier frame may equal.
           __ipeAdoptFullBody(data.epoch, function() { __ipePatch(data.body); }, data.route);
-        }).catch(function() { __ipeLoaderEnd(); });
+        }).catch(function() {
+          // An unreadable refusal still answers the event: the events queued
+          // behind it go.
+          __ipeLoaderEnd();
+          __ipeDrainQueue();
+        });
       case __IPE_EVENT_ANSWER.SESSION_LOST:
         // The marked 404 no DOM may show. The probe confirms it and reloads,
         // and the event waits in the retry queue meanwhile.
@@ -1888,7 +1906,7 @@ function __ipePostEvent(body, fromQueue) {
         // A timeout, a full queue, or a server or deploying edge that is up
         // but not answering: the same retry path as a network failure.
         __ipeLoaderEnd();
-        __ipeOnPostFailure(body, fromQueue);
+        __ipeOnPostFailure(body);
         return;
       case __IPE_EVENT_ANSWER.TOO_LARGE:
         __ipeOnPostRefused(body, __IPE_EVENT_ANSWER.TOO_LARGE);
@@ -1943,9 +1961,9 @@ function __ipePostEvent(body, fromQueue) {
       if (ipeMark === "1" && typeof data.seq === "number") __ipeRetirePending(body.seq);
     });
   }).catch(function() {
-    if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;
+    if (__ipeEventInFlight === body) __ipeEventInFlight = null;
     __ipeLoaderEnd();
-    __ipeOnPostFailure(body, fromQueue);
+    __ipeOnPostFailure(body);
   });
 }
 // A refused event is never sent again. The values it carried are left out of
@@ -2029,8 +2047,10 @@ function __ipeEnqueue(body, atHead) {
   if (atHead) __ipeEventQueue.unshift(body);
   else __ipeEventQueue.push(body);
 }
-function __ipeOnPostFailure(body, fromQueue) {
-  __ipeEnqueue(body, fromQueue);
+// A failed event goes back to the head of the queue: every event queued since
+// was sent after it.
+function __ipeOnPostFailure(body) {
+  __ipeEnqueue(body, true);
   __ipeShowReconnecting();
   __ipeScheduleRetry();
 }
@@ -2084,7 +2104,7 @@ function __ipeScheduleRetry() {
 }
 function __ipeDrainQueue() {
   if (__ipeEnded) return;
-  if (__ipeQueueInFlight) return;
+  if (__ipeEventInFlight) return;
   if (__ipeEventQueue.length === 0) return;
   // Send the head of the queue. If it succeeds, __ipeOnPostSuccess
   // recurses into __ipeDrainQueue to send the next one. If it fails,
