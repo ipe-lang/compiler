@@ -44,7 +44,7 @@ use crate::pinned_deps::{Agrees, FfiPosture, LOCK_CAP, LockDrift, LockRefusal, P
 use crate::progress::{Door, Mode, Stage};
 use crate::remote_ingest::{
     Captured, GroupedChild, LOCK_FETCH_LIMITS, LOCK_RESOLVE_LIMITS, LocalCeiling, LocalRefusal,
-    LocalSource, LocalWall, METADATA_LIMITS, RunError, run_local,
+    LocalSource, LocalWall, METADATA_LIMITS, RunError, SOURCE_UNPACK_LIMITS, run_local,
 };
 use crate::style::TerminalSafe;
 use crate::target_dir::LinkableTargetDir;
@@ -1144,8 +1144,21 @@ enum LockEnv<'a> {
     /// The build command's program and environment, so the lock comes from
     /// the toolchain that consumes it.
     Build(&'a Command),
-    /// A bare `cargo` with the ambient environment.
-    Bare(&'a Path),
+    /// A bare `cargo` with the ambient environment, plus the named toolchain
+    /// homes set explicitly.
+    Bare(&'a Path, ToolHomes<'a>),
+}
+
+/// The toolchain homes a host-side cargo child is given explicitly, as
+/// `NAME`/directory pairs, so it reads and writes the very homes a later
+/// step (the Tier-2 jail) binds. Empty leaves the ambient environment.
+pub type ToolHomes<'a> = &'a [(&'static str, &'a Path)];
+
+/// Set each toolchain home of `homes` on `child`.
+fn apply_tool_homes(homes: ToolHomes<'_>, child: &mut Command) {
+    for (name, dir) in homes {
+        child.env(name, dir);
+    }
 }
 
 impl LockEnv<'_> {
@@ -1153,15 +1166,15 @@ impl LockEnv<'_> {
     fn program(&self) -> &OsStr {
         match self {
             Self::Build(build) => build.get_program(),
-            Self::Bare(cargo) => cargo.as_os_str(),
+            Self::Bare(cargo, _) => cargo.as_os_str(),
         }
     }
 
-    /// Give `update` the build's environment; a bare `cargo` adds none.
+    /// Give `update` the build's environment; a bare `cargo` adds only its homes.
     fn forward_into(self, update: &mut Command) {
         match self {
             Self::Build(build) => forward_build_env(build, update),
-            Self::Bare(_) => {}
+            Self::Bare(_, homes) => apply_tool_homes(homes, update),
         }
     }
 }
@@ -1233,7 +1246,7 @@ pub enum LockOutcome {
 /// stdin closed, and judged FFI-bearing: user crates may add names, never
 /// move a pin. A non-zero exit is a [`LockOutcome::Unresolved`] and a
 /// disagreement a [`LockOutcome::Drift`], not errors: the caller decides
-/// whether either is fatal.
+/// whether either is fatal. `homes` are set on the update explicitly.
 ///
 /// # Errors
 /// - [`CliError::OutputRefused`] if `crate_dir` or its lock is a link.
@@ -1242,7 +1255,11 @@ pub enum LockOutcome {
 /// - [`CliError::Io`] (naming `crate_dir`) if cargo cannot be spawned or
 ///   waited on, or the lock cannot be written or read back.
 /// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
-pub fn lock_offline(cargo: &Path, crate_dir: &Path) -> Result<LockOutcome, CliError> {
+pub fn lock_offline(
+    cargo: &Path,
+    crate_dir: &Path,
+    homes: ToolHomes<'_>,
+) -> Result<LockOutcome, CliError> {
     let posture = FfiPosture::FfiBearing;
     let set = match crate::pinned_deps::pinned_set() {
         Ok(set) => set,
@@ -1251,7 +1268,8 @@ pub fn lock_offline(cargo: &Path, crate_dir: &Path) -> Result<LockOutcome, CliEr
     let held = HeldDir::open(crate_dir)?
         .ok_or_else(|| CliError::from(OutputRefusal::Replaced(crate_dir.to_path_buf())))?;
     seed_lock(&held, set)?;
-    let updated = update_lock_offline_within(LockEnv::Bare(cargo), crate_dir, LOCK_RESOLVE_LIMITS)?;
+    let updated =
+        update_lock_offline_within(LockEnv::Bare(cargo, homes), crate_dir, LOCK_RESOLVE_LIMITS)?;
     if !updated.status.success() {
         return Ok(LockOutcome::Unresolved {
             code: updated.status.code(),
@@ -1260,6 +1278,64 @@ pub fn lock_offline(cargo: &Path, crate_dir: &Path) -> Result<LockOutcome, CliEr
     Ok(match judge_lock(&held, set, posture)? {
         Ok(Agrees { .. }) => LockOutcome::Seeded,
         Err(drift) => LockOutcome::Drift(refusal_of(crate_dir, posture, drift)),
+    })
+}
+
+/// Proof that every locked host-platform source of a crate sits unpacked in
+/// its cargo home. Only [`unpack_locked_sources`] builds one.
+#[derive(Debug)]
+pub struct SourcesUnpacked(());
+
+/// How an offline unpack of a crate's locked sources ended.
+#[derive(Debug)]
+pub enum SourcesOutcome {
+    /// cargo unpacked every locked host-platform source.
+    Unpacked(SourcesUnpacked),
+    /// cargo exited non-zero, or was ended by a signal (`code` is `None`): a
+    /// locked package is absent from the registry cache, or the lock does not
+    /// hold.
+    Unavailable {
+        /// cargo's exit code, when it exited.
+        code: Option<i32>,
+    },
+}
+
+/// Unpack every locked host-platform source of the crate at `crate_dir` into
+/// its cargo home, offline: `cargo fetch --offline --locked --target host-tuple`.
+///
+/// cargo unpacks a cached `.crate` archive into `registry/src` lazily, on the
+/// first build that reads it. A later step that reads the cargo home read-only
+/// (the Tier-2 jail) cannot make that write, so this step makes it first,
+/// from the registry cache alone, held to [`SOURCE_UNPACK_LIMITS`] with stdin
+/// closed. `host-tuple` limits the walk to the platform a target-less build
+/// compiles for. `homes` are set on the child explicitly. It runs no package
+/// code: `fetch` runs no build script and links nothing.
+///
+/// # Errors
+/// - [`CliError::LocalLimitExceeded`] if cargo crosses a ceiling; its process
+///   group is killed.
+/// - [`CliError::Io`] (naming `crate_dir`) if cargo cannot be spawned or waited on.
+/// - [`CliError::ChildPipeHeld`] if a process cargo started holds a pipe open.
+pub fn unpack_locked_sources(
+    cargo: &Path,
+    crate_dir: &Path,
+    homes: ToolHomes<'_>,
+) -> Result<SourcesOutcome, CliError> {
+    let mut fetch = Command::new(cargo);
+    fetch
+        .args(["fetch", "--offline", "--locked", "--target", "host-tuple"])
+        .arg("--manifest-path")
+        .arg(crate_dir.join("Cargo.toml"))
+        .current_dir(crate_dir);
+    apply_tool_homes(homes, &mut fetch);
+    let fetched = run_local(fetch, SOURCE_UNPACK_LIMITS, LocalSource::SourceUnpack)
+        .map_err(|e| local_run_error(crate_dir, e))?;
+    Ok(if fetched.status.success() {
+        SourcesOutcome::Unpacked(SourcesUnpacked(()))
+    } else {
+        SourcesOutcome::Unavailable {
+            code: fetched.status.code(),
+        }
     })
 }
 
@@ -2531,7 +2607,7 @@ mod tests {
             let cargo = sleeping_stub(&base);
             let started = std::time::Instant::now();
             let locked = update_lock_offline_within(
-                LockEnv::Bare(cargo.path()),
+                LockEnv::Bare(cargo.path(), &[]),
                 &base,
                 LOCK_RESOLVE_LIMITS.with_wall(LocalWall::of_secs::<1>()),
             );
@@ -2565,7 +2641,7 @@ mod tests {
         fn an_offline_lock_flooding_stdout_is_refused() {
             let base = scratch("lock-stdout");
             let cargo = stub(&base, "head -c 1048576 /dev/zero");
-            let locked = lock_offline(cargo.path(), &base);
+            let locked = lock_offline(cargo.path(), &base, &[]);
             assert!(
                 matches!(
                     &locked,
@@ -2584,7 +2660,7 @@ mod tests {
         fn an_offline_lock_that_fails_is_unresolved_not_an_error() {
             let base = scratch("lock-fail");
             let cargo = stub(&base, "exit 101");
-            let locked = lock_offline(cargo.path(), &base);
+            let locked = lock_offline(cargo.path(), &base, &[]);
             assert_eq!(
                 locked.ok(),
                 Some(LockOutcome::Unresolved { code: Some(101) })
@@ -2601,7 +2677,7 @@ mod tests {
         fn an_offline_lock_that_succeeds_is_seeded_from_the_pinned_set() {
             let base = scratch("lock-ok");
             let cargo = stub(&base, "true");
-            let locked = lock_offline(cargo.path(), &base);
+            let locked = lock_offline(cargo.path(), &base, &[]);
             assert_eq!(locked.ok(), Some(LockOutcome::Seeded));
             assert_eq!(
                 std::fs::read(base.join("Cargo.lock")).ok().as_deref(),
@@ -3493,7 +3569,7 @@ mod tests {
                 ),
             );
             let started = std::time::Instant::now();
-            let locked = lock_offline(cargo.path(), &base);
+            let locked = lock_offline(cargo.path(), &base, &[]);
             assert!(
                 matches!(
                     &locked,

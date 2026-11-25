@@ -851,14 +851,48 @@ mod real_jail {
     /// A directory under `~/.cache/ipe/` (never `/tmp`, which the jail masks with
     /// a tmpfs): the emitted app crate, the bound crate, and the runtime copy the
     /// jailed probe build reads must all live where `--ro-bind / /` can see them.
-    fn non_tmp_base(tag: &str) -> PathBuf {
+    ///
+    /// The directory is removed when the returned [`E2eBase`] drops, so a
+    /// failing assertion does not leave the staged trees behind.
+    fn non_tmp_base(tag: &str) -> E2eBase {
         let base = dirs_cache_root()
             .join("ipe")
             .join("tier2-e2e")
             .join(format!("{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create non-tmp e2e base");
-        base
+        E2eBase(base)
+    }
+
+    /// A [`non_tmp_base`] directory, removed with everything under it on drop
+    /// (a panicking test included).
+    #[derive(Debug)]
+    struct E2eBase(PathBuf);
+
+    impl std::ops::Deref for E2eBase {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for E2eBase {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::ffi::OsStr> for E2eBase {
+        fn as_ref(&self) -> &std::ffi::OsStr {
+            self.0.as_os_str()
+        }
+    }
+
+    impl Drop for E2eBase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// `$XDG_CACHE_HOME` or `~/.cache` — the write-boundary root the project
@@ -1142,7 +1176,6 @@ mod real_jail {
             String::from_utf8_lossy(&unprovisioned.stderr)
         );
         provision_into(provisioned.dir(), Some(&empty_home));
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -1187,7 +1220,186 @@ mod real_jail {
             // a benign package, never an environment gap to pass over.
             Err(e) => panic!("a benign native package must certify on this host's jail: {e}"),
         }
-        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A cargo home at `staged` holding the invoker's registry index (copied),
+    /// archive cache and `bin` tools (hard-linked, copied across filesystems),
+    /// with NO unpacked `registry/src`: the shape a restored CI cache leaves.
+    /// The invoker's home is only read.
+    // A POSIX jail alone binds the cargo home read-only.
+    #[cfg(not(target_os = "windows"))]
+    fn stage_cargo_home_without_sources(real: &std::path::Path, staged: &std::path::Path) {
+        let registry = staged.join("registry");
+        copy_tree(
+            &real.join("registry").join("index"),
+            &registry.join("index"),
+            Stage::Copy,
+            0,
+        );
+        copy_tree(
+            &real.join("registry").join("cache"),
+            &registry.join("cache"),
+            Stage::Link,
+            0,
+        );
+        copy_tree(&real.join("bin"), &staged.join("bin"), Stage::Link, 0);
+        assert!(
+            staged.join("bin").join("cargo").is_file(),
+            "the staged cargo home must hold the invoker's `cargo`"
+        );
+        assert!(
+            !registry.join("src").exists(),
+            "the staged cargo home must start with no unpacked sources"
+        );
+    }
+
+    /// How [`copy_tree`] places a file.
+    #[cfg(not(target_os = "windows"))]
+    #[derive(Debug, Clone, Copy)]
+    enum Stage {
+        /// A fresh copy, for files cargo may rewrite in place (the index).
+        Copy,
+        /// A hard link (a copy across filesystems), for files nothing rewrites.
+        Link,
+    }
+
+    /// The deepest directory [`copy_tree`] descends: a registry tree is three
+    /// levels deep, so a deeper one is not a registry tree.
+    #[cfg(not(target_os = "windows"))]
+    const STAGE_MAX_DEPTH: usize = 8;
+
+    /// Place every regular file under `from` at the same relative path under `to`.
+    #[cfg(not(target_os = "windows"))]
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path, how: Stage, depth: usize) {
+        assert!(
+            depth <= STAGE_MAX_DEPTH,
+            "registry tree deeper than expected: {}",
+            from.display()
+        );
+        std::fs::create_dir_all(to).expect("create staged registry dir");
+        let Ok(entries) = std::fs::read_dir(from) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.expect("read registry entry");
+            // A link (a rustup proxy in `bin`) is placed as the file it names,
+            // so the staged tree resolves without the invoker's home.
+            let source = std::fs::canonicalize(entry.path()).expect("resolve registry entry");
+            let target = to.join(entry.file_name());
+            if source.is_dir() {
+                copy_tree(&source, &target, how, depth + 1);
+            } else if source.is_file() {
+                let placed = match how {
+                    Stage::Copy => std::fs::copy(&source, &target).map(|_| ()),
+                    Stage::Link => std::fs::hard_link(&source, &target)
+                        .or_else(|_| std::fs::copy(&source, &target).map(|_| ())),
+                };
+                placed.expect("stage registry file");
+            }
+        }
+    }
+
+    /// Set only on the staged-cargo-home test's re-exec of this binary, to the
+    /// base its parent emitted the package and staged the cargo home under.
+    #[cfg(not(target_os = "windows"))]
+    const STAGED_HOME_CHILD: &str = "IPE_TIER2_STAGED_HOME_BASE";
+
+    /// The emitted package root and crate under `base`, as
+    /// [`emit_real_native_package`] lays them out.
+    #[cfg(not(target_os = "windows"))]
+    fn emitted_layout(base: &std::path::Path) -> (PathBuf, PathBuf) {
+        (base.join("pkg"), base.join("out"))
+    }
+
+    /// The re-exec side: `native_tier2` over the package the parent emitted
+    /// under `base`, with the staged cargo home as the invoker's.
+    #[cfg(not(target_os = "windows"))]
+    fn certify_over_the_staged_home(base: &std::path::Path) {
+        let (pkg, out) = emitted_layout(base);
+        let declared: BTreeSet<Capability> = set(&[Capability::NativeFfi]);
+        let verdict = native_tier2(&NativeAudit {
+            declared: &declared,
+            has_rust_deps: true,
+            root: &pkg,
+            emitted_dir: &out,
+        });
+        match verdict {
+            Ok(outcome) => assert_eq!(
+                outcome,
+                Tier2Outcome::Certified {
+                    platform: CERTIFIED_PLATFORM
+                },
+                "a native package certifies over a cargo home whose sources are not unpacked"
+            ),
+            Err(e) => panic!(
+                "a benign native package must certify over a cargo home holding only the \
+                 registry cache (its sources unpacked before the read-only jail): {e}"
+            ),
+        }
+    }
+
+    /// The parent side: emit the package, stage a cargo home with no unpacked
+    /// sources, and re-exec `test` with that home as `CARGO_HOME` and its `bin`
+    /// first on `PATH`, both set at the spawn.
+    #[cfg(not(target_os = "windows"))]
+    fn stage_and_rerun(test: &str) {
+        let base = non_tmp_base("certify-unpacked");
+        let (_pkg, provisioned) = emit_real_native_package(&base, false);
+        assert_eq!(
+            emitted_layout(&base).1,
+            provisioned.dir(),
+            "the re-exec reads the crate where the parent emitted it"
+        );
+
+        let user_home = ipe::env_dir::home().ok();
+        let real_cargo = ipe::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")
+            .expect("an absolute CARGO_HOME")
+            .expect("a cargo home");
+        let staged = base.join("staged-cargo-home");
+        stage_cargo_home_without_sources(real_cargo.as_path(), &staged);
+        let mut path = vec![staged.join("bin")];
+        path.extend(std::env::split_paths(
+            &ipe_env::var_os("PATH").unwrap_or_default(),
+        ));
+        let path = std::env::join_paths(path).expect("a PATH from absolute entries");
+
+        let _guard = JAIL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rerun = e2e_support::rerun_this_test_exact(test, |cmd| {
+            cmd.arg("--nocapture")
+                .env(STAGED_HOME_CHILD, &base)
+                .env("CARGO_HOME", &staged)
+                .env("PATH", &path);
+        });
+        assert!(
+            rerun.is_ok(),
+            "the staged-cargo-home re-exec did not certify: {rerun:?}"
+        );
+        assert!(
+            staged.join("registry").join("src").is_dir(),
+            "the locked sources were unpacked into the staged cargo home, outside the jail"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn a_native_package_certifies_over_a_cargo_home_whose_sources_are_not_unpacked() {
+        // THE READ-ONLY-HOME REFUSAL: a restored CI cache holds the registry's
+        // `.crate` archives but not their unpacked `registry/src` trees, and the
+        // jail binds the cargo home read-only, so cargo inside it cannot unpack.
+        // Drive the whole `native_tier2` entry with a staged cargo home in that
+        // shape as the invoker's (`CARGO_HOME` and `PATH`, set at the spawn of a
+        // re-exec of this test): the package must still certify, which only
+        // holds when every locked source is unpacked before the jail. The
+        // invoker's cargo home is never written.
+        let Some(_tools) = e2e_tools() else { return };
+        match ipe_env::var_os(STAGED_HOME_CHILD) {
+            Some(base) => certify_over_the_staged_home(std::path::Path::new(&base)),
+            None => stage_and_rerun(
+                "real_jail::a_native_package_certifies_over_a_cargo_home_whose_sources_are_not_unpacked",
+            ),
+        }
     }
 
     #[test]
@@ -1251,7 +1463,6 @@ mod real_jail {
             "a package reaching a withheld axis must never certify: {msg}"
         );
         eprintln!("audit_native e2e: undeclared-axis native package REJECTED end-to-end: {msg}");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Write a `package.ipe` for a `Rust.Csum`-crossing app whose `declares`
@@ -1315,7 +1526,6 @@ mod real_jail {
         );
         // The refusal fires before the output root is claimed: nothing is written.
         assert!(!out.exists(), "a refused build must write nothing");
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The mirror admit path: with `declares = [ NativeFfi ]` the SAME crossing is
@@ -1349,7 +1559,6 @@ mod real_jail {
                 "a granted native crossing must pass the consent gate, got: {msg}"
             );
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A development build asks no consent: the SAME ungranted crossing the
@@ -1378,7 +1587,6 @@ mod real_jail {
                 "a dev build never runs the consent gate, got: {msg}"
             );
         }
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     // ── `ipe release run`: every run is confined ────────────────────────────
@@ -1535,7 +1743,6 @@ mod real_jail {
                 base.join("out").into_os_string(),
             ],
         );
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             stdout.contains("started"),
             "the program must have run:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1580,7 +1787,6 @@ mod real_jail {
 
         std::fs::remove_file(dir.join("ipe.profile")).expect("drop the profile");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started") && stderr.contains("ipe.profile"),
             "a bundle with no profile refuses before running:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1629,7 +1835,6 @@ mod real_jail {
         let (ok, stdout, stderr) =
             release_run_with_tmpdir(&work, &[dir.into_os_string()], Some(&tmpdir));
         let left = floor_bearing_files(&tmpdir);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             ok && stdout.contains("started")
                 && stdout.contains(&format!("tmpdir={}", tmpdir.display())),
@@ -1667,7 +1872,6 @@ mod real_jail {
                 inside.into_os_string(),
             ],
         );
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             ok && stdout.contains("started") && stdout.contains("granted-working-tree-read"),
             "the granted working tree is readable (control):\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1698,7 +1902,6 @@ mod real_jail {
         let (granted_ok, granted_stdout, granted_stderr) =
             release_run(&work, &[granted.into_os_string()]);
         let (ok, stdout, stderr) = release_run(&work, &[withheld.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             granted_ok && granted_stdout.contains("started") && granted_stdout.contains("forked"),
             "an app granted Subprocess forks (control):\n\
@@ -1737,7 +1940,6 @@ mod real_jail {
         let (dir, _) = floor_bundle(&base.join("stripped"), &[]);
         std::fs::write(dir.join("ipe-app"), "#!/bin/sh\necho started\n").expect("strip the floor");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started"),
             "an app with no embedded floor refuses:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1765,7 +1967,6 @@ mod real_jail {
         )
         .expect("a development build's app");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started"),
             "a development build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1842,7 +2043,6 @@ mod real_jail {
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("started"),
             "a dev build never runs as a release:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -1878,7 +2078,6 @@ mod real_jail {
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("ipe-capfloor"),
             "a forged release literal never runs a dev build:\nstdout:\n{stdout}\nstderr:\n{stderr}"
@@ -2003,7 +2202,6 @@ mod real_jail {
         let work = base.join("work");
         std::fs::create_dir_all(&work).expect("work dir");
         let (ok, stdout, stderr) = release_run(&work, &[dir.into_os_string()]);
-        let _ = std::fs::remove_dir_all(&base);
         assert!(
             !ok && !stdout.contains("ipe-capfloor"),
             "a forged release literal never runs a dev run binary:\nstdout:\n{stdout}\nstderr:\n{stderr}"

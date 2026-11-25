@@ -366,6 +366,11 @@ const ENV_SKIPS: &[(&str, &str, &str)] = &[
     ),
     (
         "src/ipe-cli/tests/audit_native.rs",
+        "a_native_package_certifies_over_a_cargo_home_whose_sources_are_not_unpacked",
+        JAIL_ABSENT,
+    ),
+    (
+        "src/ipe-cli/tests/audit_native.rs",
         "a_real_native_package_reaching_an_undeclared_axis_rejects_end_to_end",
         JAIL_ABSENT,
     ),

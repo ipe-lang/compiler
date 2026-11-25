@@ -496,6 +496,17 @@ pub const LOCK_RESOLVE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<120>(),
 });
 
+/// The ceilings of an offline `cargo fetch` unpacking a crate's locked sources
+/// from the local registry cache into the cargo home.
+///
+/// Its stdout is held to 64 KiB and its run to ten minutes: unpacking a large
+/// graph on a slow disk is its one cost, and a held `.package-cache` lock
+/// cannot hold the CLI past the wall.
+pub const SOURCE_UNPACK_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
+    stdout_bytes: ByteBudget::of::<{ 64 * KIB }>(),
+    wall: LocalWall::of_secs::<600>(),
+});
+
 /// The ceilings of an online cargo lock update, which fetches the registry index.
 ///
 /// Its stdout is held to 64 KiB and its run to ten minutes, the wall of
@@ -1355,6 +1366,8 @@ pub enum LocalSource {
     LockFetch,
     /// An offline `cargo update --workspace --locked` proving an emitted crate's lock replays.
     LockProbe,
+    /// An offline `cargo fetch` unpacking a crate's locked sources into the cargo home.
+    SourceUnpack,
     /// A `cargo metadata --no-deps` reading a crate's target directory.
     CargoMetadata,
     /// A toolchain query: a tool's version or its installed targets.
@@ -1383,6 +1396,7 @@ impl std::fmt::Display for LocalSource {
             Self::LockResolve => "offline cargo lock resolve",
             Self::LockFetch => "cargo lock resolve",
             Self::LockProbe => "cargo lock probe",
+            Self::SourceUnpack => "offline cargo source unpack",
             Self::CargoMetadata => "cargo metadata query",
             Self::ToolQuery => "toolchain query",
             Self::SupplyChainScan => "cargo-deny supply-chain scan",

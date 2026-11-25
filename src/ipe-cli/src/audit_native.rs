@@ -867,6 +867,34 @@ fn probe_interpreter() -> Result<ipe_sandbox::ToolPath, CliError> {
     target_os = "windows"
 ))]
 fn native_tier2_on_platform(audit: &NativeAudit) -> Result<Tier2Outcome, CliError> {
+    native_tier2_over(audit, &ToolchainRoots::of_invoker()?)
+}
+
+/// [`native_tier2`] over the toolchain homes `roots` instead of the invoker's.
+///
+/// `roots` is the one source of the cargo and Rustup homes every step reads:
+/// the host-side lock derivation and source unpack get them explicitly, and
+/// the jail binds and exports the same homes, so the sources the unpack wrote
+/// are the sources the jailed build reads.
+///
+/// # Errors
+/// As [`native_tier2`].
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+fn native_tier2_over(
+    audit: &NativeAudit,
+    roots: &ToolchainRoots,
+) -> Result<Tier2Outcome, CliError> {
+    if !is_native_bearing(audit.declared, audit.has_rust_deps) {
+        return Ok(Tier2Outcome::SkippedPureIpe);
+    }
     // 1. The wrappers the app crate actually emitted into `src/ffi.rs` — the
     //    DCE-trimmed foreign surface the artifact ships. Read from the structured
     //    sidecar (`src/ffi-wrappers.json`) the emitter writes after DCE: this is
@@ -904,8 +932,9 @@ fn native_tier2_on_platform(audit: &NativeAudit) -> Result<Tier2Outcome, CliErro
     //    the binds, the build argv, and the payload env all derive from these.
     let scratch = probe_scratch_dir(audit.root)?;
     let emitted_dir = canonical_jail_path(audit.emitted_dir)?;
-    let build_argv = emit_probe_and_build_argv(&emitted_dir, &link_paths, &scratch)?;
-    let toolchain = ToolchainHomes::of_invoker()?;
+    let build_argv = emit_probe_and_build_argv(&emitted_dir, &link_paths, &scratch, roots)?;
+    // Resolved after the unpack, so a `registry` tree the unpack created is bound.
+    let toolchain = ToolchainHomes::from_roots(roots)?;
     let Some(exercise) = ProbeExercise::real_build(build_argv, toolchain) else {
         // A non-empty survivor set always yields a non-empty build argv, so this
         // is unreachable; fail-closed rather than certify a vacuous run.
@@ -1367,16 +1396,19 @@ fn extract_json_bool(obj: &str, key: &str) -> Option<bool> {
 /// The probe is a second binary target whose crate root (`src/tier2_probe.rs`)
 /// declares `mod ffi;` and references every surviving wrapper at
 /// `crate::ffi::<slug>::<ident>`, so building it links the whole foreign surface.
-/// The build is `--offline` with a scratch-local target dir: crate sources are
-/// vendored/pre-fetched before the jailed build (design §5), so an ordinary build
-/// needs no network, and a build that DOES reach the network is a genuine,
-/// deterministic used-but-undeclared signal — not flake.
+/// The build is `--offline` with a scratch-local target dir: the lock is
+/// derived and every locked source unpacked into the cargo home of `roots`
+/// before the jailed build, outside the jail, so the build reads a read-only
+/// cargo home it never needs to write, needs no network, and a build that DOES
+/// reach the network is a genuine, deterministic used-but-undeclared signal —
+/// not flake.
 ///
 /// # Errors
 /// [`CliError::Io`] when the probe source or the patched manifest cannot be
-/// written, or the offline lock resolve cannot run;
-/// [`CliError::LocalLimitExceeded`] when that resolve crosses its time or
-/// output ceiling.
+/// written, or the offline lock resolve or source unpack cannot run;
+/// [`CliError::LocalLimitExceeded`] when either crosses its time or output
+/// ceiling; [`CliError::PackageAudit`] when a locked source cannot be unpacked
+/// from the registry cache.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -1390,6 +1422,7 @@ fn emit_probe_and_build_argv(
     emitted_dir: &CanonicalPath,
     wrapper_paths: &[String],
     scratch: &CanonicalPath,
+    roots: &ToolchainRoots,
 ) -> Result<Vec<OsString>, CliError> {
     let emitted_dir = emitted_dir.as_path();
     let scratch = scratch.as_path();
@@ -1444,15 +1477,51 @@ fn emit_probe_and_build_argv(
     // build surfaces any residual gap as a build failure, fail-closed. A lock
     // that moves a pinned package, or a step that crosses its time or output
     // ceiling, fails the audit.
-    match crate::cargo_step::lock_offline(&cargo, emitted_dir)? {
+    let homes = roots.host_homes();
+    match crate::cargo_step::lock_offline(&cargo, emitted_dir, &homes)? {
         crate::cargo_step::LockOutcome::Seeded
         | crate::cargo_step::LockOutcome::Unresolved { .. } => {}
         crate::cargo_step::LockOutcome::Drift(refusal) => {
             return Err(CliError::LockDrift(Box::new(refusal)));
         }
     }
+    // The jail binds the cargo home read-only, and cargo unpacks a cached
+    // archive into `registry/src` only on first use: a host whose cache holds
+    // the archive but not its unpacked tree (a restored CI cache) would fail
+    // the jailed build on that write. Unpack every locked source here, before
+    // the jail; one that cannot be unpacked refuses the audit now.
+    let unpacked = match crate::cargo_step::unpack_locked_sources(&cargo, emitted_dir, &homes)? {
+        crate::cargo_step::SourcesOutcome::Unpacked(unpacked) => unpacked,
+        crate::cargo_step::SourcesOutcome::Unavailable { code } => {
+            return Err(CliError::PackageAudit(sources_unavailable(code)));
+        }
+    };
 
-    Ok(vec![
+    Ok(probe_build_argv(
+        cargo,
+        manifest_path,
+        target_dir,
+        &unpacked,
+    ))
+}
+
+/// The jailed probe build's argv, built only once its sources are unpacked.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+fn probe_build_argv(
+    cargo: PathBuf,
+    manifest_path: PathBuf,
+    target_dir: PathBuf,
+    _unpacked: &crate::cargo_step::SourcesUnpacked,
+) -> Vec<OsString> {
+    vec![
         cargo.into_os_string(),
         OsString::from("build"),
         OsString::from("--offline"),
@@ -1463,7 +1532,31 @@ fn emit_probe_and_build_argv(
         manifest_path.into_os_string(),
         OsString::from("--target-dir"),
         target_dir.into_os_string(),
-    ])
+    ]
+}
+
+/// The reject for a probe build whose locked sources cannot be unpacked from
+/// the local registry cache (`code` is cargo's exit, `None` on a signal).
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+fn sources_unavailable(code: Option<i32>) -> Rejection {
+    let exit = code.map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
+    Rejection {
+        check: Check::NativeTier2,
+        message: format!(
+            "the Tier-2 probe build's locked dependency sources could not be unpacked from the \
+             local cargo registry cache (`cargo fetch --offline --locked` ended with {exit}). \
+             The jail reads the cargo home read-only, so Tier-2 refuses before the jail rather \
+             than build from a source tree it did not materialise (fail-closed)."
+        ),
+    }
 }
 
 /// The un-exercised reject: a native-bearing package with no probeable entrypoint
@@ -1506,6 +1599,67 @@ fn no_probeable_entrypoint() -> Rejection {
 #[must_use]
 pub const fn default_ro_binds() -> Vec<CanonicalPath> {
     Vec::new()
+}
+
+/// The toolchain homes Tier-2 reads, resolved once and spelled as resolved.
+///
+/// The cargo home, the Rustup home and the user home every Tier-2 step uses:
+/// the host-side lock derivation and source unpack get them explicitly
+/// ([`Self::host_homes`]), and the jail's [`ToolchainHomes`] is resolved from
+/// the same value, so the host steps and the jail never name two homes.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+#[derive(Debug)]
+struct ToolchainRoots {
+    cargo: Option<crate::env_dir::ToolHome>,
+    rustup: Option<crate::env_dir::ToolHome>,
+    // The Windows jail exports no toolchain env, so only POSIX reads it.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    user: Option<crate::env_dir::HomeDir>,
+}
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+impl ToolchainRoots {
+    /// The invoking user's toolchain homes, resolved as the tools resolve them.
+    ///
+    /// # Errors
+    /// [`CliError::EnvDirNotAbsolute`] when `CARGO_HOME` or `RUSTUP_HOME` is
+    /// set but relative: the home default instead would name a toolchain the
+    /// host `cargo` never uses.
+    fn of_invoker() -> Result<Self, CliError> {
+        let user_home = crate::env_dir::home().ok();
+        Ok(Self {
+            cargo: crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")?,
+            rustup: crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref(), ".rustup")?,
+            user: user_home,
+        })
+    }
+
+    /// The `CARGO_HOME`/`RUSTUP_HOME` pairs a host-side cargo child is given.
+    fn host_homes(&self) -> Vec<(&'static str, &Path)> {
+        [
+            ("CARGO_HOME", self.cargo.as_ref()),
+            ("RUSTUP_HOME", self.rustup.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, home)| home.map(|home| (name, home.as_path())))
+        .collect()
+    }
 }
 
 /// The toolchain homes a jailed `cargo build` resolves, each in canonical form.
@@ -1555,11 +1709,18 @@ impl ToolchainHomes {
     ///   toolchain the host `cargo` never uses.
     /// - [`CliError::PackageAudit`] per [`Self::from_homes`].
     pub fn of_invoker() -> Result<Self, CliError> {
-        let user_home = crate::env_dir::home().ok();
+        Self::from_roots(&ToolchainRoots::of_invoker()?)
+    }
+
+    /// The toolchain over `roots`, resolved per [`Self::from_homes`].
+    ///
+    /// # Errors
+    /// As [`Self::from_homes`].
+    fn from_roots(roots: &ToolchainRoots) -> Result<Self, CliError> {
         Self::from_homes(
-            crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")?,
-            crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref(), ".rustup")?,
-            user_home,
+            roots.cargo.clone(),
+            roots.rustup.clone(),
+            roots.user.clone(),
         )
     }
 
@@ -1625,6 +1786,15 @@ impl ToolchainHomes {
     /// Never; the signature matches the fallible POSIX resolution.
     #[allow(clippy::unnecessary_wraps)] // shares the fallible POSIX signature
     pub fn of_invoker() -> Result<Self, CliError> {
+        Ok(Self::default())
+    }
+
+    /// Windows: as [`Self::of_invoker`], whatever the homes.
+    ///
+    /// # Errors
+    /// Never; the signature matches the fallible POSIX resolution.
+    #[allow(clippy::unnecessary_wraps)] // shares the fallible POSIX signature
+    fn from_roots(_roots: &ToolchainRoots) -> Result<Self, CliError> {
         Ok(Self::default())
     }
 }
