@@ -1155,7 +1155,7 @@ mod pinned_relay {
         ///
         /// [`RelayUnavailable`] when no owner-only directory or socket can be
         /// created.
-        pub fn open(
+        pub(crate) fn open(
             target: VettedAddr,
             socket_port: u16,
             max_connections: u32,
@@ -1191,7 +1191,7 @@ mod pinned_relay {
 
         /// The vetted address the relay carries connections to.
         #[cfg_attr(not(test), allow(dead_code))]
-        pub const fn target(&self) -> VettedAddr {
+        pub(crate) const fn target(&self) -> VettedAddr {
             self.target
         }
 
