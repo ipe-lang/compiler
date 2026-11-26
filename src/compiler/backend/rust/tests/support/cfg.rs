@@ -62,16 +62,23 @@ pub enum Cfg {
     Test,
     /// `target_arch = "wasm32"` / `target_family = "wasm"`.
     Wasm,
-    /// An atom the build host decides: `unix`, `windows`, `target_os = ..`,
-    /// `panic = ..`, a `--cfg` flag the toolchain sets.
+    /// An atom the build host decides: `target_os = ..`, `panic = ..`, a
+    /// `--cfg` flag the toolchain sets.
     Host,
+    /// An atom a native host decides and `wasm32-unknown-unknown` fails:
+    /// `unix`, `windows`, `target_family = "unix" | "windows"`, and
+    /// `target_os = ..` naming an OS (the wasm target's is `"unknown"`).
+    NativeHost,
     All(Vec<Self>),
     Any(Vec<Self>),
     Not(Box<Self>),
 }
 
 /// The bare cfg flags the build host decides.
-const HOST_CFG_FLAGS: &[&str] = &["unix", "windows", "debug_assertions", "ipe_asan"];
+const HOST_CFG_FLAGS: &[&str] = &["debug_assertions", "ipe_asan"];
+
+/// The bare cfg flags a native host decides and the wasm target fails.
+const NATIVE_CFG_FLAGS: &[&str] = &["unix", "windows"];
 
 /// The `key = ".."` cfg atoms the build host decides, whatever the value.
 const HOST_CFG_KEYS: &[&str] = &[
@@ -98,6 +105,7 @@ pub fn parse_cfg(meta: &syn::Meta) -> Result<Cfg, String> {
         syn::Meta::Path(_) => match name.as_str() {
             "test" => Ok(Cfg::Test),
             flag if HOST_CFG_FLAGS.contains(&flag) => Ok(Cfg::Host),
+            flag if NATIVE_CFG_FLAGS.contains(&flag) => Ok(Cfg::NativeHost),
             _ => Err(format!("unknown cfg flag `{name}`")),
         },
         syn::Meta::NameValue(pair) => {
@@ -112,6 +120,10 @@ pub fn parse_cfg(meta: &syn::Meta) -> Result<Cfg, String> {
             match (name.as_str(), value.as_str()) {
                 ("feature", _) => Ok(Cfg::Feature(value)),
                 ("target_arch", "wasm32") | ("target_family", "wasm") => Ok(Cfg::Wasm),
+                ("target_family", family) if NATIVE_CFG_FLAGS.contains(&family) => {
+                    Ok(Cfg::NativeHost)
+                }
+                ("target_os", os) if os != "unknown" => Ok(Cfg::NativeHost),
                 ("target_arch" | "target_family", _) => Ok(Cfg::Host),
                 (key, _) if HOST_CFG_KEYS.contains(&key) => Ok(Cfg::Host),
                 _ => Err(format!("unknown cfg atom `{name} = \"{value}\"`")),
@@ -209,7 +221,8 @@ impl CfgEnv {
             Cfg::Feature(name) => Truth::of(self.features.contains(name)),
             Cfg::Test => Truth::Fails,
             Cfg::Wasm => Truth::of(self.wasm),
-            Cfg::Host => Truth::Varies,
+            Cfg::NativeHost if self.wasm => Truth::Fails,
+            Cfg::Host | Cfg::NativeHost => Truth::Varies,
             Cfg::All(all) => all
                 .iter()
                 .fold(Truth::Holds, |truth, c| truth.and(self.eval(c))),

@@ -505,7 +505,7 @@ mod tests {
             assert!(!spec.name.is_empty(), "empty crate name in ALL");
             assert!(!spec.version.is_empty(), "empty version for {}", spec.name);
         }
-        assert_eq!(ALL.len(), 39, "expected 39 surgery-emitted crate specs");
+        assert_eq!(ALL.len(), 42, "expected 42 surgery-emitted crate specs");
         for pinned in ALL_PINNED {
             assert!(
                 ALL.iter().any(|spec| spec.name == pinned.spec.name),
@@ -611,6 +611,27 @@ mod tests {
                     "{}: SSOT = {}, tests/golden/basics/Cargo.toml = {g_ver}",
                     spec.name, spec.version
                 ));
+            }
+        }
+        // The vendored templates declare their crates inline: each one the SSOT
+        // names must carry the SSOT version.
+        for (origin, text) in [
+            ("templates/Cargo.toml", crate::project::CARGO_TOML),
+            (
+                "project.rs WASM_CARGO_TOML",
+                crate::project::WASM_CARGO_TOML,
+            ),
+        ] {
+            let declared = parse_deps(text, true);
+            for spec in ALL {
+                if let Some(t_ver) = declared.get(spec.name)
+                    && t_ver != spec.version
+                {
+                    problems.push(format!(
+                        "{}: SSOT = {}, {origin} = {t_ver}",
+                        spec.name, spec.version
+                    ));
+                }
             }
         }
         for pinned in ALL_PINNED {

@@ -12,16 +12,16 @@ rust-version = "1.98.1"
 # occurrence, so no comment here may open a bracketed list. The last augmenter
 # promotes every declared feature the runtime crate turns on for the program
 # (`RuntimeFeature::vendored_projection`), so the vendored tree compiles a
-# selection the runtime crate can make. `encoding` is on exactly when the
-# vendored `ipe_runtime/mod.rs` declares the `encoding` / `bytes` modules; the
-# `base64` / `hex` / `percent-encoding` deps below stay non-optional in the
-# vendored escape hatch.
+# selection the runtime crate can make. A crate only feature-gated sources
+# name is optional and turned on by the feature that compiles them, mirroring
+# the runtime crate's edge: `encoding` turns on `base64` / `percent-encoding`,
+# and `server` / `http_client` / `websocket_client` turn on `futures-util`.
 default = ["json"]
 tokio = []
 crypto = []
 json = ["serde"]
 db = []
-encoding = []
+encoding = ["dep:base64", "dep:percent-encoding"]
 # Declared but inert in the vendored escape hatch: `zeroize` / `subtle` / `rsa`
 # stay non-optional below. The `#[cfg(feature = "secret")]` gates in the vendored
 # runtime source (`secret.rs`) need
@@ -69,12 +69,12 @@ webview = []
 webview-shell = ["browser-open"]
 browser-open = []
 tui = []
-websocket_client = []
+websocket_client = ["dep:futures-util"]
 # The outbound HTTP client. `http_client_cargo_toml` promotes it and adds
 # `reqwest` for a program that reaches the `http_client` runtime module; the
 # vendored `web/mod.rs` compiles the telemetry exporters and the console proxy
 # (and `system::exit_process` flushes the exporters) only with it on.
-http_client = []
+http_client = ["dep:futures-util"]
 # Promoted by `email_cargo_toml` for an `Ipe.Email` program, mirroring the
 # runtime crate; the vendored `ssrf.rs` dial helpers it reaches are gated on it.
 email = []
@@ -119,7 +119,7 @@ wasm-client = []
 # `csv_cargo_toml` promote `server` / `jwt` / `csv` into `default`;
 # `locale_cargo_toml` gives the inert `locale` entry its ICU dep edges and
 # promotes it. An augmenter never declares a name.
-server = []
+server = ["dep:futures-util"]
 jwt = []
 csv = []
 locale = []
@@ -135,9 +135,10 @@ sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_urlencoded = { version = "0.7", optional = true }
 unicode-general-category = "1"
-base64 = "0.22"
+base64 = { version = "0.22", optional = true }
 hex = "0.4"
-percent-encoding = "2"
+percent-encoding = { version = "2", optional = true }
+futures-util = { version = "0.3", optional = true }
 chrono = "=0.4.45"
 rust_decimal = { version = "1", features = ["serde"] }
 hmac = "0.12"

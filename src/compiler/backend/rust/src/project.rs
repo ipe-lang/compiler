@@ -310,9 +310,7 @@ url = "2"
 chrono = "=0.4.45"
 rust_decimal = { version = "1", features = ["serde"] }
 hmac = "0.12"
-sha1 = "0.10"
 sha2 = "0.10"
-md-5 = "0.10"
 subtle = "2"
 zeroize = "1"
 # Pinned exact to match `src/runtime/rust/Cargo.toml`'s own `wasm-bindgen` pin
@@ -3509,7 +3507,7 @@ fn assemble_project_text(
     // are used. Db, TEA, and Server are independent features; a program may use
     // any combination. The order: db first, then server; both modify the same
     // base manifest so we chain the transformations.
-    // The async spine (`tokio` + `futures-util` + the `"tokio"` default feature)
+    // The async spine (`tokio` + the `"tokio"` default feature)
     // is off the base template and restored here whenever the program needs the
     // reactor. This runs FIRST, before every per-surface surgery, so their
     // `default = ["tokio", "json"]` anchor sees the restored spine.
@@ -3586,8 +3584,9 @@ fn assemble_project_text(
     };
     // Ipe.Email: `email.rs` needs the `lettre` crate for the SMTP transport
     // (`reqwest`, reached through `http_client`, is added by the HTTP-client
-    // step below; every other crate it uses — `base64` / `hmac` / `sha2` /
-    // `serde_json` / `url` — is already an unconditional base-manifest dep).
+    // step below; of the other crates it uses, `hmac` / `sha2` / `serde_json`
+    // are base-manifest deps, `base64` rides the `encoding` feature the
+    // runtime's `email` implies, and `url` comes with the `url` module row).
     // Add `lettre` only when the program uses `Email.send`.
     let cargo_toml = if ctx.uses_email {
         email_cargo_toml(&cargo_toml)?
@@ -4880,8 +4879,9 @@ fn replace_feature_line(
 /// 2. Appending `tokio-tungstenite` (the handshake only), `tokio-rustls`,
 ///    `rustls` and `webpki-roots` to the `[dependencies]` table, each rendered from its
 ///    [`crate_specs`] pin: the runtime owns the `wss://` TLS and trusts
-///    `webpki-roots` alone (`futures-util` and `url`, its other deps, are
-///    already in the base).
+///    `webpki-roots` alone (`futures-util`, its other dep, is the base
+///    template's optional entry the `websocket_client` feature turns on, and
+///    `url` comes with the `url` module row).
 ///
 /// # Errors
 ///
@@ -5012,9 +5012,10 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
 ///
 /// `email.rs` (the vendored `Ipe.Email` runtime module) needs `lettre` for the
 /// SMTP transport; `reqwest` (which it reaches through `http_client`) is added
-/// by [`http_client_cargo_toml`] under the shared HTTP-client predicate, and
-/// every other crate it uses (`base64` / `hmac` / `sha2` / `serde_json` /
-/// `url`) is already an unconditional base-manifest dependency. The emitted
+/// by [`http_client_cargo_toml`] under the shared HTTP-client predicate; of the
+/// other crates it uses, `hmac` / `sha2` / `serde_json` are base-manifest
+/// dependencies, `base64` rides the `encoding` feature the runtime's `email`
+/// implies, and `url` comes with the `url` module row. The emitted
 /// crate declares the `email` module through the `mod.rs` append; the `email`
 /// feature is promoted as well, mirroring the runtime crate, because the
 /// vendored `ssrf.rs` gates the dial helpers `email.rs` reaches on it.
@@ -5097,13 +5098,8 @@ fn locale_cargo_toml(base: &str) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn url_cargo_toml(base: &str) -> DResult<String> {
-    // `tinyvec` is a transitive dep of `idna` (pulled by `url 2.x`). Version
-    // 1.13+ uses `vec!` in a way that requires the `std` feature; without it
-    // the emitted project's `cargo build` fails with "cannot find macro `vec`
-    // in this scope". Declaring it here forces the feature on via cargo's
-    // feature-unification for every vendored emitted project that reaches url.
     let url_dep = format!(
-        "{} = \"{}\"\ntinyvec = {{ version = \"1\", features = [\"std\"] }}\n\n",
+        "{} = \"{}\"\n\n",
         crate_specs::URL.name,
         crate_specs::URL.version,
     );
@@ -5379,7 +5375,7 @@ fn vendored_tokio_for(
 ///
 /// The base template ships NO async runtime: a pure program (only `Io.println`,
 /// string / list / math / json computation, the pure `Task` monad ops) enters
-/// through the std-only `block_on` and links neither `tokio` nor `futures-util`.
+/// through the std-only `block_on` and links no `tokio`.
 /// A program that reaches ANY reactor-requiring kernel
 /// ([`EmitCtx::uses_async_runtime`]) restores the spine:
 ///
@@ -5390,17 +5386,17 @@ fn vendored_tokio_for(
 /// 2. write the `tokio` dependency as the first `[dependencies]` line (before
 ///    `dlmalloc`), enabling exactly the given `tokio` features — the one place
 ///    the line is written; no later step edits it.
-/// 3. append `futures-util` to the `[dependencies]` table.
 ///
-/// The `tokio` / `futures-util` versions come from the [`crate_specs`] SSOT
-/// (drift-guarded against `runtime/Cargo.toml`).
+/// The `tokio` version comes from the [`crate_specs`] SSOT (drift-guarded
+/// against `runtime/Cargo.toml`). `futures-util` is not part of the spine: the
+/// template declares it optional, turned on by the features whose sources name
+/// it (`server`, `http_client`, `websocket_client`).
 ///
 /// # Errors
 ///
 /// Returns [`Diagnostic::CompilerBug`] if the `default = ["json"]` or `dlmalloc`
-/// anchor is absent, or the manifest does not carry exactly one
-/// `[dependencies]` table — a golden-drift invariant violation (fail-loud,
-/// never a silent no-op that would emit an async program without a runtime).
+/// anchor is absent — a golden-drift invariant violation (fail-loud, never a
+/// silent no-op that would emit an async program without a runtime).
 fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResult<String> {
     const DEFAULT_ANCHOR: &str = r#"default = ["json"]"#;
     const DEFAULT_RESTORED: &str = r#"default = ["tokio", "json"]"#;
@@ -5409,11 +5405,6 @@ fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResu
     // `dlmalloc = `, which also occurs inside the `alloc_dlmalloc` FEATURE line).
     const DLMALLOC_ANCHOR: &str = r#"dlmalloc = { version = "0.2""#;
     let tokio_dep = crate_specs::tokio_dependency_line(tokio) + "\n";
-    let futures_dep = format!(
-        "{} = \"{}\"\n",
-        crate_specs::FUTURES_UTIL.name,
-        crate_specs::FUTURES_UTIL.version,
-    );
 
     let bug = |anchor: &str| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::project::async_runtime_cargo_toml",
@@ -5434,13 +5425,7 @@ fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResu
     step2.push_str(step1.get(..dl_at).unwrap_or(""));
     step2.push_str(&tokio_dep);
     step2.push_str(step1.get(dl_at..).unwrap_or(""));
-
-    // Step 3 — append the `futures-util` line to the `[dependencies]` table.
-    append_dependencies(
-        &step2,
-        &futures_dep,
-        "ipe_backend_rust::project::async_runtime_cargo_toml",
-    )
+    Ok(step2)
 }
 
 /// Build the heavy-`Ipe.Crypto`-enabled `Cargo.toml` by appending the five

@@ -603,15 +603,17 @@ enum RefKind {
 /// Every crate a dependency table of the runtime crate or the vendored
 /// manifest template names, by crate name: the crates a runtime path can
 /// reach. A path whose first segment is one of them counts as a use of it.
-#[allow(clippy::expect_used)] // test scaffolding: an unreadable manifest cannot be skipped
 static EXTERN_CRATES: std::sync::LazyLock<BTreeSet<String>> = std::sync::LazyLock::new(|| {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut names = BTreeSet::new();
-    for rel in ["../../../runtime/rust/Cargo.toml", "templates/Cargo.toml"] {
-        let text = std::fs::read_to_string(manifest.join(rel)).expect("read a dependency manifest");
-        names.extend(dependency_tables(&text).into_iter().map(|dep| dep.name));
-    }
-    names
+    [
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../runtime/rust/Cargo.toml"
+        )),
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/templates/Cargo.toml")),
+    ]
+    .into_iter()
+    .flat_map(|text| dependency_tables(text).into_iter().map(|dep| dep.name))
+    .collect()
 });
 
 /// One entry of a manifest's (non-dev) dependency tables.
@@ -622,6 +624,19 @@ struct DepEntry {
     optional: bool,
     /// The `cfg(..)` of a `[target.'cfg(..)'.dependencies]` table.
     target: Option<String>,
+}
+
+/// The packages whose library is named other than the package (`-` read as
+/// `_`): source names the library. A missing row shows as a dependency both
+/// unused (under the package name) and missing (under the library name).
+const LIB_NAMES: &[(&str, &str)] = &[("md-5", "md5")];
+
+/// The name source uses for the dependency declared under `key`.
+fn lib_name(key: &str) -> String {
+    LIB_NAMES
+        .iter()
+        .find(|(package, _)| *package == key)
+        .map_or_else(|| key.replace('-', "_"), |(_, lib)| (*lib).to_owned())
 }
 
 /// Every entry of the `[dependencies]` and `[target.'..'.dependencies]` tables
@@ -649,7 +664,7 @@ fn dependency_tables(cargo_toml: &str) -> Vec<DepEntry> {
             continue;
         }
         out.push(DepEntry {
-            name: key.replace('-', "_"),
+            name: lib_name(key),
             optional: value.replace(' ', "").contains("optional=true"),
             target: target.clone(),
         });
@@ -676,7 +691,7 @@ fn active_dependencies(cargo_toml: &str, env: &CfgEnv) -> BTreeSet<String> {
             }
         }
     }
-    let turned_on: BTreeSet<String> = turned_on.iter().map(|n| n.replace('-', "_")).collect();
+    let turned_on: BTreeSet<String> = turned_on.iter().map(|n| lib_name(n)).collect();
     dependency_tables(cargo_toml)
         .into_iter()
         .filter(|dep| {
@@ -695,25 +710,29 @@ fn active_dependencies(cargo_toml: &str, env: &CfgEnv) -> BTreeSet<String> {
 /// The prefix of every unused-dependency violation, so a check can select them.
 const UNUSED_DEP: &str = "unused dependency:";
 
-/// Every crate the emitted manifest compiles against that no compiled module
-/// names: `used` holds the crates the compiled modules reach. Cargo's
-/// `unused_dependencies` lint reports each one, and a build that denies
-/// warnings fails on it though `ipe` exited 0.
-fn unused_dependency_violations(
-    cargo_toml: &str,
-    env: &CfgEnv,
-    used: &BTreeSet<String>,
-) -> Vec<String> {
-    active_dependencies(cargo_toml, env)
-        .into_iter()
-        .filter(|dep| !used.contains(dep))
-        .map(|dep| {
-            format!(
-                "{UNUSED_DEP} the emitted manifest declares `{dep}`, but no module the \
-                 crate compiles names it"
-            )
-        })
-        .collect()
+/// The prefix of every missing-dependency violation, so a check can select them.
+const MISSING_DEP: &str = "missing dependency:";
+
+/// Where the emitted manifest and the compiled sources disagree: `used` holds
+/// the crates the compiled modules name. A crate the manifest turns on that
+/// none names is reported by Cargo's `unused_dependencies` lint, so a build that
+/// denies warnings fails though `ipe` exited 0. A crate a compiled module names
+/// that the manifest does not turn on fails the build outright (E0433).
+fn dependency_violations(cargo_toml: &str, env: &CfgEnv, used: &BTreeSet<String>) -> Vec<String> {
+    let active = active_dependencies(cargo_toml, env);
+    let unused = active.iter().filter(|dep| !used.contains(*dep)).map(|dep| {
+        format!(
+            "{UNUSED_DEP} the emitted manifest declares `{dep}`, but no module the \
+             crate compiles names it"
+        )
+    });
+    let missing = used.iter().filter(|dep| !active.contains(*dep)).map(|dep| {
+        format!(
+            "{MISSING_DEP} a module the crate compiles names `{dep}`, but the emitted \
+             manifest does not declare it"
+        )
+    });
+    unused.chain(missing).collect()
 }
 
 /// One crate-root or `tokio::` reference and the predicate it is compiled under.
@@ -1961,7 +1980,7 @@ fn closure_violations(
             }
         }
     }
-    out.extend(unused_dependency_violations(&emit.cargo_toml, env, &used));
+    out.extend(dependency_violations(&emit.cargo_toml, env, &used));
     out
 }
 
@@ -1988,13 +2007,12 @@ fn crate_level_externs(
         if let Ok(file) = syn::parse_file(src) {
             syn::visit::Visit::visit_file(&mut whole, &file);
         }
-        used.extend(
-            whole
-                .refs
-                .into_iter()
-                .filter(|r| r.kind == RefKind::Extern)
-                .map(|r| r.seg),
-        );
+        used.extend(required_of(
+            RefKind::Extern,
+            &whole.refs,
+            &Cfg::All(Vec::new()),
+            env,
+        ));
     }
     used
 }
@@ -2029,7 +2047,6 @@ impl Emit {
 }
 
 /// The emitted project of one flag mask.
-#[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
 fn emit_mask(
     interner: &Interner,
     main: ipe_intern::Symbol,
@@ -2037,10 +2054,16 @@ fn emit_mask(
     target: Target,
     intent: BuildIntent,
 ) -> Emit {
+    emit_module(interner, module_for_mask(main, mask), target, intent)
+}
+
+/// The emitted project of one body-free module.
+#[allow(clippy::expect_used)] // test scaffolding: a body-free emit cannot fail
+fn emit_module(interner: &Interner, module: Module, target: Target, intent: BuildIntent) -> Emit {
     let prog = Program {
         imports_unsafe_submodule: false,
         imported_web_capabilities: std::collections::BTreeSet::new(),
-        modules: vec![module_for_mask(main, mask)],
+        modules: vec![module],
     };
     let emitted = RustBackend::new(interner)
         .with_target(target)
@@ -2056,7 +2079,12 @@ fn emit_mask(
             Some(rel) => {
                 runtime_files.insert(rel.to_owned(), src);
             }
-            None if path.as_str().ends_with(".rs") => program_files.push(src),
+            None if Path::new(path.as_str())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rs")) =>
+            {
+                program_files.push(src);
+            }
             None => {}
         }
     }
@@ -2334,17 +2362,60 @@ fn web_shape_declares_tea() {
     );
 }
 
-/// The named witness of the vendored `regex` / `bcrypt` breach: a featureless
+/// A program that needs the reactor and no surface (a `Time.sleep` CLI) is a
+/// state no flag mask reaches: every surface flag forces the async spine on,
+/// but the spine alone is none of them. Its manifest names exactly the crates
+/// its compiled modules name, under both build intents.
+#[test]
+fn async_spine_alone_declares_a_closed_manifest() {
+    let runtime_root = e2e_support::require_runtime().into_path_buf();
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    for intent in EMIT_INTENTS {
+        let mut module = module_for_mask(main, 0);
+        module.uses_async_runtime = true;
+        let emit = emit_module(&interner, module, Target::Native, intent);
+        let env = manifest_env(&emit.cargo_toml, false);
+        assert!(
+            env.features.contains("tokio"),
+            "the async spine must restore the `tokio` feature: {:?}",
+            env.features
+        );
+        let violations = closure_violations(&runtime_root, &emit, &env, &mut ScanCache::default());
+        assert!(
+            violations.is_empty(),
+            "async-spine-only SEAL breach — {intent:?} emit, features {:?}:\n{}",
+            env.features,
+            violations.join("\n")
+        );
+    }
+}
+
+/// The named witness of the vendored unused-crate breach: a featureless
 /// program and a web app compile no `regex`, `bcrypt`, or `uuid` user, so
 /// their manifests turn none of those crates on; a featureless program
-/// compiles no render core, so it turns no `serde_urlencoded` on either.
+/// compiles no render core and no `encoding` source, so it turns no
+/// `serde_urlencoded`, `base64`, or `percent-encoding` on either; a terminal
+/// program serves nothing and dials nothing, so it turns no `futures-util` on.
 #[test]
 fn on_demand_crates_stay_off_without_their_modules() {
     let mut interner = Interner::new();
     let main = interner.intern("Main").expect("intern Main");
     for (mask, absent) in [
-        (0, &["regex", "bcrypt", "uuid", "serde_urlencoded"][..]),
+        (
+            0,
+            &[
+                "regex",
+                "bcrypt",
+                "uuid",
+                "serde_urlencoded",
+                "base64",
+                "percent_encoding",
+                "futures_util",
+            ][..],
+        ),
         (1 << 3, &["regex", "bcrypt"][..]),
+        (1 << 4, &["futures_util"][..]),
     ] {
         for intent in EMIT_INTENTS {
             let emit = emit_mask(&interner, main, mask, Target::Native, intent);
@@ -3094,7 +3165,7 @@ fn tokio_fixture_violations(
     emit.cargo_toml = tokio.map_or_else(String::new, tokio_line);
     closure_violations(root, &emit, &env, &mut ScanCache::default())
         .into_iter()
-        .filter(|v| !v.starts_with(UNUSED_DEP))
+        .filter(|v| !v.starts_with(UNUSED_DEP) && !v.starts_with(MISSING_DEP))
         .collect()
 }
 
@@ -3114,7 +3185,7 @@ fn unused_dep_fixture(
         wasm: false,
     };
     let mut emit = Emit::of_mod_rs(mod_rs);
-    emit.cargo_toml = cargo_toml.to_owned();
+    cargo_toml.clone_into(&mut emit.cargo_toml);
     emit.program_files = program.iter().map(|src| (*src).to_owned()).collect();
     closure_violations(root, &emit, &env, &mut ScanCache::default())
         .into_iter()
@@ -3210,6 +3281,156 @@ fn a_declared_dependency_no_compiled_module_names_is_refused() {
         item_gated_out.iter().any(|v| v.contains("`bcrypt`")),
         "the one item naming `bcrypt` compiles out with `auth` off: refused; \
          got {item_gated_out:?}"
+    );
+}
+
+/// The missing-dependency verdicts of the fixture `mod_rs` and program
+/// sources `program` over `cargo_toml`, with exactly `features` on, for the
+/// native or the wasm target.
+fn missing_dep_fixture(
+    root: &Path,
+    mod_rs: &str,
+    cargo_toml: &str,
+    features: &[&str],
+    program: &[&str],
+    wasm: bool,
+) -> Vec<String> {
+    let env = CfgEnv {
+        features: features.iter().map(|f| (*f).to_owned()).collect(),
+        wasm,
+    };
+    let mut emit = Emit::of_mod_rs(mod_rs);
+    cargo_toml.clone_into(&mut emit.cargo_toml);
+    emit.program_files = program.iter().map(|src| (*src).to_owned()).collect();
+    closure_violations(root, &emit, &env, &mut ScanCache::default())
+        .into_iter()
+        .filter(|v| v.starts_with(MISSING_DEP) || v.starts_with(UNUSED_DEP))
+        .collect()
+}
+
+/// The converse direction: a crate a compiled module names that the manifest
+/// does not turn on fails the build (E0433), so moving a crate onto a feature
+/// or a module row is refused unless every compiled user turns it on.
+#[test]
+fn a_named_crate_the_manifest_does_not_turn_on_is_refused() {
+    let root = closure_fixture(
+        "missing-dep",
+        &[(
+            "matcher.rs",
+            "pub fn m(p: &str) -> bool { regex::Regex::new(p).is_ok() }\n",
+        )],
+    );
+    let none = "[dependencies]\n";
+    let regex_optional = "[features]\nregex = [\"dep:regex\"]\n\n[dependencies]\n\
+                          regex = { version = \"1\", optional = true }\n";
+    let missing = missing_dep_fixture(&root, "pub mod matcher;\n", none, &[], &[], false);
+    let optional_off =
+        missing_dep_fixture(&root, "pub mod matcher;\n", regex_optional, &[], &[], false);
+    let optional_on = missing_dep_fixture(
+        &root,
+        "pub mod matcher;\n",
+        regex_optional,
+        &["regex"],
+        &[],
+        false,
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        names_crate(&missing, MISSING_DEP, "regex"),
+        "`matcher` names `regex`, the manifest lacks it: refused; got {missing:?}"
+    );
+    assert!(
+        names_crate(&optional_off, MISSING_DEP, "regex"),
+        "`regex` optional and off while `matcher` compiles: refused; got {optional_off:?}"
+    );
+    assert!(optional_on.is_empty(), "`regex` turned on: {optional_on:?}");
+}
+
+/// Whether a verdict list holds a `prefix` verdict naming `krate`.
+fn names_crate(verdicts: &[String], prefix: &str, krate: &str) -> bool {
+    verdicts
+        .iter()
+        .any(|v| v.starts_with(prefix) && v.contains(&format!("`{krate}`")))
+}
+
+/// The missing direction reads every user under its cfg: a program file is a
+/// user, a user that compiles out (a feature off, a native-only cfg on the wasm
+/// target) needs nothing, and a package whose library has another name
+/// (`md-5` / `md5`) is matched by its library name.
+#[test]
+fn a_named_crate_is_read_under_cfg_and_by_library_name() {
+    let root = closure_fixture(
+        "missing-dep-forms",
+        &[
+            (
+                "digest.rs",
+                "pub fn d(s: &str) -> [u8; 16] { md5::compute(s).0 }\n",
+            ),
+            (
+                "native.rs",
+                "#[cfg(unix)]\npub fn pid() -> u32 { rustix::process::getpid().as_raw_nonzero().get().unsigned_abs() }\n\
+                 #[cfg(target_os = \"linux\")]\npub fn uid() -> u32 { rustix::process::getuid().as_raw() }\n",
+            ),
+        ],
+    );
+    let none = "[dependencies]\n";
+    let program_gated = "#[cfg(feature = \"alloc_mimalloc\")]\n#[global_allocator]\n\
+                         static A: mimalloc::MiMalloc = mimalloc::MiMalloc;\nfn main() {}\n";
+    let mimalloc_optional = "[features]\nalloc_mimalloc = [\"dep:mimalloc\"]\n\n\
+                             [dependencies]\nmimalloc = { version = \"0.1\", optional = true }\n";
+    let program_off =
+        missing_dep_fixture(&root, "", mimalloc_optional, &[], &[program_gated], false);
+    let program_on = missing_dep_fixture(
+        &root,
+        "",
+        mimalloc_optional,
+        &["alloc_mimalloc"],
+        &[program_gated],
+        false,
+    );
+    let program_undeclared = missing_dep_fixture(
+        &root,
+        "",
+        none,
+        &["alloc_mimalloc"],
+        &[program_gated],
+        false,
+    );
+    let lib_named = missing_dep_fixture(
+        &root,
+        "pub mod digest;\n",
+        "[dependencies]\nmd-5 = \"0.10\"\n",
+        &[],
+        &[],
+        false,
+    );
+    let on_native = missing_dep_fixture(&root, "pub mod native;\n", none, &[], &[], false);
+    let on_wasm = missing_dep_fixture(&root, "pub mod native;\n", none, &[], &[], true);
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        program_off.is_empty(),
+        "the program's allocator compiles out with its feature off: {program_off:?}"
+    );
+    assert!(
+        program_on.is_empty(),
+        "the allocator feature turns `mimalloc` on: {program_on:?}"
+    );
+    assert!(
+        names_crate(&program_undeclared, MISSING_DEP, "mimalloc"),
+        "the program names `mimalloc`, the manifest lacks it: refused; \
+         got {program_undeclared:?}"
+    );
+    assert!(
+        lib_named.is_empty(),
+        "`md-5` is the package of library `md5`: {lib_named:?}"
+    );
+    assert!(
+        names_crate(&on_native, MISSING_DEP, "rustix"),
+        "a native host may compile the `unix` / `linux` items: refused; got {on_native:?}"
+    );
+    assert!(
+        on_wasm.is_empty(),
+        "the wasm target compiles neither native-only item: {on_wasm:?}"
     );
 }
 

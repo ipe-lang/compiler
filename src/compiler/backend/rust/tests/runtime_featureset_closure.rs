@@ -1338,7 +1338,7 @@ fn host_gated_module_reference_is_refused() {
         gates.unsatisfied(&refs, &env_with(&[])),
         vec![
             "`ipe_runtime::host::` needs `mod host`, which is compiled only on some \
-             build hosts (declared under [All([Host])])"
+             build hosts (declared under [All([NativeHost])])"
                 .to_owned()
         ],
     );
