@@ -15,7 +15,6 @@ impl IpeStringify for IpeDbStoreColumn {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum IpeDbStoreColumnSpec {
-    PrimaryKey(String),
     Serial(String),
     Unique(String),
     DefaultNow(String),
@@ -26,10 +25,6 @@ pub(crate) enum IpeDbStoreColumnSpec {
 impl IpeStringify for IpeDbStoreColumnSpec {
     fn ipe_show(&self) -> String {
         match self {
-            IpeDbStoreColumnSpec::PrimaryKey(p0) => format!(
-                "PrimaryKey {}",
-                (&ipe_runtime::stringify::Wrap(p0)).dispatch()
-            ),
             IpeDbStoreColumnSpec::Serial(p0) => {
                 format!("Serial {}", (&ipe_runtime::stringify::Wrap(p0)).dispatch())
             }

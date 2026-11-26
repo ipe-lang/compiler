@@ -1472,7 +1472,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `Draft` | A table under construction: its schema is known but its access intent is |
 | `Store` | One classified, queryable table whose schema, reads, and writes derive from |
 | `Column` | One typed column: its (validated) name and its abstract type for the |
-| `ColumnSpec` | A DB-only fact the record type cannot express: primary key, serial |
+| `ColumnSpec` | A per-column DB-only fact the record type cannot express: serial |
 | `PrimaryKeyDecl` | The table's primary key: none, one column, or several columns forming one |
 | `IndexSpec` | A declarative performance index over one or more of the store's columns. |
 | `Row` | A row read back from the database: every column keyed by its name, values |
@@ -1516,6 +1516,7 @@ Ipe.Db.Store — typed, injection-safe persistence over the audited `Ipe.Db`.
 | `insert` | `insert conn store row` — insert one row and return its generated id. The |
 | `insertReturning` | `insertReturning conn store row` — insert one row and return the stored row |
 | `upsert` | `upsert conn store row` — insert `row`, or, when a row with the same key |
+| `insertIfAbsent` | `insertIfAbsent conn store row` — insert `row` unless a row with the same |
 | `all` | `all conn store` — read every row and decode each through the store's |
 | `get` | `get conn store keyValue` — read the single row whose primary key equals |
 | `delete` | `delete conn store keyValue` — delete the row whose primary key equals |

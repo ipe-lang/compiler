@@ -80,10 +80,11 @@ pure data — no stored function.
 
 ## `ColumnSpec`
 
-A DB-only fact the record type cannot express: primary key, serial
+A per-column DB-only fact the record type cannot express: serial
 (DB-assigned) id, uniqueness, or a DB-stamped default. A typed ADT, not a
 stringly flag — an impossible spec (a flag typo, a malformed default) is
-unrepresentable.
+unrepresentable. The primary key is a table-level fact and lives only in the
+`PrimaryKeyDecl`, never as a spec, so the key is recorded in one place.
 
 ## `PrimaryKeyDecl`
 
@@ -417,9 +418,11 @@ with `findWhere` / `updateWhere` / `deleteWhere` naming every key column;
 a key column listed twice, records a typed `Err` that every read and write on
 the store fails with.
 
-`createSql` / `migrations` do not yet render a table-level
-`PRIMARY KEY (...)` clause: for a composite key they ALWAYS return a typed
-`Err`, so the table must already exist (created outside `Ipe.Db.Store`).
+`createSql` / `migrations` render the key as one table-level constraint,
+`PRIMARY KEY (user_id, group_id)`, columns in declared order, on SQLite and
+Postgres alike. A composite key on a store with a `serial` column is refused
+there with a typed `Err` (`AUTOINCREMENT` exists only on a one-column
+`INTEGER` key).
 
 Example:
 
@@ -444,10 +447,9 @@ rules as `compositePrimaryKey2`: key order is significant, an accessor naming
 a missing field is a type error, the by-key operations return a typed `Err`
 on the resulting store, `updateWhere` never writes any key column, and a
 second key declaration records a typed `Err` that every read and write fails
-with. `createSql` / `migrations` ALWAYS return a typed `Err` for a composite
-key (no table-level `PRIMARY KEY (...)` clause is rendered yet), so the table
-must already exist. For more than three columns, or a raw-column
-`fromColumns` draft, use `compositePrimaryKeyNamed`.
+with. `createSql` / `migrations` render the table-level
+`PRIMARY KEY (sensor, day, hour)`. For more than three columns, or a
+raw-column `fromColumns` draft, use `compositePrimaryKeyNamed`.
 
 Example:
 
@@ -495,6 +497,11 @@ SQL runs:
 * a name that is not a column of the draft;
 * a column listed twice;
 * a draft that already declares a primary key (single or composite).
+
+`createSql` / `migrations` render the key as one table-level constraint,
+`PRIMARY KEY (user_id, group_id)`, columns in declared order; a `serial`
+column on the same store is refused there (`AUTOINCREMENT` exists only on a
+one-column `INTEGER` key).
 
 Example:
 
@@ -637,6 +644,21 @@ yields `Ok`, and any identifier that somehow does not validate fails closed
 with no DDL produced. This is the one place a Store builds SQL text for the
 create entry; it builds only from validated identifiers and holds no values,
 so there is nothing to inject.
+
+The primary key renders from the store's one key declaration, identically on
+SQLite and Postgres:
+
+* a one-column key (`primaryKey`) is inline on its column:
+  `CREATE TABLE IF NOT EXISTS tags (slug TEXT PRIMARY KEY, label TEXT)`
+* a composite key (`compositePrimaryKey2` / `compositePrimaryKey3` /
+  `compositePrimaryKeyNamed`) is one table-level constraint, its columns in
+  declared order (the order the key's backing index uses):
+  `CREATE TABLE IF NOT EXISTS memberships (user_id TEXT, group_id TEXT, role TEXT, PRIMARY KEY (user_id, group_id))`
+
+An invalid key is an `Err`, never DDL without it: a refused declaration (a
+second key, a malformed composite list), a key column that is not a valid
+identifier or not a column of the store, or a composite key on a store with a
+`serial` column (`AUTOINCREMENT` exists only on a one-column `INTEGER` key).
 
 The DDL is the store's FROZEN schema — the table name, columns, and specs as
 first constructed — and is exactly the create entry `migrations` emits first.
@@ -782,6 +804,43 @@ Example:
     saveSetting : Db -> Store Setting -> String -> String -> Task Error Int
     saveSetting conn store name value =
         Store.upsert conn store { name = name, value = value }
+
+## `insertIfAbsent`
+
+```ipe
+insertIfAbsent : Db -> Store a -> a -> Task Error Int
+```
+
+`insertIfAbsent conn store row` — insert `row` unless a row with the same
+key already exists, in which case the stored row is left untouched (the first
+write wins); returns `1` when the row was inserted and `0` when its key was
+already present. The key is derived from the store's declaration exactly as
+`upsert` derives it — the primary key (every column of a composite key), or,
+for a store with no primary key, its one `unique` column — and every refusal
+`upsert` makes, `insertIfAbsent` makes too, as a typed `Err` naming
+`insertIfAbsent` before any SQL is sent.
+
+The check and the insert are one atomic statement (`INSERT … ON CONFLICT (…)
+DO NOTHING`), so two concurrent writers of the same key never both insert and
+neither sees an error. A row that conflicts on a unique column other than the
+target is the database's typed `Err`, never a silent skip. Routes through the
+audited `Db.insertFieldsIfAbsent`, which re-validates every identifier and
+binds every value.
+
+Example:
+
+    import Ipe.Db as Db exposing (Db)
+    import Ipe.Db.Store as Store exposing (Store)
+    import Ipe.Task as Task exposing (Task)
+    import Ipe.Error exposing (Error)
+
+    type alias Vote =
+        { voter : String, ballot : String, choice : String }
+
+    -- keyed on (voter, ballot): a voter's first choice stands.
+    castVote : Db -> Store Vote -> Vote -> Task Error Int
+    castVote conn store vote =
+        Store.insertIfAbsent conn store vote
 
 ## `all`
 
