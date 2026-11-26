@@ -2913,10 +2913,7 @@ mod zonk_row_tail_tests {
     #[test]
     fn zonk_reads_rigid_row_open() {
         let mut uf = UnionFind::<Content>::new();
-        let name = crate::ty::SkolemName::of_annotation_var(0).expect("raw 0 is an annotation id");
-        let ext = uf
-            .fresh(Content::Rigid(name))
-            .expect("fresh rigid must not fail");
+        let ext = uf.fresh(Content::Rigid).expect("fresh rigid must not fail");
         let rec = record_over(&mut uf, &[1], ext);
         let tail = tag_solver_var(uf.find(ext).expect("find must not fail"));
         let ty = zonk_unbounded(&mut uf, rec).expect("a rigid-row record must read back");
@@ -2944,20 +2941,19 @@ mod zonk_row_tail_tests {
     /// other terminal as the faithful read-back reads it.
     #[test]
     fn zonk_emitted_closes_only_non_rigid_rows() {
-        let name = crate::ty::SkolemName::of_annotation_var(0).expect("raw 0 is an annotation id");
         let terminals = [
             (Content::Flex, true),
             (
                 Content::Super {
-                    rigid: None,
+                    rigid: false,
                     bounds: TyBounds::eq(),
                 },
                 true,
             ),
-            (Content::Rigid(name), false),
+            (Content::Rigid, false),
             (
                 Content::Super {
-                    rigid: Some(name),
+                    rigid: true,
                     bounds: TyBounds::eq(),
                 },
                 false,
@@ -3130,10 +3126,7 @@ mod zonk_row_tail_tests {
     fn solved_ground_matches_zonked_ground() -> Result<(), String> {
         let mut uf = UnionFind::<Content>::new();
         let flex = uf.fresh(Content::Flex).expect("fresh flex must not fail");
-        let name = crate::ty::SkolemName::of_annotation_var(0).expect("raw 0 is an annotation id");
-        let rigid = uf
-            .fresh(Content::Rigid(name))
-            .expect("fresh rigid must not fail");
+        let rigid = uf.fresh(Content::Rigid).expect("fresh rigid must not fail");
         let empty = empty_row(&mut uf);
         let open_flex = record_over(&mut uf, &[1], flex);
         let open_rigid = record_over(&mut uf, &[1], rigid);

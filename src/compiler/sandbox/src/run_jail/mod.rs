@@ -219,7 +219,13 @@ impl<'fd> JailArgv<'fd> {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "macos",
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
+))]
 impl JailArgv<'_> {
     /// The `Command` this argv runs: its first element is the program, the
     /// rest its arguments.
@@ -283,6 +289,13 @@ pub struct JailLaunch {
 #[cfg(unix)]
 impl JailLaunch {
     /// A launch running `command` and handing the child `named`.
+    #[cfg(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )
+    ))]
     pub(crate) const fn new(
         command: std::process::Command,
         named: ipe_runtime_rust::system::NamedFds,
@@ -296,6 +309,7 @@ impl JailLaunch {
     /// # Errors
     ///
     /// [`RunJailDefect::Spawn`] for an empty argv.
+    #[cfg(target_os = "macos")]
     pub(crate) fn fd_free(argv: &JailArgv<'static>) -> Result<Self, RunJailDefect> {
         Ok(Self::new(
             argv.command()?,
@@ -333,7 +347,7 @@ impl JailLaunch {
     }
 
     /// Clear the inherited environment and set exactly `pairs`.
-    #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn scrub_env(&mut self, pairs: &[(OsString, OsString)]) {
         self.command.env_clear();
         for (name, value) in pairs {
@@ -366,7 +380,7 @@ impl JailLaunch {
 
     /// Replace this process with the jail, keeping its stdio. Returns only
     /// when the replacement did not happen.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "linux")]
     #[must_use]
     pub fn exec(self) -> RunJailDefect {
         let err = ipe_runtime_rust::system::exec_naming(self.command, self.named);

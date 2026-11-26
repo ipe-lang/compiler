@@ -452,14 +452,7 @@ fn enable(label: &str, pipeline: Pipeline) {
         ),
     );
     record_exporter_runtime();
-    let started = crate::threads::spawn_service(
-        "push exporter",
-        "the OTLP push batch exporter",
-        batcher(rx, client, pipeline),
-    );
-    if let Err(refused) = started {
-        crate::system::emit_runtime_log("push", &refused.to_string());
-    }
+    tokio::spawn(batcher(rx, client, pipeline));
 }
 
 /// The exporter's reqwest client for `ingest_url`: explicit timeouts so a

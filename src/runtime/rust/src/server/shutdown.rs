@@ -681,15 +681,7 @@ fn arm_in(
         work: Arc::new(Work::default()),
         pools,
     });
-    crate::threads::spawn_task_on(
-        "shutdown signal watch",
-        &runtime,
-        crate::threads::TaskScope::RuntimeOwned("the process's stop signals belong to no request"),
-        run_signals(Arc::clone(&shutdown), source, exit),
-    )
-    .detach(crate::threads::Detached::NoIpeCode(
-        "the signal watch and the runtime's own teardown hooks",
-    ));
+    runtime.spawn(run_signals(Arc::clone(&shutdown), source, exit));
     *held = Some(Arc::clone(&shutdown));
     Ok(Armed { shutdown })
 }
@@ -809,23 +801,13 @@ macro_rules! forward {
     ($listener:expr, $tx:expr, $signal:expr) => {{
         let mut listener = $listener;
         let tx = $tx;
-        let forwarding = crate::threads::spawn_task(
-            "stop signal forward",
-            crate::threads::TaskScope::RuntimeOwned(
-                "the process's stop signals belong to no request",
-            ),
-            async move {
-                while listener.recv().await.is_some() {
-                    if tx.send($signal).await.is_err() {
-                        return;
-                    }
+        tokio::spawn(async move {
+            while listener.recv().await.is_some() {
+                if tx.send($signal).await.is_err() {
+                    return;
                 }
-            },
-        )
-        .map_err(std::io::Error::other)?;
-        forwarding.detach(crate::threads::Detached::NoIpeCode(
-            "it forwards an OS stop signal into the watch's channel",
-        ));
+            }
+        });
     }};
 }
 

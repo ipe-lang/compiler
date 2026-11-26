@@ -2,8 +2,6 @@ use strum::EnumCount as _;
 
 use ipe_diagnostics::Located;
 
-use crate::ty::SkolemName;
-
 use super::{
     BTreeMap, BTreeSet, BinopClass, Builder, Builtins, CallSite, Constraint, ConstraintOrigin,
     Content, CtorScheme, DResult, Diagnostic, FlatType, Generated, InferError, Interner,
@@ -244,28 +242,8 @@ impl<'a> Builder<'a> {
         self.uf.fresh(Content::Flex)
     }
 
-    /// Mint the rigid (skolem) variable standing for annotation variable `name`.
-    pub fn rigid(&mut self, name: SkolemName) -> DResult<VarId> {
-        self.uf.fresh(Content::Rigid(name))
-    }
-
-    /// A fresh variable for the annotation variable whose raw id is `raw`.
-    ///
-    /// A signature instantiated to check its own body (`rigid`) mints a rigid
-    /// named after the variable; any other instantiation mints a flex. A
-    /// solver-tagged raw names no annotation variable, so a rigid for it is an
-    /// internal bug, never an unnamed rigid.
-    fn annotation_var(&mut self, raw: u32, rigid: bool) -> DResult<VarId> {
-        if !rigid {
-            return self.flex();
-        }
-        let name = SkolemName::of_annotation_var(raw).ok_or_else(|| Diagnostic::CompilerBug {
-            where_: super::STAGE,
-            detail:
-                "a signature's rigid type variable carries a solver id, not its annotation name"
-                    .to_owned(),
-        })?;
-        self.rigid(name)
+    pub fn rigid(&mut self) -> DResult<VarId> {
+        self.uf.fresh(Content::Rigid)
     }
 
     pub fn structure(&mut self, f: FlatType) -> DResult<VarId> {
@@ -353,7 +331,7 @@ impl<'a> Builder<'a> {
     /// concrete type that does not actually support the operation.
     pub fn super_var(&mut self, bounds: TyBounds, span: Span) -> DResult<VarId> {
         let v = self.uf.fresh(Content::Super {
-            rigid: None,
+            rigid: false,
             bounds,
         })?;
         let home = self.home()?;
@@ -701,7 +679,7 @@ impl<'a> Builder<'a> {
                         if let Some(v) = vars.get(raw_id).copied() {
                             v
                         } else {
-                            let v = self.annotation_var(*raw_id, rigid)?;
+                            let v = if rigid { self.rigid()? } else { self.flex()? };
                             vars.insert(*raw_id, v);
                             v
                         }
@@ -730,7 +708,7 @@ impl<'a> Builder<'a> {
                 if let Some(v) = vars.get(id).copied() {
                     return Ok(v);
                 }
-                let v = self.annotation_var(*id, rigid)?;
+                let v = if rigid { self.rigid()? } else { self.flex()? };
                 vars.insert(*id, v);
                 Ok(v)
             }

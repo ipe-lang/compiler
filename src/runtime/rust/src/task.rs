@@ -115,23 +115,17 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let started = crate::threads::spawn_task(
-        "foreign async task",
-        crate::threads::TaskScope::Caller,
-        future,
-    );
-    let task = started.map_err(GuardedEnd::Refused)?;
-    task.join_contained()
-        .await
-        .map_err(|unjoined| match unjoined {
-            crate::threads::Unjoined::Trip(fault) => GuardedEnd::Trip(fault),
-            crate::threads::Unjoined::Ended(crate::threads::TaskEnded::Panicked(payload)) => {
-                GuardedEnd::Panicked(payload)
-            }
-            crate::threads::Unjoined::Ended(crate::threads::TaskEnded::Cancelled(join_err)) => {
-                GuardedEnd::Cancelled(join_err)
-            }
-        })
+    let handle = spawn_in_current_scope(future);
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    let joined = handle.await;
+    guard.defuse();
+    joined.map_err(|join_err| match join_err.try_into_panic() {
+        Ok(payload) => match closure_unwind(payload) {
+            ClosureUnwind::Trip(fault) => GuardedEnd::Trip(fault),
+            ClosureUnwind::Foreign(payload) => GuardedEnd::Panicked(payload),
+        },
+        Err(join_err) => GuardedEnd::Cancelled(join_err),
+    })
 }
 
 /// How a task spawned by [`spawn_guarded_raw`] ended without its output.
@@ -144,8 +138,6 @@ pub enum GuardedEnd {
     Panicked(Box<dyn std::any::Any + Send>),
     /// The join resolved without a panic (the task was cancelled).
     Cancelled(tokio::task::JoinError),
-    /// The task never started: no tokio runtime runs on the calling thread.
-    Refused(crate::threads::ThreadRefused),
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -160,7 +152,6 @@ impl GuardedEnd {
             Self::Trip(fault) => fault.to_ipe_error(),
             Self::Panicked(payload) => ipe_error_from_panic("foreign async task panicked", payload),
             Self::Cancelled(join_err) => ipe_error_from_foreign(join_err),
-            Self::Refused(refused) => refused.into_error(),
         }
     }
 }
@@ -213,10 +204,6 @@ fn unchanneled_outcome<T>(raw: Result<Option<T>, GuardedEnd>) -> Result<Option<T
             note_foreign_error(join_err);
             Ok(None)
         }
-        Err(GuardedEnd::Refused(refused)) => {
-            note_foreign_error(refused);
-            Ok(None)
-        }
     }
 }
 
@@ -260,10 +247,10 @@ fn drive_entry_caught<E: crate::FromIpeError, A>(
 ///
 /// Every caller-owned task-local scope is carried here and only here: a new
 /// one wraps the result, `carry_new_scope(carry_web_session(..))`, and every
-/// task started in [`crate::threads::TaskScope::Caller`] inherits it.
+/// spawn through [`spawn_in_current_scope`] inherits it.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 #[allow(clippy::missing_const_for_fn)] // const only in builds that carry no scope
-pub(crate) fn on_behalf_of_caller<F: std::future::Future>(
+fn on_behalf_of_caller<F: std::future::Future>(
     task: F,
 ) -> impl std::future::Future<Output = F::Output> {
     carry_web_session(carry_request_streams(carry_server_request(task)))
@@ -329,16 +316,17 @@ const fn carry_server_request<F: std::future::Future>(task: F) -> F {
 
 /// Spawn `task` on the runtime inside every scope its caller runs in.
 ///
-/// The bare-handle start of the callers not yet behind
-/// [`crate::threads::TaskHandle`]; every other task start goes through
-/// [`crate::threads::spawn_task`].
+/// The spawn every task of this module goes through, and the one a spawn for
+/// work on user code's behalf elsewhere in the runtime must use: a bare spawn
+/// starts the task outside the caller's task-locals, where a credential it
+/// verifies binds to nothing.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub(crate) fn spawn_in_current_scope<F>(task: F) -> tokio::task::JoinHandle<F::Output>
 where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    crate::threads::spawn_unmigrated(task)
+    tokio::spawn(on_behalf_of_caller(task))
 }
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
@@ -984,16 +972,16 @@ pub fn task_run<
 // failed, NO task ordered after the failing one can fire its side effect (they
 // are all aborted before this future resolves).
 //
-// TOTALITY: no unwrap/expect/panic/indexing. A failed contained join is a
+// TOTALITY: no unwrap/expect/panic/indexing. A `JoinError` from `h.await` is a
 // panic inside the spawned task (we never `.await` a handle after issuing its
 // abort, so the cancelled-handle case is reachable only on runtime shutdown);
 // `parallel_child_failure` hands a runtime trip back under its typed kind;
 // any other panic, and a cancel, it logs server-side under a correlation id and
 // hands Ipê a generic `Unexpected` naming the panic or the cancel. The
 // cancelled arm stays total rather than resting on an unreachable assumption.
-/// One started `Task.parallel` child; dropping it aborts the child.
+/// One spawned `Task.parallel` child and the guard that aborts it on drop.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-type ParallelChild<E, A> = crate::threads::TaskHandle<IpeResult<E, A>>;
+type ParallelChild<E, A> = (tokio::task::JoinHandle<IpeResult<E, A>>, AbortOnDrop);
 
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
 pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>(
@@ -1006,26 +994,21 @@ pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>
         // Each spawned task stays inside the request scope this one runs in.
         // Each handle is paired with an abort guard, so dropping this future
         // (a cancelled parent) aborts every child not yet joined.
-        let mut handles: std::collections::VecDeque<ParallelChild<E, A>> =
-            std::collections::VecDeque::with_capacity(tasks.len());
-        for task in tasks {
-            let started = crate::threads::spawn_task(
-                "parallel task",
-                crate::threads::TaskScope::Caller,
-                task,
-            );
-            match started {
-                Ok(child) => handles.push_back(child),
-                Err(refused) => {
-                    return IpeResult::Err(E::from_ipe_error(refused.into_error::<IpeError>()));
-                }
-            }
-        }
+        let mut handles: std::collections::VecDeque<ParallelChild<E, A>> = tasks
+            .into_iter()
+            .map(|task| {
+                let handle = spawn_in_current_scope(task);
+                let guard = AbortOnDrop::new(handle.abort_handle());
+                (handle, guard)
+            })
+            .collect();
         let mut out = Vec::with_capacity(handles.len());
-        while let Some(child) = handles.pop_front() {
-            let result = match child.join_contained().await {
+        while let Some((h, guard)) = handles.pop_front() {
+            let joined = h.await;
+            guard.defuse();
+            let result = match joined {
                 Ok(r) => r,
-                Err(unjoined) => IpeResult::Err(parallel_child_failure(unjoined)),
+                Err(join_err) => IpeResult::Err(parallel_child_failure(join_err)),
             };
             match result {
                 IpeResult::Ok(a) => out.push(a),
@@ -1035,7 +1018,7 @@ pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>
                     // side effects can fire once we have reported failure.
                     // Already-awaited tasks (`Ok`, popped) are complete — nothing
                     // to abort. `abort()` on a finished handle is a harmless no-op.
-                    for survivor in &handles {
+                    for (survivor, _) in &handles {
                         survivor.abort();
                     }
                     return IpeResult::Err(e);
@@ -1053,10 +1036,16 @@ pub fn task_parallel<E: crate::FromIpeError + Send + 'static, A: Send + 'static>
 /// it is kinded `Unexpected` and named for what it is; the payload or
 /// `JoinError` detail is logged under the correlation id only.
 #[cfg(all(feature = "tokio", not(target_arch = "wasm32")))]
-fn parallel_child_failure<E: crate::FromIpeError>(unjoined: crate::threads::Unjoined) -> E {
-    match unjoined {
-        crate::threads::Unjoined::Trip(fault) => E::from_ipe_error(fault.to_ipe_error()),
-        crate::threads::Unjoined::Ended(ended) => ended.into_error("parallel task"),
+fn parallel_child_failure<E: crate::FromIpeError>(join_err: tokio::task::JoinError) -> E {
+    match join_err.try_into_panic() {
+        Ok(payload) => crate::core::ipe_error_from_unwind(
+            crate::core::UnwindBoundary::Task("parallel task panicked"),
+            payload,
+        ),
+        Err(join_err) => E::from_ipe_error(crate::IpeError::unexpected(format!(
+            "parallel task cancelled (ref {})",
+            crate::core::note_foreign_error(join_err)
+        ))),
     }
 }
 
@@ -1714,9 +1703,7 @@ mod parallel_abort_tests {
             "an aborted spawn joins as a cancel: {joined:?}"
         );
         if let Err(join_err) = joined {
-            let err: crate::IpeError = parallel_child_failure(crate::threads::Unjoined::Ended(
-                crate::threads::TaskEnded::Cancelled(join_err),
-            ));
+            let err: crate::IpeError = parallel_child_failure(join_err);
             assert_eq!(
                 crate::ipe_error_kind(err.clone()),
                 crate::IpeErrorKind::Unexpected
@@ -2281,6 +2268,107 @@ mod loop_tests {
     }
 }
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod spawn_scope_scan_tests {
+    /// A spelling that starts a task on a runtime or a thread pool.
+    const RAW_SPAWNS: [&str; 7] = [
+        "tokio::spawn",
+        "task::spawn",
+        "spawn_local",
+        "spawn_blocking",
+        "JoinSet",
+        "Handle::spawn",
+        ".spawn(",
+    ];
+
+    /// The production source of this module: everything before its first
+    /// test module, refused if any non-test item follows that module.
+    fn production_source() -> &'static str {
+        let source = include_str!("task.rs");
+        let Some((production, tests)) = source.split_once("#[cfg(test)]") else {
+            panic!("task.rs carries its test modules");
+        };
+        for line in tests.lines() {
+            let top_level = !line.is_empty() && !line.starts_with(char::is_whitespace);
+            assert!(
+                !top_level
+                    || ["#[", "mod ", "}", ")", "//"]
+                        .iter()
+                        .any(|item| line.starts_with(item)),
+                "production code follows a test module in task.rs, so the spawn scan \
+                 cannot see it; move it above the first test module: {line}"
+            );
+        }
+        production
+    }
+
+    #[test]
+    fn task_spawns_only_through_the_scope_carrier() {
+        let mut carriers = 0;
+        for line in production_source().lines() {
+            let code = line.trim();
+            if code.starts_with("//") {
+                continue;
+            }
+            if code == "tokio::spawn(on_behalf_of_caller(task))" {
+                carriers += 1;
+                continue;
+            }
+            assert!(
+                !RAW_SPAWNS.iter().any(|raw| code.contains(raw)),
+                "a spawn in task.rs drops the caller's request scope; route it \
+                 through `spawn_in_current_scope`: {code}"
+            );
+            assert!(
+                !(code.starts_with("use ") && code.contains("tokio") && code.contains("spawn")),
+                "a spawn imported into task.rs escapes the scan: {code}"
+            );
+        }
+        assert_eq!(
+            carriers, 1,
+            "`spawn_in_current_scope` is the one runtime spawn"
+        );
+    }
+
+    #[test]
+    fn the_scope_carrier_carries_every_caller_scope() {
+        let production = production_source();
+        let carrier = production
+            .split_once("fn on_behalf_of_caller<")
+            .and_then(|(_, body)| body.split_once("\n}"))
+            .map(|(body, _)| body);
+        assert!(
+            carrier.is_some_and(|body| {
+                [
+                    "carry_web_session(",
+                    "carry_request_streams(",
+                    "carry_server_request(",
+                ]
+                .iter()
+                .all(|scope| body.contains(scope))
+            }),
+            "`on_behalf_of_caller` carries the Web session, the request stream table \
+             and the request binding set"
+        );
+    }
+
+    #[test]
+    fn block_on_thread_carries_the_scope() {
+        let production = production_source();
+        let carried = production.find("let future = on_behalf_of_caller(future);");
+        let spawned = production.find("crate::threads::spawn_sized(");
+        assert!(
+            matches!((carried, spawned), (Some(c), Some(s)) if c < s),
+            "`block_on` carries the caller's scope before its entry thread starts"
+        );
+        assert_eq!(
+            production.matches("spawn_sized(").count(),
+            1,
+            "`block_on` is the one thread spawn of task.rs"
+        );
+    }
+}
+
 #[cfg(all(
     test,
     feature = "tokio",
@@ -2419,38 +2507,6 @@ mod unchanneled_join_tests {
                 ))
             ),
             "{joined:?}"
-        );
-    }
-
-    /// `future` polled once on the calling thread, with no runtime running.
-    fn poll_once_without_a_runtime<F: std::future::Future>(
-        future: F,
-    ) -> std::task::Poll<F::Output> {
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        std::pin::pin!(future).as_mut().poll(&mut context)
-    }
-
-    // With no runtime running, a guarded foreign call ends typed: the typed
-    // channel gets `Unavailable`, the `None` channel gets `None`; neither
-    // panics.
-    #[test]
-    fn a_guarded_spawn_without_a_runtime_refuses_typed() {
-        let typed = poll_once_without_a_runtime(ffi_spawn_guarded(async { 7_i64 }));
-        assert!(
-            matches!(
-                &typed,
-                std::task::Poll::Ready(Err(crate::IpeError::Error(
-                    crate::IpeErrorKind::Unavailable,
-                    _
-                )))
-            ),
-            "{typed:?}"
-        );
-        let unchanneled =
-            poll_once_without_a_runtime(ffi_spawn_guarded_unchanneled(async { Some(7_i64) }));
-        assert!(
-            matches!(unchanneled, std::task::Poll::Ready(None)),
-            "{unchanneled:?}"
         );
     }
 }

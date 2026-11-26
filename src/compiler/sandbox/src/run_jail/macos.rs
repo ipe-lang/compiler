@@ -8,7 +8,7 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-use super::{JailArgv, JailLaunch, RunJailDefect, RunJailTools, SandboxProfile};
+use super::{RunJailDefect, RunJailTools, SandboxProfile};
 use crate::host_tool::{self, HostTool, ToolPath};
 use crate::{CanonicalPath, JailMounts};
 
@@ -85,6 +85,8 @@ pub fn exec_in_run_jail(
     app: &Path,
     app_args: &[OsString],
 ) -> Result<std::convert::Infallible, RunJailDefect> {
+    use std::os::unix::process::CommandExt as _;
+
     // `sandbox-exec` is the mandatory macOS jail primitive. Absent ⇒ refuse; the
     // capability-bearing app is never run unconfined.
     let sandbox_exec = seatbelt_of(tools)?;
@@ -101,26 +103,22 @@ pub fn exec_in_run_jail(
     let sbpl = crate::build_jail::checked_sbpl(profile, &mounts).map_err(RunJailDefect::Path)?;
 
     // argv: sandbox-exec -p <profile> <app> <app_args…>. Direct argv, no shell.
-    let mut argv: Vec<OsString> = Vec::with_capacity(app_args.len().saturating_add(4));
-    argv.push(sandbox_exec.as_path().into_os_string());
-    argv.push(OsString::from("-p"));
-    argv.push(OsString::from(sbpl));
-    argv.push(app.as_os_str().to_owned());
-    argv.extend(app_args.iter().cloned());
-    // The exec goes through the runtime descriptor floor: Seatbelt checks a path
-    // when it is opened, so a descriptor this process holds would reach the app
-    // past every SBPL rule; the app inherits stdio alone.
-    let mut launch = JailLaunch::fd_free(&JailArgv::fd_free(argv))?;
+    let mut cmd = sandbox_exec.command();
+    cmd.arg("-p").arg(&sbpl).arg(app).args(app_args);
     // Enforce the `env` axis in the launcher (Seatbelt cannot scrub env): clear
     // the inherited environment and re-export ONLY the scrubbed base plus the
     // profile's allowlisted names, mirroring the Linux jail's `--clearenv`. The
     // scrub is the SAME `macos_scrubbed_env` the e2e proves, so what confines the
     // env at run time and what the test asserts cannot drift.
     let host_env = crate::host_env::granted;
-    launch.scrub_env(&crate::build_jail::macos_scrubbed_env(
-        profile, scoped_tmp, &host_env,
-    ));
-    Err(launch.exec())
+    cmd.env_clear();
+    for (name, value) in crate::build_jail::macos_scrubbed_env(profile, scoped_tmp, &host_env) {
+        cmd.env(name, value);
+    }
+    let err = cmd.exec();
+    Err(RunJailDefect::Spawn {
+        detail: err.to_string(),
+    })
 }
 
 /// A verified embedded app binary held in memory.
@@ -138,11 +136,7 @@ pub struct SealedApp {
 
 impl SealedApp {
     /// Read the app bytes for the capability-floor verification scan.
-    ///
-    /// # Errors
-    ///
-    /// Infallible in practice; returns `Result` for arm-parity with the Linux
-    /// sealed-memfd read.
+    #[must_use]
     pub fn read_sealed_bytes(&self) -> Result<Vec<u8>, RunJailDefect> {
         Ok(self.bytes.clone())
     }
