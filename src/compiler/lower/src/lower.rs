@@ -35606,6 +35606,13 @@ mod tests {
     const PROGRAM_PHANTOM_TAG_SPAN: Span = Span::new(50, 51);
     /// A span the binder-type tests record `Program Web <free var>` at.
     const PROGRAM_PHANTOM_MSG_SPAN: Span = Span::new(60, 61);
+    /// The spans the binder-type tests record `Program <tag> <free var>` at,
+    /// one per shape tag other than `Web`.
+    const PROGRAM_PHANTOM_MSG_SHAPE_SPANS: [(&str, Span); 3] = [
+        ("Tui", Span::new(62, 63)),
+        ("Cli", Span::new(64, 65)),
+        ("Worker", Span::new(66, 67)),
+    ];
 
     /// Run `check` against a lowerer whose solved regions are the spans above.
     fn with_binder_type_lowerer(check: impl FnOnce(&Lowerer<'_>, ipe_intern::Symbol)) {
@@ -35615,6 +35622,10 @@ mod tests {
         interner.intern("String").unwrap();
         let program = interner.intern("Program").unwrap();
         let web = interner.intern("Web").unwrap();
+        let shape_tags: Vec<(ipe_intern::Symbol, Span)> = PROGRAM_PHANTOM_MSG_SHAPE_SPANS
+            .iter()
+            .map(|(tag, span)| (interner.intern(tag).unwrap(), *span))
+            .collect();
         let module = canon::Module {
             imports_unsafe_submodule: false,
             imported_web_capabilities: BTreeSet::new(),
@@ -35654,6 +35665,23 @@ mod tests {
                 ],
             },
         );
+        for (tag, span) in shape_tags {
+            types.regions.insert(
+                (Vec::new(), span),
+                Ty::Con {
+                    module: vec![],
+                    name: program,
+                    args: vec![
+                        Ty::Con {
+                            module: vec![],
+                            name: tag,
+                            args: vec![],
+                        },
+                        Ty::Var(7),
+                    ],
+                },
+            );
+        }
         let lowerer = Lowerer::new(
             &module,
             &types,
@@ -36954,7 +36982,334 @@ mod tests {
         });
     }
 
+    /// A phantom `Program` message parameter is defaultable under every shape tag.
+    ///
+    /// With the `Web` case and the tag-slot refusal above, this pins the
+    /// phantom guard's accepted set: the message slot under each
+    /// [`super::ProgramShapeTag`], never the tag slot.
+    #[test]
+    fn binder_ir_type_pins_phantom_program_msg_every_shape() {
+        with_binder_type_lowerer(|lowerer, _| {
+            for (spelled, span) in PROGRAM_PHANTOM_MSG_SHAPE_SPANS {
+                let tag = super::ProgramShapeTag::parse(spelled);
+                assert!(tag.is_some(), "`{spelled}` is a shape tag");
+                let Some(tag) = tag else { return };
+                let got = lowerer.binder_ir_type(Some(span));
+                assert!(
+                    matches!(&got, Ok(Some(super::BinderType::Phantom(leaf))) if *leaf == tag.app_leaf()),
+                    "a phantom Program msg under `{spelled}` must classify at its app leaf, got {got:?}"
+                );
+            }
+        });
+    }
+
+    /// A phantom binder with a deferred fn-value capture refuses at the capture's span.
+    ///
+    /// The phantom type is classification-only and never takes the `Arc`
+    /// carrier, so the capture fails closed as IPE-L0126 rather than leaking
+    /// a bare `Box` capture.
+    #[test]
+    fn apply_binder_move_ownership_refuses_phantom_non_clone_capture() {
+        with_binder_type_lowerer(|lowerer, sym| {
+            let capture_span = Span::new(120, 121);
+            lowerer
+                .deferred_fun_captures
+                .borrow_mut()
+                .insert(sym, capture_span);
+            let binder_ty = super::BinderType::Phantom(super::IrType::Str);
+            let got = lowerer.apply_binder_move_ownership(
+                sym,
+                &binder_ty,
+                super::Expr::Int(0),
+                UNIT_SPAN,
+            );
+            assert!(
+                matches!(
+                    got,
+                    Err(super::Diagnostic::Lower {
+                        span,
+                        msg: super::LowerError::Unsupported(super::Feature::NonCloneCapture),
+                    }) if span == capture_span
+                ),
+                "a phantom binder with a deferred fn capture must refuse at the capture, got {got:?}"
+            );
+        });
+    }
+
+    /// `Program shape String`, a shape-generic `Program` annotation over `shape`.
+    fn program_over_shape_var(
+        program: ipe_intern::Symbol,
+        shape: ipe_intern::Symbol,
+        string: ipe_intern::Symbol,
+    ) -> canon::Type {
+        canon::Type::Con {
+            home: vec![],
+            name: program,
+            args: vec![
+                canon::Type::Var(shape),
+                canon::Type::Con {
+                    home: vec![],
+                    name: string,
+                    args: vec![],
+                },
+            ],
+        }
+    }
+
+    /// A nullary builtin annotation head.
+    fn canon_leaf(name: ipe_intern::Symbol) -> canon::Type {
+        canon::Type::Con {
+            home: vec![],
+            name,
+            args: vec![],
+        }
+    }
+
+    /// The `(span, msg)` of a lowering refusal, `None` for any other outcome.
+    fn lower_refusal<T>(got: ipe_diagnostics::DResult<T>) -> Option<(Span, super::LowerError)> {
+        match got {
+            Err(super::Diagnostic::Lower { span, msg }) => Some((span, msg)),
+            _ => None,
+        }
+    }
+
+    /// A shape-generic `Program` return annotation refuses at the signature's span.
+    #[test]
+    fn split_typed_sig_program_shape_var_return_reports_sig_span() {
+        with_named_lowerer(&["Program", "shape", "String"], |lowerer, syms| {
+            let [program, shape, string] = syms else {
+                return;
+            };
+            let ret_ty = program_over_shape_var(*program, *shape, *string);
+            let sig_span = Span::new(100, 110);
+            let got = lower_refusal(lowerer.split_typed_sig(&ret_ty, &[], &[], sig_span, None));
+            assert!(
+                matches!(
+                    got,
+                    Some((span, super::LowerError::Unsupported(super::Feature::Polymorphism)))
+                        if span == sig_span
+                ),
+                "a shape-generic return must refuse as L0102 at the signature, got {got:?}"
+            );
+        });
+    }
+
+    /// A shape-generic `Program` parameter annotation refuses at its own pattern's span.
+    #[test]
+    fn split_typed_sig_program_shape_var_param_reports_param_span() {
+        with_named_lowerer(
+            &["Program", "shape", "String", "Int", "p"],
+            |lowerer, syms| {
+                let [program, shape, string, int, p] = syms else {
+                    return;
+                };
+                let ty = canon::Type::Lambda(
+                    Box::new(program_over_shape_var(*program, *shape, *string)),
+                    Box::new(canon_leaf(*int)),
+                );
+                let sig_span = Span::new(100, 130);
+                let pat_span = Span::new(112, 113);
+                let patterns = [Located::new(pat_span, canon::Pattern_::PVar(*p))];
+                let got =
+                    lower_refusal(lowerer.split_typed_sig(&ty, &patterns, &[], sig_span, None));
+                assert!(
+                    matches!(
+                        got,
+                        Some((span, super::LowerError::Unsupported(super::Feature::Polymorphism)))
+                            if span == pat_span
+                    ),
+                    "a shape-generic parameter must refuse as L0102 at its pattern, got {got:?}"
+                );
+            },
+        );
+    }
+
+    /// A `Dict Float v` parameter annotation refuses at its own pattern's span.
+    #[test]
+    fn split_typed_sig_float_keyed_dict_reports_span() {
+        with_named_lowerer(&["Dict", "Float", "Int", "d"], |lowerer, syms| {
+            let [dict, float, int, d] = syms else { return };
+            let ty = canon::Type::Lambda(
+                Box::new(canon::Type::Con {
+                    home: vec![],
+                    name: *dict,
+                    args: vec![canon_leaf(*float), canon_leaf(*int)],
+                }),
+                Box::new(canon_leaf(*int)),
+            );
+            let sig_span = Span::new(100, 130);
+            let pat_span = Span::new(114, 115);
+            let patterns = [Located::new(pat_span, canon::Pattern_::PVar(*d))];
+            let got = lower_refusal(lowerer.split_typed_sig(&ty, &patterns, &[], sig_span, None));
+            assert!(
+                matches!(
+                    got,
+                    Some((span, super::LowerError::Unsupported(super::Feature::FloatKeyedCollection)))
+                        if span == pat_span
+                ),
+                "a float-keyed dict parameter must refuse as L0117 at its pattern, got {got:?}"
+            );
+        });
+    }
+
+    /// A projection wider than five columns refuses at the projection's span.
+    #[test]
+    fn projection_decode_lambda_wider_than_five_reports_at() {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let store_home: Vec<ipe_intern::Symbol> = ["Ipe", "Db", "Store"]
+            .iter()
+            .map(|segment| interner.intern(segment).unwrap())
+            .collect();
+        let reader = interner.intern(super::ProjColKind::Text.reader()).unwrap();
+        let int = interner.intern("Int").unwrap();
+        let string = interner.intern("String").unwrap();
+        let row_binder = interner.intern("row").unwrap();
+        let int_ty = canon::Type::Con {
+            home: vec![],
+            name: int,
+            args: vec![],
+        };
+        let reader_def = canon::Def::Typed {
+            home: store_home,
+            name: Located::new(Span::new(1, 2), reader),
+            free_vars: vec![],
+            patterns: vec![],
+            body: Located::new(Span::new(3, 4), canon::Expr_::Unit),
+            ty: canon::Type::Lambda(
+                Box::new(int_ty.clone()),
+                Box::new(canon::Type::Lambda(
+                    Box::new(canon::Type::Con {
+                        home: vec![],
+                        name: string,
+                        args: vec![],
+                    }),
+                    Box::new(int_ty),
+                )),
+            ),
+        };
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs: vec![reader_def],
+        };
+        let types = empty_solved_types();
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![row_binder],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        let cols: Vec<super::ProjectedColumn> = (0..6)
+            .map(|i| super::ProjectedColumn {
+                source: super::ProjectionSource::Column {
+                    alias: "a0".to_owned(),
+                    column: format!("c{i}"),
+                },
+                kind: super::ProjColKind::Text,
+            })
+            .collect();
+        let at = Span::new(140, 141);
+        let got = lowerer.projection_decode_lambda(&cols, at).err();
+        assert!(
+            matches!(
+                &got,
+                Some(super::Diagnostic::Lower { span, .. }) if *span == at
+            ),
+            "a six-column projection must refuse at the projection's span, got {got:?}"
+        );
+        assert_eq!(
+            got,
+            Some(super::unsupported_store_select(
+                at,
+                super::StoreSelectProjectionDefect::UnsupportedProjectionBody,
+            )),
+            "the refusal is the unsupported-projection-body defect"
+        );
+    }
+
+    /// The shape-tag table agrees with the kernel registry and both type-lowering paths.
+    ///
+    /// Every tag round-trips through its spelling, names an `Ipe.Tea` builtin,
+    /// and lowers `Program <tag> String` to its app leaf from an annotation
+    /// and from a solved type alike; every `Ipe.Tea` shape builtin is a tag.
+    #[test]
+    fn program_shape_tag_agrees_with_kernel_registry() {
+        let registry_shapes: BTreeSet<&str> = ipe_kernels::BUILTIN_TYPES
+            .iter()
+            .filter(|row| {
+                row.tag()
+                    .is_some_and(|tag| format!("{tag:?}").starts_with("ProgramShape"))
+            })
+            .map(ipe_kernels::BuiltinRow::name)
+            .collect();
+        let table_shapes: BTreeSet<&str> = super::ProgramShapeTag::ALL
+            .iter()
+            .map(|tag| tag.spelling())
+            .collect();
+        assert_eq!(
+            registry_shapes, table_shapes,
+            "the shape tags are exactly the registry's `Program` shape builtins"
+        );
+        let names: Vec<&str> = std::iter::once(super::PROGRAM_CARRIER)
+            .chain(["String"])
+            .chain(super::ProgramShapeTag::ALL.iter().map(|tag| tag.spelling()))
+            .collect();
+        with_named_lowerer(&names, |lowerer, syms| {
+            let [program, string, tag_syms @ ..] = syms else {
+                return;
+            };
+            for (tag, tag_sym) in super::ProgramShapeTag::ALL.iter().zip(tag_syms) {
+                assert_eq!(super::ProgramShapeTag::parse(tag.spelling()), Some(*tag));
+                assert!(
+                    ipe_kernels::BuiltinType::of_head(&["Ipe", "Tea"], tag.spelling()).is_some(),
+                    "`{}` is an `Ipe.Tea` builtin type",
+                    tag.spelling()
+                );
+                let annotation = canon::Type::Con {
+                    home: vec![],
+                    name: *program,
+                    args: vec![canon_leaf(*tag_sym), canon_leaf(*string)],
+                };
+                assert_eq!(
+                    lowerer.ir_type_from_canon(&annotation, &[], Span::new(1, 2)),
+                    Ok(tag.app_leaf()),
+                    "an annotated `Program {}` lowers to its app leaf",
+                    tag.spelling()
+                );
+                let solved = Ty::Con {
+                    module: vec![],
+                    name: *program,
+                    args: vec![builtin_leaf(*tag_sym), builtin_leaf(*string)],
+                };
+                assert_eq!(
+                    lowerer.ir_type_from_ty(&solved, Span::new(1, 2)),
+                    Ok(tag.app_leaf()),
+                    "a solved `Program {}` lowers to its app leaf",
+                    tag.spelling()
+                );
+            }
+        });
+    }
+
     /// A phantom under a function arrow does not lower and refuses with that typed error.
+
     #[test]
     fn binder_ir_type_refuses_unlowerable_type() {
         with_binder_type_lowerer(|lowerer, _| {
