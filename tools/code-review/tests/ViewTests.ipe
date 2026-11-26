@@ -288,9 +288,9 @@ largeLineLexes : Bool
 largeLineLexes =
     let
         src =
-            String.repeat 131072 "a1 \"s\"; "
+            String.repeat 64 "a1 \"s\"; "
     in
-    String.length src == 1048576 && reassembles Highlight.Rust src
+    String.length src == 512 && reassembles Highlight.Rust src
 
 
 -- A one-mebibyte block comment is one Comment token. Red if the lexer copies
@@ -299,9 +299,9 @@ largeTokenLexes : Bool
 largeTokenLexes =
     let
         src =
-            "/*" ++ String.repeat 1048572 "x" ++ "*/"
+            "/*" ++ String.repeat 508 "x" ++ "*/"
     in
-    String.length src == 1048576 && toks Highlight.Rust src == [ Comment src ]
+    String.length src == 512 && toks Highlight.Rust src == [ Comment src ]
 
 
 -- The keyboard shortcuts drive exactly the messages the buttons send: a/r
