@@ -406,7 +406,7 @@ pub fn inject_interfaces(
         if sources.contains_key(&mod_path) {
             return Err(FfiPrepError::ModuleClaimed {
                 module: c.module_name.clone(),
-                slug: c.slug.clone(),
+                slug: c.slug.to_string(),
             });
         }
         let pseudo_path = cache_root_hint.join(format!("{}.ipe", c.slug));
@@ -432,6 +432,8 @@ pub struct AssembledEmit {
 /// the combined `src/ffi.rs` (one `pub mod <slug>` per crate).
 ///
 /// # Errors
+/// [`FfiPrepError::SlugCollision`] when two installed crates share one module
+/// slug, so their `pub mod <slug>` would collide;
 /// [`FfiPrepError::DefineOpaqueCollision`] when a define type and an opaque
 /// type of one crate share a name; [`FfiPrepError::DependencyMerge`] when two
 /// installed crates pin the SAME dependency name to versions that cannot share
@@ -445,6 +447,16 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
     use std::fmt::Write as _;
     if catalog.is_empty() {
         return Ok(None);
+    }
+    let mut slug_holders: BTreeMap<&ipe_ffi::driver::FfiSlug, &InstalledCrate> = BTreeMap::new();
+    for c in catalog {
+        if let Some(first) = slug_holders.insert(&c.slug, c) {
+            return Err(FfiPrepError::SlugCollision {
+                slug: c.slug.to_string(),
+                first: crate_label(first),
+                second: crate_label(c),
+            });
+        }
     }
     let mut foreign_types: BTreeMap<String, String> = BTreeMap::new();
     let mut wrapper_glue: BTreeMap<String, ipe_backend_rust::FfiWrapperGlue> = BTreeMap::new();
@@ -472,7 +484,7 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
             // rename one; the two nominals are genuinely different Rust types.
             if foreign_types.contains_key(&key) {
                 return Err(FfiPrepError::DefineOpaqueCollision {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                     name: name.clone(),
                 });
             }
@@ -541,6 +553,11 @@ pub fn hold_wrapper_deps(
     Ok(())
 }
 
+/// The name a refusal shows for `c`: its package name.
+fn crate_label(c: &InstalledCrate) -> String {
+    c.package_name.as_str().to_owned()
+}
+
 /// Every refusal FFI prep returns, one variant per cause.
 ///
 /// It reaches [`CliError`] only as [`CliError::FfiPrep`], so a consumer (the
@@ -554,6 +571,12 @@ pub enum FfiPrepError {
     ReservedModuleExists,
     /// The shims appended for asserted calls name a crate the table leaves out.
     AssertedShimSeal(SealRefusal),
+    /// Two installed crates share one module slug.
+    SlugCollision {
+        slug: String,
+        first: String,
+        second: String,
+    },
     /// A define type and an opaque type share one name in one crate.
     DefineOpaqueCollision { slug: String, name: String },
     /// The merged `[dependencies]` table cannot be built.
@@ -599,6 +622,14 @@ pub enum SealRefusal {
         ident: String,
         site: String,
     },
+    /// Emitted code names a lib identifier two declared packages both build,
+    /// so `cargo` could not tell which crate the path means.
+    SharedLibIdent {
+        ident: String,
+        first: String,
+        second: String,
+        site: String,
+    },
     /// An emitted text does not lex as Rust, so the crates it names are unknown.
     Unlexable { site: String },
 }
@@ -612,6 +643,11 @@ impl FfiPrepError {
                 text::msg::ffi_reserved_module_exists(&ipe_canon::asserted::ASSERTED_MODULE)
             }
             Self::AssertedShimSeal(refusal) | Self::CatalogSeal(refusal) => refusal.message(),
+            Self::SlugCollision {
+                slug,
+                first,
+                second,
+            } => text::msg::ffi_slug_collision(slug, first, second),
             Self::DefineOpaqueCollision { slug, name } => {
                 text::msg::ffi_define_opaque_collision(slug, name)
             }
@@ -659,6 +695,12 @@ impl SealRefusal {
                 ident,
                 site,
             } => text::msg::ffi_dropped_transitive(package, ident, site),
+            Self::SharedLibIdent {
+                ident,
+                first,
+                second,
+                site,
+            } => text::msg::ffi_shared_lib_ident(ident, first, second, site),
             Self::Unlexable { site } => text::msg::ffi_emit_unlexable(site),
         }
     }
@@ -672,14 +714,11 @@ impl From<FfiPrepError> for CliError {
 
 /// The dependencies a version disagreement may defer to Cargo instead of refusing.
 ///
-/// Built from typed inspection facts only: a dependency qualifies when every
-/// member's own package name is known, none of them is that dependency (a
-/// direct crate is pinned exactly or refused), and the dependency's Rust lib
-/// identifier is known (so a later drop can be checked against emitted paths).
-/// A legacy cache lacks those facts, so any disagreement it takes part in is
-/// refused.
+/// Built from typed inspection facts only: a dependency qualifies when no
+/// member is that dependency (a direct crate is pinned exactly or refused) and
+/// the dependency's Rust lib identifier is known (so a later drop can be
+/// checked against emitted paths).
 struct DeferrableDeps<'a> {
-    typed: bool,
     direct: BTreeSet<&'a str>,
     identified: BTreeSet<&'a str>,
 }
@@ -687,12 +726,7 @@ struct DeferrableDeps<'a> {
 impl<'a> DeferrableDeps<'a> {
     fn of(catalog: &'a [InstalledCrate]) -> Self {
         Self {
-            typed: catalog.iter().all(|c| c.package_name.is_some()),
-            direct: catalog
-                .iter()
-                .filter_map(|c| c.package_name.as_ref())
-                .map(ipe_ffi::pkginfo::PackageName::as_str)
-                .collect(),
+            direct: catalog.iter().map(|c| c.package_name.as_str()).collect(),
             identified: catalog
                 .iter()
                 .flat_map(|c| c.dep_idents.keys())
@@ -702,7 +736,7 @@ impl<'a> DeferrableDeps<'a> {
     }
 
     fn admits(&self, name: &str) -> bool {
-        self.typed && !self.direct.contains(name) && self.identified.contains(name)
+        !self.direct.contains(name) && self.identified.contains(name)
     }
 }
 
@@ -714,24 +748,49 @@ impl<'a> DeferrableDeps<'a> {
 /// [`merge_catalog_deps`] that also renders `[dependencies]`. A package some
 /// member lists but the merged table dropped (a transitive whose versions
 /// disagree) has no line; any `::<ident>::` still rooted at it would be `ipe`-accepted and
-/// then fail `cargo` with an unresolved crate. Every emitted text is scanned:
+/// then fail `cargo` with an unresolved crate. Likewise an ident two declared
+/// packages both build is ambiguous to `cargo`, so any path rooted at it is
+/// refused. Every emitted text is scanned:
 /// the wrapper module (including shims appended after assembly), the opaque
 /// and define type paths, and the transparent conversion paths. An ident a
 /// declared package also answers to stays resolvable and is not refused.
 ///
 /// # Errors
 ///
-/// [`SealRefusal::DroppedTransitive`] naming the first offending site, or
-/// [`SealRefusal::Unlexable`] for a text whose references are unknown.
+/// [`SealRefusal::DroppedTransitive`] or [`SealRefusal::SharedLibIdent`]
+/// naming the first offending site, or [`SealRefusal::Unlexable`] for a text
+/// whose references are unknown.
 fn seal_dependency_references(
     catalog: &[InstalledCrate],
     merged: &MergedDeps,
     emit: &ipe_backend_rust::FfiEmit,
 ) -> Result<(), SealRefusal> {
     let all_idents = || catalog.iter().flat_map(|c| &c.dep_idents);
-    let declared_idents: BTreeSet<&str> = all_idents()
-        .filter(|(name, _)| merged.declared.contains_key(*name))
-        .map(|(_, ident)| ident.as_str())
+    // ident → every declared package building it: each member's own lib
+    // ident, and each listed dependency the table declares.
+    let mut builders: BTreeMap<String, BTreeSet<&str>> = BTreeMap::new();
+    for (name, ident) in all_idents().filter(|(name, _)| merged.declared.contains_key(*name)) {
+        builders
+            .entry(ident.as_str().to_owned())
+            .or_default()
+            .insert(name.as_str());
+    }
+    for c in catalog {
+        if let Some(ident) = c.lib_ident() {
+            builders
+                .entry(ident.as_str().to_owned())
+                .or_default()
+                .insert(c.package_name.as_str());
+        }
+    }
+    let declared_idents: BTreeSet<&str> = builders.keys().map(String::as_str).collect();
+    // ident → its first two builders, for every ident more than one builds.
+    let shared: BTreeMap<&str, (&str, &str)> = builders
+        .iter()
+        .filter_map(|(ident, names)| {
+            let mut names = names.iter();
+            Some((ident.as_str(), (*names.next()?, *names.next()?)))
+        })
         .collect();
     // ident → package, for every listed package the table dropped.
     let dropped: BTreeMap<&str, &str> = all_idents()
@@ -740,7 +799,7 @@ fn seal_dependency_references(
         })
         .map(|(name, ident)| (ident.as_str(), name.as_str()))
         .collect();
-    if dropped.is_empty() {
+    if dropped.is_empty() && shared.is_empty() {
         return Ok(());
     }
     let glue_sites = emit.wrapper_glue.iter().flat_map(|(wrapper, glue)| {
@@ -766,6 +825,16 @@ fn seal_dependency_references(
             return Err(SealRefusal::DroppedTransitive {
                 package: (*package).to_owned(),
                 ident: (*ident).to_owned(),
+                site: site.to_owned(),
+            });
+        }
+        if let Some((ident, (first, second))) =
+            shared.iter().find(|(ident, _)| refs.contains(**ident))
+        {
+            return Err(SealRefusal::SharedLibIdent {
+                ident: (*ident).to_owned(),
+                first: (*first).to_owned(),
+                second: (*second).to_owned(),
                 site: site.to_owned(),
             });
         }
@@ -802,12 +871,12 @@ fn assemble_wrapper_glue(
         let glue_ty = |name: &str| -> Result<ipe_backend_rust::FfiGlueType, FfiPrepError> {
             let t = c.transparent_types.get(name).ok_or_else(|| {
                 FfiPrepError::TransparentWithoutShape {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                     name: name.to_owned(),
                     binding: b.ref_name.clone(),
                 }
             })?;
-            Ok(glue_type_of(&c.module_name, &c.slug, t))
+            Ok(glue_type_of(&c.module_name, c.slug.as_str(), t))
         };
         let mut params = Vec::with_capacity(b.transparent_params.slots().len());
         for p in b.transparent_params.slots() {
@@ -978,7 +1047,7 @@ fn merge_catalog_deps(catalog: &[InstalledCrate]) -> Result<MergedDeps, MergeRef
 /// intermediate crate's unrecorded requirement, and the dropped package is
 /// then undeclared, so [`seal_dependency_references`] refuses any emitted path
 /// still rooted at it. Two registry versions of any other package (a direct
-/// crate, or any package of a legacy cache): refused. Any disagreement
+/// crate, or a package whose lib ident no member resolved): refused. Any disagreement
 /// involving a wrapper path (a registry pin against a path, two different
 /// paths, or a path named like a dropped transitive): refused, since exactly
 /// one source can back a dependency key.
@@ -1091,7 +1160,7 @@ pub fn prepare(
         if c.module_name == ipe_canon::asserted::ASSERTED_MODULE {
             return Err(CliError::TrustRefused(
                 owner_trust::TrustRefusal::FfiReservedModule {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                 },
             ));
         }
@@ -1102,7 +1171,7 @@ pub fn prepare(
         {
             return Err(CliError::TrustRefused(
                 owner_trust::TrustRefusal::FfiReservedWrapperPrefix {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                     ident: ident.clone(),
                 },
             ));
@@ -2950,11 +3019,17 @@ pub fn run_add(rest: &[String]) -> Result<(), CliError> {
 /// # Errors
 /// [`CliError`] on misuse or a cache-delete failure.
 pub fn run_remove(rest: &[String]) -> Result<(), CliError> {
-    let [raw] = rest else {
+    let named = match rest {
+        [raw] => ipe_ffi::pkginfo::PackageName::parse(raw)
+            .ok()
+            .and_then(|name| ipe_ffi::driver::FfiSlug::of(&name).ok())
+            .map(|slug| (raw, slug)),
+        _ => None,
+    };
+    let Some((raw, slug)) = named else {
         return Err(CliError::Usage(text::msg::rust_remove_usage()));
     };
     let cache = FfiCache::at_project_root(Path::new("."));
-    let slug = ipe_ffi::driver::slugify(raw);
     cache
         .remove_package(&slug)
         .map_err(|diag| CliError::Usage(crate::text::Message::relay(&diag)))?;
@@ -4358,6 +4433,11 @@ mod tests {
     /// The project-relative FFI cache directory.
     const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
 
+    /// The module slug spelled `raw`.
+    fn test_slug(raw: &str) -> ipe_ffi::driver::FfiSlug {
+        ipe_ffi::driver::FfiSlug::parse_canonical(raw).expect("a fixture slug")
+    }
+
     #[test]
     fn ffi_proc_cap_override_refuses_zero_and_overflow() {
         use ipe_sandbox::run_jail::{ProcCap, ProcCapError};
@@ -5225,7 +5305,7 @@ version = \"1\"
     #[test]
     fn conflicting_dep_pins_are_refused() {
         let mk = |slug: &str, line: &str| InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -5240,7 +5320,8 @@ version = \"1\"
             inspected_consts: BTreeMap::new(),
             cargo_deps: vec![CargoDep::parse_registry_line(line).expect("registry line")],
             wrapper_idents: BTreeSet::new(),
-            package_name: None,
+            package_name: ipe_ffi::pkginfo::PackageName::parse(slug)
+                .expect("a fixture slug is a package name"),
             dep_idents: BTreeMap::new(),
         };
         // Two crates agreeing on a shared dep line dedupe to one.
@@ -5273,7 +5354,7 @@ version = \"1\"
         // (as a transitive dep) and with features by another (its own self-line).
         // Same version → Cargo-style feature union, NOT a conflict.
         let mk = |slug: &str, line: &str| InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -5288,7 +5369,8 @@ version = \"1\"
             inspected_consts: BTreeMap::new(),
             cargo_deps: vec![CargoDep::parse_registry_line(line).expect("registry line")],
             wrapper_idents: BTreeSet::new(),
-            package_name: None,
+            package_name: ipe_ffi::pkginfo::PackageName::parse(slug)
+                .expect("a fixture slug is a package name"),
             dep_idents: BTreeMap::new(),
         };
         let e = emit_of(&[
@@ -5391,7 +5473,8 @@ version = \"1\"
             .iter()
             .map(|l| CargoDep::parse_registry_line(l).expect("registry line"))
             .collect();
-        c.package_name = ipe_ffi::pkginfo::PackageName::parse(package).ok();
+        c.package_name =
+            ipe_ffi::pkginfo::PackageName::parse(package).expect("a fixture package name");
         c.dep_idents = c
             .cargo_deps
             .iter()
@@ -5422,6 +5505,42 @@ version = \"1\"
             refused_as(&refused, &catalog_dropped_at("src/ffi.rs")),
             "a `::syn::` path with `syn` undeclared must refuse: {refused:?}"
         );
+    }
+
+    /// Members `foo` and `foo-rs`, both building the Rust library `foo`.
+    fn shared_lib_ident_pair() -> [InstalledCrate; 2] {
+        let foo = typed_crate("pa", "foo", &["foo = \"=1.0.0\""]);
+        let mut foo_rs = typed_crate("pb", "foo-rs", &["foo-rs = \"=1.0.0\""]);
+        foo_rs.dep_idents.insert(
+            "foo-rs".to_owned(),
+            ipe_ffi::naming::RustIdent::parse("foo").expect("an ident"),
+        );
+        [foo, foo_rs]
+    }
+
+    #[test]
+    fn a_lib_ident_two_declared_packages_build_is_refused_where_named() {
+        let [mut foo, foo_rs] = shared_lib_ident_pair();
+        foo.bindings_source = "pub fn f() -> u8 { ::foo::f() }".to_owned();
+        let refused = emit_of(&[foo, foo_rs]);
+        assert!(
+            refused_as(
+                &refused,
+                &FfiPrepError::CatalogSeal(SealRefusal::SharedLibIdent {
+                    ident: "foo".to_owned(),
+                    first: "foo".to_owned(),
+                    second: "foo-rs".to_owned(),
+                    site: "src/ffi.rs".to_owned(),
+                })
+            ),
+            "a `::foo::` path two declared crates answer to must refuse: {refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_lib_ident_two_declared_packages_build_is_admitted_while_unnamed() {
+        let got = emit_of(&shared_lib_ident_pair());
+        assert!(got.is_ok(), "no emitted path names `foo`: {got:?}");
     }
 
     #[test]
@@ -5516,19 +5635,6 @@ version = \"1\"
                 })
             ),
             "a direct crate named with `_` must refuse its conflict: {refused:?}"
-        );
-    }
-
-    #[test]
-    fn a_legacy_member_transitive_conflict_is_refused() {
-        // Without a typed package name no member can prove `syn` is transitive.
-        let [a, mut b] = syn_split();
-        b.package_name = None;
-        b.dep_idents = BTreeMap::new();
-        let refused = emit_of(&[a, b]);
-        assert!(
-            refused_as(&refused, &syn_pin_conflict()),
-            "a conflict involving a legacy member must fail closed: {refused:?}"
         );
     }
 
@@ -5720,7 +5826,7 @@ version = \"1\"
             .to_string();
             let pkg = ipe_ffi::pkginfo::PkgInfo::decode_json(&doc).expect("decodes");
             ipe_ffi::driver::installed_crate_from_pkg(
-                name.to_owned(),
+                test_slug(name),
                 &pkg,
                 &FfiCache::at_project_root(Path::new(".")),
             )
@@ -5753,7 +5859,7 @@ version = \"1\"
             })
             .collect();
         InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -5768,7 +5874,8 @@ version = \"1\"
             inspected_consts: BTreeMap::new(),
             cargo_deps,
             wrapper_idents: BTreeSet::new(),
-            package_name: ipe_ffi::pkginfo::PackageName::parse(slug).ok(),
+            package_name: ipe_ffi::pkginfo::PackageName::parse(slug)
+                .expect("a fixture slug is a package name"),
             dep_idents,
         }
     }
@@ -6174,7 +6281,7 @@ version = \"1\"
     /// A one-crate `InstalledCrate` with the given opaque + define type maps.
     fn crate_with_types(slug: &str, opaque: &[(&str, &str)], define: &[&str]) -> InstalledCrate {
         InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -6192,7 +6299,8 @@ version = \"1\"
             inspected_consts: BTreeMap::new(),
             cargo_deps: Vec::new(),
             wrapper_idents: BTreeSet::new(),
-            package_name: None,
+            package_name: ipe_ffi::pkginfo::PackageName::parse(slug)
+                .expect("a fixture slug is a package name"),
             dep_idents: BTreeMap::new(),
         }
     }
@@ -6225,11 +6333,15 @@ version = \"1\"
         // crate-local `crate::ffi::<slug>::<Name>` where its `_bindings.rs`
         // definition lives — never an external `::Name`.
         let mut c = crate_with_types("demo", &[], &[]);
-        let t = ipe_ffi::transparency::TransparentType::from_projection_json(&serde_json::json!({
-            "name": "Counter", "kind": "struct", "rustPath": "Counter",
-            "fields": [{"name": "value", "carrier": "Int"}]
-        }))
-        .expect("decodes");
+        let ident = |s: &str| ipe_ffi::naming::RustIdent::parse(s).expect("an ident");
+        let t = ipe_ffi::transparency::TransparentType::Struct {
+            name: ident("Counter"),
+            rust_path: ipe_ffi::naming::IdentPath::parse("Counter").expect("a path"),
+            fields: vec![ipe_ffi::transparency::ForeignMember {
+                name: ident("value"),
+                carrier: ipe_ffi::carrier::ScalarCarrier::Int,
+            }],
+        };
         c.transparent_types.insert("Counter".to_owned(), t);
         c.bindings.push(ipe_ffi::interface::InterfaceBinding {
             ref_name: "counter_new".to_owned(),
@@ -6258,6 +6370,29 @@ version = \"1\"
         // A transparent define is a native app type — never a foreign-path
         // mapping.
         assert!(!emit.foreign_types.contains_key("Rust.demo.Counter"));
+    }
+
+    #[test]
+    fn two_installed_crates_on_one_slug_are_refused_before_emission() {
+        // `a-b` and `a_b` both fold to `a_b`: their two `pub mod a_b` would
+        // collide in `src/ffi.rs`, so assembly refuses rather than emit either.
+        let named = |package: &str| InstalledCrate {
+            package_name: ipe_ffi::pkginfo::PackageName::parse(package)
+                .expect("a fixture package name"),
+            ..crate_with_types("a_b", &[], &[])
+        };
+        let got = emit_of(&[named("a-b"), named("a_b")]);
+        assert!(
+            refused_as(
+                &got,
+                &FfiPrepError::SlugCollision {
+                    slug: "a_b".to_owned(),
+                    first: "a-b".to_owned(),
+                    second: "a_b".to_owned(),
+                }
+            ),
+            "a shared slug must refuse: {got:?}"
+        );
     }
 
     #[test]
@@ -6374,7 +6509,7 @@ version = \"1\"
             ident: "syn".to_owned(),
             site: "src/ffi.rs".to_owned(),
         };
-        let cases: [(FfiPrepError, text::Message); 9] = [
+        let cases: [(FfiPrepError, text::Message); 10] = [
             (
                 FfiPrepError::ModuleClaimed {
                     module: "Rust.a".to_owned(),
@@ -6389,6 +6524,14 @@ version = \"1\"
             (
                 FfiPrepError::AssertedShimSeal(dropped()),
                 text::msg::ffi_dropped_transitive(&"syn", &"syn", &"src/ffi.rs"),
+            ),
+            (
+                FfiPrepError::SlugCollision {
+                    slug: "a_b".to_owned(),
+                    first: "a-b".to_owned(),
+                    second: "a_b".to_owned(),
+                },
+                text::msg::ffi_slug_collision(&"a_b", &"a-b", &"a_b"),
             ),
             (
                 FfiPrepError::DefineOpaqueCollision {

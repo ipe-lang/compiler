@@ -35,10 +35,12 @@ pub const RUST_FFI_CONST_MEMBER: &str = "const";
 
 /// The reserved `_bindings.rs` identifier prefix of every asserted shim.
 ///
-/// Installed-crate wrapper identifiers derive from `<slug>_<fn>` and a slug
-/// cannot begin with `ipe_asserted` under the crate-name gate, but the driver
-/// still refuses any installed crate claiming the prefix — the prefix is what
-/// classifies a lowered foreign call as asserted, so it must be unforgeable.
+/// Installed-crate wrapper identifiers derive from `<slug>_<fn>`, and the
+/// FFI module-slug grammar (`ipe_ffi::driver::FfiSlug`) refuses every slug
+/// in the `ipe_asserted` namespace, so no installed crate can spell the
+/// prefix. The prefix is what classifies a lowered foreign call as asserted,
+/// so it must be unforgeable; a build-time assertion in `ipe_ffi::asserted`
+/// keeps it inside that reserved namespace.
 pub const ASSERTED_WRAPPER_PREFIX: &str = "ipe_asserted_";
 
 /// A validated `crate::path::function` target of an asserted call.

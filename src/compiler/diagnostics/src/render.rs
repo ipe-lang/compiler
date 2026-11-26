@@ -349,6 +349,25 @@ fn ffi_prose(msg: &FfiError) -> String {
             "Crate `{crate_name}` needs the system library `{system_lib}`, \
              which pkg-config cannot find. {install_hint}."
         ),
+        FfiError::SlugCollision {
+            slug,
+            installed: Some(installed),
+            incoming,
+        } => format!(
+            "Crate `{incoming}` maps to the module slug `{slug}`, which the installed \
+             crate `{installed}` already holds."
+        ),
+        FfiError::SlugCollision {
+            slug,
+            installed: None,
+            incoming,
+        } => format!(
+            "Crate `{incoming}` maps to the module slug `{slug}`, whose cached record \
+             does not decode, so it is not overwritten."
+        ),
+        FfiError::SlugRefused { name, detail } => {
+            format!("Crate `{name}` folds to no legal module slug: {detail}.")
+        }
     }
 }
 
@@ -1814,7 +1833,9 @@ fn ffi_label(msg: &FfiError) -> Option<String> {
         | FfiError::ShapeContradiction { .. }
         | FfiError::SourceRejected { .. }
         | FfiError::ArtifactIo { .. }
-        | FfiError::SystemLibraryNotFound { .. } => None,
+        | FfiError::SystemLibraryNotFound { .. }
+        | FfiError::SlugCollision { .. }
+        | FfiError::SlugRefused { .. } => None,
     }
 }
 

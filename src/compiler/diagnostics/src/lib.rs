@@ -84,6 +84,20 @@ mod tests {
                 crate_name: hostile(),
                 install_hint: hostile(),
             },
+            FfiError::SlugCollision {
+                slug: hostile(),
+                installed: Some(hostile()),
+                incoming: hostile(),
+            },
+            FfiError::SlugCollision {
+                slug: hostile(),
+                installed: None,
+                incoming: hostile(),
+            },
+            FfiError::SlugRefused {
+                name: hostile(),
+                detail: hostile(),
+            },
         ]
         .map(|msg| Diagnostic::Ffi { msg })
         .into_iter()
@@ -165,6 +179,13 @@ mod tests {
                     system_lib: "wayland-client".into(),
                     crate_name: "wayland-sys".into(),
                     install_hint: "apt install libwayland-dev".into(),
+                },
+            },
+            IPE_F4416 => Diagnostic::Ffi {
+                msg: FfiError::SlugCollision {
+                    slug: "a_b".into(),
+                    installed: Some("a-b".into()),
+                    incoming: "a_b".into(),
                 },
             },
             // Environment
@@ -843,7 +864,7 @@ mod tests {
     fn every_code_renders_through_the_pipeline() {
         let representatives: &[Code] = &[
             IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414,
-            IPE_F4415, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_I0001,
+            IPE_F4415, IPE_F4416, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_I0001,
         ];
 
         for &code in representatives {

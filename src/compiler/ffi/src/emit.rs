@@ -822,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn transparent_type_json_round_trips_through_the_projection_decoder() {
+    fn transparent_type_json_writes_every_variant_kind() {
         let pkg = PkgInfo::decode_json(
             &serde_json::json!({
                 "pkg": "tm", "name": "tm", "version": "0.1.0",
@@ -847,9 +847,18 @@ mod tests {
             .transparent()
             .get("Shade")
             .expect("transparent");
-        let wire = transparent_type_json(original);
-        let decoded = TransparentType::from_projection_json(&wire).expect("round-trips");
-        assert_eq!(&decoded, original);
+        assert_eq!(
+            transparent_type_json(original),
+            serde_json::json!({
+                "name": "Shade", "kind": "enum", "rustPath": "tm::Shade",
+                "variants": [
+                    {"name": "On", "kind": "unit"},
+                    {"name": "Level", "kind": "tuple", "carriers": ["Int"]},
+                    {"name": "Mix", "kind": "struct",
+                     "members": [{"name": "amount", "carrier": "Int"}]}
+                ]
+            })
+        );
     }
 
     #[test]

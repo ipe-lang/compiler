@@ -12,7 +12,7 @@ use std::fmt;
 use ipe_diagnostics::terminal::TerminalSafe;
 use ipe_diagnostics::{
     Code, Diagnostic as SharedDiag, FfiError, IPE_F4400, IPE_F4401, IPE_F4402, IPE_F4411,
-    IPE_F4412, IPE_F4415,
+    IPE_F4412, IPE_F4415, IPE_F4416,
 };
 
 use crate::asserted::AssertedSite;
@@ -86,6 +86,25 @@ pub enum Diagnostic {
         /// A short OS-aware install hint, or a generic `-dev`/`.pc` fallback.
         install_hint: String,
     },
+    /// `IPE-F4416` — the crate being installed maps to a module slug another
+    /// package already holds in the cache; the occupant is left untouched.
+    SlugCollision {
+        /// The module slug both packages map to.
+        slug: String,
+        /// The occupant's package name, or `None` when its inspection
+        /// document does not decode.
+        installed: Option<String>,
+        /// The package name being installed.
+        incoming: String,
+    },
+    /// `IPE-F4416` — the crate being installed has a package name that folds
+    /// to no legal module slug; nothing is cached.
+    SlugRefused {
+        /// The package name being installed, verbatim.
+        name: String,
+        /// Which slug rule the folded name breaks.
+        defect: crate::driver::SlugDefect,
+    },
 }
 
 impl Diagnostic {
@@ -99,6 +118,7 @@ impl Diagnostic {
             Self::SourceRejected { .. } => IPE_F4411,
             Self::ArtifactIo { .. } => IPE_F4412,
             Self::SystemLibraryNotFound { .. } => IPE_F4415,
+            Self::SlugCollision { .. } | Self::SlugRefused { .. } => IPE_F4416,
         }
     }
 }
@@ -146,6 +166,19 @@ impl From<Diagnostic> for FfiError {
                 system_lib: system_lib.as_str().into(),
                 crate_name: crate_name.into(),
                 install_hint: install_hint.into(),
+            },
+            Diagnostic::SlugCollision {
+                slug,
+                installed,
+                incoming,
+            } => Self::SlugCollision {
+                slug: slug.into(),
+                installed: installed.map(Into::into),
+                incoming: incoming.into(),
+            },
+            Diagnostic::SlugRefused { name, defect } => Self::SlugRefused {
+                name: name.into(),
+                detail: defect.to_string().into(),
             },
         }
     }
@@ -962,6 +995,25 @@ pub enum WireDefect {
         /// The offending line.
         got: String,
     },
+    /// An FFI cache file name whose slug is outside the [`crate::driver::FfiSlug`] grammar.
+    SlugFileName {
+        /// The slug spelling the file name carries.
+        got: String,
+        /// Which slug rule it breaks.
+        defect: crate::driver::SlugDefect,
+    },
+    /// A cached crate whose slug is not the one its package name folds to.
+    SlugMismatch {
+        /// The slug the cache files carry.
+        slug: String,
+        /// The package name the inspection document declares.
+        name: String,
+    },
+    /// A cached crate with no inspection document to re-derive it from.
+    InspectionMissing {
+        /// The slug the cache files carry.
+        slug: String,
+    },
     /// An FFI cache directory that is not `<project>/.ipe/cache/ffi/rust`.
     ///
     /// The project root a wrapper crate is jailed to is derived from the cache
@@ -1088,6 +1140,9 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
             ),
             WireDefect::LegacyDependencyLine { got } => wire_text::legacy_line(f, got),
             WireDefect::CacheRootUnanchored { got } => wire_text::cache_unanchored(f, got),
+            WireDefect::SlugFileName { got, defect } => wire_text::slug_file_name(f, got, *defect),
+            WireDefect::SlugMismatch { slug, name } => wire_text::slug_mismatch(f, slug, name),
+            WireDefect::InspectionMissing { slug } => wire_text::inspection_missing(f, slug),
             WireDefect::Json { detail } => write!(f, "{detail}"),
         }
     }
@@ -1184,6 +1239,34 @@ mod wire_text {
         write!(
             f,
             "a type string nests past the depth ceiling of {max} on foreign types"
+        )
+    }
+
+    pub(super) fn slug_file_name(
+        f: &mut fmt::Formatter<'_>,
+        got: &str,
+        defect: crate::driver::SlugDefect,
+    ) -> fmt::Result {
+        write!(
+            f,
+            "{got:?} is not a module slug ({defect}); remove the file, then re-run \
+             `ipe rust add` for the crate it belongs to"
+        )
+    }
+
+    pub(super) fn slug_mismatch(f: &mut fmt::Formatter<'_>, slug: &str, name: &str) -> fmt::Result {
+        write!(
+            f,
+            "the cache holds package {name:?} under slug {slug:?}, which is not the slug \
+             that name maps to; re-run `ipe rust add {name}`"
+        )
+    }
+
+    pub(super) fn inspection_missing(f: &mut fmt::Formatter<'_>, slug: &str) -> fmt::Result {
+        write!(
+            f,
+            "crate slug {slug:?} has no inspection document; remove its cache files and \
+             reinstall the crate with `ipe rust add`"
         )
     }
 
@@ -1373,6 +1456,17 @@ mod tests {
             },
             WireDefect::CacheRootUnanchored {
                 got: FORGED.to_owned(),
+            },
+            WireDefect::SlugFileName {
+                got: FORGED.to_owned(),
+                defect: crate::driver::SlugDefect::Charset,
+            },
+            WireDefect::SlugMismatch {
+                slug: FORGED.to_owned(),
+                name: FORGED.to_owned(),
+            },
+            WireDefect::InspectionMissing {
+                slug: FORGED.to_owned(),
             },
         ];
         for defect in defects {

@@ -1638,12 +1638,16 @@ messages! {
     ffi_module_clash(module, krate) = "ffi-module-clash";
     /// An FFI define type collides with an inspected opaque type.
     ffi_define_opaque_collision(krate, name) = "ffi-define-opaque-collision";
+    /// Two installed FFI crates share one module slug.
+    ffi_slug_collision(slug, first, second) = "ffi-slug-collision";
     /// Installed FFI crates bind one dependency name to two different sources.
     ffi_dependency_source_conflict(name, first, second) = "ffi-dependency-source-conflict";
     /// Installed FFI crates pin one dependency to two versions.
     ffi_dependency_pin_conflict(name, first, second) = "ffi-dependency-pin-conflict";
     /// Emitted FFI code names a dependency left out of the manifest.
     ffi_dropped_transitive(name, ident, site) = "ffi-dropped-transitive";
+    /// Emitted FFI code names a lib identifier two declared packages share.
+    ffi_shared_lib_ident(ident, first, second, site) = "ffi-shared-lib-ident";
     /// Emitted FFI code does not lex, so its crate references are unknown.
     ffi_emit_unlexable(site) = "ffi-emit-unlexable";
     /// An FFI binding marks a type transparent without its shape.

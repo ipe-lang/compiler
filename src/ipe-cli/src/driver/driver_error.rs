@@ -1930,6 +1930,7 @@ const fn ffi_prep_fault(refusal: &crate::ffi::FfiPrepError) -> crate::screen::Fa
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
         | FfiPrepError::AssertedShimSeal(_)
+        | FfiPrepError::SlugCollision { .. }
         | FfiPrepError::DefineOpaqueCollision { .. }
         | FfiPrepError::DependencyMerge(_)
         | FfiPrepError::CatalogSeal(_)

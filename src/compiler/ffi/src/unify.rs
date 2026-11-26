@@ -310,7 +310,9 @@ mod tests {
                 transparent_result: None,
             })
             .collect();
-        let slug = module.to_lowercase().replace('.', "_");
+        let slug =
+            crate::driver::FfiSlug::parse_canonical(&module.to_lowercase().replace('.', "_"))
+                .expect("a fixture module folds to a slug");
         InstalledCrate {
             kernel_name: module.replace('.', "_"),
             module_name: module.to_owned(),
@@ -321,7 +323,8 @@ mod tests {
             define_types: std::collections::BTreeSet::new(),
             transparent_types: std::collections::BTreeMap::new(),
             cargo_deps: vec![],
-            package_name: None,
+            package_name: crate::pkginfo::PackageName::parse(slug.as_str())
+                .expect("a fixture slug is a package name"),
             dep_idents: std::collections::BTreeMap::new(),
             bindings,
             wrapper_idents: std::collections::BTreeSet::new(),
