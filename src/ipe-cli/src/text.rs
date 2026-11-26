@@ -1317,7 +1317,7 @@ messages! {
     /// The Android build steps: wrapper bootstrap, debug build, install, store build.
     ///
     /// The one rendering every producer (CLI note, README, guide) carries verbatim.
-    android_build_steps(gradle, api) = "android-build-steps";
+    android_build_steps(gradle, sha, api) = "android-build-steps";
     /// The note under a written Android shell project: unsigned, and how to sign it.
     mobile_android_note = "mobile-android-note";
     /// The note under a written iOS shell project.

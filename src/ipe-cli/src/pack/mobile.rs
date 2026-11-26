@@ -3,8 +3,8 @@
 //!
 //! The `web client` build produces a self-contained offline SPA bundle
 //! (`index.html` + a boot script + the `wasm-bindgen` glue + the `.wasm`). This
-//! module lays out a native shell *around* that bundle: an iOS Xcode project
-//! whose `WKWebView` serves the bundle through a `WKURLSchemeHandler` (so the
+//! module lays out a native shell *around* that bundle: iOS sources (Swift,
+//! `Info.plist`, assets) for an Xcode app target, whose `WKWebView` serves the bundle through a `WKURLSchemeHandler` (so the
 //! `.wasm` loads with the correct MIME, which a bare `file://` load cannot
 //! guarantee), or an Android Gradle project whose `WebView` serves it through a
 //! `WebViewAssetLoader`. The webview loads ONLY the bundled local assets — an
@@ -51,8 +51,8 @@ use super::permissions::{self, ApiLevel, Platform, RequestGroup, RuntimeRequestG
 /// rather than silently falling through.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
 pub enum MobileOs {
-    /// An iOS app — an Xcode project with a `WKWebView` + `WKURLSchemeHandler`
-    /// shell and an `Info.plist`.
+    /// An iOS app — the Swift sources of a `WKWebView` + `WKURLSchemeHandler`
+    /// shell and an `Info.plist`, added to an Xcode app target.
     Ios,
     /// An Android app — a Gradle project with a `WebView` + `WebViewAssetLoader`
     /// shell and an `AndroidManifest.xml`.
@@ -87,6 +87,12 @@ impl MobileOs {
     pub const fn build_runs_on_linux(self) -> bool {
         matches!(self, Self::Android)
     }
+}
+
+/// The directory name of the shell for `os` of the app whose slug is `slug`:
+/// `<slug>-<os>`, under `dist/<os>/`.
+fn shell_root_name(os: MobileOs, slug: &str) -> String {
+    format!("{slug}-{}", os.as_str())
 }
 
 impl std::str::FromStr for MobileOs {
@@ -723,12 +729,6 @@ const ANDROID_JAVA_DIR: &str = "app/src/main/java/dev/ipe/app/";
 /// The file the capture file provider reads its one exposed directory from.
 const ANDROID_CAPTURE_PATHS: &str = "app/src/main/res/xml/capture_paths.xml";
 
-/// The Firebase Cloud Messaging client library a push shell links.
-const FIREBASE_MESSAGING_VERSION: &str = "24.0.0";
-
-/// The `androidx.core` library: notifications and the capture file provider.
-const ANDROIDX_CORE_VERSION: &str = "1.13.1";
-
 /// The most bytes of one push message's sealed field the push service reads.
 const FCM_DATA_MAX_BYTES: usize = 4096;
 
@@ -1031,7 +1031,7 @@ fn android_layout(
     let plan = AndroidPlan::of(shell, pin)?;
     let identity = &shell.identity;
     let slug = app_slug(&identity.name);
-    let root_name = format!("{slug}-android");
+    let root_name = shell_root_name(MobileOs::Android, &slug);
     let mut files = vec![
         generated_file(
             "app/src/main/AndroidManifest.xml".to_owned(),
@@ -1544,8 +1544,31 @@ fn render_capture_paths() -> String {
 /// The Android Gradle plugin the app module applies.
 const ANDROID_GRADLE_PLUGIN_VERSION: &str = "8.5.2";
 
-/// The oldest Gradle the pinned Android Gradle plugin runs on.
-const ANDROID_GRADLE_MIN_VERSION: &str = "8.7";
+/// The Gradle release the generated wrapper downloads; the pinned Android
+/// Gradle plugin is tested on it.
+const ANDROID_GRADLE_VERSION: &str = "8.7";
+
+/// The SHA-256 of the `gradle-8.7-bin.zip` distribution the wrapper verifies
+/// on every `./gradlew` run.
+const ANDROID_GRADLE_DISTRIBUTION_SHA256: &str =
+    "544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d";
+
+/// Whether `digest` is a SHA-256 written as 64 lowercase hex digits.
+const fn is_lowercase_sha256_hex(digest: &str) -> bool {
+    let mut rest = digest.as_bytes();
+    let mut count: usize = 0;
+    while let [byte, tail @ ..] = rest {
+        if !matches!(byte, b'0'..=b'9' | b'a'..=b'f') {
+            return false;
+        }
+        count = count.saturating_add(1);
+        rest = tail;
+    }
+    count == 64
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the pinned Gradle distribution digest is not a 64-digit lowercase SHA-256 [ledger #boundary]
+const _: () = assert!(is_lowercase_sha256_hex(ANDROID_GRADLE_DISTRIBUTION_SHA256));
 
 /// The API level the shell compiles against and targets.
 const ANDROID_API_LEVEL: ApiLevel = ApiLevel::new(34);
@@ -1566,11 +1589,160 @@ const ANDROID_GRADLE_PLUGIN_MAX_API_LEVEL: ApiLevel = ApiLevel::new(34);
 /// is revisited.
 const ANDROID_ORIENTATION_ADVISORY_FROM: ApiLevel = ApiLevel::new(36);
 
-/// The `androidx.webkit` library: the asset loader and the message bridge.
-const ANDROIDX_WEBKIT_VERSION: &str = "1.11.0";
+/// A Kotlin release, ordered by (major, minor, patch).
+#[derive(Clone, Copy, Debug)]
+struct KotlinVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
 
-/// The `androidx.appcompat` library the shell's activity extends.
-const ANDROIDX_APPCOMPAT_VERSION: &str = "1.7.0";
+impl KotlinVersion {
+    /// The release `major.minor.patch`.
+    const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    /// How `self` orders against `other`, field by field.
+    const fn compare(self, other: Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let pairs = [
+            (self.major, other.major),
+            (self.minor, other.minor),
+            (self.patch, other.patch),
+        ];
+        let mut rest = pairs.as_slice();
+        while let [(mine, theirs), tail @ ..] = rest {
+            if *mine < *theirs {
+                return Ordering::Less;
+            }
+            if *mine > *theirs {
+                return Ordering::Greater;
+            }
+            rest = tail;
+        }
+        Ordering::Equal
+    }
+}
+
+impl std::fmt::Display for KotlinVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// When a library is linked into the app module.
+#[derive(Clone, Copy, Debug)]
+enum Linked {
+    /// In every shell.
+    Always,
+    /// Only in a shell that serves push.
+    Push,
+}
+
+impl Linked {
+    /// Whether a shell that does (`push`) or does not serve push links it.
+    const fn links_into(self, push: bool) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Push => push,
+        }
+    }
+}
+
+/// One pinned Maven library the app module links.
+#[derive(Debug)]
+struct MavenLibrary {
+    /// The `group:artifact` coordinate.
+    coordinate: &'static str,
+    /// The pinned version.
+    version: &'static str,
+    /// The `kotlin-stdlib` version its POM declares; `None` for a Java-only library.
+    kotlin_stdlib: Option<KotlinVersion>,
+    /// Which shells link it.
+    linked: Linked,
+}
+
+/// Every library the app module links, in emitted order.
+///
+/// Each `kotlin_stdlib` is the version the library's published POM declares;
+/// [`KOTLIN_BOM_VERSION`] must equal the highest of them.
+const ANDROID_LIBRARIES: &[MavenLibrary] = &[
+    // The asset loader and the message bridge.
+    MavenLibrary {
+        coordinate: "androidx.webkit:webkit",
+        version: "1.11.0",
+        kotlin_stdlib: None,
+        linked: Linked::Always,
+    },
+    // The activity base class.
+    MavenLibrary {
+        coordinate: "androidx.appcompat:appcompat",
+        version: "1.7.0",
+        kotlin_stdlib: Some(KotlinVersion::new(1, 8, 22)),
+        linked: Linked::Always,
+    },
+    // Notifications and the capture file provider.
+    MavenLibrary {
+        coordinate: "androidx.core:core",
+        version: "1.13.1",
+        kotlin_stdlib: Some(KotlinVersion::new(1, 8, 22)),
+        linked: Linked::Always,
+    },
+    // The Firebase Cloud Messaging client.
+    MavenLibrary {
+        coordinate: "com.google.firebase:firebase-messaging",
+        version: "24.0.0",
+        kotlin_stdlib: Some(KotlinVersion::new(1, 8, 22)),
+        linked: Linked::Push,
+    },
+];
+
+/// The `kotlin-bom` platform that aligns every `kotlin-stdlib*` module the
+/// libraries pull in transitively.
+///
+/// The app module applies no Kotlin plugin, so nothing else aligns the
+/// family: without it a transitive `kotlin-stdlib-jdk7`/`-jdk8` older than
+/// [`KOTLIN_STDLIB_MERGED_FROM`] duplicates classes `kotlin-stdlib` carries.
+const KOTLIN_BOM_VERSION: KotlinVersion = KotlinVersion::new(1, 8, 22);
+
+/// The release from which `kotlin-stdlib` carries the `jdk7`/`jdk8` classes;
+/// a BOM below it cannot remove the duplicate classes.
+const KOTLIN_STDLIB_MERGED_FROM: KotlinVersion = KotlinVersion::new(1, 8, 0);
+
+/// Whether `bom` equals the highest `kotlin-stdlib` any library in `libs`
+/// declares and sits at or above [`KOTLIN_STDLIB_MERGED_FROM`].
+///
+/// A table no row of which declares a stdlib disagrees: there is nothing for
+/// the BOM to equal.
+const fn kotlin_bom_agrees(libs: &[MavenLibrary], bom: KotlinVersion) -> bool {
+    use std::cmp::Ordering;
+    let mut highest: Option<KotlinVersion> = None;
+    let mut rest = libs;
+    while let [library, tail @ ..] = rest {
+        if let Some(declared) = library.kotlin_stdlib {
+            highest = match highest {
+                Some(seen) if !matches!(seen.compare(declared), Ordering::Less) => Some(seen),
+                Some(_) | None => Some(declared),
+            };
+        }
+        rest = tail;
+    }
+    match highest {
+        Some(seen) => {
+            matches!(seen.compare(bom), Ordering::Equal)
+                && !matches!(bom.compare(KOTLIN_STDLIB_MERGED_FROM), Ordering::Less)
+        }
+        None => false,
+    }
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if the Kotlin BOM drifts from the stdlib the pinned Android libraries declare [ledger #boundary]
+const _: () = assert!(kotlin_bom_agrees(ANDROID_LIBRARIES, KOTLIN_BOM_VERSION));
 
 /// Whether the Android levels agree: the minimum is under the target, the
 /// target is one the pinned Gradle plugin supports and sits under the
@@ -1614,16 +1786,8 @@ const ANDROID_GRADLE_REPOSITORIES: &str = "pluginManagement {\n\
 /// `gradle.properties`: the `AndroidX` libraries the shell links need it.
 const ANDROID_GRADLE_PROPERTIES: &str = "android.useAndroidX=true\n";
 
-/// Render the app-module `build.gradle`; the Firebase library is linked only
-/// when the shell serves push.
+/// Render the app-module `build.gradle`.
 fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
-    let push = if plan.push.is_some() {
-        format!(
-            "    implementation 'com.google.firebase:firebase-messaging:{FIREBASE_MESSAGING_VERSION}'\n"
-        )
-    } else {
-        String::new()
-    };
     format!(
         "plugins {{ id 'com.android.application' version '{ANDROID_GRADLE_PLUGIN_VERSION}' }}\n\
          android {{\n\
@@ -1641,15 +1805,32 @@ fn render_android_build_gradle(plan: &AndroidPlan<'_>) -> String {
          \x20       targetCompatibility JavaVersion.VERSION_1_8\n\
          \x20   }}\n\
          }}\n\
-         dependencies {{\n\
-         \x20   implementation 'androidx.webkit:webkit:{ANDROIDX_WEBKIT_VERSION}'\n\
-         \x20   implementation 'androidx.appcompat:appcompat:{ANDROIDX_APPCOMPAT_VERSION}'\n\
-         \x20   implementation 'androidx.core:core:{ANDROIDX_CORE_VERSION}'\n\
-         {push}\
-         }}\n",
+         {dependencies}",
         ns = gradle_string_escape(plan.package),
         version = gradle_string_escape(&plan.identity.version),
+        dependencies = render_android_dependencies(plan.push.is_some()),
     )
+}
+
+/// Render the app module's `dependencies` block: the [`KOTLIN_BOM_VERSION`]
+/// platform, then one line per [`ANDROID_LIBRARIES`] row a shell that does
+/// (`push`) or does not serve push links.
+fn render_android_dependencies(push: bool) -> String {
+    use std::fmt::Write as _;
+    let mut block = format!(
+        "dependencies {{\n    implementation platform('org.jetbrains.kotlin:kotlin-bom:{KOTLIN_BOM_VERSION}')\n"
+    );
+    for library in ANDROID_LIBRARIES {
+        if library.linked.links_into(push) {
+            let _ = writeln!(
+                block,
+                "    implementation '{}:{}'",
+                library.coordinate, library.version
+            );
+        }
+    }
+    block.push_str("}\n");
+    block
 }
 
 /// The URL the Android shell opens: [`csp::ANDROID_ASSET_ORIGIN`] plus
@@ -3425,7 +3606,11 @@ public final class IpeApplication extends Application {
 /// android`, and this README) carries verbatim, so neither can hand-write a
 /// `gradlew` line that drifts from the other.
 pub(crate) fn android_build_steps() -> crate::text::Message {
-    crate::text::android_build_steps(&ANDROID_GRADLE_MIN_VERSION, &ANDROID_API_LEVEL)
+    crate::text::android_build_steps(
+        &ANDROID_GRADLE_VERSION,
+        &ANDROID_GRADLE_DISTRIBUTION_SHA256,
+        &ANDROID_API_LEVEL,
+    )
 }
 
 /// The Android shell's build/README note.
@@ -3480,7 +3665,7 @@ fn android_readme(root_name: &str, profile: BundleProfile, base: &MountBase) -> 
 
 // ── iOS ──────────────────────────────────────────────────────────────────────
 
-/// Assemble the iOS Xcode shell project layout.
+/// Assemble the iOS shell sources: Swift files, `Info.plist` and assets.
 ///
 /// The SPA assets ride under `App/www/`; a `WKURLSchemeHandler` serves them under
 /// a custom `ipe-app://` scheme with the correct MIME per extension (a bare
@@ -3501,7 +3686,7 @@ fn ios_layout(
         .reach(BundleHost::IosScheme)
         .map_err(|refusal| CliError::ProjectRefused(text::Message::relay(&refusal)))?;
     let slug = app_slug(&identity.name);
-    let root_name = format!("{slug}-ios");
+    let root_name = shell_root_name(MobileOs::Ios, &slug);
     let mut files = Vec::new();
 
     let plist = render_ios_info_plist(shell, accepts)?;
@@ -3841,8 +4026,11 @@ fn ios_readme(root_name: &str, base: &MountBase) -> String {
          The Info.plist NS…UsageDescription keys are derived from the app's accepted\n\
          web capabilities — never hand-authored.\n\
          \n\
-         Build: open this project in Xcode on macOS; a signed, runnable .ipa requires\n\
-         macOS + Xcode + a signing identity (out of scope on this host).\n",
+         Build: this directory holds sources, not an Xcode project. On macOS, create a\n\
+         new Xcode iOS App target and add the files under App/ to it (App/Info.plist as\n\
+         its Info.plist, App/www/ as a folder reference), then build and run it in a\n\
+         Simulator; a signed, runnable .ipa also needs a signing identity (out of scope\n\
+         on this host).\n",
         entry = ios_entry_url(base),
     )
 }
@@ -4666,11 +4854,11 @@ mod tests {
         );
         let readme = text_of(&shell, "README.txt");
         assert!(readme.contains("gradle wrapper"), "{readme}");
-        assert!(readme.contains(ANDROID_GRADLE_MIN_VERSION), "{readme}");
+        assert!(readme.contains(ANDROID_GRADLE_VERSION), "{readme}");
     }
 
-    /// `app/build.gradle` fills every toolchain number from its one const:
-    /// each API level line and each `AndroidX` library line appears exactly once.
+    /// `app/build.gradle` fills every API level from its one const: each level
+    /// line appears exactly once.
     #[test]
     fn android_gradle_renders_each_toolchain_number_from_its_const() {
         let shell = android(&full_pin());
@@ -4679,9 +4867,6 @@ mod tests {
             format!("compileSdk {ANDROID_API_LEVEL}"),
             format!("targetSdk {ANDROID_API_LEVEL}"),
             format!("minSdk {ANDROID_MIN_API_LEVEL}"),
-            format!("implementation 'androidx.webkit:webkit:{ANDROIDX_WEBKIT_VERSION}'"),
-            format!("implementation 'androidx.appcompat:appcompat:{ANDROIDX_APPCOMPAT_VERSION}'"),
-            format!("implementation 'androidx.core:core:{ANDROIDX_CORE_VERSION}'"),
         ] {
             assert_eq!(
                 gradle
@@ -4692,14 +4877,245 @@ mod tests {
                 "{expected}: {gradle}"
             );
         }
-        assert_eq!(
-            gradle
-                .lines()
-                .filter(|line| line.contains("androidx."))
-                .count(),
-            3,
-            "every AndroidX library is one of the three const-rendered lines: {gradle}"
+    }
+
+    // ── Android dependency set: one table, one Kotlin alignment ───────────────
+
+    /// The `build.gradle` of the shell without push, and of the one with push.
+    fn plain_and_push_gradle() -> [(&'static str, String); 2] {
+        let plain = android(&shell_pin(
+            &accepts(&[web(WebCapability::Notification)]),
+            &MountBase::root(),
+        ));
+        let push = android(&full_pin());
+        [
+            ("plain", text_of(&plain, "app/build.gradle").to_owned()),
+            ("push", text_of(&push, "app/build.gradle").to_owned()),
+        ]
+    }
+
+    /// The text of `gradle` from its `dependencies {` line on, or the empty
+    /// string when it has none.
+    fn dependency_block(gradle: &str) -> &str {
+        gradle
+            .find("dependencies {")
+            .and_then(|at| gradle.get(at..))
+            .unwrap_or_default()
+    }
+
+    /// Both shells, with and without push, align the Kotlin stdlib family
+    /// through the one `kotlin-bom` platform line inside `dependencies {`.
+    #[test]
+    fn android_gradle_aligns_the_kotlin_stdlib_through_one_bom() {
+        let bom = format!(
+            "    implementation platform('org.jetbrains.kotlin:kotlin-bom:{KOTLIN_BOM_VERSION}')"
         );
+        for (variant, gradle) in plain_and_push_gradle() {
+            assert_eq!(
+                gradle.lines().filter(|line| *line == bom).count(),
+                1,
+                "{variant}: {gradle}"
+            );
+            assert_eq!(
+                gradle.matches("kotlin-bom").count(),
+                1,
+                "{variant}: {gradle}"
+            );
+            assert!(
+                dependency_block(&gradle).contains(bom.as_str()),
+                "{variant}: the BOM lies inside `dependencies {{`: {gradle}"
+            );
+        }
+    }
+
+    /// A table row the `kotlin_bom_agrees` refusals are built from.
+    const fn kotlin_row(stdlib: Option<KotlinVersion>) -> MavenLibrary {
+        MavenLibrary {
+            coordinate: "org.example:library",
+            version: "1.0.0",
+            kotlin_stdlib: stdlib,
+            linked: Linked::Always,
+        }
+    }
+
+    /// A BOM equal to the highest declared stdlib agrees, whatever Java-only
+    /// or older rows sit beside it: the refusals below are not a check that
+    /// refuses everything. The shipped table is held by the `const` assertion.
+    #[test]
+    fn kotlin_bom_agrees_with_the_highest_declared_stdlib() {
+        let java_and_newest = [
+            kotlin_row(None),
+            kotlin_row(Some(KotlinVersion::new(1, 8, 0))),
+            kotlin_row(Some(KotlinVersion::new(1, 9, 0))),
+        ];
+        assert!(kotlin_bom_agrees(
+            &java_and_newest,
+            KotlinVersion::new(1, 9, 0)
+        ));
+    }
+
+    /// A library declaring a newer stdlib than the BOM is refused: the BOM must
+    /// move with it.
+    #[test]
+    fn kotlin_bom_disagrees_with_a_library_declaring_a_newer_stdlib() {
+        let skewed = [
+            kotlin_row(Some(KotlinVersion::new(1, 8, 22))),
+            kotlin_row(Some(KotlinVersion::new(1, 9, 0))),
+            kotlin_row(Some(KotlinVersion::new(1, 8, 22))),
+        ];
+        assert!(!kotlin_bom_agrees(&skewed, KotlinVersion::new(1, 8, 22)));
+    }
+
+    /// A BOM above every declared stdlib is refused: it would upgrade
+    /// `kotlin-stdlib` past what every library was built against.
+    #[test]
+    fn kotlin_bom_above_every_declared_stdlib_disagrees() {
+        let rows = [
+            kotlin_row(Some(KotlinVersion::new(1, 8, 22))),
+            kotlin_row(Some(KotlinVersion::new(1, 8, 10))),
+            kotlin_row(None),
+        ];
+        assert!(!kotlin_bom_agrees(&rows, KotlinVersion::new(1, 9, 0)));
+        assert!(!kotlin_bom_agrees(&rows, KotlinVersion::new(1, 8, 23)));
+    }
+
+    /// A BOM below the release that merged `jdk7`/`jdk8` into `kotlin-stdlib`
+    /// is refused even when it equals every declared stdlib, and a table that
+    /// declares no stdlib at all has nothing to agree with.
+    #[test]
+    fn kotlin_bom_below_the_merged_stdlib_floor_disagrees() {
+        let old = [kotlin_row(Some(KotlinVersion::new(1, 7, 10)))];
+        assert!(!kotlin_bom_agrees(&old, KotlinVersion::new(1, 7, 10)));
+        let java_only = [kotlin_row(None)];
+        assert!(!kotlin_bom_agrees(&java_only, KOTLIN_BOM_VERSION));
+        assert!(!kotlin_bom_agrees(&[], KOTLIN_BOM_VERSION));
+    }
+
+    /// The `dependencies` block of each variant, written out in full: a library
+    /// or BOM bump is a reviewed edit of this expectation.
+    #[test]
+    fn android_build_gradle_dependency_block_is_exact() {
+        let plain = "dependencies {\n\
+            \x20   implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')\n\
+            \x20   implementation 'androidx.webkit:webkit:1.11.0'\n\
+            \x20   implementation 'androidx.appcompat:appcompat:1.7.0'\n\
+            \x20   implementation 'androidx.core:core:1.13.1'\n\
+            }\n";
+        let push = "dependencies {\n\
+            \x20   implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')\n\
+            \x20   implementation 'androidx.webkit:webkit:1.11.0'\n\
+            \x20   implementation 'androidx.appcompat:appcompat:1.7.0'\n\
+            \x20   implementation 'androidx.core:core:1.13.1'\n\
+            \x20   implementation 'com.google.firebase:firebase-messaging:24.0.0'\n\
+            }\n";
+        let [(_, plain_gradle), (_, push_gradle)] = plain_and_push_gradle();
+        assert_eq!(dependency_block(&plain_gradle), plain);
+        assert_eq!(dependency_block(&push_gradle), push);
+    }
+
+    /// Every library line renders from [`ANDROID_LIBRARIES`]: the `implementation`
+    /// lines are exactly the BOM plus the rows the variant links, and no other
+    /// line names an `AndroidX` or Firebase library.
+    #[test]
+    fn every_android_library_line_renders_from_the_table() {
+        for ((variant, gradle), push) in plain_and_push_gradle().into_iter().zip([false, true]) {
+            let mut expected = vec![format!(
+                "    implementation platform('org.jetbrains.kotlin:kotlin-bom:{KOTLIN_BOM_VERSION}')"
+            )];
+            expected.extend(
+                ANDROID_LIBRARIES
+                    .iter()
+                    .filter(|library| library.linked.links_into(push))
+                    .map(|library| {
+                        format!(
+                            "    implementation '{}:{}'",
+                            library.coordinate, library.version
+                        )
+                    }),
+            );
+            let named: Vec<&str> = gradle
+                .lines()
+                .filter(|line| {
+                    line.contains("implementation")
+                        || line.contains("androidx.")
+                        || line.contains("firebase")
+                        || line.contains("kotlin")
+                })
+                .collect();
+            assert_eq!(named, expected, "{variant}: {gradle}");
+        }
+    }
+
+    /// The build steps pin Gradle to one version and its distribution digest,
+    /// never an open "or newer" floor.
+    #[test]
+    fn android_build_steps_pin_the_gradle_distribution() {
+        let steps = android_build_steps();
+        for needle in [
+            format!("--gradle-version {ANDROID_GRADLE_VERSION}"),
+            format!("--gradle-distribution-sha256-sum {ANDROID_GRADLE_DISTRIBUTION_SHA256}"),
+        ] {
+            assert!(steps.contains(needle.as_str()), "{needle}: {steps}");
+        }
+        assert!(!steps.contains("or newer"), "{steps}");
+        let digest = ANDROID_GRADLE_DISTRIBUTION_SHA256;
+        let short = digest.get(1..).unwrap_or_default();
+        let long = format!("{digest}0");
+        let upper = digest.to_ascii_uppercase();
+        let not_hex = format!("g{short}");
+        for refused in [short, long.as_str(), upper.as_str(), not_hex.as_str(), ""] {
+            assert!(!is_lowercase_sha256_hex(refused), "{refused:?}");
+        }
+    }
+
+    /// Every mobile output path `docs/guide/delivery.md` names is the one the
+    /// packer composes: `out/release/<slug>/dist/<os>/<name>-<os>`.
+    #[test]
+    fn delivery_md_names_the_output_dirs_the_packer_writes() {
+        use crate::delivery::Shape;
+        use crate::delivery_set::{DeliverySet, ShipEntry};
+        use crate::output_dir::{DEFAULT_OUTPUT_DIR, OutputArea};
+        let doc = std::fs::read_to_string(repo_root_for_tests().join("docs/guide/delivery.md"))
+            .expect("docs/guide/delivery.md reads");
+        for (os, entry) in [
+            (MobileOs::Android, ShipEntry::ClientAndroid),
+            (MobileOs::Ios, ShipEntry::ClientIos),
+        ] {
+            let set = DeliverySet::resolve(Shape::Web, &[entry]).expect("a web delivery set");
+            let slugs: Vec<String> = set
+                .planned()
+                .filter_map(|plan| plan.slug().ok())
+                .map(|slug| slug.as_str().to_owned())
+                .collect();
+            assert_eq!(slugs.len(), 1, "{slugs:?}");
+            let member = format!(
+                "{DEFAULT_OUTPUT_DIR}/{}/{}",
+                OutputArea::Release.dir_name(),
+                slugs.concat()
+            );
+            let dist = format!("/{}/{}/", OutputArea::Dist.dir_name(), os.as_str());
+            let named = format!("{member}{dist}{}", shell_root_name(os, "<name>"));
+            assert!(
+                doc.contains(named.as_str()),
+                "delivery.md must name {named}"
+            );
+            let suffix = format!("-{}", os.as_str());
+            for (at, _) in doc.match_indices(dist.as_str()) {
+                let before = doc.get(..at).unwrap_or_default();
+                let root: String = doc
+                    .get(at.saturating_add(dist.len())..)
+                    .unwrap_or_default()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '<' | '>'))
+                    .collect();
+                assert!(
+                    before.ends_with(member.as_str()) && root.ends_with(suffix.as_str()),
+                    "delivery.md names `{}` where the packer writes {member}{dist}<name>{suffix}",
+                    doc.get(at..at.saturating_add(dist.len()).saturating_add(root.len()))
+                        .unwrap_or_default()
+                );
+            }
+        }
     }
 
     /// The build steps name the API level the shell compiles against.
