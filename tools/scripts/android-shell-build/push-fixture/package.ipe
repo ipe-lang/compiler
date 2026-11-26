@@ -1,0 +1,33 @@
+module Package exposing (package)
+
+import Ipe.Package exposing (..)
+
+
+-- | The push variant of the Android shell build: a wasm client that accepts
+-- `JsPort Push`, with the `delivery.mobile.push` record an Android pack needs.
+-- The Firebase identifiers are grammar-valid placeholders; the build never
+-- contacts Firebase.
+package : Package
+package =
+    { name = "android-push-shell"
+    , version = "0.1.0"
+    , wasm = On { mode = Render }
+    , capabilities =
+        { declares = []
+        , accepts = [ JsPort Push ]
+        }
+    , delivery =
+        { mobile =
+            { bundleId = "io.ipe.androidpushshell"
+            , push =
+                { apns = Development
+                , fcm =
+                    { projectId = "android-push-shell"
+                    , applicationId = "1:1234567890:android:abc123"
+                    , apiKey = "AIza-android-push-shell"
+                    , senderId = "1234567890"
+                    }
+                }
+            }
+        }
+    }

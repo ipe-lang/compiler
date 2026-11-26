@@ -15,7 +15,8 @@ name: Build & test
 #     feature job wasi-run and the Windows job windows-test), the 14-shard e2e
 #     SEAL and its coverage proof (seal-slice-cover), seal-smoke, seal-modset (vendored),
 #     the runtime feature-combo / full-feature builds, registry-admission, the
-#     release-target checks, the Linux x64 Tier-2 jail and browser-e2e. They run once, on the combined tree
+#     release-target checks, the Linux x64 Tier-2 jail, browser-e2e and
+#     android-shell-build. They run once, on the combined tree
 #     the queue is about to land.
 #   • POST-MERGE (`post_merge`: push to main, dispatch) — the ASAN/TSAN
 #     sanitizers and the arm64 Tier-2 proof.
@@ -180,6 +181,8 @@ jobs:
         run: python3 .github/ci/test_strict_yaml.py -v
       - name: Prove the fail-closed change-classifier refusals (unit tests)
         run: python3 .github/ci/test_change_class.py -v
+      - name: Prove the Android Kotlin-stdlib resolution judge refusals (unit tests)
+        run: python3 .github/ci/test_android_resolution.py -v
       - name: The e2e shards and their cover run exactly the SSOT plan
         run: python3 .github/ci/e2e_shard.py --lint
       - name: Prove the e2e shard-partition refusals (unit tests)
@@ -1613,7 +1616,7 @@ jobs:
   # required-check target and a `fail-fast: false` shard failure is easy to miss.
   # This job is the phase verdict over every shard and over the other
   # end-to-end proofs of the tests phase (`seal-modset-vendored`,
-  # `linux-x64-tier2`, `browser-e2e`) — one stable context name (`e2e-all`)
+  # `linux-x64-tier2`, `browser-e2e`, `android-shell-build`) — one stable context name (`e2e-all`)
   # branch protection can require, so a red in any of them blocks a landing.
   # A bare, stable `name` so the required-check context is exactly `e2e-all`
   # (branch protection matches the check name literally; a parenthetical would
@@ -1621,7 +1624,7 @@ jobs:
   e2e-all:
     name: e2e-all
     runs-on: ubuntu-latest
-    needs: [changes, e2e, test-prep, seal-modset-vendored, linux-x64-tier2, browser-e2e]
+    needs: [changes, e2e, test-prep, seal-modset-vendored, linux-x64-tier2, browser-e2e, android-shell-build]
     if: always()
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1638,6 +1641,7 @@ jobs:
             seal-modset-vendored=${{ needs.seal-modset-vendored.result }}
             linux-x64-tier2=${{ needs.linux-x64-tier2.result }}
             browser-e2e=${{ needs.browser-e2e.result }}
+            android-shell-build=${{ needs.android-shell-build.result }}
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
@@ -3019,6 +3023,50 @@ jobs:
           path: tools/scripts/browser-e2e/artifacts/
           if-no-files-found: warn
           retention-days: 7
+
+  # The SEAL for the Android target: `ipe release build web client android`
+  # accepting a program must mean its Gradle project assembles. Generates the
+  # shell of a wasm client without push and of one that accepts `JsPort Push`
+  # (it links Firebase), follows the build steps the packer writes into each
+  # README.txt (the pinned Gradle wrapper, then `assembleDebug`), and judges the
+  # resolved Kotlin stdlib (.github/ci/android_resolution.py): every
+  # `kotlin-stdlib*` row must resolve to the generated `kotlin-bom` version.
+  # Tests phase, scoped on `code` like `browser-e2e`; `e2e-all` aggregates it.
+  # It must never free disk space by deleting /usr/local/lib/android: the
+  # runner's Android SDK is what it builds against.
+  android-shell-build:
+    name: android-shell-build (generated Gradle project assembles)
+    runs-on: ubuntu-latest
+    needs: [changes, quick-check, build-tools]
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: ./.github/actions/rust-toolchain-pinned
+        with:
+          targets: wasm32-unknown-unknown
+      # The wasm-bindgen CLI, pinned to the Cargo.lock wasm-bindgen version: the
+      # `web client` bundle inside each shell runs it.
+      - uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        with:
+          tool: wasm-bindgen@0.2.126
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-directories: |
+            ${{ github.workspace }}/.cache/android-shell-target
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ci-ipe-release
+          path: ${{ runner.temp }}/ipe-release
+      - name: Mark the prebuilt ipe executable
+        run: chmod +x "$RUNNER_TEMP/ipe-release/ipe"
+      - name: Assemble the generated Android shells
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}/.cache/android-shell-target
+        run: bash tools/scripts/android-shell-build/run.sh "$RUNNER_TEMP/ipe-release/ipe"
 
   # The live `main-protection` ruleset requires exactly the manifest's derived
   # `{context, integration_id}` set (.github/ci/check_required_set.py). Not
