@@ -764,8 +764,10 @@ impl CacheDir {
     /// The text of the regular file `name`, read never through a link; `None` when no regular file is there.
     ///
     /// A link or other non-regular entry holds no record and reads as `None`,
-    /// never followed; a text past [`OCCUPANT_PROBE_CAP`] bytes is an
-    /// `InvalidData` error.
+    /// never followed, so the rename that replaces it is the next step; a
+    /// directory, which no rename can replace, is an `IsADirectory` error, so
+    /// the write is refused before any artifact changes. A text past
+    /// [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
     fn read(&self, name: &str) -> std::io::Result<Option<String>> {
         use rustix::fs::{AtFlags, FileType, Mode, OFlags};
         use rustix::io::Errno;
@@ -775,14 +777,23 @@ impl CacheDir {
             Err(e) if e == Errno::NOENT => return Ok(None),
             Err(e) => {
                 let entry = rustix::fs::statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
-                return if FileType::from_raw_mode(entry.st_mode) == FileType::RegularFile {
-                    Err(e.into())
-                } else {
-                    Ok(None)
+                return match FileType::from_raw_mode(entry.st_mode) {
+                    FileType::RegularFile => Err(e.into()),
+                    FileType::Directory => Err(std::io::ErrorKind::IsADirectory.into()),
+                    FileType::Symlink
+                    | FileType::Fifo
+                    | FileType::Socket
+                    | FileType::CharacterDevice
+                    | FileType::BlockDevice
+                    | FileType::Unknown => Ok(None),
                 };
             }
         };
-        if !file.metadata()?.file_type().is_file() {
+        let kind = file.metadata()?.file_type();
+        if kind.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        if !kind.is_file() {
             return Ok(None);
         }
         read_capped(file).map(Some)
@@ -858,6 +869,7 @@ impl CacheDir {
     /// The text of the regular file `name`, never through a link; `None` when no regular file is there.
     ///
     /// A link or other non-regular entry holds no record and reads as `None`;
+    /// a directory, which no rename can replace, is an `IsADirectory` error;
     /// a text past [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
     fn read(&self, name: &str) -> std::io::Result<Option<String>> {
         let path = self.dir.join(name);
@@ -865,6 +877,7 @@ impl CacheDir {
             Ok(meta) if meta.file_type().is_file() => {
                 read_capped(std::fs::File::open(&path)?).map(Some)
             }
+            Ok(meta) if meta.file_type().is_dir() => Err(std::io::ErrorKind::IsADirectory.into()),
             Ok(_) => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
@@ -2981,6 +2994,34 @@ mod tests {
             std::fs::read_to_string(&paths.pkg_json).expect("occupant"),
             "{ not json"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_the_slug_record_refuses_the_write_before_any_artifact() {
+        let root = scratch_dir("slug-record-dir");
+        let cache = FfiCache::at_project_root(&root);
+        let paths = cache.artifact_paths(&FfiSlug::parse_canonical("a_b").expect("a slug"));
+        std::fs::create_dir_all(&paths.pkg_json).expect("a directory at the record");
+        let refused = install_from_inspection(&cache, &named_json("a-b"));
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::ArtifactIo { path, .. }) if path.ends_with("a_b.pkg.json")
+            ),
+            "{refused:?}"
+        );
+        for artifact in every_artifact(&paths) {
+            if artifact != &paths.pkg_json {
+                assert!(
+                    std::fs::symlink_metadata(artifact).is_err(),
+                    "{} is never written",
+                    artifact.display()
+                );
+            }
+        }
+        assert!(paths.pkg_json.is_dir(), "the directory is left in place");
         let _ = std::fs::remove_dir_all(&root);
     }
 
