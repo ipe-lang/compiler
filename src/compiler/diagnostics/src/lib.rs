@@ -86,8 +86,17 @@ mod tests {
             },
             FfiError::SlugCollision {
                 slug: hostile(),
-                installed: hostile(),
+                installed: Some(hostile()),
                 incoming: hostile(),
+            },
+            FfiError::SlugCollision {
+                slug: hostile(),
+                installed: None,
+                incoming: hostile(),
+            },
+            FfiError::SlugRefused {
+                name: hostile(),
+                detail: hostile(),
             },
         ]
         .map(|msg| Diagnostic::Ffi { msg })
@@ -175,7 +184,7 @@ mod tests {
             IPE_F4416 => Diagnostic::Ffi {
                 msg: FfiError::SlugCollision {
                     slug: "a_b".into(),
-                    installed: "a-b".into(),
+                    installed: Some("a-b".into()),
                     incoming: "a_b".into(),
                 },
             },

@@ -97,6 +97,14 @@ pub enum Diagnostic {
         /// The package name being installed.
         incoming: String,
     },
+    /// `IPE-F4416` — the crate being installed has a package name that folds
+    /// to no legal module slug; nothing is cached.
+    SlugRefused {
+        /// The package name being installed, verbatim.
+        name: String,
+        /// Which slug rule the folded name breaks.
+        defect: crate::driver::SlugDefect,
+    },
 }
 
 impl Diagnostic {
@@ -110,7 +118,7 @@ impl Diagnostic {
             Self::SourceRejected { .. } => IPE_F4411,
             Self::ArtifactIo { .. } => IPE_F4412,
             Self::SystemLibraryNotFound { .. } => IPE_F4415,
-            Self::SlugCollision { .. } => IPE_F4416,
+            Self::SlugCollision { .. } | Self::SlugRefused { .. } => IPE_F4416,
         }
     }
 }
@@ -165,12 +173,12 @@ impl From<Diagnostic> for FfiError {
                 incoming,
             } => Self::SlugCollision {
                 slug: slug.into(),
-                installed: installed
-                    .unwrap_or_else(|| {
-                        "a crate whose inspection document does not decode".to_owned()
-                    })
-                    .into(),
+                installed: installed.map(Into::into),
                 incoming: incoming.into(),
+            },
+            Diagnostic::SlugRefused { name, defect } => Self::SlugRefused {
+                name: name.into(),
+                detail: defect.to_string().into(),
             },
         }
     }
@@ -469,11 +477,6 @@ impl fmt::Display for AssertedDefect {
 pub enum SourceDefect {
     /// A crate name outside `[A-Za-z0-9_-]+`.
     CrateNameIllegal,
-    /// A crate name that folds to no legal module slug.
-    CrateSlugRefused {
-        /// Which slug rule the folded name breaks.
-        defect: crate::driver::SlugDefect,
-    },
     /// A git URL whose scheme is not `https://`.
     SchemeNotHttps,
     /// A git URL with no host component.
@@ -539,9 +542,6 @@ impl fmt::Display for SourceDefect {
         match self {
             Self::CrateNameIllegal => {
                 f.write_str("crate name must be non-empty and match [A-Za-z0-9_-]+")
-            }
-            Self::CrateSlugRefused { defect } => {
-                write!(f, "crate name folds to no legal module slug: {defect}")
             }
             Self::SchemeNotHttps => f.write_str("git source must use the https:// scheme"),
             Self::HostMissing => f.write_str("git URL has no host component"),

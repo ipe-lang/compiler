@@ -2670,10 +2670,19 @@ pub enum FfiError {
     SlugCollision {
         /// The module slug both crates map to.
         slug: TerminalSafe,
-        /// The package name of the crate already installed under the slug.
-        installed: TerminalSafe,
+        /// The package name of the crate already installed under the slug,
+        /// or `None` when its inspection document does not decode.
+        installed: Option<TerminalSafe>,
         /// The package name of the crate being installed.
         incoming: TerminalSafe,
+    },
+    /// `IPE-F4416` — a crate being installed has a package name that folds to
+    /// no legal module slug.
+    SlugRefused {
+        /// The package name being installed.
+        name: TerminalSafe,
+        /// Which slug rule the folded name breaks.
+        detail: TerminalSafe,
     },
 }
 
@@ -4496,7 +4505,7 @@ const fn ffi_code(msg: &FfiError) -> Code {
         FfiError::ArtifactIo { .. } => IPE_F4412,
         FfiError::AssertedRefused { .. } => IPE_F4414,
         FfiError::SystemLibraryNotFound { .. } => IPE_F4415,
-        FfiError::SlugCollision { .. } => IPE_F4416,
+        FfiError::SlugCollision { .. } | FfiError::SlugRefused { .. } => IPE_F4416,
     })
 }
 
@@ -4525,7 +4534,8 @@ const fn ffi_span(msg: &FfiError) -> Span {
         | FfiError::SourceRejected { .. }
         | FfiError::ArtifactIo { .. }
         | FfiError::SystemLibraryNotFound { .. }
-        | FfiError::SlugCollision { .. } => Span::DUMMY,
+        | FfiError::SlugCollision { .. }
+        | FfiError::SlugRefused { .. } => Span::DUMMY,
     }
 }
 
@@ -4551,13 +4561,38 @@ fn ffi_help(msg: &FfiError) -> Vec<HelpLine> {
             ),
             HelpLine::SeeExplain("IPE-F4415"),
         ],
-        FfiError::SlugCollision { installed, .. } => vec![
+        FfiError::SlugCollision {
+            installed: Some(installed),
+            ..
+        } => vec![
             HelpLine::Note(
                 format!(
                     "remove `{installed}` with `ipe rust remove {installed}` before adding \
                      the other crate, or keep only one of the two"
                 )
                 .into_boxed_str(),
+            ),
+            HelpLine::SeeExplain("IPE-F4416"),
+        ],
+        FfiError::SlugCollision {
+            installed: None,
+            incoming,
+            ..
+        } => vec![
+            HelpLine::Note(
+                format!(
+                    "remove the undecodable record with `ipe rust remove {incoming}`, \
+                     then add the crate again"
+                )
+                .into_boxed_str(),
+            ),
+            HelpLine::SeeExplain("IPE-F4416"),
+        ],
+        FfiError::SlugRefused { .. } => vec![
+            HelpLine::Note(
+                "no crate with this package name can be installed; pick another crate \
+                 or wrap it in a local wrapper crate under a different name"
+                    .into(),
             ),
             HelpLine::SeeExplain("IPE-F4416"),
         ],

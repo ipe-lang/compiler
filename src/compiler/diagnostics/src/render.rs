@@ -351,12 +351,23 @@ fn ffi_prose(msg: &FfiError) -> String {
         ),
         FfiError::SlugCollision {
             slug,
-            installed,
+            installed: Some(installed),
             incoming,
         } => format!(
             "Crate `{incoming}` maps to the module slug `{slug}`, which the installed \
              crate `{installed}` already holds."
         ),
+        FfiError::SlugCollision {
+            slug,
+            installed: None,
+            incoming,
+        } => format!(
+            "Crate `{incoming}` maps to the module slug `{slug}`, whose cached record \
+             does not decode, so it is not overwritten."
+        ),
+        FfiError::SlugRefused { name, detail } => {
+            format!("Crate `{name}` folds to no legal module slug: {detail}.")
+        }
     }
 }
 
@@ -1823,7 +1834,8 @@ fn ffi_label(msg: &FfiError) -> Option<String> {
         | FfiError::SourceRejected { .. }
         | FfiError::ArtifactIo { .. }
         | FfiError::SystemLibraryNotFound { .. }
-        | FfiError::SlugCollision { .. } => None,
+        | FfiError::SlugCollision { .. }
+        | FfiError::SlugRefused { .. } => None,
     }
 }
 

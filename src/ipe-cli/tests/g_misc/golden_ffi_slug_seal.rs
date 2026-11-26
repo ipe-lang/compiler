@@ -7,7 +7,8 @@
 //! refusal tests prove two crates folding to one slug are refused with
 //! IPE-F4416, the first kept, and that a package spelling the reserved
 //! asserted-shim namespace is refused before anything is cached. Under
-//! `IPE_E2E=1` the emitted crate builds against the real `Match` crate and runs.
+//! `IPE_E2E=1` the emitted crate builds against the real `Match` crate and
+//! runs, called both by an asserted path and through the imported binding.
 //!
 //! ```text
 //! cargo test -p ipe --test g_misc golden_ffi_slug_seal
@@ -51,11 +52,21 @@ const MAIN_IPE: &str = "module Main exposing (main)\n\
     \x20       Ok n -> Io.println (\"bumped \" ++ String.fromInt n)\n\
     \x20       Err _ -> Io.println \"err\"\n";
 
-/// A project declaring `Match`, its FFI cache seeded with `Match`'s inspection.
+/// The program calling `Match`'s `f` through its imported binding module.
+const IMPORT_MAIN_IPE: &str = "module Main exposing (main)\n\
+    import Ipe.Io as Io\n\
+    import Ipe.String as String\n\
+    import Rust.Match as M\n\n\
+    main =\n\
+    \x20   case M.f 41 of\n\
+    \x20       Ok n -> Io.println (\"bumped \" ++ String.fromInt n)\n\
+    \x20       Err _ -> Io.println \"err\"\n";
+
+/// A project running `main` and declaring `Match`, its FFI cache seeded with `Match`'s inspection.
 #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
-fn match_fixture() -> RootFixture {
+fn match_fixture(main: &str) -> RootFixture {
     let fixture = RootFixture::from_tree(
-        &SourceTree::main(MAIN_IPE).field("rustDependencies = [ rustDep \"Match\" \"=0.1.0\" ]"),
+        &SourceTree::main(main).field("rustDependencies = [ rustDep \"Match\" \"=0.1.0\" ]"),
     )
     .expect("the fixture project must be written and resolved");
     let cache = FfiCache::at_project_root(fixture.path());
@@ -77,10 +88,10 @@ fn cached_names(project_root: &Path) -> Vec<String> {
     )
 }
 
-/// Build the `Match` fixture into a fresh `out_dir`, returning the emitted crate's root.
-fn built_match(out_dir: &str) -> PathBuf {
+/// Build the `Match` fixture running `main` into a fresh `out_dir`, returning the emitted crate's root.
+fn built_match(out_dir: &str, main: &str) -> PathBuf {
     let runtime = e2e_support::require_runtime().into_path_buf();
-    let fixture = match_fixture();
+    let fixture = match_fixture(main);
     let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_dir);
     e2e_support::scratch::fresh(&out);
     let built = ipe::build_fixture(&fixture, &out, &runtime);
@@ -93,7 +104,7 @@ fn built_match(out_dir: &str) -> PathBuf {
 #[test]
 #[allow(clippy::expect_used)] // test fixture: a failed build or read IS the failure
 fn an_escaped_slug_names_the_module_and_the_lib_ident_names_the_call() {
-    let out = built_match("ffi_slug_seal_out");
+    let out = built_match("ffi_slug_seal_out", MAIN_IPE);
     let ffi_rs = fs::read_to_string(out.join("src/ffi.rs")).expect("emitted src/ffi.rs");
     assert!(
         ffi_rs.contains("pub mod match_ {"),
@@ -112,13 +123,42 @@ fn an_escaped_slug_names_the_module_and_the_lib_ident_names_the_call() {
 /// SEAL proof under `IPE_E2E=1`: the emitted crate builds against the real
 /// `Match` crate under its escaped slug and runs.
 #[test]
-#[allow(clippy::expect_used)] // test fixture: a failed build, write or run IS the failure
 fn an_escaped_slug_crate_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
-    let out = built_match("ffi_slug_seal_e2e_out");
-    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_slug_seal_e2e");
+    runs_against_the_real_match("ffi_slug_seal_e2e", MAIN_IPE);
+}
+
+/// `import Rust.Match` reaches the wrapper in the escaped `match_` module,
+/// whose body calls the crate by its lib identifier.
+#[test]
+#[allow(clippy::expect_used)] // test fixture: a failed build or read IS the failure
+fn an_imported_binding_lives_in_the_escaped_slug_and_calls_the_lib_ident() {
+    let out = built_match("ffi_slug_seal_import_out", IMPORT_MAIN_IPE);
+    let ffi_rs = fs::read_to_string(out.join("src/ffi.rs")).expect("emitted src/ffi.rs");
+    assert!(
+        ffi_rs.contains("pub mod match_ {") && ffi_rs.contains("Match::f("),
+        "the imported binding lives in the escaped slug and calls the lib identifier:\n{ffi_rs}"
+    );
+}
+
+/// SEAL proof under `IPE_E2E=1` for the imported binding: the emitted crate
+/// builds against the real `Match` crate and runs.
+#[test]
+fn an_escaped_slug_binding_called_through_its_import_builds_and_runs() {
+    if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
+        return;
+    }
+    runs_against_the_real_match("ffi_slug_seal_import_e2e", IMPORT_MAIN_IPE);
+}
+
+/// Build `main` against a local `Match` crate whose `f` bumps its argument,
+/// and run it: it must print `bumped 42`.
+#[allow(clippy::expect_used)] // test fixture: a failed build, write or run IS the failure
+fn runs_against_the_real_match(label: &str, main: &str) {
+    let out = built_match(&format!("{label}_out"), main);
+    let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("ipec_{label}"));
     e2e_support::scratch::fresh(&tmp);
     let crate_dir = tmp.join("Match");
     fs::create_dir_all(crate_dir.join("src")).expect("mkdir Match");
@@ -144,7 +184,7 @@ fn an_escaped_slug_crate_builds_and_runs() {
     );
     fs::write(&manifest_path, patched).expect("patched Cargo.toml");
 
-    let ran = e2e_support::build_and_run_rust("ffi_slug_seal", &out);
+    let ran = e2e_support::build_and_run_rust(label, &out);
     assert!(
         ran.is_ok(),
         "{}",
@@ -192,9 +232,14 @@ fn a_package_in_the_asserted_shim_namespace_is_refused_before_caching() {
     let fixture = RootFixture::main(MAIN_IPE).expect("the fixture project resolves");
     let cache = FfiCache::at_project_root(fixture.path());
     let refused = install_from_inspection(&cache, &inspection("ipe-asserted-x"));
+    let text = refused
+        .as_ref()
+        .err()
+        .map(ToString::to_string)
+        .unwrap_or_default();
     assert!(
-        refused.is_err(),
-        "the reserved namespace is refused: {refused:?}"
+        text.contains("IPE-F4416") && text.contains("ipe-asserted-x"),
+        "the reserved namespace is refused with the slug family's code: {refused:?}"
     );
     let cached = cached_names(fixture.path());
     assert!(

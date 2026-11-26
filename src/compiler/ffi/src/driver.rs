@@ -645,6 +645,30 @@ struct LevelError {
     source: std::io::Error,
 }
 
+/// The cache's exclusive install lock, released when dropped.
+///
+/// Every write and removal holds it from the occupant probe through its last
+/// rename, so two installs racing on one slug run one after the other: the
+/// second probe sees the first's record and refuses, never interleaving two
+/// packages' artifacts under one slug.
+struct InstallLock {
+    /// The handle the advisory lock is held on.
+    _held: std::fs::File,
+}
+
+/// The entry the non-Unix install lock is held on; no slug starts with `.`,
+/// so it names no artifact.
+#[cfg(not(unix))]
+const INSTALL_LOCK_NAME: &str = ".install.lock";
+
+/// `FILE_FLAG_OPEN_REPARSE_POINT`: open a link or junction itself, never its target.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// `FILE_FLAG_BACKUP_SEMANTICS`: let an open name a directory, so it is judged, not failed.
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
 /// The name of a fresh temporary sibling of the entry `name`, unique to this call within this process.
 fn temp_name(name: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -724,6 +748,19 @@ impl CacheDir {
                 .map_err(|e| fail(&shown, e))?;
         }
         Ok(Some(Self { dir: level }))
+    }
+
+    /// Take the cache's exclusive install lock, waiting while another holder has it.
+    ///
+    /// The lock is held on the cache directory's own handle, so no lock file
+    /// is created in the cache.
+    fn lock(&self) -> std::io::Result<InstallLock> {
+        // A fresh open of the directory, never a duplicate of the held handle:
+        // the lock belongs to this guard alone and is released when it drops.
+        let held = rustix::fs::openat(&self.dir, ".", Self::dir_flags(), rustix::fs::Mode::empty())
+            .map(std::fs::File::from)?;
+        held.lock()?;
+        Ok(InstallLock { _held: held })
     }
 
     /// Replace the entry `name` with a new owner-only file holding `contents`.
@@ -849,6 +886,23 @@ impl CacheDir {
         Ok(Some(Self { dir: level }))
     }
 
+    /// Take the cache's exclusive install lock, waiting while another holder has it.
+    ///
+    /// The lock is held on [`INSTALL_LOCK_NAME`], opened as the entry itself,
+    /// never through a link.
+    fn lock(&self) -> std::io::Result<InstallLock> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        );
+        let held = options.open(self.dir.join(INSTALL_LOCK_NAME))?;
+        held.lock()?;
+        Ok(InstallLock { _held: held })
+    }
+
     /// Replace the entry `name` with a new file holding `contents`, through a temporary sibling and a rename.
     fn replace(&self, name: &str, contents: &str) -> std::io::Result<()> {
         use std::io::Write as _;
@@ -871,17 +925,33 @@ impl CacheDir {
     /// A link or other non-regular entry holds no record and reads as `None`;
     /// a directory, which no rename can replace, is an `IsADirectory` error;
     /// a text past [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
+    ///
+    /// The entry is opened first and its handle judged, so what is judged is
+    /// what is read; on Windows the open names a link or junction itself.
     fn read(&self, name: &str) -> std::io::Result<Option<String>> {
-        let path = self.dir.join(name);
-        match std::fs::symlink_metadata(&path) {
-            Ok(meta) if meta.file_type().is_file() => {
-                read_capped(std::fs::File::open(&path)?).map(Some)
-            }
-            Ok(meta) if meta.file_type().is_dir() => Err(std::io::ErrorKind::IsADirectory.into()),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        );
+        let file = match options.open(self.dir.join(name)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let kind = file.metadata()?.file_type();
+        if kind.is_symlink() {
+            return Ok(None);
         }
+        if kind.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        if !kind.is_file() {
+            return Ok(None);
+        }
+        read_capped(file).map(Some)
     }
 
     /// Remove the entry `name`; an absent entry is fine.
@@ -1025,7 +1095,7 @@ impl FfiCache {
     ///
     /// `IPE-F4412` naming a cache level that is a link or not a directory, or
     /// the first path that could not be written; a wire-defect diagnostic when
-    /// the cache is not anchored at a project root; `IPE-F4411` when the
+    /// the cache is not anchored at a project root; `IPE-F4416` when the
     /// package name folds to no legal slug; `IPE-F4416` when another package
     /// already holds the slug, or its occupant's inspection document does not
     /// decode.
@@ -1039,13 +1109,14 @@ impl FfiCache {
             detail: e.to_string(),
         };
         let level_err = |e: LevelError| io_err(&e.path, &e.source);
-        let slug = FfiSlug::of(pkg.name_pkg()).map_err(|defect| Diagnostic::SourceRejected {
-            source: pkg.name().to_owned(),
-            defect: SourceDefect::CrateSlugRefused { defect },
+        let slug = FfiSlug::of(pkg.name_pkg()).map_err(|defect| Diagnostic::SlugRefused {
+            name: pkg.name().to_owned(),
+            defect,
         })?;
         let dir = CacheDir::open(self.project_root()?, true)
             .map_err(level_err)?
             .ok_or_else(|| io_err(&self.root, &std::io::ErrorKind::NotFound.into()))?;
+        let _install = dir.lock().map_err(|e| io_err(&self.root, &e))?;
         let names = ArtifactNames::for_slug(&slug);
         let paths = self.artifact_paths(&slug);
         // The occupant probe reads the exact `<slug>.pkg.json` the write below
@@ -1119,6 +1190,7 @@ impl FfiCache {
         else {
             return Ok(());
         };
+        let _install = dir.lock().map_err(|e| io_err(&self.root, &e))?;
         let names = ArtifactNames::for_slug(slug);
         let paths = self.artifact_paths(slug);
         for (name, path) in [
@@ -2635,7 +2707,6 @@ mod tests {
     }
 
     /// A fresh scratch directory named for `tag` and this process.
-    #[cfg(unix)]
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = ipe_test_temp::temp_root().join(format!("ipe-ffi-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2988,9 +3059,58 @@ mod tests {
             ),
             "{refused:?}"
         );
+        let shown = refused
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            shown.contains("ipe rust remove a-b") && !shown.contains("remove `a crate"),
+            "the remedy names the crate being added, never a placeholder: {shown}"
+        );
         assert_eq!(
             std::fs::read_to_string(&paths.pkg_json).expect("occupant"),
             "{ not json"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_held_install_lock_holds_the_occupant_probe_until_release() {
+        let root = scratch_dir("slug-lock");
+        let cache = FfiCache::at_project_root(&root);
+        let dir = CacheDir::open(&root, true)
+            .ok()
+            .flatten()
+            .expect("cache opens");
+        let held = dir.lock().expect("lock");
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sent.send(install_from_inspection(&cache, &named_json("a_b")).map(|_| ()));
+            })
+            .expect("spawn the waiting install");
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_err(),
+            "an install never probes while another holder has the lock"
+        );
+        let names = ArtifactNames::for_slug(&FfiSlug::parse_canonical("a_b").expect("a slug"));
+        dir.replace(&names.pkg_json, &named_json("a-b"))
+            .expect("the holder commits its record");
+        drop(held);
+        let outcome = received
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the released lock lets the waiting install report");
+        worker.join().expect("the waiting install's thread");
+        assert!(
+            matches!(
+                &outcome,
+                Err(Diagnostic::SlugCollision { installed: Some(installed), .. })
+                    if installed == "a-b"
+            ),
+            "the waiting install sees the committed record and refuses: {outcome:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3031,14 +3151,17 @@ mod tests {
         assert!(
             matches!(
                 &refused,
-                Err(Diagnostic::SourceRejected {
-                    defect: SourceDefect::CrateSlugRefused {
-                        defect: SlugDefect::Reserved
-                    },
+                Err(Diagnostic::SlugRefused {
+                    defect: SlugDefect::Reserved,
                     ..
                 })
             ),
             "{refused:?}"
+        );
+        assert_eq!(
+            refused.as_ref().err().map(Diagnostic::code),
+            Some(ipe_diagnostics::IPE_F4416),
+            "a slug refusal is the slug family's code, never the git-source gate's"
         );
         assert!(
             !cache.root().exists(),
