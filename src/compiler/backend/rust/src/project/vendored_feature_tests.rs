@@ -700,7 +700,7 @@ fn augmenter_declaring_a_feature_is_refused() {
         matches!(&promoted, Ok(m) if default_features(m) == ["server"]),
         "promoting a declared feature lists it in default: {promoted:?}"
     );
-    let without = CARGO_TOML.replacen("\nserver = []\n", "\n", 1);
+    let without = CARGO_TOML.replacen("\nserver = [\"dep:futures-util\"]\n", "\n", 1);
     assert_ne!(
         without, CARGO_TOML,
         "precondition: the base declares server"
@@ -733,14 +733,21 @@ fn augmenter_declaring_a_feature_is_refused() {
 #[test]
 fn base_manifest_declares_gates_inert() {
     let declared = declared_features(CARGO_TOML);
-    for gate in ["server", "jwt", "db", "locale"] {
+    // Inert: the entry turns on no other feature. `server` turns on only the
+    // optional crate its sources name.
+    for (gate, line) in [
+        ("server", r#"server = ["dep:futures-util"]"#),
+        ("jwt", "jwt = []"),
+        ("db", "db = []"),
+        ("locale", "locale = []"),
+    ] {
         assert!(
             declared.contains(gate),
             "templates/Cargo.toml must declare {gate:?}"
         );
         assert!(
-            CARGO_TOML.lines().any(|l| l == format!("{gate} = []")),
-            "templates/Cargo.toml must declare {gate:?} inert"
+            CARGO_TOML.lines().any(|l| l == line),
+            "templates/Cargo.toml must declare {gate:?} inert as `{line}`"
         );
     }
     assert_eq!(default_features(CARGO_TOML), ["json"]);

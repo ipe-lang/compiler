@@ -3716,13 +3716,6 @@ fn assemble_project_text(
         &cargo_toml,
         &crate::runtime_features::runtime_features(ctx),
     )?;
-    // Foreign-crate FFI: append the bound crates' pinned [dependencies] lines
-    // (exact versions + effective feature sets, pre-merged by the driver).
-    let cargo_toml = if ctx.uses_ffi {
-        ffi_cargo_toml(&cargo_toml, ctx)?
-    } else {
-        cargo_toml
-    };
     // The vendored `ipe_runtime/mod.rs`: the base default plus one `pub mod`
     // append per reached module, in the dependency order fixed by `MOD_APPENDS`
     // (a module is declared before any module that imports it). The manifest
@@ -3735,7 +3728,14 @@ fn assemble_project_text(
         }
         mod_rs
     };
-    let cargo_toml = module_deps_cargo_toml(&cargo_toml, &declared)?;
+    // Foreign-crate FFI: the bound crates' pinned [dependencies] lines (exact
+    // versions + effective feature sets, pre-merged by the driver).
+    let ffi_dep_lines = if ctx.uses_ffi {
+        Some(ffi_emit(ctx)?.dep_lines.as_slice())
+    } else {
+        None
+    };
+    let cargo_toml = vendored_dependencies(&cargo_toml, &declared, ffi_dep_lines)?;
 
     let mut files = BTreeMap::new();
     // The emitted Rust source files: `src/main.rs` always, plus one
@@ -4504,6 +4504,30 @@ fn runtime_projection_cargo_toml(
         })
 }
 
+/// The key an entry line of a dependency table declares; `None` for a blank,
+/// comment, or header line.
+fn dependency_key(line: &str) -> Option<&str> {
+    let text = line.trim();
+    if text.is_empty() || text.starts_with('#') || text.starts_with('[') {
+        return None;
+    }
+    text.split_once('=').map(|(key, _)| key.trim())
+}
+
+/// Every key the `header` table of `manifest` declares.
+fn dependency_keys<'a>(manifest: &'a str, header: &str) -> std::collections::BTreeSet<&'a str> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut in_table = false;
+    for line in manifest.lines() {
+        if line.starts_with('[') {
+            in_table = line.trim() == header;
+        } else if in_table && let Some(key) = dependency_key(line) {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
 /// Append `deps` to the manifest's `[dependencies]` table, after its last entry.
 ///
 /// The insertion point is read from the table itself, never from the section
@@ -4550,6 +4574,21 @@ fn append_dependencies(base: &str, deps: &str, where_: &'static str) -> DResult<
     if entries.is_empty() {
         return Ok(base.to_owned());
     }
+    let mut keys = dependency_keys(base, HEADER);
+    for line in entries.lines() {
+        let Some(key) = dependency_key(line) else {
+            continue;
+        };
+        if !keys.insert(key) {
+            return Err(Diagnostic::CompilerBug {
+                where_,
+                detail: format!(
+                    "dependency `{key}` would be declared twice in `{HEADER}` — a duplicate \
+                     key cargo refuses"
+                ),
+            });
+        }
+    }
     let (head, tail) = base.split_at_checked(at).ok_or_else(drift)?;
     let mut out = String::with_capacity(base.len() + entries.len() + 2);
     out.push_str(head);
@@ -4578,8 +4617,13 @@ fn module_deps_cargo_toml(base: &str, rows: &[&ModAppend]) -> DResult<String> {
     for spec in rows.iter().flat_map(|row| row.deps) {
         if !named.contains(&spec.name) {
             named.push(spec.name);
-            // Infallible: `fmt::Write` into a `String` never fails.
-            let _ = writeln!(lines, "{} = \"{}\"", spec.name, spec.version);
+            let pinned = crate_specs::PinnedCrate {
+                spec: *spec,
+                default_features: true,
+                features: &[],
+            };
+            lines.push_str(&pinned.dependency_line(&[]));
+            lines.push('\n');
         }
     }
     append_dependencies(
@@ -5833,17 +5877,59 @@ fn json_string(s: &str) -> String {
 /// [`Diagnostic::CompilerBug`] when the FFI emission inputs are absent while
 /// the program uses FFI, or when the manifest anchor drifted.
 fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
-    let ffi = ctx.ffi.as_ref().ok_or_else(|| Diagnostic::CompilerBug {
+    ffi_dependencies_cargo_toml(base, &ffi_emit(ctx)?.dep_lines)
+}
+
+/// The FFI emission inputs of a program that lowers a foreign-wrapper call.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the driver supplied none.
+fn ffi_emit<'c>(ctx: &'c EmitCtx<'_>) -> DResult<&'c crate::FfiEmit> {
+    ctx.ffi.as_ref().ok_or_else(|| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::project::ffi_cargo_toml",
         detail: "program lowers foreign-wrapper calls but the driver supplied no FFI \
                  emission inputs (RustBackend::with_ffi)"
             .to_owned(),
-    })?;
+    })
+}
+
+/// The vendored manifest's dependency tail: the crates of the declared
+/// [`MOD_APPENDS`] rows, then the bound FFI crates. The rows go first so a
+/// bound crate of the same name reuses the row's entry instead of declaring
+/// the key twice.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when an anchor is absent or a
+/// dependency key would be declared twice.
+fn vendored_dependencies(
+    base: &str,
+    rows: &[&ModAppend],
+    ffi_dep_lines: Option<&[String]>,
+) -> DResult<String> {
+    let with_rows = module_deps_cargo_toml(base, rows)?;
+    match ffi_dep_lines {
+        Some(lines) => ffi_dependencies_cargo_toml(&with_rows, lines),
+        None => Ok(with_rows),
+    }
+}
+
+/// Append the bound FFI crates' `dep_lines` to `base`.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when an anchor is absent.
+fn ffi_dependencies_cargo_toml(base: &str, dep_lines: &[String]) -> DResult<String> {
+    const WHERE: &str = "ipe_backend_rust::project::ffi_cargo_toml";
     // Keys the base manifest already declares under a `[...dependencies]`
     // table: re-declaring one (uuid's transitive `futures-util`, say) is a
     // hard `cargo` duplicate-key error, so those lines are skipped — the
-    // base pin governs and cargo's resolver unifies the shared graph.
-    let mut base_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    // base pin governs and cargo's resolver unifies the shared graph. A key
+    // the base declares `optional` is off unless a feature turns it on, so a
+    // bound crate of that name is switched on through `default` (`dep:`
+    // enables the crate alone, never the runtime feature of the same name).
+    let mut base_keys: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
     let mut in_deps = false;
     for raw in base.lines() {
         let line = raw.trim();
@@ -5851,25 +5937,33 @@ fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
             in_deps = line.contains("dependencies");
             continue;
         }
-        if in_deps && let Some((name, _)) = line.split_once('=') {
-            base_keys.insert(name.trim());
+        if in_deps && let Some((name, value)) = line.split_once('=') {
+            let optional = value
+                .split([',', '{', '}'])
+                .any(|field| field.split_whitespace().collect::<String>() == "optional=true");
+            base_keys.insert(name.trim(), optional);
         }
     }
     let mut dep_block = String::new();
-    for line in &ffi.dep_lines {
+    let mut turned_on: Vec<&str> = Vec::new();
+    for line in dep_lines {
         let key = line.split('=').next().unwrap_or(line).trim();
-        if base_keys.contains(key) {
-            continue;
+        match base_keys.get(key) {
+            Some(true) => turned_on.push(key),
+            Some(false) => {}
+            None => {
+                dep_block.push_str(line);
+                dep_block.push('\n');
+            }
         }
-        dep_block.push_str(line);
-        dep_block.push('\n');
     }
     dep_block.push('\n');
-    append_dependencies(
-        base,
-        &dep_block,
-        "ipe_backend_rust::project::ffi_cargo_toml",
-    )
+    let base = turned_on
+        .into_iter()
+        .try_fold(base.to_owned(), |toml, key| {
+            promote_default_feature(&toml, &format!("dep:{key}"), WHERE)
+        })?;
+    append_dependencies(&base, &dep_block, WHERE)
 }
 
 /// Emit the `into_sql_param` impl for `SqlValue` and `into_field_param` impl
@@ -5980,6 +6074,9 @@ mod tests {
         insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
         server_cargo_toml, shake_ffi_by_fn_ident, wasm_hydrate_entry, wasm_present_modules,
         wasm_runtime_bindings, web_cargo_toml, websocket_cargo_toml, wrapper_call_paths,
+    };
+    use super::{
+        MOD_APPENDS, ModAppend, append_dependencies, dependency_keys, vendored_dependencies,
     };
     use crate::DbDriver;
     use crate::crate_specs;
@@ -6175,7 +6272,7 @@ mod tests {
         );
         // Feature declaration must be present.
         assert!(
-            out.contains("server = []"),
+            out.lines().any(|l| l == r#"server = ["dep:futures-util"]"#),
             "manifest must declare the server feature: {out}"
         );
         // The tokio line is written once, by the async restore; the server
@@ -6237,7 +6334,7 @@ mod tests {
             "manifest must declare the db feature: {out}"
         );
         assert!(
-            out.contains("server = []"),
+            out.lines().any(|l| l == r#"server = ["dep:futures-util"]"#),
             "manifest must declare the server feature: {out}"
         );
         // sqlx dep (from db_cargo_toml) plus axum dep (from server_cargo_toml)
@@ -6885,10 +6982,106 @@ mod tests {
             default_line(&out)
         );
         assert!(
-            out.lines().any(|l| l == "http_client = []"),
+            out.lines()
+                .any(|l| l == r#"http_client = ["dep:futures-util"]"#),
             "the template must declare http_client"
         );
         assert!(out.contains("reqwest = {"), "reqwest must be added");
+    }
+
+    /// The `MOD_APPENDS` row whose crates include `name`.
+    fn row_naming(name: &str) -> Vec<&'static ModAppend> {
+        MOD_APPENDS
+            .iter()
+            .filter(|row| row.deps.iter().any(|d| d.name == name))
+            .take(1)
+            .collect()
+    }
+
+    /// How many entry lines of the `[dependencies]` table declare `key`.
+    fn declarations(manifest: &str, key: &str) -> usize {
+        let mut in_table = false;
+        manifest
+            .lines()
+            .filter(|line| {
+                if line.starts_with('[') {
+                    in_table = line.trim() == "[dependencies]";
+                    return false;
+                }
+                in_table && line.split_once('=').is_some_and(|(k, _)| k.trim() == key)
+            })
+            .count()
+    }
+
+    /// A bound FFI crate a declared module row also names keeps one entry,
+    /// never a duplicate key cargo refuses.
+    #[test]
+    fn a_bound_crate_a_module_row_names_is_declared_once() {
+        let rows = row_naming("regex");
+        assert_eq!(rows.len(), 1, "a MOD_APPENDS row names `regex`");
+        let lines = vec![r#"regex = "=1.11.1""#.to_owned()];
+        let out = vendored_dependencies(CARGO_TOML, &rows, Some(&lines));
+        assert!(
+            out.as_ref().is_ok_and(|m| declarations(m, "regex") == 1),
+            "regex declared exactly once: {out:?}"
+        );
+    }
+
+    /// A bound FFI crate the base declares `optional` is switched on through
+    /// `default`, never dropped while its feature stays off.
+    #[test]
+    fn a_bound_crate_the_base_declares_optional_is_turned_on() {
+        for key in [
+            "base64",
+            "futures-util",
+            "percent-encoding",
+            "serde_urlencoded",
+        ] {
+            assert!(
+                CARGO_TOML.lines().any(|l| l.starts_with(&format!("{key} = {{"))
+                    && l.contains("optional = true")),
+                "the template declares `{key}` optional"
+            );
+            let lines = vec![format!(r#"{key} = "=0.1.0""#)];
+            let out = vendored_dependencies(CARGO_TOML, &[], Some(&lines));
+            assert!(
+                out.as_ref()
+                    .is_ok_and(|m| default_line(m).contains(&format!("\"dep:{key}\""))
+                        && declarations(m, key) == 1),
+                "`{key}` turned on once through default: {out:?}"
+            );
+        }
+        let lines = vec![r#"serde_json = "=1.0.140""#.to_owned()];
+        let out = vendored_dependencies(CARGO_TOML, &[], Some(&lines));
+        assert!(
+            out.as_ref().is_ok_and(
+                |m| !default_line(m).contains("dep:") && declarations(m, "serde_json") == 1
+            ),
+            "a non-optional base key is reused as is: {out:?}"
+        );
+    }
+
+    /// Appending a key the `[dependencies]` table already declares, or one key
+    /// twice, is a compiler bug at emit time, never a cargo duplicate-key error.
+    /// A key only a target table declares is not a duplicate.
+    #[test]
+    fn a_duplicate_dependency_key_is_refused() {
+        const W: &str = "test";
+        assert!(dependency_keys(CARGO_TOML, "[dependencies]").contains("serde_json"));
+        for block in ["serde_json = \"1\"\n", "a = \"1\"\nb = \"1\"\na = \"2\"\n"] {
+            assert!(
+                matches!(
+                    append_dependencies(CARGO_TOML, block, W),
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug { .. })
+                ),
+                "{block:?} must be refused"
+            );
+        }
+        let target_only = append_dependencies(CARGO_TOML, "rustix = \"1\"\n", W);
+        assert!(
+            target_only.is_ok_and(|m| declarations(&m, "rustix") == 1),
+            "a target-table key may also enter `[dependencies]`"
+        );
     }
 
     /// `email_cargo_toml` and `config_cargo_toml` promote their features, which

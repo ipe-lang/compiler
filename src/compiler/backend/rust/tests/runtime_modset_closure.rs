@@ -1934,7 +1934,13 @@ fn closure_violations(
         tokio_line_features(&emit.cargo_toml)
     };
     let mut out = Vec::new();
-    let mut used = crate_level_externs(runtime_root, &overlay, &file, emit, env);
+    let mut used = match crate_level_externs(runtime_root, &overlay, &file, emit, env) {
+        Ok(used) => used,
+        Err(e) => {
+            out.push(e);
+            BTreeSet::new()
+        }
+    };
     for decl in &decls {
         if env.eval(&decl.cond) == Truth::Fails {
             continue;
@@ -1987,25 +1993,34 @@ fn closure_violations(
 /// The dependency crates the emitted crate names outside the declared runtime
 /// modules: the items of `ipe_runtime/mod.rs` other than its `mod`
 /// declarations, and every program source file. A program file is read whole:
-/// none carries a `#[cfg(..)]` the emitter gates a dependency use behind.
+/// none carries a `#[cfg(..)]` the emitter gates a dependency use behind. A
+/// program file that does not parse, or an item the scanner cannot read, is an
+/// error: reading it as naming nothing would hide every crate it needs from
+/// the missing direction.
 fn crate_level_externs(
     runtime_root: &Path,
     overlay: &Overlay,
     mod_rs: &syn::File,
     emit: &Emit,
     env: &CfgEnv,
-) -> BTreeSet<String> {
+) -> Result<BTreeSet<String>, String> {
     let mut scanner = RefScanner::new(runtime_root, overlay, runtime_root.to_path_buf(), 1);
     for item in &mod_rs.items {
         if !matches!(item, syn::Item::Mod(_)) {
             syn::visit::Visit::visit_item(&mut scanner, item);
         }
     }
+    if !scanner.errors.is_empty() {
+        return Err(format!("`mod.rs`: {}", scanner.errors.join("; ")));
+    }
     let mut used = required_of(RefKind::Extern, &scanner.refs, &Cfg::All(Vec::new()), env);
     for src in &emit.program_files {
         let mut whole = RefScanner::new(runtime_root, overlay, runtime_root.to_path_buf(), 0);
-        if let Ok(file) = syn::parse_file(src) {
-            syn::visit::Visit::visit_file(&mut whole, &file);
+        let file = syn::parse_file(src)
+            .map_err(|e| format!("an emitted program file does not parse: {e}"))?;
+        syn::visit::Visit::visit_file(&mut whole, &file);
+        if !whole.errors.is_empty() {
+            return Err(format!("a program file: {}", whole.errors.join("; ")));
         }
         used.extend(required_of(
             RefKind::Extern,
@@ -2014,7 +2029,7 @@ fn crate_level_externs(
             env,
         ));
     }
-    used
+    Ok(used)
 }
 
 /// The build intents every flag mask is checked under: a release emit and a
@@ -3431,6 +3446,34 @@ fn a_named_crate_is_read_under_cfg_and_by_library_name() {
     assert!(
         on_wasm.is_empty(),
         "the wasm target compiles neither native-only item: {on_wasm:?}"
+    );
+}
+
+/// A program file the scanner cannot read is refused, never read as naming
+/// no crate: the missing direction would otherwise pass vacuously.
+#[test]
+fn an_unreadable_program_file_is_refused() {
+    let root = closure_fixture("dep-unreadable", &[("plain.rs", "pub fn p() {}\n")]);
+    let env = CfgEnv {
+        features: BTreeSet::new(),
+        wasm: false,
+    };
+    let verdicts = |program: &str| {
+        let mut emit = Emit::of_mod_rs("pub mod plain;\n");
+        emit.program_files = vec![program.to_owned()];
+        closure_violations(&root, &emit, &env, &mut ScanCache::default())
+    };
+    let unparsable = verdicts("fn main() { let _ = regex::escape(\"a\") \n");
+    let unknown_cfg =
+        verdicts("#[cfg(no_such_cfg)]\nfn f() { let _ = regex::escape(\"a\"); }\nfn main() {}\n");
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        unparsable.iter().any(|v| v.contains("does not parse")),
+        "an unparsable program file: refused; got {unparsable:?}"
+    );
+    assert!(
+        unknown_cfg.iter().any(|v| v.starts_with("a program file:")),
+        "a program item under an unreadable cfg: refused; got {unknown_cfg:?}"
     );
 }
 
