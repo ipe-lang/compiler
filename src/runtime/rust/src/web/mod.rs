@@ -9709,7 +9709,8 @@ mod base_path_tests {
             "__ipeDrainQueue",
             "__ipeWatchdog",
             "__ipeSend",
-            "__ipeFlushPendingBeacon",
+            "__ipeSendEvent",
+            "__ipeFlushOnLeave",
             "__ipeReloadDocument",
         ] {
             let body = body_of(guarded).unwrap_or_default();
@@ -9732,7 +9733,6 @@ mod base_path_tests {
         // first on an ended session, or in a navigation the reader starts; a
         // new sink anywhere else is refused here.
         let guarded_heads = [
-            "function __ipeFlushPendingBeacon(",
             "function __ipePostEvent(",
             "window.__ipePortSend = function(",
             "function __ipeReloadDocument(",
@@ -9776,12 +9776,7 @@ mod base_path_tests {
                 );
             }
         }
-        for sink in [
-            "fetch(",
-            "sendBeacon(",
-            "new EventSource(",
-            "location.reload(",
-        ] {
+        for sink in ["fetch(", "new EventSource(", "location.reload("] {
             assert!(kinds.contains(sink), "the scan saw no `{sink}`");
         }
         for head in guarded_heads {
