@@ -2270,3 +2270,19 @@ fn a_frame_list_without_a_web_leaf_is_refused_at_build() -> TestResult {
     }
     Ok(())
 }
+
+/// The Android shell job's push fixture grants exactly the capabilities it
+/// discloses, so `ipe release build` admits it through the app-boundary consent
+/// gate (IPE-S0002) instead of refusing the job's first run.
+#[test]
+fn the_android_push_fixture_grants_exactly_what_it_discloses() -> TestResult {
+    let dir = support::repo_root().join("tools/scripts/android-shell-build/push-fixture");
+    let root = ProjectRoot::resolve(RootArg::at(&dir))?;
+    let accepted = root.manifest().capabilities_accept.clone();
+    let r = verify_capabilities(&root, &accepted);
+    assert!(
+        r.is_ok(),
+        "the push fixture's accepts must equal its inferred set: {r:?}"
+    );
+    Ok(())
+}

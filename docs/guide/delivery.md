@@ -191,8 +191,9 @@ there is no remote host and no `file://` access. See
 
 `ipe release build web client ios` writes the iOS shell as sources, not an Xcode
 project: the Swift files of a `WKWebView` + `WKURLSchemeHandler` shell, the
-derived-permission `Info.plist`, and the client's assets. You add them to a new
-Xcode iOS App target on macOS; a signed `.ipa` also needs a signing identity. As with desktop, `build web client <os>` lays out the same shell
+derived-permission `Info.plist`, and the client's assets. You build them in a new
+Xcode project on macOS (see [iOS (simulator)](#ios-simulator) below); a signed
+`.ipa` also needs a signing identity. As with desktop, `build web client <os>` lays out the same shell
 around a fast dev client; `release web client <os>` hosts the production client.
 
 ## Running and simulating each host
@@ -259,13 +260,15 @@ Android SDK.
 not an Xcode project, so there is no scheme to build from the command line.
 Simulating needs **macOS + Xcode**:
 
-1. In Xcode, create a new iOS App project (or target).
-2. Add the files under `App/` to it: `App/Info.plist` as the target's `Info.plist`,
-   and `App/www/` as a folder reference so the client keeps its layout.
-3. Pick an iOS Simulator and press ⌘R.
+<!-- ios-build-steps -->
+1. On macOS, create a new Xcode iOS App project (Interface: Storyboard, Language: Swift) and name its product exactly as the `CFBundleExecutable` value in `App/Info.plist`.
+2. Delete the template's `AppDelegate.swift`, `SceneDelegate.swift`, `ViewController.swift`, `Main.storyboard`, `Info.plist` and `Assets.xcassets`: the shell's `App/AppDelegate.swift` is the app's one `@main` entry point, and two entry points do not compile.
+3. Add the files under `App/` to the target, with `App/www/` as a folder reference so the client keeps its layout.
+4. In the target's Build Settings, set Generate Info.plist File to No and Info.plist File to `App/Info.plist`.
+5. Pick an iOS Simulator and press ⌘R. A signed, distributable `.ipa` also needs a signing identity.
+<!-- /ios-build-steps -->
 
-A distributable `.ipa` additionally needs a signing identity. iOS cannot be
-built or simulated on Linux or Windows.
+iOS cannot be built or simulated on Linux or Windows.
 
 ## OS permissions come from your capabilities
 

@@ -111,6 +111,9 @@ jobs:
       emit: ${{ steps.classify.outputs.emit != 'false' }}
       # `sanitize` — `emit` plus the rest of the asan/tsan crates' closure.
       sanitize: ${{ steps.classify.outputs.sanitize != 'false' }}
+      # `mobile` — the generated mobile shells' packer, manifest grammar,
+      # catalog text and the runtime text spliced into them.
+      mobile: ${{ steps.classify.outputs.mobile != 'false' }}
       # `release_only` — normalised to `true`/`false` here, once, so no consumer
       # ever splices the raw writer value into a `run:` script.
       release_only: ${{ steps.release.outputs.release_only == 'true' }}
@@ -152,7 +155,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
-        run: python3 .github/ci/change_class.py --code --emit --sanitize --wasm --editors
+        run: python3 .github/ci/change_class.py --code --emit --sanitize --wasm --editors --mobile
 
   # Fail-closed guard against clone bloat: a commit that tracks a build artifact
   # (a target/ directory, an .rlib/.rmeta/.o/.a/.so/.dylib/.wasm blob) or any file
@@ -1618,6 +1621,8 @@ jobs:
   # end-to-end proofs of the tests phase (`seal-modset-vendored`,
   # `linux-x64-tier2`, `browser-e2e`, `android-shell-build`) — one stable context name (`e2e-all`)
   # branch protection can require, so a red in any of them blocks a landing.
+  # `android-shell-build` keys on its own `mobile` scope, which `scopes` hands
+  # the verdict, so it may skip only where that scope is off.
   # A bare, stable `name` so the required-check context is exactly `e2e-all`
   # (branch protection matches the check name literally; a parenthetical would
   # make the required-context string brittle).
@@ -1645,6 +1650,7 @@ jobs:
           phase: tests
           tier: ${{ needs.changes.outputs.tests }}
           scope: ${{ needs.changes.outputs.code }}
+          scopes: android-shell-build=${{ needs.changes.outputs.mobile }}
 
   # ── SEAL slice ────────────────────────────────────────────────────────────
   # The e2e shard coverage proof: `tools/scripts/e2e-shard-cover.py` lists the
@@ -3031,14 +3037,16 @@ jobs:
   # README.txt (the pinned Gradle wrapper, then `assembleDebug`), and judges the
   # resolved Kotlin stdlib (.github/ci/android_resolution.py): every
   # `kotlin-stdlib*` row must resolve to the generated `kotlin-bom` version.
-  # Tests phase, scoped on `code` like `browser-e2e`; `e2e-all` aggregates it.
+  # Tests phase (merge queue and nightly), scoped on `mobile`: a merge group
+  # runs it only when a mobile-relevant path changed, a nightly always does;
+  # `e2e-all` aggregates it.
   # It must never free disk space by deleting /usr/local/lib/android: the
   # runner's Android SDK is what it builds against.
   android-shell-build:
     name: android-shell-build (generated Gradle project assembles)
     runs-on: ubuntu-latest
     needs: [changes, quick-check, build-tools]
-    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.mobile == 'true'
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

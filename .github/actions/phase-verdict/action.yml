@@ -3,12 +3,12 @@ description: >-
   The one aggregation rule for a required context whose work runs in a later
   phase than the pull request (the contributing guide, "CI phases"). A
   skipped required check reports as passing, so the context is this verdict,
-  run on every event: it passes vacuously only where the work's phase or scope
-  is off, and on any event of that phase it passes only when every needed job
-  succeeded. A failed or absent classifier, a failed or cancelled need, a
+  run on every event: a needed job may skip only where the phase or that job's
+  own scope is off, and every needed job that runs must succeed. A failed or absent classifier, a failed or cancelled need, a
   phase flag that disagrees with the event, or a malformed result list fails
   it. `ci/verify-manifest.py` check 11 holds every aggregator to this exact
-  step, with `results` naming each of the job's needs once, `changes` first.
+  step, with `results` naming each of the job's needs once, `changes` first,
+  and `scopes` naming each aggregated job keyed on another scope than `scope`.
 
 inputs:
   results:
@@ -25,6 +25,13 @@ inputs:
   scope:
     description: The `changes` scope output the aggregated jobs key on, `true` or `false`.
     required: true
+  scopes:
+    description: >-
+      Space-separated `job=flag` pairs, one per aggregated job keyed on another
+      `changes` scope output than `scope`, each flag that output (`true` or
+      `false`); a job it does not name keys on `scope`.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -36,6 +43,7 @@ runs:
         PHASE: ${{ inputs.phase }}
         TIER: ${{ inputs.tier }}
         SCOPE: ${{ inputs.scope }}
+        SCOPES: ${{ inputs.scopes }}
       run: |
         set -euo pipefail
         # The event's phase membership, derived independently of `changes`.
@@ -51,6 +59,18 @@ runs:
         if [ "$TIER" != "$member" ]; then
           echo "::error::phase verdict FAILED: phase flag ($TIER) disagrees with event $GITHUB_EVENT_NAME" >&2; exit 1
         fi
+        # Each aggregated job's own scope flag: its `scopes` pair, else `scope`.
+        declare -A own=()
+        read -r -a scoped <<< "$SCOPES"
+        for pair in "${scoped[@]}"; do
+          job="${pair%%=*}"
+          flag="${pair#*=}"
+          if [ "$job" = "$pair" ] || [ -z "$job" ] || [ "$job" = changes ] || [ -n "${own[$job]+set}" ]; then
+            echo "::error::phase verdict FAILED: malformed or repeated scopes pair $pair" >&2; exit 1
+          fi
+          case "$flag" in true|false) ;; *) echo "::error::phase verdict FAILED: scope flag of $job is neither true nor false" >&2; exit 1 ;; esac
+          own[$job]="$flag"
+        done
         read -r -a pairs <<< "$RESULTS"
         if [ "${#pairs[@]}" -lt 2 ]; then
           echo "::error::phase verdict FAILED: no aggregated job besides changes" >&2; exit 1
@@ -70,22 +90,26 @@ runs:
             fi
             continue
           fi
+          flag="${own[$job]:-$SCOPE}"
+          unset 'own[$job]'
           case "$result" in
             success) ;;
-            skipped) unrun="$unrun $job=$result" ;;
+            skipped)
+              if [ "$TIER" = true ] && [ "$flag" = true ]; then unrun="$unrun $job=$result"; fi ;;
             *) broken="$broken $job=$result" ;;
           esac
         done
+        if [ "${#own[@]}" -ne 0 ]; then
+          echo "::error::phase verdict FAILED: scopes names a job results does not:${!own[*]}" >&2; exit 1
+        fi
         if [ -n "$broken" ]; then
           echo "::error::phase verdict FAILED:$broken" >&2; exit 1
         fi
-        if [ "$TIER" = true ] && [ "$SCOPE" = true ]; then
-          if [ -n "$unrun" ]; then
-            echo "::error::phase verdict FAILED: this event must run every aggregated job:$unrun" >&2; exit 1
-          fi
-          echo "phase verdict PASSED: every aggregated job succeeded."
-        elif [ "$TIER" = false ]; then
+        if [ -n "$unrun" ]; then
+          echo "::error::phase verdict FAILED: this event must run every aggregated job its scope selects:$unrun" >&2; exit 1
+        fi
+        if [ "$TIER" = false ]; then
           echo "phase verdict PASSED vacuously: $GITHUB_EVENT_NAME is outside the $PHASE phase."
         else
-          echo "phase verdict PASSED vacuously: the classifier proved the change irrelevant to this scope."
+          echo "phase verdict PASSED: every aggregated job its scope selects succeeded."
         fi

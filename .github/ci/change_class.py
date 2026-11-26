@@ -111,6 +111,22 @@ SCOPES: dict[str, tuple[str, ...]] = {
     "panic_scan": ("src/**/*.rs", "src/**/Cargo.toml"),
     # editors/tree-sitter-ipe/scripts/parity-check.sh parses src/stdlib/Ipe/ (and examples/).
     "grammar": ("editors/tree-sitter-ipe/**", "src/stdlib/Ipe/**"),
+    # The generated mobile shells: the `ipe` packer that writes them, the
+    # manifest grammar their delivery record parses through, and the runtime
+    # text (CSP, native bridge, mount base) spliced into them. The job runs the
+    # prebuilt `ipe`, so no cargo package selection reaches check 16.
+    "mobile": (
+        "src/ipe-cli/src/pack/**",
+        "src/ipe-cli/text/**",
+        "src/ipe-cli/src/bundle_www.rs",
+        "src/ipe-cli/src/package_manifest.rs",
+        "src/ipe-cli/src/project.rs",
+        "src/runtime/rust/src/csp.rs",
+        "src/runtime/rust/src/encoding.rs",
+        "src/runtime/rust/src/js_port_glue.rs",
+        "src/stdlib/Ipe/Browser/**",
+        "src/stdlib/Ipe/Package.ipe",
+    ),
 }
 
 # Paths CI consumes that must never be PROSE (the guard asserts it).

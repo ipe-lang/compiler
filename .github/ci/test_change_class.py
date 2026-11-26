@@ -113,6 +113,27 @@ class ClassifyTest(unittest.TestCase):
         self.assertFalse(result["wasm"])
         self.assertFalse(result["editors"])
         self.assertFalse(result["grammar"])
+        self.assertFalse(result["mobile"])
+
+    def test_mobile_runs_on_the_shell_generator_and_what_it_splices(self) -> None:
+        for path in (
+            "src/ipe-cli/src/pack/mobile.rs",
+            "src/ipe-cli/src/pack/permissions.rs",
+            "src/ipe-cli/text/messages.md",
+            "src/ipe-cli/src/project.rs",
+            "src/runtime/rust/src/csp.rs",
+            "src/stdlib/Ipe/Browser/Push.ipe",
+            # Outside the scoped roots: the job's script and workflow force it.
+            "tools/scripts/android-shell-build/run.sh",
+            ".github/workflows/ci.yml",
+        ):
+            with self.subTest(path=path):
+                self.assertTrue(self.classify({path: "x\n"})["mobile"])
+
+    def test_mobile_skips_a_compiler_only_change(self) -> None:
+        for path in ("src/compiler/types/src/constrain.rs", "src/ipe-cli/src/driver/commands.rs"):
+            with self.subTest(path=path):
+                self.assertFalse(self.classify({path: "x\n"})["mobile"])
 
     def test_narrow_scope_runs_on_its_pattern(self) -> None:
         self.assertTrue(self.classify({"src/runtime/rust/src/lib.rs": "x\n"})["emit"])
