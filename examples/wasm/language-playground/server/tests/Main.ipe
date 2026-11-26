@@ -122,6 +122,7 @@ joins =
         , Test.test "a nested source lands in the run directory" (\_ -> Test.equal (Ok "/home/pg/.cache/ipe/playground-runs/t0/src/ipe_mods/app.rs") (staged "src/ipe_mods/app.rs"))
         , Test.test "a parent escape is refused" (\_ -> Test.err (staged "../x"))
         , Test.test "an escape through a subdirectory is refused" (\_ -> Test.err (staged "a/../../b"))
+        , Test.test "a parent segment that stays inside folds away" (\_ -> Test.equal (Ok "/home/pg/.cache/ipe/playground-runs/t0/b") (staged "a/../b"))
         , Test.test "an absolute name is refused" (\_ -> Test.err (staged "/abs"))
         , Test.test "an absolute name into the run directory's parent is refused" (\_ -> Test.err (staged "/home/pg/.cache/ipe/playground-runs/t1/src/main.rs"))
         , Test.test "an empty name is refused" (\_ -> Test.err (staged ""))
@@ -130,6 +131,8 @@ joins =
         , Test.test "the run directory is a token beneath HOME" (\_ -> Test.equal (Ok "/home/pg/.cache/ipe/playground-runs/0a1b") (Result.map Path.toString (Runner.absoluteHome "/home/pg" |> Result.andThen (\h -> Runner.runDirFor h "0a1b"))))
         , Test.test "a traversing run token is refused" (\_ -> Test.err (Runner.absoluteHome "/home/pg" |> Result.andThen (\h -> Runner.runDirFor h "../../x")))
         , Test.test "an empty run token is refused" (\_ -> Test.err (Runner.absoluteHome "/home/pg" |> Result.andThen (\h -> Runner.runDirFor h "")))
+        , Test.test "a nested run token is refused" (\_ -> Test.err (Runner.absoluteHome "/home/pg" |> Result.andThen (\h -> Runner.runDirFor h "a/b")))
+        , Test.test "a dot-prefixed run token is refused" (\_ -> Test.err (Runner.absoluteHome "/home/pg" |> Result.andThen (\h -> Runner.runDirFor h "./x")))
         , Test.test "a layout file is joined beneath the root" (\_ -> Test.equal (Ok "/srv/playground/static/app.js") (Result.map Path.toString (Layout.rootOf "/srv/playground/server" |> Result.mapError (\_ -> ()) |> Result.andThen (\r -> Paths.below r "static/app.js" |> Result.mapError (\_ -> ())))))
         , Test.test "a layout file outside the root is refused" (\_ -> Test.err (Layout.rootOf "/srv/playground/server" |> Result.mapError (\_ -> ()) |> Result.andThen (\r -> Paths.below r "../etc/passwd" |> Result.mapError (\_ -> ()))))
         ]

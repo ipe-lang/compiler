@@ -59,11 +59,22 @@ runPlan wall plan =
 
 
 {-| The run directory for one run token: `.cache/ipe/playground-runs/<token>`
-beneath `home`. A token that is not one plain relative name is refused.
+beneath `home`. A token that is not exactly one plain path component is refused.
 -}
 runDirFor : Path -> String -> Result Error Path
 runDirFor home token =
-    Paths.below home ".cache/ipe/playground-runs" |> Result.andThen (\runs -> Paths.below runs token)
+    Paths.below home ".cache/ipe/playground-runs"
+        |> Result.andThen (\runs -> Paths.below runs token)
+        |> Result.andThen (oneComponent token)
+
+
+oneComponent : String -> Path -> Result Error Path
+oneComponent token dir =
+    if Path.base dir == token then
+        Ok dir
+
+    else
+        "a run token must be one plain name, got: " ++ String.left 200 token |> Error.invalidInput |> Err
 
 
 runJail : JailWall -> Path -> Path -> Task Error RawOutcome

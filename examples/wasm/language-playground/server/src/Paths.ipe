@@ -7,9 +7,10 @@ import Ipe.Result as Result
 
 -- The server's one way to name a path beneath a root it already holds. The
 -- relative text is parsed as a `Path` and joined with `Path.under`, so an
--- empty, absolute, `..`-escaping or NUL-bearing child is refused and the
--- result is proven to lie below the root; no path is ever built by gluing
--- strings around a separator.
+-- empty, absolute or NUL-bearing child is refused, `..` segments fold before
+-- the check (`a/../b` names `b`), a child whose folded form still escapes is
+-- refused, and the result is proven to lie below the root; no path is ever
+-- built by gluing strings around a separator.
 {-| `rel` beneath `root`, or the reason it cannot lie there. -}
 below : Path -> String -> Result Error Path
 below root rel =
