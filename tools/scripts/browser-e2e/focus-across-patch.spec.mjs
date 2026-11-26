@@ -499,12 +499,14 @@ test("focus-across-patch: a reopened panel focuses its autofocus field again", a
   await open(page);
   await focusRoot(page);
   await page.keyboard.press("F2");
+  await expect(page.locator("input#reason")).toHaveCount(1);
   await expect(page.locator("input#reason")).toBeFocused();
   // The key reaches the root's handler from the field: the panel closes.
   await page.keyboard.press("F2");
   await expect(page.locator("input#reason")).toHaveCount(0);
   await expect.poll(() => focusedId(page)).toBe("root");
   await page.keyboard.press("F2");
+  await expect(page.locator("input#reason")).toHaveCount(1);
   await expect(page.locator("input#reason")).toBeFocused();
 });
 
@@ -513,6 +515,7 @@ test("focus-across-patch: typing into an autofocus field never refocuses it", as
   await focusRoot(page);
   await page.keyboard.press("F2");
   const field = page.locator("input#reason");
+  await expect(field).toHaveCount(1);
   await expect(field).toBeFocused();
   await page.keyboard.type("abc");
   // Let each debounced input event's render land.
