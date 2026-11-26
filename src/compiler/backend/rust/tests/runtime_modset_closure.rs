@@ -596,6 +596,124 @@ enum RefKind {
     Crate,
     /// A whole `tokio::` path, its segments joined by `::`.
     Tokio,
+    /// A dependency crate, named by its crate name (`-` read as `_`).
+    Extern,
+}
+
+/// Every crate a dependency table of the runtime crate or the vendored
+/// manifest template names, by crate name: the crates a runtime path can
+/// reach. A path whose first segment is one of them counts as a use of it.
+#[allow(clippy::expect_used)] // test scaffolding: an unreadable manifest cannot be skipped
+static EXTERN_CRATES: std::sync::LazyLock<BTreeSet<String>> = std::sync::LazyLock::new(|| {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut names = BTreeSet::new();
+    for rel in ["../../../runtime/rust/Cargo.toml", "templates/Cargo.toml"] {
+        let text = std::fs::read_to_string(manifest.join(rel)).expect("read a dependency manifest");
+        names.extend(dependency_tables(&text).into_iter().map(|dep| dep.name));
+    }
+    names
+});
+
+/// One entry of a manifest's (non-dev) dependency tables.
+#[derive(Debug)]
+struct DepEntry {
+    /// The crate name, `-` read as `_`.
+    name: String,
+    optional: bool,
+    /// The `cfg(..)` of a `[target.'cfg(..)'.dependencies]` table.
+    target: Option<String>,
+}
+
+/// Every entry of the `[dependencies]` and `[target.'..'.dependencies]` tables
+/// of `cargo_toml`; dev and build dependency tables are not read.
+fn dependency_tables(cargo_toml: &str) -> Vec<DepEntry> {
+    let mut out = Vec::new();
+    let mut table: Option<Option<String>> = None;
+    for line in cargo_toml.lines() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code).trim();
+        if line.starts_with('[') {
+            table = if code == "[dependencies]" {
+                Some(None)
+            } else {
+                code.strip_prefix("[target.'")
+                    .and_then(|rest| rest.strip_suffix("'.dependencies]"))
+                    .map(|cfg| Some(cfg.to_owned()))
+            };
+            continue;
+        }
+        let (Some(target), Some((key, value))) = (&table, code.split_once('=')) else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"');
+        if key.is_empty() || key.contains(' ') {
+            continue;
+        }
+        out.push(DepEntry {
+            name: key.replace('-', "_"),
+            optional: value.replace(' ', "").contains("optional=true"),
+            target: target.clone(),
+        });
+    }
+    out
+}
+
+/// The dependency crates the emitted crate described by `cargo_toml` compiles
+/// against in `env`: every non-optional entry, and every optional one an
+/// enabled feature turns on (`dep:x`, `x/f`, or a feature named `x`), in a
+/// table whose target predicate does not fail. A target predicate the
+/// evaluator cannot read counts as holding.
+fn active_dependencies(cargo_toml: &str, env: &CfgEnv) -> BTreeSet<String> {
+    let table = feature_table(cargo_toml);
+    let mut turned_on: BTreeSet<String> = env.features.clone();
+    for feature in &env.features {
+        for entry in table.get(feature).into_iter().flatten() {
+            if let Some(dep) = entry.strip_prefix("dep:") {
+                turned_on.insert(dep.to_owned());
+            } else if let Some((dep, _)) = entry.split_once('/')
+                && !dep.ends_with('?')
+            {
+                turned_on.insert(dep.to_owned());
+            }
+        }
+    }
+    let turned_on: BTreeSet<String> = turned_on.iter().map(|n| n.replace('-', "_")).collect();
+    dependency_tables(cargo_toml)
+        .into_iter()
+        .filter(|dep| {
+            let target_holds = dep.target.as_deref().is_none_or(|cfg| {
+                syn::parse_str::<syn::Meta>(cfg)
+                    .ok()
+                    .and_then(|meta| cfg::parse_cfg(&meta).ok())
+                    .is_none_or(|cond| env.eval(&cond) != Truth::Fails)
+            });
+            target_holds && (!dep.optional || turned_on.contains(&dep.name))
+        })
+        .map(|dep| dep.name)
+        .collect()
+}
+
+/// The prefix of every unused-dependency violation, so a check can select them.
+const UNUSED_DEP: &str = "unused dependency:";
+
+/// Every crate the emitted manifest compiles against that no compiled module
+/// names: `used` holds the crates the compiled modules reach. Cargo's
+/// `unused_dependencies` lint reports each one, and a build that denies
+/// warnings fails on it though `ipe` exited 0.
+fn unused_dependency_violations(
+    cargo_toml: &str,
+    env: &CfgEnv,
+    used: &BTreeSet<String>,
+) -> Vec<String> {
+    active_dependencies(cargo_toml, env)
+        .into_iter()
+        .filter(|dep| !used.contains(dep))
+        .map(|dep| {
+            format!(
+                "{UNUSED_DEP} the emitted manifest declares `{dep}`, but no module the \
+                 crate compiles names it"
+            )
+        })
+        .collect()
 }
 
 /// One crate-root or `tokio::` reference and the predicate it is compiled under.
@@ -604,7 +722,8 @@ struct GatedRef {
     kind: RefKind,
     /// For [`RefKind::Crate`], the first segment after the crate root
     /// (`crate::<seg>`), or a `<no file ..>` marker for a `mod` declaration
-    /// whose file is absent; for [`RefKind::Tokio`], the path.
+    /// whose file is absent; for [`RefKind::Tokio`], the path; for
+    /// [`RefKind::Extern`], the crate name.
     seg: String,
     cond: Cfg,
 }
@@ -639,6 +758,9 @@ struct RefScanner<'r> {
     refs: Vec<GatedRef>,
     pending: Vec<PendingFile>,
     errors: Vec<String>,
+    /// Set while the tokens of a non-`cfg` attribute are walked: only the
+    /// dependency crates they name are recorded.
+    extern_only: bool,
 }
 
 impl<'r> RefScanner<'r> {
@@ -655,6 +777,20 @@ impl<'r> RefScanner<'r> {
             refs: Vec::new(),
             pending: Vec::new(),
             errors: Vec::new(),
+            extern_only: false,
+        }
+    }
+
+    /// Record the dependency crate a path of two or more segments (or one a
+    /// glob follows) starts at. A single segment is a local name as often as a
+    /// crate, so it is read as one only where it can name nothing else: a `use`
+    /// leaf or an `extern crate`.
+    fn record_extern(&mut self, segs: &[String], continues: bool) {
+        if let Some(first) = segs.first()
+            && (continues || segs.len() > 1)
+            && EXTERN_CRATES.contains(first)
+        {
+            self.push(RefKind::Extern, first.clone());
         }
     }
 
@@ -718,6 +854,10 @@ impl<'r> RefScanner<'r> {
     /// runtime module (`use crate::encoding;`): a bare root item is resolved by
     /// no module.
     fn record_path(&mut self, segs: &[String], continues: bool) {
+        self.record_extern(segs, continues);
+        if self.extern_only {
+            return;
+        }
         if self.record_tokio(segs, continues) {
             return;
         }
@@ -748,6 +888,11 @@ impl<'r> RefScanner<'r> {
     /// which the tokio classification refuses: paths through the alias are not
     /// read.
     fn record_use_leaf(&mut self, segs: &[String]) {
+        if let [only] = segs
+            && EXTERN_CRATES.contains(only)
+        {
+            self.push(RefKind::Extern, only.clone());
+        }
         if let [only] = segs
             && only == "tokio"
         {
@@ -947,7 +1092,13 @@ impl<'ast> syn::visit::Visit<'ast> for RefScanner<'_> {
                 .iter()
                 .map(|s| s.ident.to_string())
                 .collect();
+            self.record_extern(&segs, false);
             self.record_tokio(&segs, false);
+            if let syn::Meta::List(list) = &attr.meta {
+                let outer = std::mem::replace(&mut self.extern_only, true);
+                self.macro_tokens(list.tokens.clone());
+                self.extern_only = outer;
+            }
         }
     }
 
@@ -974,6 +1125,10 @@ impl<'ast> syn::visit::Visit<'ast> for RefScanner<'_> {
 
     fn visit_item_extern_crate(&mut self, node: &'ast syn::ItemExternCrate) {
         self.gated(&node.attrs, |scanner| {
+            let name = node.ident.to_string();
+            if EXTERN_CRATES.contains(&name) {
+                scanner.push(RefKind::Extern, name);
+            }
             if node.ident == "tokio" {
                 scanner.push(RefKind::Tokio, "tokio".to_owned());
             }
@@ -1760,6 +1915,7 @@ fn closure_violations(
         tokio_line_features(&emit.cargo_toml)
     };
     let mut out = Vec::new();
+    let mut used = crate_level_externs(runtime_root, &overlay, &file, emit, env);
     for decl in &decls {
         if env.eval(&decl.cond) == Truth::Fails {
             continue;
@@ -1785,6 +1941,7 @@ fn closure_violations(
             )
         };
         out.extend(errors.iter().map(|e| format!("`{}`: {e}", decl.name)));
+        used.extend(required_of(RefKind::Extern, &refs, &decl.cond, env));
         out.extend(tokio_violations(
             &decl.name,
             &required_of(RefKind::Tokio, &refs, &decl.cond, env),
@@ -1804,7 +1961,42 @@ fn closure_violations(
             }
         }
     }
+    out.extend(unused_dependency_violations(&emit.cargo_toml, env, &used));
     out
+}
+
+/// The dependency crates the emitted crate names outside the declared runtime
+/// modules: the items of `ipe_runtime/mod.rs` other than its `mod`
+/// declarations, and every program source file. A program file is read whole:
+/// none carries a `#[cfg(..)]` the emitter gates a dependency use behind.
+fn crate_level_externs(
+    runtime_root: &Path,
+    overlay: &Overlay,
+    mod_rs: &syn::File,
+    emit: &Emit,
+    env: &CfgEnv,
+) -> BTreeSet<String> {
+    let mut scanner = RefScanner::new(runtime_root, overlay, runtime_root.to_path_buf(), 1);
+    for item in &mod_rs.items {
+        if !matches!(item, syn::Item::Mod(_)) {
+            syn::visit::Visit::visit_item(&mut scanner, item);
+        }
+    }
+    let mut used = required_of(RefKind::Extern, &scanner.refs, &Cfg::All(Vec::new()), env);
+    for src in &emit.program_files {
+        let mut whole = RefScanner::new(runtime_root, overlay, runtime_root.to_path_buf(), 0);
+        if let Ok(file) = syn::parse_file(src) {
+            syn::visit::Visit::visit_file(&mut whole, &file);
+        }
+        used.extend(
+            whole
+                .refs
+                .into_iter()
+                .filter(|r| r.kind == RefKind::Extern)
+                .map(|r| r.seg),
+        );
+    }
+    used
 }
 
 /// The build intents every flag mask is checked under: a release emit and a
@@ -1819,6 +2011,9 @@ struct Emit {
     /// Every other file the project writes under `src/ipe_runtime/`, keyed by
     /// its path under the runtime root.
     runtime_files: BTreeMap<String, String>,
+    /// The source of every `.rs` file the project writes outside
+    /// `src/ipe_runtime/`.
+    program_files: Vec<String>,
 }
 
 impl Emit {
@@ -1828,6 +2023,7 @@ impl Emit {
             mod_rs: mod_rs.to_owned(),
             cargo_toml: String::new(),
             runtime_files: BTreeMap::new(),
+            program_files: Vec::new(),
         }
     }
 }
@@ -1852,6 +2048,7 @@ fn emit_mask(
         .emit(&prog)
         .expect("emit must succeed for a body-free program");
     let mut runtime_files = BTreeMap::new();
+    let mut program_files = Vec::new();
     let mut mod_rs = None;
     for (path, src) in emitted.files {
         match path.as_str().strip_prefix("src/ipe_runtime/") {
@@ -1859,6 +2056,7 @@ fn emit_mask(
             Some(rel) => {
                 runtime_files.insert(rel.to_owned(), src);
             }
+            None if path.as_str().ends_with(".rs") => program_files.push(src),
             None => {}
         }
     }
@@ -1866,6 +2064,7 @@ fn emit_mask(
         mod_rs: mod_rs.expect("emitted project must contain ipe_runtime/mod.rs"),
         cargo_toml: emitted.cargo_toml,
         runtime_files,
+        program_files,
     }
 }
 
@@ -2133,6 +2332,32 @@ fn web_shape_declares_tea() {
         declared.contains("tea") && declared.contains("web"),
         "uses_web must declare both `web` and `tea`; got {declared:?}"
     );
+}
+
+/// The named witness of the vendored `regex` / `bcrypt` breach: a featureless
+/// program and a web app compile no `regex`, `bcrypt`, or `uuid` user, so
+/// their manifests turn none of those crates on; a featureless program
+/// compiles no render core, so it turns no `serde_urlencoded` on either.
+#[test]
+fn on_demand_crates_stay_off_without_their_modules() {
+    let mut interner = Interner::new();
+    let main = interner.intern("Main").expect("intern Main");
+    for (mask, absent) in [
+        (0, &["regex", "bcrypt", "uuid", "serde_urlencoded"][..]),
+        (1 << 3, &["regex", "bcrypt"][..]),
+    ] {
+        for intent in EMIT_INTENTS {
+            let emit = emit_mask(&interner, main, mask, Target::Native, intent);
+            let env = manifest_env(&emit.cargo_toml, false);
+            let active = active_dependencies(&emit.cargo_toml, &env);
+            let present: Vec<&&str> = absent.iter().filter(|dep| active.contains(**dep)).collect();
+            assert!(
+                present.is_empty(),
+                "mask {mask:#b}, {intent:?} emit: the manifest turns on {present:?}, \
+                 which no compiled module names"
+            );
+        }
+    }
 }
 
 #[test]
@@ -2852,7 +3077,9 @@ fn fixture_violations(root: &Path, mod_rs: &str, features: &[&str]) -> Vec<Strin
 }
 
 /// The violations of the fixture `mod_rs` with exactly `features` on and the
-/// emitted `tokio` line enabling `tokio` (`None`: no `tokio` dependency).
+/// emitted `tokio` line enabling `tokio` (`None`: no `tokio` dependency). A
+/// fixture that names no `tokio::` path leaves its `tokio` line unused; that
+/// verdict belongs to the unused-dependency fixtures, so it is not read here.
 fn tokio_fixture_violations(
     root: &Path,
     mod_rs: &str,
@@ -2866,6 +3093,157 @@ fn tokio_fixture_violations(
     let mut emit = Emit::of_mod_rs(mod_rs);
     emit.cargo_toml = tokio.map_or_else(String::new, tokio_line);
     closure_violations(root, &emit, &env, &mut ScanCache::default())
+        .into_iter()
+        .filter(|v| !v.starts_with(UNUSED_DEP))
+        .collect()
+}
+
+// ── unused dependency ────────────────────────────────────────────────────────
+
+/// The unused-dependency verdicts of the fixture `mod_rs` and program sources
+/// `program` over the emitted manifest `cargo_toml`, with exactly `features` on.
+fn unused_dep_fixture(
+    root: &Path,
+    mod_rs: &str,
+    cargo_toml: &str,
+    features: &[&str],
+    program: &[&str],
+) -> Vec<String> {
+    let env = CfgEnv {
+        features: features.iter().map(|f| (*f).to_owned()).collect(),
+        wasm: false,
+    };
+    let mut emit = Emit::of_mod_rs(mod_rs);
+    emit.cargo_toml = cargo_toml.to_owned();
+    emit.program_files = program.iter().map(|src| (*src).to_owned()).collect();
+    closure_violations(root, &emit, &env, &mut ScanCache::default())
+        .into_iter()
+        .filter(|v| v.starts_with(UNUSED_DEP))
+        .collect()
+}
+
+/// The shape of the vendored `regex` / `bcrypt` breach: a manifest that
+/// declares a crate no compiled module names is refused, since cargo's
+/// `unused_dependencies` lint fails a build that denies warnings. The crate's
+/// user compiled, or the dependency optional and off, it builds.
+#[test]
+fn a_declared_dependency_no_compiled_module_names_is_refused() {
+    let root = closure_fixture(
+        "unused-dep",
+        &[
+            (
+                "matcher.rs",
+                "pub fn m(p: &str) -> bool { regex::Regex::new(p).is_ok() }\n",
+            ),
+            (
+                "hasher.rs",
+                "#[cfg(feature = \"auth\")]\npub fn h() { let _ = bcrypt::DEFAULT_COST; }\n",
+            ),
+            ("plain.rs", "pub fn p() {}\n"),
+        ],
+    );
+    let regex_dep = "[dependencies]\nregex = \"1\"\n";
+    let breach = unused_dep_fixture(&root, "pub mod plain;\n", regex_dep, &[], &[]);
+    let used = unused_dep_fixture(
+        &root,
+        "pub mod plain;\npub mod matcher;\n",
+        regex_dep,
+        &[],
+        &[],
+    );
+    let gated_out = unused_dep_fixture(
+        &root,
+        "#[cfg(feature = \"regex\")]\npub mod matcher;\n",
+        regex_dep,
+        &[],
+        &[],
+    );
+    let by_program = unused_dep_fixture(
+        &root,
+        "pub mod plain;\n",
+        regex_dep,
+        &[],
+        &["fn main() { let _ = regex::escape(\"a\"); }\n"],
+    );
+    let bcrypt_optional = "[features]\nauth = [\"dep:bcrypt\"]\n\n[dependencies]\n\
+                           bcrypt = { version = \"0.17\", optional = true }\n";
+    let optional_off = unused_dep_fixture(&root, "pub mod plain;\n", bcrypt_optional, &[], &[]);
+    let optional_on =
+        unused_dep_fixture(&root, "pub mod plain;\n", bcrypt_optional, &["auth"], &[]);
+    let optional_used =
+        unused_dep_fixture(&root, "pub mod hasher;\n", bcrypt_optional, &["auth"], &[]);
+    let item_gated_out = unused_dep_fixture(
+        &root,
+        "pub mod hasher;\n",
+        "[dependencies]\nbcrypt = \"0.17\"\n",
+        &[],
+        &[],
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        breach.iter().any(|v| v.contains("`regex`")),
+        "`regex` declared, no compiled module names it: refused; got {breach:?}"
+    );
+    assert!(used.is_empty(), "`matcher` names `regex`: {used:?}");
+    assert!(
+        gated_out.iter().any(|v| v.contains("`regex`")),
+        "`matcher` compiles out with `regex` off, so nothing names the crate: \
+         refused; got {gated_out:?}"
+    );
+    assert!(
+        by_program.is_empty(),
+        "the program names `regex`: {by_program:?}"
+    );
+    assert!(
+        optional_off.is_empty(),
+        "an optional dependency off: {optional_off:?}"
+    );
+    assert!(
+        optional_on.iter().any(|v| v.contains("`bcrypt`")),
+        "`auth` turns `bcrypt` on, no compiled module names it: refused; got {optional_on:?}"
+    );
+    assert!(
+        optional_used.is_empty(),
+        "`hasher` names `bcrypt`: {optional_used:?}"
+    );
+    assert!(
+        item_gated_out.iter().any(|v| v.contains("`bcrypt`")),
+        "the one item naming `bcrypt` compiles out with `auth` off: refused; \
+         got {item_gated_out:?}"
+    );
+}
+
+/// A crate is named by a `use` leaf, a renamed `use`, an `extern crate`, a
+/// derive path, or a macro path; a lone local name that spells a crate is not
+/// a use of it.
+#[test]
+fn every_crate_naming_form_counts_as_a_use() {
+    let root = closure_fixture(
+        "dep-forms",
+        &[
+            ("leaf.rs", "use regex;\n"),
+            ("renamed.rs", "use bcrypt as bc;\n"),
+            ("ext.rs", "extern crate uuid;\n"),
+            ("derive.rs", "#[derive(serde::Serialize)]\npub struct S;\n"),
+            ("mac.rs", "pub fn j() { let _ = serde_json::json!({}); }\n"),
+            ("local.rs", "pub fn l(url: u8) -> u8 { url }\n"),
+        ],
+    );
+    let manifest = "[dependencies]\nregex = \"1\"\nbcrypt = \"0.17\"\nuuid = \"1\"\n\
+                    serde = \"1\"\nserde_json = \"1\"\nurl = \"2\"\n";
+    let verdicts = unused_dep_fixture(
+        &root,
+        "pub mod leaf;\npub mod renamed;\npub mod ext;\npub mod derive;\npub mod mac;\n\
+         pub mod local;\n",
+        manifest,
+        &[],
+        &[],
+    );
+    let _ = std::fs::remove_dir_all(&root);
+    assert!(
+        verdicts.len() == 1 && verdicts.iter().all(|v| v.contains("`url`")),
+        "every form names its crate; a local `url` binding names no crate: {verdicts:?}"
+    );
 }
 
 /// A `tokio = { .. }` dependency line enabling exactly `features`.
@@ -3091,6 +3469,7 @@ fn runtime_crate_tokio_references_are_declared() {
                 String::new()
             },
             runtime_files: BTreeMap::new(),
+            program_files: Vec::new(),
         };
         let env = CfgEnv {
             features,

@@ -35,21 +35,22 @@ dev-posture = []
 # check; promoted into `default` for a serving program that reaches
 # `Db.connect`. Implies `db` and `server`, mirroring the runtime crate.
 db-operator = ["db", "server"]
-# Declared but inert in the vendored escape hatch: `serde` / `serde_json` /
-# `serde_urlencoded` stay non-optional below. The floor serde derives
+# Declared but inert in the vendored escape hatch: `serde` / `serde_json` stay
+# non-optional below. The floor serde derives
 # (`IpeMaybe`/`IpeResult`/`IpeError`/`Decimal`/`Patch`) and the `dom/form`
 # decode are `#[cfg(feature = "serde")]` in the vendored source, so this entry
 # keeps rustc's check-cfg quiet AND enables those derives. `json` implies it (the
 # floor `default = ["json"]` keeps serde on), mirroring the runtime crate.
 serde = []
 # The server-free render core (the `crate::dom` diff/dispatch/form pipeline +
-# `style_inject`/`page_shell`). Declared but inert in the vendored escape hatch:
-# its deps (`serde` / `serde_json` / `serde_urlencoded`) stay non-optional below.
-# The render-core `#[cfg(feature = "web-core")]` gates in the vendored source
-# (`dom/form.rs`, `html.rs`'s `html_on_raw_*`/`is_void`, `css_safety.rs`'s style
-# sinks, `web_page_core.rs`) need this entry to compile — every render host (web /
-# wasm-client / webview) promotes it. `web` implies it, mirroring the runtime crate.
-web-core = []
+# `style_inject`/`page_shell`). The render-core `#[cfg(feature = "web-core")]`
+# gates in the vendored source (`dom/form.rs`, `html.rs`'s
+# `html_on_raw_*`/`is_void`, `css_safety.rs`'s style sinks, `web_page_core.rs`)
+# need this entry to compile — every render host (web / wasm-client / webview)
+# promotes it. `web` implies it, mirroring the runtime crate. It turns on
+# `serde_urlencoded`, whose one user is the `web-core`-gated `dom/form.rs`
+# decode, so a crate without the render core does not declare it.
+web-core = ["dep:serde_urlencoded"]
 # `web` implies `widget-assets`, mirroring the runtime crate: the vendored
 # `web/mod.rs` serves the SRI-pinned port glue (`port_glue_script`, the glue
 # route) under `#[cfg(feature = "widget-assets")]`, and the trimmed
@@ -132,8 +133,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 indexmap = "2"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
-serde_urlencoded = "0.7"
-regex = "1"
+serde_urlencoded = { version = "0.7", optional = true }
 unicode-general-category = "1"
 base64 = "0.22"
 hex = "0.4"
@@ -144,8 +144,6 @@ hmac = "0.12"
 subtle = "2"
 zeroize = "1"
 getrandom = "0.2"
-uuid = { version = "1" }
-bcrypt = "0.17"
 
 # Unix-only: the vendored runtime reaches unix syscalls through rustix's safe
 # wrappers — `Io.readSecret` terminal echo (termios), `Process.runInPty`

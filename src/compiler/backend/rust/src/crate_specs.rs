@@ -378,6 +378,21 @@ pub const RSA: PinnedCrate = PinnedCrate {
     default_features: true,
     features: &["sha2"],
 };
+// The crates only an on-demand vendored runtime module compiles against: the
+// vendored manifest names each exactly when a `MOD_APPENDS` row declaring a
+// module that uses it is emitted.
+pub const REGEX: CrateSpec = CrateSpec {
+    name: "regex",
+    version: "1",
+};
+pub const UUID: CrateSpec = CrateSpec {
+    name: "uuid",
+    version: "1",
+};
+pub const BCRYPT: CrateSpec = CrateSpec {
+    name: "bcrypt",
+    version: "0.17",
+};
 pub const FUTURES_UTIL: CrateSpec = CrateSpec {
     name: "futures-util",
     version: "0.3",
@@ -443,6 +458,9 @@ pub const ALL: &[CrateSpec] = &[
     JSONWEBTOKEN,
     URL,
     RSA.spec,
+    REGEX,
+    UUID,
+    BCRYPT,
     FUTURES_UTIL,
     CHRONO,
     RUST_DECIMAL,
