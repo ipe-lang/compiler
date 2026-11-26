@@ -1570,11 +1570,8 @@ pub struct InstalledCrate {
     /// The typed `[dependencies]` entries the emitted app crate needs.
     pub cargo_deps: Vec<CargoDep>,
     /// The crate's own Cargo package name, the `[dependencies]` key its direct
-    /// pin renders under.
-    ///
-    /// `None` when no inspection document proves which dependency line is the
-    /// direct crate; the loader admits no such entry.
-    pub package_name: Option<PackageName>,
+    /// pin renders under, proven by the crate's inspection document.
+    pub package_name: PackageName,
     /// Cargo package name → Rust lib identifier, for every dependency the
     /// crate's inspection resolved.
     ///
@@ -1608,11 +1605,12 @@ impl InstalledCrate {
     /// The Rust lib identifier emitted code names the crate by.
     ///
     /// The identifier the crate's own inspection resolved for its package
-    /// name, else the package name with `-` turned into `_`. `None` when the
-    /// package name is unknown, so a lookup by lib identifier finds nothing.
+    /// name, else the package name with `-` turned into `_`. `None` when that
+    /// spelling is no Rust identifier, so a lookup by lib identifier finds
+    /// nothing.
     #[must_use]
     pub fn lib_ident(&self) -> Option<crate::naming::RustIdent> {
-        let name = self.package_name.as_ref()?;
+        let name = &self.package_name;
         self.dep_idents
             .get(name.as_str())
             .cloned()
@@ -1929,7 +1927,7 @@ pub fn installed_crate_from_pkg(
         define_types: iface.define_types,
         transparent_types: iface.transparent_types,
         cargo_deps: cargo_deps(pkg, cache)?,
-        package_name: Some(pkg.name_pkg().clone()),
+        package_name: pkg.name_pkg().clone(),
         dep_idents,
         bindings: iface.bindings,
         wrapper_idents,
@@ -3013,7 +3011,7 @@ mod tests {
             "{refused:?}"
         );
         for artifact in every_artifact(&paths) {
-            if artifact != &paths.pkg_json {
+            if artifact != paths.pkg_json {
                 assert!(
                     std::fs::symlink_metadata(artifact).is_err(),
                     "{} is never written",

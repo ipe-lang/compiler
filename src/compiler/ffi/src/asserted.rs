@@ -1810,7 +1810,8 @@ mod tests {
             kernel_name: module.replace('.', "_"),
             module_name: module.to_owned(),
             slug: fixture_slug(slug),
-            package_name: crate::pkginfo::PackageName::parse(slug).ok(),
+            package_name: crate::pkginfo::PackageName::parse(slug)
+                .expect("a fixture slug is a package name"),
             dep_idents: BTreeMap::new(),
             interface_source: String::new(),
             opaque_types: types

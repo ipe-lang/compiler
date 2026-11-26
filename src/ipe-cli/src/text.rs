@@ -1646,6 +1646,8 @@ messages! {
     ffi_dependency_pin_conflict(name, first, second) = "ffi-dependency-pin-conflict";
     /// Emitted FFI code names a dependency left out of the manifest.
     ffi_dropped_transitive(name, ident, site) = "ffi-dropped-transitive";
+    /// Emitted FFI code names a lib identifier two declared packages share.
+    ffi_shared_lib_ident(ident, first, second, site) = "ffi-shared-lib-ident";
     /// Emitted FFI code does not lex, so its crate references are unknown.
     ffi_emit_unlexable(site) = "ffi-emit-unlexable";
     /// An FFI binding marks a type transparent without its shape.

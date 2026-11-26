@@ -2145,6 +2145,10 @@ re-add one of the crates so the version pins agree
 installed FFI crates need different versions of dependency `{name}`, so the app does not declare it, but `{site}` names its crate `{ident}` directly
 re-add the crates so their `{name}` versions agree
 
+## ffi-shared-lib-ident
+
+installed FFI crates `{first}` and `{second}` both build the Rust library `{ident}`, so `{site}` naming `{ident}` cannot tell them apart — remove one with `ipe rust remove`
+
 ## ffi-emit-unlexable
 
 generated FFI code at `{site}` is not valid Rust, so the crates it names cannot be checked — re-run `ipe add`

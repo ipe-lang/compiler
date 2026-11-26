@@ -179,7 +179,7 @@ fn a_second_crate_on_a_held_slug_is_refused_and_the_first_kept() {
             .expect("the catalog loads");
     let occupants: Vec<String> = loaded
         .iter()
-        .filter_map(|c| c.package_name.as_ref().map(|n| n.as_str().to_owned()))
+        .map(|c| c.package_name.as_str().to_owned())
         .collect();
     assert_eq!(occupants, ["a-b"], "the first crate stays the occupant");
 }
