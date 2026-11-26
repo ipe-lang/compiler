@@ -255,7 +255,7 @@ pub fn main_list_decoder_of<T1: 'static + Send + Clone>(
                     + Sync
                     + 'static,
             > = Box::new(move |s: String| -> IpeResult<ipe_runtime::error::IpeError, Vec<T1>> {
-                decode_from_json_string(decode_list((r.clone()).dec.clone()), s)
+                decode_from_json_string(decode_list((r).dec.clone()), s)
             });
             __ipe_fn
         },

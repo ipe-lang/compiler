@@ -286,7 +286,7 @@ pub fn main_encode_list<T1: 'static + Clone>(codec: MainCodec<T1>, xs: Vec<T1>) 
                 json_enc_list(
                     {
                         let __ipe_fn: Box<dyn Fn(T1) -> JsonVal + Send + Sync + 'static> =
-                            Box::new(move |eta_0: T1| -> JsonVal { (r).enc.clone()(eta_0) });
+                            Box::new(move |eta_0: T1| -> JsonVal { (r).enc(eta_0) });
                         __ipe_fn
                     },
                     xs,
@@ -301,9 +301,7 @@ pub fn main_decode_list<T1: 'static + Send + Clone>(
 ) -> IpeResult<ipe_runtime::error::IpeError, Vec<T1>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match codec {
-        MainCodec::Codec(r) => {
-            decode_from_json_string(decode_list(((r).mkDec.clone())(Rec_ {  })), s)
-        }
+        MainCodec::Codec(r) => decode_from_json_string(decode_list(((r).mkDec)(Rec_ {  })), s),
     }
 }
 pub fn main_report_ints(res: IpeResult<ipe_runtime::error::IpeError, Vec<i64>>) -> String {

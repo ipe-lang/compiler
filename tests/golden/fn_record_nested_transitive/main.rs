@@ -260,10 +260,7 @@ pub fn main_run(o: RecInnerName, x: i64) -> i64 {
     ({
         let dup = o.clone();
         ipe_runtime::math::ipe_int_add(
-            ipe_runtime::math::ipe_int_add(
-                ((o).inner.clone()).op.clone()(x),
-                ((dup.clone()).inner.clone()).op.clone()(x),
-            ),
+            ipe_runtime::math::ipe_int_add(((o).inner.clone()).op(x), ((dup).inner.clone()).op(x)),
             ((dup).inner.clone()).tag,
         )
     })

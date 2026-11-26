@@ -501,14 +501,14 @@ pub(crate) fn user_ipe_db_store_public<T1: Clone>(
         IpeDbStoreDraft::Draft(r) => {
             IpeDbStoreStore::Store(
                 RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable {
-                    codec: (r.clone()).codec.clone(),
-                    currentColumns: (r.clone()).currentColumns.clone(),
-                    frozenColumns: (r.clone()).frozenColumns.clone(),
-                    frozenTable: (r.clone()).frozenTable.clone(),
-                    indexes: (r.clone()).indexes.clone(),
-                    ops: (r.clone()).ops.clone(),
-                    pk: (r.clone()).pk.clone(),
-                    specs: (r.clone()).specs.clone(),
+                    codec: (r).codec.clone(),
+                    currentColumns: (r).currentColumns.clone(),
+                    frozenColumns: (r).frozenColumns.clone(),
+                    frozenTable: (r).frozenTable.clone(),
+                    indexes: (r).indexes.clone(),
+                    ops: (r).ops.clone(),
+                    pk: (r).pk.clone(),
+                    specs: (r).specs.clone(),
                     table: (r).table.clone(),
                 },
             )
@@ -570,10 +570,9 @@ pub(crate) fn user_ipe_db_store_store_view<T1: Clone>(
 ) -> IpeDbStoreColumnView {
     let _ipe_recursion_guard = crate::recursion_guard();
     match store {
-        IpeDbStoreStore::Store(r) => IpeDbStoreColumnView::ColumnView(
-            (r.clone()).frozenColumns.clone(),
-            (r).currentColumns.clone(),
-        ),
+        IpeDbStoreStore::Store(r) => {
+            IpeDbStoreColumnView::ColumnView((r).frozenColumns.clone(), (r).currentColumns.clone())
+        }
     }
 }
 pub(crate) fn user_ipe_db_store_resolve_column(
@@ -953,10 +952,10 @@ pub(crate) fn user_ipe_db_store_recast_exists_ref(
             let r = *r;
             IpeDbStoreExistsRef::ExistsRef(Box::new(
                 RecOuterColShareColShareReadShareTableShareView {
-                    outerCol: (r.clone()).outerCol.clone(),
-                    shareCol: (r.clone()).shareCol.clone(),
-                    shareRead: crate::user_ipe_db_store_recast_pred((r.clone()).shareRead.clone()),
-                    shareTable: (r.clone()).shareTable.clone(),
+                    outerCol: (r).outerCol.clone(),
+                    shareCol: (r).shareCol.clone(),
+                    shareRead: crate::user_ipe_db_store_recast_pred((r).shareRead.clone()),
+                    shareTable: (r).shareTable.clone(),
                     shareView: (r).shareView.clone(),
                 },
             ))
@@ -1059,7 +1058,7 @@ pub(crate) fn user_ipe_db_store_first_unknown_exists_share_column(
                 match ref_ {
                     IpeDbStoreExistsRef::ExistsRef(r) => {
                         let r = *r;
-                        return crate::user_ipe_db_store_first_unknown_policy_column((r.clone()).shareView.clone(), ipe_runtime::list::ipe_list_cons((r.clone()).shareCol.clone(), crate::user_ipe_db_store_pred_columns((r).shareRead.clone())));
+                        return crate::user_ipe_db_store_first_unknown_policy_column((r).shareView.clone(), ipe_runtime::list::ipe_list_cons((r).shareCol.clone(), crate::user_ipe_db_store_pred_columns((r).shareRead.clone())));
                     }
                 }
             }
@@ -1410,15 +1409,15 @@ pub(crate) fn user_ipe_db_store_exists_fragment(
     match ref_ {
         IpeDbStoreExistsRef::ExistsRef(r) => {
             let r = *r;
-            match (crate::user_ipe_db_store_live_name((r.clone()).shareView.clone(), (r.clone()).shareCol.clone()), crate::user_ipe_db_store_live_name(outerView, (r.clone()).outerCol.clone()))
+            match (crate::user_ipe_db_store_live_name((r).shareView.clone(), (r).shareCol.clone()), crate::user_ipe_db_store_live_name(outerView, (r).outerCol.clone()))
             {
                 (IpeResult::Err(e), _) => IpeResult::Err(e),
                 (_, IpeResult::Err(e)) => IpeResult::Err(e),
                 (IpeResult::Ok(liveShareCol), IpeResult::Ok(liveOuterCol)) => crate::user_ipe_db_store_exists_fragment_live(
                     principal,
-                    (r.clone()).shareTable.clone(),
-                    (r.clone()).shareView.clone(),
-                    (r.clone()).shareRead.clone(),
+                    (r).shareTable.clone(),
+                    (r).shareView.clone(),
+                    (r).shareRead.clone(),
                     string_concat(vec![(r).shareTable.clone(), ".".to_string(), liveShareCol]),
                     string_concat(vec![outerTable, ".".to_string(), liveOuterCol]),
                 ),
@@ -1549,11 +1548,11 @@ pub(crate) fn user_ipe_db_store_read_only(p: IpeDbStorePred) -> IpeDbStorePolicy
         IpeDbStorePolicy::Policy(r) => {
             IpeDbStorePolicy::Policy(
                 RecDeleteImmutablesInsertMasksOwnersReadUpdate {
-                    delete: (r.clone()).delete.clone(),
-                    immutables: (r.clone()).immutables.clone(),
-                    insert: (r.clone()).insert.clone(),
-                    masks: (r.clone()).masks.clone(),
-                    owners: (r.clone()).owners.clone(),
+                    delete: (r).delete.clone(),
+                    immutables: (r).immutables.clone(),
+                    insert: (r).insert.clone(),
+                    masks: (r).masks.clone(),
+                    owners: (r).owners.clone(),
                     read: p,
                     update: (r).update.clone(),
                 },
@@ -1568,7 +1567,7 @@ pub(crate) fn user_ipe_db_store_owner_column_named(col: String) -> IpeDbStorePol
             IpeDbStorePolicy::Policy(
                 RecDeleteImmutablesInsertMasksOwnersReadUpdate {
                     delete: IpeDbStorePred::POwner(col.clone()),
-                    immutables: (r.clone()).immutables.clone(),
+                    immutables: (r).immutables.clone(),
                     insert: IpeDbStorePred::POwner(col.clone()),
                     masks: (r).masks.clone(),
                     owners: vec![col.clone()],
@@ -1589,12 +1588,12 @@ pub(crate) fn user_ipe_db_store_mask_named(
         IpeDbStorePolicy::Policy(r) => {
             IpeDbStorePolicy::Policy(
                 RecDeleteImmutablesInsertMasksOwnersReadUpdate {
-                    delete: (r.clone()).delete.clone(),
-                    immutables: (r.clone()).immutables.clone(),
-                    insert: (r.clone()).insert.clone(),
-                    masks: list_append((r.clone()).masks.clone(), vec![(col, pred)]),
-                    owners: (r.clone()).owners.clone(),
-                    read: (r.clone()).read.clone(),
+                    delete: (r).delete.clone(),
+                    immutables: (r).immutables.clone(),
+                    insert: (r).insert.clone(),
+                    masks: list_append((r).masks.clone(), vec![(col, pred)]),
+                    owners: (r).owners.clone(),
+                    read: (r).read.clone(),
                     update: (r).update.clone(),
                 },
             )
@@ -1611,24 +1610,18 @@ pub(crate) fn user_ipe_db_store_and_policy(
             IpeDbStorePolicy::Policy(e) => {
                 IpeDbStorePolicy::Policy(
                     RecDeleteImmutablesInsertMasksOwnersReadUpdate {
-                        delete: IpeDbStorePred::PAll(Box::new(vec![
-                            (b.clone()).delete.clone(),
-                            (e.clone()).delete.clone(),
-                        ])),
-                        immutables: list_append(
-                            (b.clone()).immutables.clone(),
-                            (e.clone()).immutables.clone(),
-                        ),
-                        insert: IpeDbStorePred::PAll(Box::new(vec![
-                            (b.clone()).insert.clone(),
-                            (e.clone()).insert.clone(),
-                        ])),
-                        masks: list_append((b.clone()).masks.clone(), (e.clone()).masks.clone()),
-                        owners: list_append((b.clone()).owners.clone(), (e.clone()).owners.clone()),
-                        read: IpeDbStorePred::PAll(Box::new(vec![
-                            (b.clone()).read.clone(),
-                            (e.clone()).read.clone(),
-                        ])),
+                        delete: IpeDbStorePred::PAll(Box::new(
+                            vec![(b).delete.clone(), (e).delete.clone()],
+                        )),
+                        immutables: list_append((b).immutables.clone(), (e).immutables.clone()),
+                        insert: IpeDbStorePred::PAll(Box::new(
+                            vec![(b).insert.clone(), (e).insert.clone()],
+                        )),
+                        masks: list_append((b).masks.clone(), (e).masks.clone()),
+                        owners: list_append((b).owners.clone(), (e).owners.clone()),
+                        read: IpeDbStorePred::PAll(Box::new(
+                            vec![(b).read.clone(), (e).read.clone()],
+                        )),
                         update: IpeDbStorePred::PAll(Box::new(
                             vec![(b).update.clone(), (e).update.clone()],
                         )),
@@ -1656,7 +1649,7 @@ pub(crate) fn user_ipe_db_store_secured_legal_key<T1: Clone>(
 ) -> IpeResult<ipe_runtime::error::IpeError, IpeDbStoreSecured<T1>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match draft.clone() {
-        IpeDbStoreDraft::Draft(r) => match crate::user_ipe_db_store_first_unknown_policy_column(IpeDbStoreColumnView::ColumnView((r.clone()).frozenColumns.clone(), (r.clone()).currentColumns.clone()), crate::user_ipe_db_store_policy_columns(policy.clone()))
+        IpeDbStoreDraft::Draft(r) => match crate::user_ipe_db_store_first_unknown_policy_column(IpeDbStoreColumnView::ColumnView((r).frozenColumns.clone(), (r).currentColumns.clone()), crate::user_ipe_db_store_policy_columns(policy.clone()))
         {
             IpeMaybe::Just(bad) => {
                 IpeResult::Err(crate::user_ipe_db_store_unknown_column_error(bad))
@@ -1666,7 +1659,7 @@ pub(crate) fn user_ipe_db_store_secured_legal_key<T1: Clone>(
                 IpeMaybe::Just(bad) => {
                     IpeResult::Err(crate::user_ipe_db_store_unknown_column_error(bad))
                 }
-                IpeMaybe::Nothing => match crate::user_ipe_db_store_first_non_nullable_mask_column(IpeDbStoreColumnView::ColumnView((r.clone()).frozenColumns.clone(), (r).currentColumns.clone()), policy.clone())
+                IpeMaybe::Nothing => match crate::user_ipe_db_store_first_non_nullable_mask_column(IpeDbStoreColumnView::ColumnView((r).frozenColumns.clone(), (r).currentColumns.clone()), policy.clone())
                 {
                     IpeMaybe::Just(bad) => {
                         IpeResult::Err(crate::user_ipe_db_store_non_nullable_mask_error(bad))
@@ -1758,10 +1751,10 @@ pub(crate) fn user_ipe_db_store_first_unknown_policy_exists_share_column(
             crate::user_ipe_db_store_first_unknown_exists_share_column_in(
                 list_append(
                     vec![
-                        (r.clone()).read.clone(),
-                        (r.clone()).insert.clone(),
-                        (r.clone()).update.clone(),
-                        (r.clone()).delete.clone(),
+                        (r).read.clone(),
+                        (r).insert.clone(),
+                        (r).update.clone(),
+                        (r).delete.clone(),
                     ],
                     list_map_consume(
                         {
@@ -1785,12 +1778,12 @@ pub(crate) fn user_ipe_db_store_policy_columns(policy: IpeDbStorePolicy) -> Vec<
     match policy {
         IpeDbStorePolicy::Policy(r) => {
             list_concat(vec![
-                crate::user_ipe_db_store_pred_columns((r.clone()).read.clone()),
-                crate::user_ipe_db_store_pred_columns((r.clone()).insert.clone()),
-                crate::user_ipe_db_store_pred_columns((r.clone()).update.clone()),
-                crate::user_ipe_db_store_pred_columns((r.clone()).delete.clone()),
-                (r.clone()).owners.clone(),
-                (r.clone()).immutables.clone(),
+                crate::user_ipe_db_store_pred_columns((r).read.clone()),
+                crate::user_ipe_db_store_pred_columns((r).insert.clone()),
+                crate::user_ipe_db_store_pred_columns((r).update.clone()),
+                crate::user_ipe_db_store_pred_columns((r).delete.clone()),
+                (r).owners.clone(),
+                (r).immutables.clone(),
                 list_map_consume(
                     {
                         let __ipe_fn: Box<
@@ -1798,7 +1791,7 @@ pub(crate) fn user_ipe_db_store_policy_columns(policy: IpeDbStorePolicy) -> Vec<
                         > = Box::new(crate::user_ipe_db_store_mask_column);
                         __ipe_fn
                     },
-                    (r.clone()).masks.clone(),
+                    (r).masks.clone(),
                 ),
                 list_concat_map(
                     {
@@ -1895,11 +1888,10 @@ pub(crate) fn user_ipe_db_store_masked_read<T1: 'static + Send + Sync + Clone>(
 ) -> IpeTask<Vec<T1>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match store.clone() {
-        IpeDbStoreStore::Store(r) => match crate::user_ipe_db_store_key_decl_fault((r.clone()).pk.clone())
-        {
+        IpeDbStoreStore::Store(r) => match crate::user_ipe_db_store_key_decl_fault((r).pk.clone()) {
             IpeMaybe::Just(e) => task_fail(e),
-            IpeMaybe::Nothing => match (r.clone()).codec.clone() {
-                IpeCodecCodec::Codec(codecR) => db_find_where_masked(conn.clone(), (r.clone()).table.clone(), list_map2({ let __ipe_fn: Box<dyn Fn(IpeDbStoreColumn, IpeDbStoreColumn) -> ipe_runtime::db::SqlFragment + Send + Sync + 'static> = Box::new(move |declared: IpeDbStoreColumn, current: IpeDbStoreColumn| -> ipe_runtime::db::SqlFragment { crate::user_ipe_db_store_projection_term(principal.clone(), store.clone(), policy.clone(), crate::user_ipe_db_store_column_name(declared), crate::user_ipe_db_store_column_name(current)) }); __ipe_fn }, (r.clone()).frozenColumns.clone(), (r).currentColumns.clone()), whereFrag, ((codecR).mkDec.clone())(Rec_ {  })),
+            IpeMaybe::Nothing => match (r).codec.clone() {
+                IpeCodecCodec::Codec(codecR) => db_find_where_masked(conn.clone(), (r).table.clone(), list_map2({ let __ipe_fn: Box<dyn Fn(IpeDbStoreColumn, IpeDbStoreColumn) -> ipe_runtime::db::SqlFragment + Send + Sync + 'static> = Box::new(move |declared: IpeDbStoreColumn, current: IpeDbStoreColumn| -> ipe_runtime::db::SqlFragment { crate::user_ipe_db_store_projection_term(principal.clone(), store.clone(), policy.clone(), crate::user_ipe_db_store_column_name(declared), crate::user_ipe_db_store_column_name(current)) }); __ipe_fn }, (r).frozenColumns.clone(), (r).currentColumns.clone()), whereFrag, ((codecR).mkDec)(Rec_ {  })),
             },
         },
     }

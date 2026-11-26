@@ -232,7 +232,7 @@ pub fn main_sum_r(c: MainRChain) -> i64 {
         MainRChain::REnd => 0i64,
         MainRChain::RNode(rec) => {
             let rec = *rec;
-            ipe_runtime::math::ipe_int_add((rec.clone()).val, crate::main_sum_r((rec).rest.clone()))
+            ipe_runtime::math::ipe_int_add((rec).val, crate::main_sum_r((rec).rest.clone()))
         }
     }
 }

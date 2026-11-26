@@ -10,7 +10,7 @@ pub(crate) fn main_doc_codec() -> IpeCodecCodec<RecAuthorBody> {
                 json_enc_object(vec![
                     (
                         "author".to_string(),
-                        json_enc_string((codec_rec_4026639940.clone()).author.clone()),
+                        json_enc_string((codec_rec_4026639940).author.clone()),
                     ),
                     (
                         "body".to_string(),
@@ -101,7 +101,7 @@ pub(crate) fn main_share_codec() -> IpeCodecCodec<RecDocRefMember> {
                 json_enc_object(vec![
                     (
                         "doc_ref".to_string(),
-                        json_enc_string((codec_rec_4026691588.clone()).docRef.clone()),
+                        json_enc_string((codec_rec_4026691588).docRef.clone()),
                     ),
                     (
                         "member".to_string(),
@@ -244,7 +244,7 @@ pub(crate) fn main_handle_shared_docs(
                                                     + 'static,
                                             > = Box::new(
                                                 move |ipe_accessor_arg: RecAuthorBody| -> String {
-                                                    (ipe_accessor_arg).body.clone()
+                                                    (ipe_accessor_arg).body
                                                 },
                                             );
                                             __ipe_fn
@@ -297,7 +297,7 @@ pub(crate) fn main_handle_my_docs(
                                                     + 'static,
                                             > = Box::new(
                                                 move |ipe_accessor_arg: RecAuthorBody| -> String {
-                                                    (ipe_accessor_arg).body.clone()
+                                                    (ipe_accessor_arg).body
                                                 },
                                             );
                                             __ipe_fn
@@ -321,10 +321,7 @@ pub(crate) fn main_mask_codec() -> IpeCodecCodec<RecOwnerSsn> {
                 dyn Fn(RecOwnerSsn) -> JsonVal + Send + Sync + 'static,
             > = ::std::sync::Arc::new(move |d: RecOwnerSsn| -> JsonVal {
                 json_enc_object(vec![
-                    (
-                        "owner".to_string(),
-                        json_enc_string((d.clone()).owner.clone()),
-                    ),
+                    ("owner".to_string(), json_enc_string((d).owner.clone())),
                     (
                         "ssn".to_string(),
                         crate::main_encode_maybe_string((d).ssn.clone()),

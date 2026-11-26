@@ -235,7 +235,7 @@ pub fn main_ops() -> RecAddMul {
 }
 pub fn main_run(table: RecAddMul, x: i64) -> i64 {
     let _ipe_recursion_guard = crate::recursion_guard();
-    ipe_runtime::math::ipe_int_add((table.clone()).add.clone()(x), (table).mul.clone()(x))
+    ipe_runtime::math::ipe_int_add((table.clone()).add(x), (table).mul(x))
 }
 pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();

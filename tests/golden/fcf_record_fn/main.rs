@@ -277,11 +277,11 @@ pub fn ipe_main() -> IpeTask<()> {
     let _ipe_recursion_guard = crate::recursion_guard();
     io_println(format!(
         "{}{}",
-        string_from_int((crate::main_runner()).run.clone()(3i64)),
+        string_from_int((crate::main_runner()).run(3i64)),
         format!(
             "{}{}",
             ",".to_string(),
-            string_from_int((crate::main_guard()).shouldRetry.clone()(3i64))
+            string_from_int((crate::main_guard()).shouldRetry(3i64))
         )
     ))
 }

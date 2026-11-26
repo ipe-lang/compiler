@@ -6,10 +6,10 @@ pub(crate) fn user_ipe_db_codec_codec_from_row<T1: 'static + Send + Clone>(
 ) -> IpeResult<ipe_runtime::error::IpeError, T1> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match codec {
-        IpeCodecCodec::Codec(r) => match (r.clone()).shp.clone() {
+        IpeCodecCodec::Codec(r) => match (r).shp.clone() {
             IpeCodecShape::SRecord(columns) => match crate::user_ipe_db_codec_value_from_row(row, columns)
             {
-                IpeResult::Ok(value) => decode_from_json_value((r).mkDec.clone()(Rec_ {  }), value),
+                IpeResult::Ok(value) => decode_from_json_value((r).mkDec(Rec_ {  }), value),
                 IpeResult::Err(e) => IpeResult::Err(e),
             },
             IpeCodecShape::SScalar(_) => {

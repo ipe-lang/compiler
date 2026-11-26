@@ -362,14 +362,14 @@ pub(crate) fn user_ipe_db_store_public<T1: Clone>(
         IpeDbStoreDraft::Draft(r) => {
             IpeDbStoreStore::Store(
                 RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable {
-                    codec: (r.clone()).codec.clone(),
-                    currentColumns: (r.clone()).currentColumns.clone(),
-                    frozenColumns: (r.clone()).frozenColumns.clone(),
-                    frozenTable: (r.clone()).frozenTable.clone(),
-                    indexes: (r.clone()).indexes.clone(),
-                    ops: (r.clone()).ops.clone(),
-                    pk: (r.clone()).pk.clone(),
-                    specs: (r.clone()).specs.clone(),
+                    codec: (r).codec.clone(),
+                    currentColumns: (r).currentColumns.clone(),
+                    frozenColumns: (r).frozenColumns.clone(),
+                    frozenTable: (r).frozenTable.clone(),
+                    indexes: (r).indexes.clone(),
+                    ops: (r).ops.clone(),
+                    pk: (r).pk.clone(),
+                    specs: (r).specs.clone(),
                     table: (r).table.clone(),
                 },
             )
@@ -391,13 +391,12 @@ pub(crate) fn user_ipe_db_store_all<T1: 'static + Send + Sync + Clone>(
 ) -> IpeTask<Vec<T1>> {
     let _ipe_recursion_guard = crate::recursion_guard();
     match store {
-        IpeDbStoreStore::Store(r) => match crate::user_ipe_db_store_key_decl_fault((r.clone()).pk.clone())
-        {
+        IpeDbStoreStore::Store(r) => match crate::user_ipe_db_store_key_decl_fault((r).pk.clone()) {
             IpeMaybe::Just(e) => task_fail(e),
             IpeMaybe::Nothing => task_and_then(
-                db_find_where(conn.clone(), (r.clone()).table.clone(), crate::user_ipe_db_store_always_true()),
+                db_find_where(conn.clone(), (r).table.clone(), crate::user_ipe_db_store_always_true()),
                 Box::new(move |rows: Vec<HashMap<String, String>>| -> IpeTask<Vec<T1>> {
-                    crate::user_ipe_db_store_decode_rows((r.clone()).codec.clone(), rows)
+                    crate::user_ipe_db_store_decode_rows((r).codec.clone(), rows)
                 }),
             ),
         },

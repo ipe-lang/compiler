@@ -228,12 +228,12 @@ pub fn main_apply(c: RecCountFormatLabelOnChange) -> String {
     let _ipe_recursion_guard = crate::recursion_guard();
     format!(
         "{}{}",
-        (c.clone()).label.clone(),
+        (c).label.clone(),
         format!(
             "{}{}",
             ": ".to_string(),
-            (c.clone()).format.clone()(ipe_runtime::math::ipe_int_add(
-                (c.clone()).onChange.clone()("hello".to_string()),
+            (c.clone()).format(ipe_runtime::math::ipe_int_add(
+                (c.clone()).onChange("hello".to_string()),
                 (c).count,
             ))
         )
