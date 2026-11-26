@@ -1608,7 +1608,11 @@ pub const fn default_ro_binds() -> Vec<CanonicalPath> {
 /// The cargo home, the Rustup home and the user home every Tier-2 step uses:
 /// the host-side lock derivation and source unpack get them explicitly
 /// ([`Self::host_homes`]), and the jail's [`ToolchainHomes`] is resolved from
-/// the same value, so the host steps and the jail never name two homes.
+/// the same value, so the host steps and the jail never name two homes. The
+/// toolchain rustup selects travels the same way: the host steps inherit the
+/// invoker's `RUSTUP_TOOLCHAIN`, and the jail exports the value read here, so
+/// the jailed build never falls back to rustup's default while the host steps
+/// honour the override.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -1622,9 +1626,49 @@ pub const fn default_ro_binds() -> Vec<CanonicalPath> {
 struct ToolchainRoots {
     cargo: Option<crate::env_dir::ToolHome>,
     rustup: Option<crate::env_dir::ToolHome>,
-    // The Windows jail exports no toolchain env, so only POSIX reads it.
+    // The Windows jail exports no toolchain env, so only POSIX reads them.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     user: Option<crate::env_dir::HomeDir>,
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    toolchain: Option<RustupToolchain>,
+}
+
+/// The toolchain rustup selects for a Tier-2 step, as `RUSTUP_TOOLCHAIN` names it.
+///
+/// The jail scrubs its environment, so a jailed build that is not handed this
+/// value resolves rustup's default toolchain instead.
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RustupToolchain(OsString);
+
+#[cfg(any(
+    all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ),
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "windows"
+))]
+impl RustupToolchain {
+    /// `name` as a toolchain selection; `None` when empty, which names none.
+    #[must_use]
+    pub fn named(name: OsString) -> Option<Self> {
+        (!name.is_empty()).then_some(Self(name))
+    }
+
+    /// The invoker's `RUSTUP_TOOLCHAIN`, when set and non-empty.
+    fn of_invoker() -> Option<Self> {
+        ipe_env::var_os("RUSTUP_TOOLCHAIN").and_then(Self::named)
+    }
 }
 
 #[cfg(any(
@@ -1649,6 +1693,7 @@ impl ToolchainRoots {
             cargo: crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")?,
             rustup: crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref(), ".rustup")?,
             user: user_home,
+            toolchain: RustupToolchain::of_invoker(),
         })
     }
 
@@ -1692,6 +1737,9 @@ pub struct ToolchainHomes {
     /// its own scrubbed env instead.
     #[cfg(not(target_os = "windows"))]
     env: Vec<(&'static str, CanonicalPath)>,
+    /// The toolchain the POSIX payload exports as `RUSTUP_TOOLCHAIN`.
+    #[cfg(not(target_os = "windows"))]
+    toolchain: Option<RustupToolchain>,
 }
 
 #[cfg(any(
@@ -1723,11 +1771,13 @@ impl ToolchainHomes {
             roots.cargo.clone(),
             roots.rustup.clone(),
             roots.user.clone(),
+            roots.toolchain.clone(),
         )
     }
 
     /// The toolchain over the given homes, each resolved to its canonical form
-    /// once; an absent home is skipped.
+    /// once; an absent home is skipped. `toolchain` is exported as
+    /// `RUSTUP_TOOLCHAIN` when present.
     ///
     /// # Errors
     /// [`CliError::PackageAudit`] carrying a [`Check::NativeTier2`]
@@ -1738,6 +1788,7 @@ impl ToolchainHomes {
         cargo_home: Option<crate::env_dir::ToolHome>,
         rustup_home: Option<crate::env_dir::ToolHome>,
         user_home: Option<crate::env_dir::HomeDir>,
+        toolchain: Option<RustupToolchain>,
     ) -> Result<Self, CliError> {
         let cargo_home = existing_jail_path(cargo_home.map(|home| home.as_path().to_path_buf()))?;
         let rustup_home = existing_jail_path(rustup_home.map(|home| home.as_path().to_path_buf()))?;
@@ -1766,12 +1817,18 @@ impl ToolchainHomes {
         Ok(Self {
             ro_binds,
             env: cargo_home_env(cargo_home, rustup_home, user_home),
+            toolchain,
         })
     }
 
     /// The `NAME`/value pairs the payload exports for the toolchain.
     fn env(&self) -> &[(&'static str, CanonicalPath)] {
         &self.env
+    }
+
+    /// The toolchain the payload exports as `RUSTUP_TOOLCHAIN`, if any.
+    const fn toolchain(&self) -> Option<&RustupToolchain> {
+        self.toolchain.as_ref()
     }
 }
 
@@ -2286,6 +2343,9 @@ impl JailProbeRunner<'_> {
         if let Some(toolchain) = self.exercise.toolchain() {
             for (name, home) in toolchain.env() {
                 invocation_prefix.push(assignment(name, home.as_path().as_os_str()));
+            }
+            if let Some(RustupToolchain(name)) = toolchain.toolchain() {
+                invocation_prefix.push(assignment("RUSTUP_TOOLCHAIN", name));
             }
         }
         invocation_prefix.push(OsString::from("/bin/sh"));
@@ -3426,6 +3486,7 @@ mod tests {
                 Some(tool(&link.join("cargo"))),
                 Some(tool(&link.join("rustup"))),
                 Some(user(link)),
+                None,
             )
             .expect("disjoint homes resolve");
             let tools = inert_tools();
@@ -3607,7 +3668,7 @@ mod tests {
             let cargo = tree.link.join("cargo");
             for rustup in [cargo.clone(), tree.link] {
                 let refused =
-                    ToolchainHomes::from_homes(Some(tool(&cargo)), Some(tool(&rustup)), None);
+                    ToolchainHomes::from_homes(Some(tool(&cargo)), Some(tool(&rustup)), None, None);
                 assert!(
                     matches!(
                         refused,
@@ -3629,10 +3690,57 @@ mod tests {
                 Some(tool(&absent)),
                 Some(tool(&absent)),
                 Some(user(&absent)),
+                None,
             )
             .expect("absent homes are skipped");
             assert!(toolchain.ro_binds().is_empty());
             assert!(toolchain.env().is_empty());
+            assert!(toolchain.toolchain().is_none());
+        }
+
+        /// The payload's `RUSTUP_TOOLCHAIN` tokens for a jail over `roots`.
+        fn exported_toolchains(roots: &ToolchainRoots) -> Vec<String> {
+            let tree = tree();
+            let toolchain = ToolchainHomes::from_roots(roots).expect("the roots resolve");
+            let exercise = ProbeExercise::real_build(vec![OsString::from("cargo")], toolchain)
+                .expect("non-empty argv");
+            let tools = inert_tools();
+            let runner = JailProbeRunner::new(
+                &tools,
+                TrustedWrapper { source: "exit 0" },
+                canonical(&tree.link),
+                canonical(&tree.link.join("worktree")),
+                Vec::new(),
+                Vec::new(),
+                exercise,
+            )
+            .expect("paths disjoint from the cargo home");
+            runner
+                .probe_payload(std::ffi::OsStr::new("none"), &runner.escape_path())
+                .argv()
+                .iter()
+                .map(|t| t.to_string_lossy().into_owned())
+                .filter(|t| t.starts_with("RUSTUP_TOOLCHAIN"))
+                .collect()
+        }
+
+        /// The jail scrubs its environment, so the toolchain the invoker selected
+        /// reaches the jailed build only through the payload: without it the
+        /// build resolves rustup's default while the host steps honour the
+        /// override. An empty selection names no toolchain and is not exported.
+        #[test]
+        fn the_jailed_build_resolves_the_toolchain_the_roots_select() {
+            let roots = |toolchain: &str| ToolchainRoots {
+                cargo: None,
+                rustup: None,
+                user: None,
+                toolchain: RustupToolchain::named(OsString::from(toolchain)),
+            };
+            assert_eq!(
+                exported_toolchains(&roots("1.98.1")),
+                ["RUSTUP_TOOLCHAIN=1.98.1"]
+            );
+            assert!(exported_toolchains(&roots("")).is_empty());
         }
     }
 
