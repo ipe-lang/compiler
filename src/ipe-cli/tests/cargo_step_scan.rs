@@ -382,7 +382,7 @@ fn a_program_not_naming_cargo_is_left_to_the_spawn_inventory() {
 /// A build is handed the resolved build directory, and the metadata query
 /// reads the Cargo config's pin with the variable removed, so it never reads
 /// back what ipe sets. Narrowing or probing a lockfile, and unpacking the
-/// locked sources into the cargo home, write no build output, so none is held
+/// sources a build reads into the cargo home, write no build output, so none is held
 /// to anything. Any other subcommand, a clean
 /// included, has no rule and is refused: a stale test runner is told apart by
 /// the run key it embeds, never by removing build output.
@@ -390,7 +390,7 @@ const TARGET_DIR_RULES: &[(&str, Option<&str>)] = &[
     ("build", Some(".env(\"CARGO_TARGET_DIR\",target_dir)")),
     ("metadata", Some(".env_remove(\"CARGO_TARGET_DIR\")")),
     ("update", None),
-    ("fetch", None),
+    ("tree", None),
 ];
 
 /// The production part of a source: everything before its test module.

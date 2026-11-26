@@ -1290,35 +1290,43 @@ pub fn lock_offline(
     })
 }
 
-/// Proof that every locked host-platform source of a crate sits unpacked in
-/// its cargo home. Only [`unpack_locked_sources`] builds one.
+/// Proof that every source a host build of a crate reads sits unpacked in its
+/// cargo home. Only [`unpack_locked_sources`] builds one.
 #[derive(Debug)]
 pub struct SourcesUnpacked(());
 
 /// How an offline unpack of a crate's locked sources ended.
 #[derive(Debug)]
 pub enum SourcesOutcome {
-    /// cargo unpacked every locked host-platform source.
+    /// cargo unpacked every source a host build of the crate reads.
     Unpacked(SourcesUnpacked),
     /// cargo exited non-zero, or was ended by a signal (`code` is `None`): a
-    /// locked package is absent from the registry cache, or the lock does not
-    /// hold.
+    /// package the build reads is absent from the registry cache, or the lock
+    /// does not hold.
     Unavailable {
         /// cargo's exit code, when it exited.
         code: Option<i32>,
+        /// cargo's stderr, bounded at capture and sanitised for the terminal.
+        stderr: TerminalSafe,
     },
 }
 
-/// Unpack every locked host-platform source of the crate at `crate_dir` into
-/// its cargo home, offline: `cargo fetch --offline --locked --target host-tuple`.
+/// Unpack every source a host build of the crate at `crate_dir` reads into
+/// its cargo home, offline: `cargo tree --offline --locked --target host-tuple
+/// -e normal,build --depth 0`.
 ///
 /// cargo unpacks a cached `.crate` archive into `registry/src` lazily, on the
-/// first build that reads it. A later step that reads the cargo home read-only
-/// (the Tier-2 jail) cannot make that write, so this step makes it first,
-/// from the registry cache alone, held to [`SOURCE_UNPACK_LIMITS`] with stdin
-/// closed. `host-tuple` limits the walk to the platform a target-less build
-/// compiles for. `homes` are set on the child explicitly. It runs no package
-/// code: `fetch` runs no build script and links nothing.
+/// first command that reads its manifest. A later step that reads the cargo
+/// home read-only (the Tier-2 jail) cannot make that write, so this step makes
+/// it first, from the registry cache alone, held to [`SOURCE_UNPACK_LIMITS`]
+/// with stdin closed. The walk resolves exactly the package set a target-less
+/// `cargo build` of the crate downloads: the host platform's normal and build
+/// edges, the root's default features, no dev edges. A `cargo fetch` would
+/// demand more than the build reads (every member's dev dependencies, every
+/// optional allocator of the lock), so a registry cache a build filled would
+/// be refused. `--depth 0` keeps the printed tree to its root. `homes` are set
+/// on the child explicitly. It runs no package code: `tree` runs no build
+/// script and links nothing.
 ///
 /// # Errors
 /// - [`CliError::LocalLimitExceeded`] if cargo crosses a ceiling; its process
@@ -1330,20 +1338,30 @@ pub fn unpack_locked_sources(
     crate_dir: &Path,
     homes: ToolHomes<'_>,
 ) -> Result<SourcesOutcome, CliError> {
-    let mut fetch = Command::new(cargo);
-    fetch
-        .args(["fetch", "--offline", "--locked", "--target", "host-tuple"])
-        .arg("--manifest-path")
-        .arg(crate_dir.join("Cargo.toml"))
-        .current_dir(crate_dir);
-    apply_tool_homes(homes, &mut fetch);
-    let fetched = run_local(fetch, SOURCE_UNPACK_LIMITS, LocalSource::SourceUnpack)
+    let mut walk = Command::new(cargo);
+    walk.args([
+        "tree",
+        "--offline",
+        "--locked",
+        "--target",
+        "host-tuple",
+        "--edges",
+        "normal,build",
+        "--depth",
+        "0",
+    ])
+    .arg("--manifest-path")
+    .arg(crate_dir.join("Cargo.toml"))
+    .current_dir(crate_dir);
+    apply_tool_homes(homes, &mut walk);
+    let walked = run_local(walk, SOURCE_UNPACK_LIMITS, LocalSource::SourceUnpack)
         .map_err(|e| local_run_error(crate_dir, e))?;
-    Ok(if fetched.status.success() {
+    Ok(if walked.status.success() {
         SourcesOutcome::Unpacked(SourcesUnpacked(()))
     } else {
         SourcesOutcome::Unavailable {
-            code: fetched.status.code(),
+            code: walked.status.code(),
+            stderr: walked.stderr.to_terminal(),
         }
     })
 }
