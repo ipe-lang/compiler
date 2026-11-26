@@ -26,6 +26,8 @@ unsafeRaw : String -> Html msg
 
 `unsafeRaw s` — an UN-escaped raw HTML node. The `unsafe` prefix names the
 XSS risk at every call site; user content goes through `Html.text` instead.
+Framed content in raw markup is the author's to sandbox: the runtime fences
+a frame in raw markup a patch carries, never one in the first paint.
 
 ## `unsafeScript`
 

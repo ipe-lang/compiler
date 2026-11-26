@@ -28,7 +28,10 @@ node : String -> List (Attribute msg) -> List (Html msg) -> Html msg
 `node tag attrs children` — a container element `<tag …>children</tag>`.
 A `script` or `style` tag renders only over trusted raw children (see
 `Ipe.Html.Unsafe` and `styleNode`), and `plaintext` or an unsafe tag name
-never renders: a refused element renders nothing.
+never renders: a refused element renders nothing. An `embed` with a `src`, an
+`object` with a `data`, or a `frame` with a `src` renders nothing: the
+browser gives them no sandbox and the runtime cannot prove the document they
+load comes from another origin. Use `iframe`.
 
 ## `voidNode`
 
@@ -426,6 +429,12 @@ canvas : List (Attribute msg) -> List (Html msg) -> Html msg
 iframe : List (Attribute msg) -> List (Html msg) -> Html msg
 ```
 
+`iframe attrs children` — an `<iframe>` element. Always sandboxed. The
+runtime paints `sandbox` on every `iframe`, keeping only the browser's known
+tokens. `allow-same-origin` and `allow-popups-to-escape-sandbox` are always
+removed, so the framed document never shares the app's origin. Opt into
+other tokens with `Attr.attribute "sandbox" "allow-scripts allow-forms"`.
+
 ## `progress`
 
 ```ipe
@@ -543,6 +552,11 @@ col : List (Attribute msg) -> Html msg
 ```ipe
 embed : List (Attribute msg) -> Html msg
 ```
+
+`embed attrs` — an `<embed>` element. An `embed` with a `src`, an `object`
+with a `data`, or a `frame` with a `src` renders nothing: the browser gives
+them no sandbox and the runtime cannot prove the document they load comes
+from another origin. Use `iframe`.
 
 ## `source`
 

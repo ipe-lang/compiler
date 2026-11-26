@@ -2021,7 +2021,7 @@ Ipe.Html — HTML element builders.
 | `video` | (no summary) |
 | `audio` | (no summary) |
 | `canvas` | (no summary) |
-| `iframe` | (no summary) |
+| `iframe` | `iframe attrs children` — an `<iframe>` element. Always sandboxed. The |
 | `progress` | (no summary) |
 | `meter` | (no summary) |
 | `script` | `script attrs children` — a `<script>` element. It renders only over a |
@@ -2040,7 +2040,7 @@ Ipe.Html — HTML element builders.
 | `area` | (no summary) |
 | `base` | (no summary) |
 | `col` | (no summary) |
-| `embed` | (no summary) |
+| `embed` | `embed attrs` — an `<embed>` element. An `embed` with a `src`, an `object` |
 | `source` | (no summary) |
 | `track` | (no summary) |
 | `wbr` | (no summary) |
