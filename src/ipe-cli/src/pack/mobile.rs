@@ -4026,13 +4026,20 @@ fn ios_readme(root_name: &str, base: &MountBase) -> String {
          The Info.plist NS…UsageDescription keys are derived from the app's accepted\n\
          web capabilities — never hand-authored.\n\
          \n\
-         Build: this directory holds sources, not an Xcode project. On macOS, create a\n\
-         new Xcode iOS App target and add the files under App/ to it (App/Info.plist as\n\
-         its Info.plist, App/www/ as a folder reference), then build and run it in a\n\
-         Simulator; a signed, runnable .ipa also needs a signing identity (out of scope\n\
-         on this host).\n",
+         Build: this directory holds sources, not an Xcode project.\n\
+         \n\
+         {steps}\n",
         entry = ios_entry_url(base),
+        steps = ios_build_steps(),
     )
+}
+
+/// The iOS build steps: a new Xcode App project around the shell sources.
+///
+/// The one rendering the README and the guide's marked block carry verbatim,
+/// so neither can hand-write an Xcode step that drifts from the other.
+pub(crate) const fn ios_build_steps() -> &'static str {
+    crate::text::ios_build_steps()
 }
 
 // ── Escaping ─────────────────────────────────────────────────────────────────
@@ -5294,6 +5301,59 @@ mod tests {
             "docs/guide/delivery.md's android-build-steps block drifted from \
              android_build_steps() — regenerate it, never hand-edit"
         );
+    }
+
+    // ── iOS build steps: one source, and the template's entry point removed ────
+
+    /// The README carries the one `ios_build_steps()` block verbatim.
+    #[test]
+    fn ios_readme_carries_build_steps() {
+        let readme = ios_readme("app-ios", &MountBase::root());
+        assert!(
+            readme.contains(ios_build_steps()),
+            "README must carry the ios_build_steps() block verbatim: {readme}"
+        );
+    }
+
+    /// The guide's one `ios-build-steps` block is line-for-line equal to the
+    /// catalog's own rendering.
+    #[test]
+    fn ios_build_steps_docs_block_is_rendered_block() {
+        let path = repo_root_for_tests().join("docs/guide/delivery.md");
+        let doc = std::fs::read_to_string(&path).expect("docs/guide/delivery.md reads");
+        let block = marked_block(
+            &doc,
+            "<!-- ios-build-steps -->",
+            "<!-- /ios-build-steps -->",
+        )
+        .expect("exactly one ios-build-steps marker pair in docs/guide/delivery.md");
+        let doc_lines: Vec<&str> = block.lines().collect();
+        let rendered: Vec<&str> = ios_build_steps().lines().collect();
+        assert_eq!(
+            doc_lines, rendered,
+            "docs/guide/delivery.md's ios-build-steps block drifted from \
+             ios_build_steps() - regenerate it, never hand-edit"
+        );
+    }
+
+    /// The shell's `AppDelegate` is an `@main` entry point and its `Info.plist`
+    /// names a fixed executable, so the steps must remove the template's own entry
+    /// point and plist, point the target at `App/Info.plist`, and name the product
+    /// after `CFBundleExecutable` - else following them does not build or launch.
+    #[test]
+    fn ios_build_steps_remove_the_template_entry_point_the_shell_replaces() {
+        let delegate = render_ios_app_delegate(&MountBase::root());
+        assert!(delegate.contains("@main"), "{delegate}");
+        let steps = ios_build_steps();
+        for needed in [
+            "Delete the template's `AppDelegate.swift`, `SceneDelegate.swift`",
+            "`Main.storyboard`, `Info.plist` and `Assets.xcassets`",
+            "set Generate Info.plist File to No and Info.plist File to `App/Info.plist`",
+            "name its product exactly as the `CFBundleExecutable` value",
+            "`App/www/` as a folder reference",
+        ] {
+            assert!(steps.contains(needed), "missing {needed:?} in:\n{steps}");
+        }
     }
 
     /// One `file:line` a line scan refuses outside the regions it skips.

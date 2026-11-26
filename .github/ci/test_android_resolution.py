@@ -135,6 +135,19 @@ class MainTest(unittest.TestCase):
     def test_skewed_project_fails(self) -> None:
         self.assertEqual(self.run_main(CLEAN.replace(" -> 1.8.22", ""), GRADLE), 1)
 
+    def test_platform_lowered_below_a_transitive_stdlib_fails(self) -> None:
+        # androidx.core pulls kotlin-stdlib 1.8.22, so a 1.6.21 platform cannot
+        # hold the stdlib down: Gradle resolves 1.8.22, past the written BOM.
+        lowered = CLEAN.replace("kotlin-bom:1.8.22", "kotlin-bom:1.6.21")
+        self.assertNotEqual(lowered, CLEAN)
+        self.assertEqual(self.run_main(lowered, GRADLE.replace("1.8.22", "1.6.21")), 1)
+
+    def test_platform_raised_with_every_row_following_passes(self) -> None:
+        # The judge proves the project's own platform governs every stdlib row;
+        # the generator's pin is proven by the `kotlin_bom_agrees` const assert.
+        raised = CLEAN.replace("1.8.22", "1.9.0")
+        self.assertEqual(self.run_main(raised, GRADLE.replace("1.8.22", "1.9.0")), 0)
+
     def test_missing_file_fails(self) -> None:
         self.assertEqual(ar.main(["/nonexistent/deps.txt", "/nonexistent/build.gradle"]), 1)
 

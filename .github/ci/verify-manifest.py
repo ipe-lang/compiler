@@ -268,11 +268,14 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       `continue-on-error:`, no `env:`), whose `results` lists one
       `job=${{ needs.job.result }}` pair per need in order, whose `tier` is
       its phase's output and `scope` one scope output, and each of whose
-      aggregated jobs has `if:` exactly that phase and scope.  The composite
-      fails unless `changes` succeeded and the tier agrees with the event,
-      fails on any failed or cancelled need, and on an event of its phase in
-      scope fails on any skipped need; it passes vacuously only off-phase or
-      out of scope.  Every tests-phase work job is a direct need of a phase
+      aggregated jobs has `if:` exactly that phase and one declared scope
+      output: `scope`, or another one its `scopes` pair
+      (`job=${{ needs.changes.outputs.<own> }}`, in `needs:` order) hands the
+      verdict.  The composite fails unless `changes` succeeded and the tier
+      agrees with the event, fails on any failed or cancelled need or
+      malformed `scopes`, and on an event of its phase fails on any skipped
+      need whose own scope flag is on; a need skips only off-phase or out of
+      its own scope.  Every tests-phase work job is a direct need of a phase
       verdict whose context is a `gate`, so a merge-queue red always blocks
       the merge; a tests-phase proof that is not to block runs post_merge.
   12. Gate integrity.  (a) A `pull_request_target` run holds the base
@@ -3452,8 +3455,8 @@ def _check_aggregator(where: str, wf: Workflow, wj: WorkflowJob, errors: list[st
         errors.append(f"check 11: {where} (phase verdict) step 2 must be `uses: {PHASE_VERDICT_ACTION}` with no `if:`/`continue-on-error:`/`env:`")
         return
     w = verdict.get("with")
-    if not isinstance(w, dict) or set(w) != {"results", "phase", "tier", "scope"}:
-        errors.append(f"check 11: {where} (phase verdict) `with:` must set exactly results, phase, tier, scope")
+    if not isinstance(w, dict) or set(w) - {"scopes"} != {"results", "phase", "tier", "scope"}:
+        errors.append(f"check 11: {where} (phase verdict) `with:` must set exactly results, phase, tier, scope (and scopes)")
         return
     want = " ".join(f"{n}=${{{{ needs.{n}.result }}}}" for n in needs)
     if w["results"] != want:
@@ -3468,14 +3471,45 @@ def _check_aggregator(where: str, wf: Workflow, wj: WorkflowJob, errors: list[st
     if not m or m.group(1) in PHASE_EXCLUDES or m.group(1) == "release_only":
         errors.append(f"check 11: {where} (phase verdict) `scope` must be one `changes` scope output")
         return
-    run_if = f"needs.changes.outputs.{phase} == 'true' && needs.changes.outputs.{m.group(1)} == 'true'"
+    scope = m.group(1)
+    run_if = f"needs.changes.outputs.{phase} == 'true' && needs.changes.outputs.{scope} == 'true'"
+    changes = wf.job(CLASSIFIER_JOB)
+    outputs = changes.raw.get("outputs") if changes is not None else None
+    declared = frozenset(str(k) for k in outputs) if isinstance(outputs, dict) else frozenset()
+    narrowed: list[tuple[str, str]] = []
     for n in needs[1:]:
         dep = wf.job(n)
-        if dep is not None and dep.raw.get("if") != run_if:
+        if dep is None:
+            continue
+        own = _aggregated_scope(dep.raw.get("if"), phase)
+        if own is None or own in PHASE_EXCLUDES or own == _RELEASE_ONLY_OUTPUT or own not in declared:
             errors.append(
                 f"check 11: {where} (phase verdict) aggregates {n!r}, whose `if:` must be exactly "
-                f"{run_if!r} so the verdict's tier and scope are the job's own"
+                f"{run_if!r} (or name another declared `changes` scope output in `scopes`) so the "
+                "verdict's tier and scope are the job's own"
             )
+        elif own != scope:
+            narrowed.append((n, own))
+    want_scopes = " ".join(f"{n}=${{{{ needs.changes.outputs.{s} }}}}" for n, s in narrowed)
+    if narrowed and w.get("scopes") != want_scopes:
+        errors.append(
+            f"check 11: {where} (phase verdict) `scopes` must be {want_scopes!r}: one pair per aggregated "
+            "job keyed on another scope than `scope`, in `needs:` order, so the verdict reads each job's own scope"
+        )
+    elif not narrowed and "scopes" in w:
+        errors.append(f"check 11: {where} (phase verdict) sets `scopes` but every aggregated job keys on `scope`; drop it")
+
+
+def _aggregated_scope(cond: object, phase: str) -> str | None:
+    """`<scope>` of an aggregated job's `if:` exactly
+    `needs.changes.outputs.<phase> == 'true' && needs.changes.outputs.<scope> == 'true'`, else None."""
+    if not isinstance(cond, str):
+        return None
+    m = re.fullmatch(
+        rf"needs\.changes\.outputs\.{re.escape(phase)} == 'true' && needs\.changes\.outputs\.([a-z_]+) == 'true'",
+        cond,
+    )
+    return m.group(1) if m else None
 
 
 def check_phase_routing(wfs: WorkflowSet, gate_contexts: set[str], errors: list[str]) -> None:
@@ -6109,7 +6143,7 @@ TOOL_INVOCATIONS: dict[str, dict[Argv, ToolRole]] = {
     "e2e_shard.py": {("--plan",): _V, ("--lint",): _V},
     "release_only.py": {(): _A},
     "change_class.py": {
-        ("--code", "--emit", "--sanitize", "--wasm", "--editors"): _A,
+        ("--code", "--emit", "--sanitize", "--wasm", "--editors", "--mobile"): _A,
         ("--code",): _A,
         ("--panic-scan",): _A,
         ("--playground",): _A,

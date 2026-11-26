@@ -1322,6 +1322,10 @@ messages! {
     mobile_android_note = "mobile-android-note";
     /// The note under a written iOS shell project.
     mobile_ios_note = "mobile-ios-note";
+    /// The iOS build steps: a new Xcode App project around the shell sources.
+    ///
+    /// The one rendering every producer (README, guide) carries verbatim.
+    ios_build_steps = "ios-build-steps";
     /// One disclosure line under a consent refusal.
     consent_item(item) = "consent-item";
     /// An ungranted web axis and the modules that disclose it.

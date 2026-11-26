@@ -3110,7 +3110,15 @@ note: an unsigned Android Gradle project is written here. To build it:
 
 ## mobile-ios-note
 
-note: the iOS shell sources (Swift files, Info.plist, assets) are written here, not an Xcode project: on macOS, add them to a new Xcode iOS App target; a signed, runnable .ipa also needs a signing identity (out of scope).
+note: the iOS shell sources (Swift files, Info.plist, assets) are written here, not an Xcode project: on macOS, build them in Xcode with the steps in its README.txt; a signed, runnable .ipa also needs a signing identity (out of scope).
+
+## ios-build-steps
+
+1. On macOS, create a new Xcode iOS App project (Interface: Storyboard, Language: Swift) and name its product exactly as the `CFBundleExecutable` value in `App/Info.plist`.
+2. Delete the template's `AppDelegate.swift`, `SceneDelegate.swift`, `ViewController.swift`, `Main.storyboard`, `Info.plist` and `Assets.xcassets`: the shell's `App/AppDelegate.swift` is the app's one `@main` entry point, and two entry points do not compile.
+3. Add the files under `App/` to the target, with `App/www/` as a folder reference so the client keeps its layout.
+4. In the target's Build Settings, set Generate Info.plist File to No and Info.plist File to `App/Info.plist`.
+5. Pick an iOS Simulator and press ⌘R. A signed, distributable `.ipa` also needs a signing identity.
 
 # Consent refusals
 

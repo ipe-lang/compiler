@@ -4,7 +4,7 @@ import Ipe.Package exposing (..)
 
 
 -- | The push variant of the Android shell build: a wasm client that accepts
--- `JsPort Push`, with the `delivery.mobile.push` record an Android pack needs.
+-- `JsPort Push` and the `JsPort Raw` floor its port discloses, with the `delivery.mobile.push` record an Android pack needs.
 -- The Firebase identifiers are grammar-valid placeholders; the build never
 -- contacts Firebase.
 package : Package
@@ -14,7 +14,7 @@ package =
     , wasm = On { mode = Render }
     , capabilities =
         { declares = []
-        , accepts = [ JsPort Push ]
+        , accepts = [ JsPort Push, JsPort Raw ]
         }
     , delivery =
         { mobile =
