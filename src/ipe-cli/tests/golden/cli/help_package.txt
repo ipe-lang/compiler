@@ -1,7 +1,7 @@
 exit: 0
 ---
 
-  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
+  Ipê language - v<VERSION> - https://github.com/ipe-lang/compiler
 
   Audit a package against the Tier-1 quality gate, publish it to the index, validate an index entry file, or run the index CI's authoritative receiving gate on a submitted entry.
 

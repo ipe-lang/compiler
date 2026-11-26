@@ -1,7 +1,7 @@
 exit: 0
 ---
 
-  Ipê language - v<VERSION> - https://github.com/arthurmaciel/ipe-lang
+  Ipê language - v<VERSION> - https://github.com/ipe-lang/compiler
 
   Build the production artifact — optimised, Debug.* gated. Native-bearing apps get a jailed bundle; pure-native apps get a plain optimised binary; `web desktop|ios|android` produces a production app bundle; `--target wasm` produces a production browser bundle.
 
