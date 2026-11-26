@@ -761,21 +761,29 @@ impl CacheDir {
         written
     }
 
-    /// The text of the regular file `name`, read never through a link; `None` when absent.
+    /// The text of the regular file `name`, read never through a link; `None` when no regular file is there.
     ///
-    /// A non-regular entry, or a text past [`OCCUPANT_PROBE_CAP`] bytes, is an
+    /// A link or other non-regular entry holds no record and reads as `None`,
+    /// never followed; a text past [`OCCUPANT_PROBE_CAP`] bytes is an
     /// `InvalidData` error.
     fn read(&self, name: &str) -> std::io::Result<Option<String>> {
-        use rustix::fs::{Mode, OFlags};
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags};
         use rustix::io::Errno;
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
         let file = match rustix::fs::openat(&self.dir, name, flags, Mode::empty()) {
             Ok(fd) => std::fs::File::from(fd),
             Err(e) if e == Errno::NOENT => return Ok(None),
-            Err(e) => return Err(e.into()),
+            Err(e) => {
+                let entry = rustix::fs::statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+                return if FileType::from_raw_mode(entry.st_mode) == FileType::RegularFile {
+                    Err(e.into())
+                } else {
+                    Ok(None)
+                };
+            }
         };
         if !file.metadata()?.file_type().is_file() {
-            return Err(std::io::ErrorKind::InvalidData.into());
+            return Ok(None);
         }
         read_capped(file).map(Some)
     }
@@ -847,16 +855,17 @@ impl CacheDir {
         written
     }
 
-    /// The text of the entry `name`, never through a link; `None` when absent.
+    /// The text of the regular file `name`, never through a link; `None` when no regular file is there.
     ///
-    /// A text past [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
+    /// A link or other non-regular entry holds no record and reads as `None`;
+    /// a text past [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
     fn read(&self, name: &str) -> std::io::Result<Option<String>> {
         let path = self.dir.join(name);
         match std::fs::symlink_metadata(&path) {
             Ok(meta) if meta.file_type().is_file() => {
                 read_capped(std::fs::File::open(&path)?).map(Some)
             }
-            Ok(_) => Err(std::io::ErrorKind::InvalidData.into()),
+            Ok(_) => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
@@ -1028,6 +1037,8 @@ impl FfiCache {
         let paths = self.artifact_paths(&slug);
         // The occupant probe reads the exact `<slug>.pkg.json` the write below
         // replaces: a slug another package holds is refused, never overwritten.
+        // A link there is no package's record: the rename below replaces the
+        // link itself, never writing through it.
         let occupant = dir
             .read(&names.pkg_json)
             .map_err(|e| io_err(&paths.pkg_json, &e))?;

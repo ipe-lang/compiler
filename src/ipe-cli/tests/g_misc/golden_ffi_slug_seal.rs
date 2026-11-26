@@ -33,7 +33,7 @@ fn inspection(name: &str) -> String {
             "effect": "pure"
         }],
         "errors": [],
-        "transitiveDeps": [{"ident": name, "name": name, "version": "0.1.0"}]
+        "transitiveDeps": [{"ident": name.replace('-', "_"), "name": name, "version": "0.1.0"}]
     })
     .to_string()
 }
