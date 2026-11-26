@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 //! Lower-span scan: lower production code spells no synthetic span.
 //!
 //! A lowering refusal is reported at the span of the node it lowers, which
@@ -6,7 +5,6 @@
 //! spellings `Span::new(0, 0)` and `Span { lo: 0, hi: 0 }`) reaches the user
 //! with no caret, so every such spelling outside test-only code is refused,
 //! keyed by the function it appears in, except the exact allowlist below.
-#![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::BTreeMap;
 
@@ -14,13 +12,8 @@ use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
 use syn::{Expr, ImplItem, ImplItemFn, Item, ItemFn, Lit, Macro, Member, Token, TraitItem};
 
-#[path = "../../runtime/rust/tests/support/cfg_scan.rs"]
-mod cfg_scan;
-use cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_item_attrs};
-
-#[path = "../../runtime/rust/tests/support/source_tree.rs"]
-mod source_tree;
-use source_tree::rust_sources;
+use crate::cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_item_attrs};
+use crate::source_tree::rust_sources;
 
 /// The lower crate's production source root, relative to this crate's manifest.
 const LOWER_SRC: &str = "../compiler/lower/src";
