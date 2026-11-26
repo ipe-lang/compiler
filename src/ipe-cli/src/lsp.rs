@@ -79,9 +79,7 @@ fn load_error(err: &CliError, lifted_by: LimitSource) -> LoadError {
     let detail = err.to_string();
     match err {
         CliError::Io { .. } => LoadError::Io(detail),
-        CliError::SourceRefused { .. } | CliError::DeviceNamedModule { .. } => {
-            LoadError::Refused(detail)
-        }
+        CliError::SourceRefused { .. } => LoadError::Refused(detail),
         CliError::FileTooLarge { .. } | CliError::DiscoveryLimitReached { .. } => {
             LoadError::Limit { lifted_by, detail }
         }

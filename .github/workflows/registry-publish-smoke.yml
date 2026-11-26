@@ -91,11 +91,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
 
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/sccache
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build the ipe binary
         env:
@@ -107,7 +107,7 @@ jobs:
       # it that scan is skipped with a warning. Install it so the smoke's publish
       # preview is byte-faithful to the authoritative gate, which also runs it.
       - name: Install cargo-deny (supply-chain advisory + bans enforcement)
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2
+        uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.20.2
 
@@ -143,8 +143,8 @@ jobs:
           fi
 
       # Materialise the SSH signing private key to a mode-600 file OUTSIDE the
-      # workspace and export its path as CI_JOB_PUBLISH_SIGNING_KEY; the next step
-      # hands it to `ipe package publish` as IPE_PUBLISH_SIGNING_KEY. The secret is written by the runner's own
+      # workspace and export its path as IPE_PUBLISH_SIGNING_KEY (the variable
+      # `ipe package publish` reads). The secret is written by the runner's own
       # secret-masking `run` step — never echoed, never on an argv, never under
       # `set -x` — and the file lives under RUNNER_TEMP, which the runner wipes at
       # job end. Only the PATH is exported; the key bytes never reach a log.
@@ -155,18 +155,16 @@ jobs:
           KEY_FILE="$RUNNER_TEMP/ipe-publish-signing-key"
           install -m 600 /dev/null "$KEY_FILE"
           printf '%s\n' "$IPE_REGISTRY_SIGNING_KEY" > "$KEY_FILE"
-          bash "$GITHUB_WORKSPACE/.github/ci/github-env.sh" CI_JOB_PUBLISH_SIGNING_KEY "$KEY_FILE"
+          echo "IPE_PUBLISH_SIGNING_KEY=$KEY_FILE" >> "$GITHUB_ENV"
 
       - name: Run the live publish smoke
         env:
           # The token is delivered ONLY here, on the environment. The script never
           # echoes it, never logs it, never puts it on an argv.
           IPE_SMOKE_TOKEN: ${{ secrets.IPE_REGISTRY_PUBLISH_TOKEN }}
-          # The key path the previous step exported (github-env.sh), under the
-          # name `ipe package publish` reads, so it signs the index-PR commit;
-          # without it publish fail-closes on an unsigned commit the curated
-          # index rejects.
-          IPE_PUBLISH_SIGNING_KEY: ${{ env.CI_JOB_PUBLISH_SIGNING_KEY }}
+          # IPE_PUBLISH_SIGNING_KEY is exported into $GITHUB_ENV by the previous
+          # step, so `ipe package publish` signs the index-PR commit; without it
+          # publish fail-closes on an unsigned commit the curated index rejects.
           # Staging overrides fall through to the script's production defaults when
           # the repo variables are unset.
           IPE_SMOKE_INDEX_REPO: ${{ vars.IPE_SMOKE_INDEX_REPO }}

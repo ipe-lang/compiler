@@ -1,22 +1,17 @@
 //! The one proof that turns a requested output path into an absolute one.
 //!
-//! [`ProvenOutPath`] has a private field and the walk behind
-//! [`prove_parent_steps`] is its only constructor, so no path reaches a claim
-//! without every `..` and `.` resolved out of a proven plain directory first,
-//! its prefix one that names a place on a disk or share, and every name in it
-//! one that the platform opens as spelled. The base a relative request is
-//! walked on from is a [`Cwd`], which only the process working directory
-//! supplies.
+//! [`ProvenOutPath`] has a private field and [`prove_parent_steps_from`] is its
+//! only constructor, so no path reaches a claim without every `..` and `.`
+//! resolved out of a proven plain directory first.
 
-use std::ffi::OsStr;
-use std::path::{Component, Path, PathBuf, Prefix, PrefixComponent};
+use std::path::{Component, Path, PathBuf};
 
 use super::{OutputRefusal, held};
 use crate::{CliError, io_err};
 
 /// An absolute output path with no `..` or `.` component.
 ///
-/// Built only by `prove_walk`, the one place a requested path is
+/// Built only by [`prove_parent_steps_from`], the one place a requested path is
 /// made absolute: a relative request is walked on from the working directory,
 /// component by component, and each `..` is resolved there, lexically, once
 /// the level it climbs out of is proven an existing directory that is not a
@@ -54,38 +49,6 @@ impl ProvenOutPath {
     }
 }
 
-/// The process working directory, the only base a relative request is proven against.
-///
-/// The field is private and [`Cwd::current`] reads it from the process, so no
-/// caller can hand the prover a base of its own choosing.
-#[derive(Debug)]
-pub struct Cwd(PathBuf);
-
-impl Cwd {
-    /// The process working directory.
-    ///
-    /// # Errors
-    /// [`CliError::Io`] when the working directory cannot be read.
-    pub fn current() -> Result<Self, CliError> {
-        std::env::current_dir()
-            .map(Self)
-            .map_err(|e| io_err(Path::new("."), e))
-    }
-
-    /// `path` taken as the working directory, so a test can place one.
-    #[cfg(test)]
-    #[must_use]
-    pub const fn assumed(path: PathBuf) -> Self {
-        Self(path)
-    }
-
-    /// The working directory's path.
-    #[must_use]
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-}
-
 /// Make `raw` absolute against the working directory, resolving every `..`.
 ///
 /// As [`prove_parent_steps_from`] with the working directory, read only for a
@@ -96,9 +59,10 @@ impl Cwd {
 /// directory cannot be read.
 pub fn prove_parent_steps(raw: &Path) -> Result<ProvenOutPath, CliError> {
     if raw.is_absolute() {
-        return prove_walk(raw, Path::new(""));
+        return prove_parent_steps_from(raw, Path::new(""));
     }
-    prove_parent_steps_from(raw, &Cwd::current()?)
+    let cwd = std::env::current_dir().map_err(|e| io_err(Path::new("."), e))?;
+    prove_parent_steps_from(raw, &cwd)
 }
 
 /// Make `raw` absolute against `cwd`, resolving every `..` out of a proven plain directory.
@@ -118,53 +82,29 @@ pub fn prove_parent_steps(raw: &Path) -> Result<ProvenOutPath, CliError> {
 /// [`OutputRefusal::ParentTraversal`] for an unproven `..`;
 /// [`OutputRefusal::Unplaceable`] for a path that does not name one absolute
 /// place: a Windows drive-relative `C:x`, a rooted `\x` against a working
-/// directory with no drive, a `.` or `..` inside a verbatim `\\?\` path (a
-/// literal name there, not a step), a prefix that names no place on a disk or
-/// share (`placeable_prefix`), or a component that is not one plain name
-/// opened as spelled (`is_one_name`); [`CliError::Io`] when a level cannot be
-/// inspected.
-pub fn prove_parent_steps_from(raw: &Path, cwd: &Cwd) -> Result<ProvenOutPath, CliError> {
-    let cwd = cwd.as_path();
+/// directory with no drive, or a component that is not one plain name where
+/// it lands (a `/` inside a verbatim `\\?\` component, an `a:b` that Windows
+/// reads as a drive); [`CliError::Io`] when a level cannot be inspected.
+pub fn prove_parent_steps_from(raw: &Path, cwd: &Path) -> Result<ProvenOutPath, CliError> {
+    let traversal = || -> CliError { OutputRefusal::ParentTraversal(raw.to_path_buf()).into() };
+    let unplaceable = || -> CliError { OutputRefusal::Unplaceable(raw.to_path_buf()).into() };
     let base = if raw.is_absolute() {
         Path::new("")
     } else {
         match raw.components().next() {
-            Some(Component::Prefix(_)) => return Err(unplaceable(raw)),
-            Some(Component::RootDir) => drive_of(cwd).ok_or_else(|| unplaceable(raw))?,
+            Some(Component::Prefix(_)) => return Err(unplaceable()),
+            Some(Component::RootDir) => drive_of(cwd).ok_or_else(unplaceable)?,
             Some(Component::CurDir | Component::ParentDir | Component::Normal(_)) | None => cwd,
         }
     };
-    prove_walk(raw, base)
-}
-
-/// The refusal of `raw` as naming no single place.
-fn unplaceable(raw: &Path) -> CliError {
-    OutputRefusal::Unplaceable(raw.to_path_buf()).into()
-}
-
-/// Walk `base` then `raw` as one component sequence into a proven absolute path.
-///
-/// `base` is the already chosen start of the walk: empty for an absolute
-/// `raw`, else the working directory or its drive.
-fn prove_walk(raw: &Path, base: &Path) -> Result<ProvenOutPath, CliError> {
-    let traversal = || -> CliError { OutputRefusal::ParentTraversal(raw.to_path_buf()).into() };
-    if has_verbatim_dot_component(base) || has_verbatim_dot_component(raw) {
-        return Err(unplaceable(raw));
-    }
     let mut proven = PathBuf::new();
     for component in base.components().chain(raw.components()) {
         match component {
-            Component::Prefix(prefix) => {
-                if !placeable_prefix(prefix) {
-                    return Err(unplaceable(raw));
-                }
-                proven.push(component);
-            }
-            Component::RootDir => proven.push(component),
+            Component::Prefix(_) | Component::RootDir => proven.push(component),
             Component::CurDir => {}
             Component::Normal(name) => {
                 if !is_one_name(name) {
-                    return Err(unplaceable(raw));
+                    return Err(unplaceable());
                 }
                 proven.push(name);
             }
@@ -184,7 +124,7 @@ fn prove_walk(raw: &Path, base: &Path) -> Result<ProvenOutPath, CliError> {
         }
     }
     if !proven.is_absolute() {
-        return Err(unplaceable(raw));
+        return Err(unplaceable());
     }
     Ok(ProvenOutPath(proven))
 }
@@ -201,62 +141,15 @@ pub fn drive_of(cwd: &Path) -> Option<&Path> {
     }
 }
 
-/// Whether `path` is verbatim (`\\?\`) and holds a `.` or `..` component.
-///
-/// Under a verbatim prefix neither `.` nor `..` is a step: the OS passes each
-/// through as a literal name, so dropping a `.` or popping a level for a `..`
-/// would prove a path other than the one spelled.
-fn has_verbatim_dot_component(path: &Path) -> bool {
-    let mut components = path.components();
-    let verbatim = matches!(
-        components.next(),
-        Some(Component::Prefix(prefix)) if prefix.kind().is_verbatim()
-    );
-    verbatim
-        && components.any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-}
-
-/// Whether `prefix` names a place on a disk or a share.
-///
-/// A drive (`C:`, `\\?\C:`) or a share (`\\server\share`,
-/// `\\?\UNC\server\share`) is kept. A device namespace (`\\.\pipe`,
-/// `\\.\NUL`) and any other verbatim root (`\\?\GLOBALROOT`) address the
-/// object manager rather than a directory tree, so no output lives there.
-fn placeable_prefix(prefix: PrefixComponent<'_>) -> bool {
-    matches!(
-        prefix.kind(),
-        Prefix::Disk(_) | Prefix::VerbatimDisk(_) | Prefix::UNC(..) | Prefix::VerbatimUNC(..)
-    )
-}
-
 /// Whether `name` reads back as exactly itself, one plain component.
 ///
 /// A name that reads as more — a `/` split by a non-verbatim parse, an `a:b`
 /// Windows takes for a drive prefix that would replace the path it is pushed
-/// onto — does not extend that path by one level; a name the platform
-/// rewrites on open ([`opens_as_spelled`]) names some other entry.
-fn is_one_name(name: &OsStr) -> bool {
+/// onto — does not extend that path by one level.
+fn is_one_name(name: &std::ffi::OsStr) -> bool {
     let mut parts = Path::new(name).components();
-    let single = match (parts.next(), parts.next()) {
+    match (parts.next(), parts.next()) {
         (Some(Component::Normal(only)), None) => only == name,
         _ => false,
-    };
-    single && opens_as_spelled(name)
-}
-
-/// Whether Windows opens `name` as the entry it spells.
-///
-/// A name that is not valid Unicode cannot be checked, so it is refused. An
-/// 8.3 short alias (`PROGRA~1`) passes: it names an entry of the same
-/// directory, and every disjointness check is decided on canonical paths.
-#[cfg(windows)]
-fn opens_as_spelled(name: &OsStr) -> bool {
-    name.to_str()
-        .is_some_and(super::win32_name::opens_as_spelled)
-}
-
-/// Whether the platform opens `name` as the entry it spells: always, off Windows.
-#[cfg(not(windows))]
-const fn opens_as_spelled(_name: &OsStr) -> bool {
-    true
+    }
 }

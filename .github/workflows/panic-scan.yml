@@ -19,7 +19,6 @@ on:
       - 'tools/panic-scan/**'
       - '.github/workflows/panic-scan.yml'
   pull_request:
-  merge_group:
   workflow_dispatch: {}
 
 permissions:
@@ -33,16 +32,11 @@ jobs:
     # panic-scan-relevant paths is already scanned. (A job-level author gate would
     # wrongly skip a trusted-author PR that changed runtime code.)
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # A merge-group run needs history back to the queue base for the filter.
-          fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '1' }}
+      - uses: actions/checkout@v7
 
-      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
-          # A merge-group run diffs against the queue base, not the default branch.
-          base: ${{ github.event.merge_group.base_sha }}
           filters: |
             relevant:
               - 'src/**/*.rs'

@@ -657,17 +657,9 @@ impl CacheSite {
                 if !owned {
                     return None;
                 }
-                read_without_links(
-                    out_dir,
-                    &[CACHE_DIR_NAME, salt.as_str(), epoch, file_name],
-                    crate::io_bounded::BUILD_CACHE_ENTRY_CAP,
-                )
+                read_without_links(out_dir, &[CACHE_DIR_NAME, salt.as_str(), epoch, file_name])
             }
-            Self::Explicit(dir) => read_without_links(
-                dir,
-                &[epoch, file_name],
-                crate::io_bounded::BUILD_CACHE_ENTRY_CAP,
-            ),
+            Self::Explicit(dir) => read_without_links(dir, &[epoch, file_name]),
         }
     }
 }
@@ -676,13 +668,7 @@ impl CacheRoot {
     /// Best-effort write of entry `file_name` under `epoch`.
     ///
     /// Every failure is swallowed, a refused symlink included.
-    ///
-    /// An entry past [`crate::io_bounded::BUILD_CACHE_ENTRY_CAP`] is skipped, since a read
-    /// of it would be a miss anyway.
     fn write(&self, epoch: &str, file_name: &str, bytes: &[u8]) {
-        if !within_cap(bytes, crate::io_bounded::BUILD_CACHE_ENTRY_CAP) {
-            return;
-        }
         match self {
             Self::InOwned { dir, salt } => {
                 let rel = Path::new(CACHE_DIR_NAME)
@@ -698,17 +684,11 @@ impl CacheRoot {
     }
 }
 
-/// Whether `bytes` fits within `cap` bytes.
-fn within_cap(bytes: &[u8], cap: u64) -> bool {
-    u64::try_from(bytes.len()).is_ok_and(|len| len <= cap)
-}
-
 /// Read `base/<parts...>` when each part is one plain name and no level is a symlink.
 ///
 /// The opened file must be the regular file the lstat saw, so a link swapped
-/// in after the check is a miss too. At most `cap + 1` bytes are read, and a
-/// file past `cap` is a miss.
-fn read_without_links(base: &Path, parts: &[&str], cap: u64) -> Option<Vec<u8>> {
+/// in after the check is a miss too.
+fn read_without_links(base: &Path, parts: &[&str]) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let mut path = base.to_path_buf();
     let mut seen = None;
@@ -728,16 +708,15 @@ fn read_without_links(base: &Path, parts: &[&str], cap: u64) -> Option<Vec<u8>> 
         seen = Some(meta);
     }
     let seen = seen.filter(fs::Metadata::is_file)?;
-    let file = crate::io_bounded::open_regular(&path, crate::io_bounded::FinalLink::Refuse).ok()?;
+    let mut file =
+        crate::io_bounded::open_regular(&path, crate::io_bounded::FinalLink::Refuse).ok()?;
     let opened = file.metadata().ok()?;
     if !same_file(&seen, &opened) {
         return None;
     }
     let mut bytes = Vec::new();
-    file.take(cap.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .ok()?;
-    within_cap(&bytes, cap).then_some(bytes)
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// Whether two metadata records name the same file.
@@ -2445,54 +2424,6 @@ mod tests {
             "a traversing file name writes nothing"
         );
         assert!(!root.exists(), "a refused write creates nothing");
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    /// A cache entry one byte past the cap is a miss; one at the cap is read whole.
-    #[test]
-    fn a_cache_entry_past_the_cap_is_a_miss() {
-        let base = std::env::temp_dir().join(format!("ipe_cache_cap_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("e1")).unwrap();
-        fs::write(base.join("e1").join("at.json"), [b'x'; 8]).unwrap();
-        fs::write(base.join("e1").join("over.json"), [b'x'; 9]).unwrap();
-        #[cfg(unix)] // a cache hit needs a file identity check
-        assert_eq!(
-            read_without_links(&base, &["e1", "at.json"], 8),
-            Some(vec![b'x'; 8]),
-            "an entry at the cap is read whole"
-        );
-        assert_eq!(
-            read_without_links(&base, &["e1", "over.json"], 8),
-            None,
-            "an entry past the cap is a miss"
-        );
-        let _ = fs::remove_dir_all(&base);
-    }
-
-    /// The write-side check agrees with the read cap at the boundary.
-    #[test]
-    fn only_an_entry_within_the_cap_fits() {
-        assert!(within_cap(&[0; 8], 8), "at the cap fits");
-        assert!(!within_cap(&[0; 9], 8), "one past the cap does not");
-        assert!(within_cap(&[], 0), "an empty entry fits a zero cap");
-    }
-
-    /// A planted entry past the build-cache cap is never loaded through the site.
-    #[test]
-    fn a_planted_oversized_entry_is_never_loaded() {
-        let base = std::env::temp_dir().join(format!("ipe_cache_oversized_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("e1")).unwrap();
-        let file = fs::File::create(base.join("e1").join("big.json")).unwrap();
-        file.set_len(crate::io_bounded::BUILD_CACHE_ENTRY_CAP + 1)
-            .unwrap();
-        drop(file);
-        assert_eq!(
-            explicit_site(&base).read("e1", "big.json"),
-            None,
-            "a sparse entry past the cap is a miss"
-        );
         let _ = fs::remove_dir_all(&base);
     }
 }

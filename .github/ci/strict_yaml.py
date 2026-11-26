@@ -26,9 +26,9 @@ also run it, not rely on this loader alone.
 
 from __future__ import annotations
 
-import yaml
+import re
 
-import gha_expr
+import yaml
 
 # GitHub Actions expression functions that assemble a string at run time
 # rather than naming one literally: `format`/`join`/`toJSON` build text out of
@@ -46,11 +46,54 @@ import gha_expr
 # scoped check is exactly the gap this closes, since the whole point of
 # assembly is to keep the sensitive name out of the literal text. Matched
 # case-insensitively: the Actions evaluator resolves function names ignoring
-# case (`FORMAT(` runs `format(`). Bodies are parsed by `gha_expr`, so a call
-# name inside a string literal is data and a body outside the grammar is
-# refused.
-_ASSEMBLY_CALLS = frozenset({"format", "join", "tojson"})
-_FROMJSON = "fromjson"
+# case (`FORMAT(` runs `format(`).
+_EXPRESSION_ASSEMBLY_RE = re.compile(r"\b(format|join|tojson)\s*\(", re.IGNORECASE)
+_FROMJSON_RE = re.compile(r"\b(fromjson)\s*\(", re.IGNORECASE)
+
+
+def _expression_bodies(text: str):
+    """Yield the body of every `${{ ... }}` expression in `text`, with the
+    contents of each single-quoted string literal blanked out.
+
+    An expression ends at the first `}}` OUTSIDE a string literal (`''` is an
+    escaped quote inside one), so a `}` or `}}` inside a literal cannot end
+    the scan early and hide a later call. An unterminated expression or
+    string literal runs to the end of `text` — fail closed: the rest is
+    scanned as expression, never skipped."""
+    i = 0
+    n = len(text)
+    while True:
+        start = text.find("${{", i)
+        if start < 0:
+            return
+        j = start + 3
+        body: list[str] = []
+        in_str = False
+        while j < n:
+            c = text[j]
+            if in_str:
+                if c == "'":
+                    if j + 1 < n and text[j + 1] == "'":
+                        j += 2
+                        continue
+                    in_str = False
+                    body.append(c)
+                else:
+                    body.append(" ")
+                j += 1
+                continue
+            if c == "'":
+                in_str = True
+                body.append(c)
+                j += 1
+                continue
+            if c == "}" and j + 1 < n and text[j + 1] == "}":
+                j += 2
+                break
+            body.append(c)
+            j += 1
+        yield "".join(body)
+        i = j
 
 
 class StrictYAMLError(yaml.YAMLError):
@@ -147,31 +190,19 @@ def safe_load(stream):
 
 
 def refuse_expression_assembly(text: str | None, loc: str) -> str | None:
-    """`None` if `text` is absent or its `${{ }}` expressions parse and hold
-    no expression-assembly call; otherwise an error message naming `loc`.
-
-    Expressions are read by `gha_expr`, so a call name inside a string
-    literal is data, and an expression outside the grammar is refused."""
+    """`None` if `text` is absent or contains no GitHub Actions
+    expression-assembly call; otherwise an error message naming `loc`."""
     if text is None:
         return None
-    parsed = gha_expr.parse_template(text)
-    if isinstance(parsed, gha_expr.Refusal):
-        return (
-            f"{loc}: a `${{{{ }}}}` expression is outside the expression grammar ({parsed.why}) "
-            "— what it assembles cannot be established; refused"
-        )
-    for e in parsed.exprs:
-        nodes = list(gha_expr.walk(e))
-        has_literal = any(isinstance(n, gha_expr.Literal) and n.is_string for n in nodes)
-        for n in nodes:
-            if not isinstance(n, gha_expr.Call):
-                continue
-            name = n.name.casefold()
-            if name in _ASSEMBLY_CALLS or (name == _FROMJSON and has_literal):
-                return (
-                    f"{loc}: expression-assembly call {n.name}(...) "
-                    "in a run:/env:/with:/shell: value — a value built from string-assembly "
-                    "functions (format/join/toJSON, fromJSON over a literal) can hide a target name "
-                    "from any literal-text scan; write the value as a literal instead"
-                )
+    for body in _expression_bodies(text):
+        m = _EXPRESSION_ASSEMBLY_RE.search(body)
+        if m is None and "'" in body:
+            m = _FROMJSON_RE.search(body)
+        if m is not None:
+            return (
+                f"{loc}: expression-assembly call {m.group(1)}(...) "
+                "in a run:/env:/with:/shell: value — a value built from string-assembly "
+                "functions (format/join/toJSON, fromJSON over a literal) can hide a target name "
+                "from any literal-text scan; write the value as a literal instead"
+            )
     return None

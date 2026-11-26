@@ -41,7 +41,6 @@ use ipe_canon::ast as canon;
 use ipe_diagnostics::{DResult, Diagnostic, SortedNames, Span, TypeError};
 use ipe_intern::{Interner, Symbol};
 
-use crate::homed::{HomedDiagnostic, HomedWarning};
 use crate::ty::Ty;
 
 /// Solved scrutinee types, keyed the way [`crate::SolvedTypes::regions`] is:
@@ -575,56 +574,33 @@ fn check_param_irrefutable(pat: &canon::Pattern) -> DResult<()> {
 /// full constructor signature instead of being skipped as unknown.
 ///
 /// Redundant-branch findings ([`TypeError::RedundantCaseBranch`], IPE-T0011)
-/// are pushed onto `warnings`, each paired with its owning definition's home,
-/// instead of being returned as errors — they are severity-Warning and must not
-/// abort compilation. A finding [`HomedWarning::new`] refuses (any non-Warning
-/// severity) becomes the returned error instead.
-///
-/// Every returned error carries the `home` of the definition that owns it. In a
-/// linked program spans are byte offsets local to their own source file, so a
-/// span alone cannot name its file: two modules overlap freely, and a finding
-/// in one would otherwise be framed against whichever module's definition
-/// happens to enclose the same offsets.
+/// are pushed onto `warnings` instead of being returned as errors — they are
+/// severity-Warning and must not abort compilation.
 ///
 /// # Errors
 /// * [`TypeError::RefutablePatternParameter`] when a param / binder is refutable.
 /// * [`TypeError::NonExhaustiveCase`] when the arms miss a value.
-/// * [`TypeError::WildcardCoversKnownConstructors`] (the first one, in
-///   definition order) when a catch-all arm hides constructors of a closed union.
-/// * [`Diagnostic::CompilerBug`] if a constructor symbol cannot be resolved
-///   (homeless: it belongs to no single definition).
+/// * [`Diagnostic::CompilerBug`] if a constructor symbol cannot be resolved.
 pub fn check(
     module: &canon::Module,
     extra_unions: &[&canon::Union],
     regions: &Regions,
     interner: &mut Interner,
-    warnings: &mut Vec<HomedWarning>,
-) -> Result<(), HomedDiagnostic> {
-    let sigs = Sigs::build(module, extra_unions, interner).map_err(|d| (d, Vec::new()))?;
-    let mut first_error: Option<HomedDiagnostic> = None;
+    warnings: &mut Vec<Diagnostic>,
+) -> DResult<()> {
+    let sigs = Sigs::build(module, extra_unions, interner)?;
     for def in &module.defs {
-        let home = def.home();
         let (patterns, body) = match def {
             canon::Def::Untyped { patterns, body, .. }
             | canon::Def::Typed { patterns, body, .. } => (patterns, body),
         };
         // Every function-def head parameter is a binding position.
         for p in patterns {
-            check_param_irrefutable(p).map_err(|d| (d, home.to_vec()))?;
+            check_param_irrefutable(p)?;
         }
-        let mut findings: Vec<Diagnostic> = Vec::new();
-        check_expr(body, home, &sigs, regions, interner, &mut findings)
-            .map_err(|d| (d, home.to_vec()))?;
-        for finding in findings {
-            match HomedWarning::new(finding, home) {
-                Ok(warning) => warnings.push(warning),
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
+        check_expr(body, def.home(), &sigs, regions, interner, warnings)?;
     }
-    first_error.map_or(Ok(()), Err)
+    Ok(())
 }
 
 /// The read-only context threaded through the recursive `case` walk: the
@@ -760,8 +736,7 @@ fn check_expr_ctx(e: &canon::Expr, ctx: &Ctx<'_>, warnings: &mut Vec<Diagnostic>
 ///
 /// Redundant-branch findings are pushed onto `warnings` (IPE-T0011 is a
 /// Warning-severity diagnostic that must not abort compilation).
-/// Wildcard-lint findings (IPE-T0018) share that sink; [`check`] promotes the
-/// first Error-severity one to its home-attributed `Err`.
+/// Wildcard-lint findings are also warnings (IPE-T0018).
 fn check_case(
     scrut: &canon::Expr,
     branches: &[canon::CaseBranch],
@@ -937,29 +912,13 @@ fn check_case(
 /// closed union, so it fails OPEN here, deferring to the ordinary exhaustiveness
 /// check rather than firing a false T0018). The caller reads the union's
 /// constructor list from [`Sigs::union_ctors`] under the returned key.
-///
-/// The head is matched by [`crate::unify::con_heads_compatible`], the one
-/// head-identity rule the solver unifies by: a builtin re-exported under a
-/// stdlib home (`Ipe.Result exposing (Result(..))` solves to
-/// `Con { module: [Ipe, Result], name: Result }`) is the empty-home builtin
-/// union, so its catch-all is judged against the builtin's constructors.
 fn scrutinee_union<'a>(scrut: &canon::Expr, ctx: &'a Ctx<'_>) -> Option<&'a TyId> {
     let ty = ctx.regions.get(&(ctx.home.to_vec(), scrut.span))?;
     let Ty::Con { module, name, .. } = ty else {
         return None;
     };
     let key = (module.clone(), *name);
-    if let Some((k, _)) = ctx.sigs.union_ctors.get_key_value(&key) {
-        return Some(k);
-    }
-    if !crate::unify::con_heads_compatible(module, *name, &[], *name, ctx.interner) {
-        return None;
-    }
-    let builtin_key = (Vec::new(), *name);
-    ctx.sigs
-        .union_ctors
-        .get_key_value(&builtin_key)
-        .map(|(k, _)| k)
+    ctx.sigs.union_ctors.get_key_value(&key).map(|(k, _)| k)
 }
 
 /// Accumulate the constructor names a pattern refers to at the TOP column —
@@ -1473,84 +1432,5 @@ mod tests {
         let mut budget = ExhaustBudget::from_env();
         let rows = expand_upats(&pat, &mut budget).expect("small pattern fits any default budget");
         assert_eq!(rows.len(), 2, "True | False expands to two rows");
-    }
-
-    /// The union a scrutinee of solved type `module.name` is judged against, if
-    /// any, spelled as `(home segments, name)` so calls with separate interners
-    /// compare.
-    #[allow(clippy::expect_used)] // interning short literals cannot exhaust the interner
-    fn union_of_scrutinee(module: &[&str], name: &str) -> Option<(Vec<String>, String)> {
-        let mut interner = Interner::new();
-        let main = vec![interner.intern("Main").expect("intern Main")];
-        let module: Vec<Symbol> = module
-            .iter()
-            .map(|seg| interner.intern(seg).expect("intern a home segment"))
-            .collect();
-        let name = interner.intern(name).expect("intern the type name");
-        let entry = canon::Module {
-            name: main.clone(),
-            unions: Vec::new(),
-            defs: Vec::new(),
-            imports_unsafe_submodule: false,
-            imported_web_capabilities: BTreeSet::new(),
-        };
-        let sigs = Sigs::build(&entry, &[], &mut interner).expect("builtin signatures build");
-        let scrut: canon::Expr = Located::new(Span::DUMMY, canon::Expr_::Unit);
-        let mut regions = Regions::new();
-        regions.insert(
-            (main.clone(), scrut.span),
-            Ty::Con {
-                module,
-                name,
-                args: Vec::new(),
-            },
-        );
-        let ctx = Ctx {
-            sigs: &sigs,
-            home: &main,
-            regions: &regions,
-            interner: &interner,
-        };
-        let spell = |sym: Symbol| {
-            interner
-                .resolve(sym)
-                .expect("a union symbol resolves in its interner")
-                .to_owned()
-        };
-        scrutinee_union(&scrut, &ctx)
-            .map(|(home, name)| (home.iter().copied().map(spell).collect(), spell(*name)))
-    }
-
-    /// A builtin re-exported under its stdlib home is judged as the builtin union.
-    ///
-    /// `import Ipe.Result exposing (Result(..))` solves a `Result` scrutinee to
-    /// the `Ipe.Result` home; the solver unifies that head with the empty-home
-    /// builtin, so the catch-all check must see the same union or it fails open.
-    #[test]
-    fn a_stdlib_spelled_builtin_scrutinee_is_the_builtin_union() {
-        let stdlib = union_of_scrutinee(&["Ipe", "Result"], "Result");
-        let ambient = union_of_scrutinee(&[], "Result");
-        assert!(
-            stdlib.as_ref().is_some_and(|(home, _)| home.is_empty()),
-            "an `Ipe.Result`-homed `Result` must key the builtin union, got {stdlib:?}"
-        );
-        assert_eq!(stdlib, ambient, "both spellings name one union");
-    }
-
-    /// A user-homed head sharing a builtin union's name keys no builtin union.
-    ///
-    /// `Order` is a builtin union a user module may also declare; the solver
-    /// keeps `Lib.Order` apart from it, so the catch-all check must too.
-    #[test]
-    fn a_user_homed_builtin_named_scrutinee_is_not_the_builtin_union() {
-        assert!(
-            union_of_scrutinee(&[], "Order").is_some(),
-            "the ambient `Order` is a builtin union"
-        );
-        assert_eq!(
-            union_of_scrutinee(&["Lib"], "Order"),
-            None,
-            "a user `Lib.Order` is never mistaken for the builtin"
-        );
     }
 }

@@ -41,12 +41,6 @@ pub const SOURCE_READ_CAP: u64 = 8 * 1024 * 1024;
 /// device node or accidentally-swapped large binary.
 pub const FFI_CACHE_READ_CAP: u64 = 4 * 1024 * 1024;
 
-/// Maximum bytes for one build-cache entry (an emitted project or lowered IR, as JSON).
-///
-/// 64 MiB holds the emitted Rust of a large program; an entry past it is never
-/// stored, and a planted one past it is a cache miss, never buffered whole.
-pub const BUILD_CACHE_ENTRY_CAP: u64 = 64 * 1024 * 1024;
-
 /// Maximum bytes for a recorded session trace (`session.ipelog`) shown by
 /// `ipe run --replay`.
 ///
@@ -73,8 +67,6 @@ pub enum SourceRefusal {
     NotRegularFile,
     /// The process may not open the path, or search a directory leading to it.
     AccessDenied,
-    /// The path, or a directory leading to it, is a symlink the no-follow walk refuses.
-    Symlink,
 }
 
 /// Whether [`open_regular`] follows a symlink in the path's final component.

@@ -5434,7 +5434,6 @@ name = "regen-cli-transcripts"
 version = "0.3.3"
 dependencies = [
  "ipe",
- "serde_json",
 ]
 
 [[package]]

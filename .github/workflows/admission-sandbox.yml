@@ -67,11 +67,10 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       release_only: ${{ steps.release.outputs.release_only }}
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
         with:
-          # The tested merge commit and its base parent, for the release-only diff;
-          # a merge-group run needs history back to the queue base for the filter.
-          fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '2' }}
+          # The tested merge commit and its base parent, for the release-only diff.
+          fetch-depth: 2
       # `release_only` — true only for a same-repo PR whose changed files are all
       # release-please version metadata (see .github/ci/release_only.py). Keyed on
       # the diff, never the branch name, so no PR can opt itself out of a tier.
@@ -85,11 +84,9 @@ jobs:
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
         run: python3 .github/ci/release_only.py
-      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
-          # A merge-group run diffs against the queue base, not the default branch.
-          base: ${{ github.event.merge_group.base_sha }}
           filters: |
             code:
               - 'src/**'
@@ -125,48 +122,37 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     needs: [changes]
-    # A release-only PR (`changes.release_only`: a same-repo PR whose diff is
-    # version metadata only) cannot change the OS-sandbox behaviour, and the same
-    # tree's proof already ran on the code PRs it contains. This job is a required
-    # context, so it is handled INSIDE the job via per-step `if:` (a leading
-    # trivial-pass step), never by skipping the job — a skipped job reports a pass
-    # without executing anything (verify-manifest check 8).
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
+      (
       needs.changes.outputs.code == 'true'
-      || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
-      || (github.event_name == 'pull_request' && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
-      || needs.changes.outputs.release_only == 'true'
+      || github.event_name != 'pull_request'
+      || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      )
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
-      - name: Release-please version/changelog-only diff — trivial pass
-        if: needs.changes.outputs.release_only == 'true'
-        run: |
-          echo "linux-x64: release-please-only diff (version metadata, no sandbox-relevant source changed); trivial pass, not a skip."
-
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        if: needs.changes.outputs.release_only != 'true'
+      - uses: actions/checkout@v5
 
       - name: Install bubblewrap and python3
-        if: needs.changes.outputs.release_only != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap python3
 
       - name: Make scripts executable
-        if: needs.changes.outputs.release_only != 'true'
         run: chmod +x tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
 
       # Positive control: OUTSIDE the jail, as the same root principal, net +
       # fs-escape must SUCCEED — so a block in the enforce run below can only be
       # the jail, not an unreachable host or an already-unwritable path.
       - name: Positive control (no jail — forbidden actions must succeed)
-        if: needs.changes.outputs.release_only != 'true'
         env:
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
         run: sudo -E env PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
 
       - name: Run admission jail
-        if: needs.changes.outputs.release_only != 'true'
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
@@ -181,46 +167,35 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
     needs: [changes]
-    # A release-only PR (`changes.release_only`: a same-repo PR whose diff is
-    # version metadata only) cannot change the OS-sandbox behaviour, and the same
-    # tree's proof already ran on the code PRs it contains. This job is a required
-    # context, so it is handled INSIDE the job via per-step `if:` (a leading
-    # trivial-pass step), never by skipping the job — a skipped job reports a pass
-    # without executing anything (verify-manifest check 8).
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
+      (
       needs.changes.outputs.code == 'true'
-      || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
-      || (github.event_name == 'pull_request' && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
-      || needs.changes.outputs.release_only == 'true'
+      || github.event_name != 'pull_request'
+      || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      )
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
-      - name: Release-please version/changelog-only diff — trivial pass
-        if: needs.changes.outputs.release_only == 'true'
-        run: |
-          echo "linux-arm64: release-please-only diff (version metadata, no sandbox-relevant source changed); trivial pass, not a skip."
-
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        if: needs.changes.outputs.release_only != 'true'
+      - uses: actions/checkout@v5
 
       - name: Install bubblewrap and python3
-        if: needs.changes.outputs.release_only != 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap python3
 
       - name: Make scripts executable
-        if: needs.changes.outputs.release_only != 'true'
         run: chmod +x tools/scripts/admission/jail-linux.sh tests/fixtures/admission/untrusted-build.sh
 
       # Positive control: OUTSIDE the jail, as the same root principal (see linux-x64).
       - name: Positive control (no jail — forbidden actions must succeed)
-        if: needs.changes.outputs.release_only != 'true'
         env:
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
         run: sudo -E env PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
 
       - name: Run admission jail
-        if: needs.changes.outputs.release_only != 'true'
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
@@ -236,42 +211,32 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 15
     needs: [changes]
-    # A release-only PR (`changes.release_only`: a same-repo PR whose diff is
-    # version metadata only) cannot change the OS-sandbox behaviour, and the same
-    # tree's proof already ran on the code PRs it contains. This job is a required
-    # context, so it is handled INSIDE the job via per-step `if:` (a leading
-    # trivial-pass step), never by skipping the job — a skipped job reports a pass
-    # without executing anything (verify-manifest check 8).
+    # Skip on a release-only PR (`changes.release_only`: a same-repo PR whose diff is
+    # version metadata only): the OS-sandbox behaviour cannot change from a version
+    # bump, and the same tree's proof already ran on the code PRs it contains.
     if: >-
+      (
       needs.changes.outputs.code == 'true'
-      || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
-      || (github.event_name == 'pull_request' && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
-      || needs.changes.outputs.release_only == 'true'
+      || github.event_name != 'pull_request'
+      || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+      )
+      && needs.changes.outputs.release_only != 'true'
 
     steps:
-      - name: Release-please version/changelog-only diff — trivial pass
-        if: needs.changes.outputs.release_only == 'true'
-        run: |
-          echo "macos-arm64: release-please-only diff (version metadata, no sandbox-relevant source changed); trivial pass, not a skip."
-
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-        if: needs.changes.outputs.release_only != 'true'
+      - uses: actions/checkout@v5
 
       - name: Make scripts executable
-        if: needs.changes.outputs.release_only != 'true'
         run: chmod +x tools/scripts/admission/jail-macos.sh tests/fixtures/admission/untrusted-build.sh
 
       # Positive control: OUTSIDE the jail, as the same user principal, net +
       # fs-escape must SUCCEED (the workspace path is outside the SBPL allow-list
       # jailed, but user-writable unjailed).
       - name: Positive control (no jail — forbidden actions must succeed)
-        if: needs.changes.outputs.release_only != 'true'
         env:
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
         run: PROBE_MODE=control ESCAPE_PATH="$ESCAPE_PATH" sh tests/fixtures/admission/untrusted-build.sh
 
       - name: Run admission jail
-        if: needs.changes.outputs.release_only != 'true'
         env:
           ADMISSION_TIMEOUT_SECS: '60'
           ESCAPE_PATH: ${{ github.workspace }}/admission-escape-probe
@@ -299,13 +264,13 @@ jobs:
     if: >-
       (
       needs.changes.outputs.code == 'true'
-      || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
-      || (github.event_name == 'pull_request' && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+      || github.event_name != 'pull_request'
+      || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
       && needs.changes.outputs.release_only != 'true'
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       # GHA windows-2022 runners run Moby Engine (not Docker Desktop) and do NOT
       # provide a Windows-container-mode Docker daemon, so the process-isolation
@@ -404,16 +369,16 @@ jobs:
     if: >-
       (
       needs.changes.outputs.code == 'true'
-      || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
-      || (github.event_name == 'pull_request' && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association))
+      || github.event_name != 'pull_request'
+      || !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
       && needs.changes.outputs.release_only != 'true'
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/checkout@v5
 
       - name: Run admission jail inside FreeBSD VM
-        uses: vmactions/freebsd-vm@d0518f912576ae759075aa00fb9fe27037940271 # v1.5.4
+        uses: vmactions/freebsd-vm@v1.5.4
         with:
           usesh: true
           # synctime=false skips the NTP sync that can stall the VM boot on

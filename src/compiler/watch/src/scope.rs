@@ -322,25 +322,19 @@ impl WatchScope {
     ///
     /// `module_files` are the sibling paths the entry's import closure
     /// probes, relative to the entry's directory (`A/B.ipe` for module
-    /// `A.B`), whether or not they exist yet. `loaded_files` are the ones
-    /// the build loaded: with the entry they are [`Self::file_count`], so the
-    /// count is the build's read set, never a separate look at the disk. No directory is walked or
+    /// `A.B`), whether or not they exist yet. No directory is walked or
     /// listed: the entry's directory and each real (non-symlink) directory
     /// leading to a module file are watched non-recursively, and only the
     /// entry, the module files, those directories and a `package.ipe` beside
-    /// the entry are relevant. A path in `module_files` or `loaded_files`
-    /// that is absolute or holds a `..` or root component is ignored.
+    /// the entry are relevant. A path in `module_files` that is absolute or
+    /// holds a `..` or root component is ignored.
     ///
     /// # Errors
     /// [`ScopeError::RootNotFound`] when the entry's directory does not
     /// canonicalise or the entry has no file name;
-    /// [`ScopeError::TooManyFiles`] when the relevant paths or the loaded
-    /// files exceed [`MAX_WATCHED_FILES`].
-    pub fn loose_file(
-        entry: &Path,
-        module_files: &[PathBuf],
-        loaded_files: &[PathBuf],
-    ) -> Result<Self, ScopeError> {
+    /// [`ScopeError::TooManyFiles`] when the relevant paths exceed
+    /// [`MAX_WATCHED_FILES`].
+    pub fn loose_file(entry: &Path, module_files: &[PathBuf]) -> Result<Self, ScopeError> {
         let entry_dir = entry
             .parent()
             .filter(|dir| !dir.as_os_str().is_empty())
@@ -383,22 +377,12 @@ impl WatchScope {
             }
         }
 
-        let read_set: BTreeSet<PathBuf> = std::iter::once(canon_root.join(entry_name))
-            .chain(loaded_files.iter().filter_map(|loaded| {
-                normal_components(loaded).map(|components| {
-                    components
-                        .iter()
-                        .fold(canon_root.clone(), |path, component| path.join(component))
-                })
-            }))
-            .collect();
-        let file_count = read_set.len();
-        if file_count > MAX_WATCHED_FILES {
-            return Err(ScopeError::TooManyFiles {
-                found: file_count,
-                max: MAX_WATCHED_FILES,
-            });
-        }
+        let file_count = relevant
+            .iter()
+            .filter(|path| is_source_file(path) && !is_manifest_file(path))
+            .filter(|path| path.parent().is_some_and(|dir| watched_dirs.contains(dir)))
+            .filter(|path| std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()))
+            .count();
         Ok(Self {
             root: canon_root,
             roots_to_watch,
@@ -954,7 +938,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
         let module_files = [PathBuf::from("Lib/Util.ipe"), PathBuf::from("Ipe/Io.ipe")];
-        let scope = WatchScope::loose_file(&entry, &module_files, &[PathBuf::from("Lib/Util.ipe")]);
+        let scope = WatchScope::loose_file(&entry, &module_files);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
         assert!(
@@ -1002,7 +986,7 @@ mod tests {
         fs::write(&entry, "module Main exposing (main)\nmain = 1\n").unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("Lib")).unwrap();
 
-        let scope = WatchScope::loose_file(&entry, &[PathBuf::from("Lib/Util.ipe")], &[]).unwrap();
+        let scope = WatchScope::loose_file(&entry, &[PathBuf::from("Lib/Util.ipe")]).unwrap();
         let canon_dir = fs::canonicalize(&dir).unwrap();
         let watched: Vec<&Path> = scope
             .roots_to_watch()
@@ -1020,52 +1004,10 @@ mod tests {
         let entry = dir.join("Main.ipe");
         fs::write(&entry, "module Main exposing (main)\nmain = 1\n").unwrap();
         let module_files = [PathBuf::from("../Escape.ipe"), PathBuf::from("/etc/passwd")];
-        let scope = WatchScope::loose_file(&entry, &module_files, &module_files).unwrap();
+        let scope = WatchScope::loose_file(&entry, &module_files).unwrap();
         assert_eq!(scope.roots_to_watch().len(), 1);
-        assert_eq!(
-            scope.file_count(),
-            1,
-            "an escaping loaded path is not counted"
-        );
         assert!(!scope.is_relevant(Path::new("/etc/passwd")));
         assert!(!scope.is_relevant(&dir.join("..").join("Escape.ipe")));
-    }
-
-    /// A probed module on disk that the build did not load is not counted.
-    #[test]
-    fn loose_file_count_is_the_loaded_set_not_the_disk() {
-        let dir = tmp_dir("loose_count");
-        let entry = dir.join("Main.ipe");
-        fs::write(&entry, "module Main exposing (main)\nmain = 1\n").unwrap();
-        fs::write(dir.join("Seen.ipe"), "module Seen exposing (x)\nx = 1\n").unwrap();
-        fs::write(
-            dir.join("Unread.ipe"),
-            "module Unread exposing (x)\nx = 1\n",
-        )
-        .unwrap();
-        let probed = [PathBuf::from("Seen.ipe"), PathBuf::from("Unread.ipe")];
-        let scope = WatchScope::loose_file(&entry, &probed, &[PathBuf::from("Seen.ipe")]).unwrap();
-        assert_eq!(scope.file_count(), 2, "the entry and Seen.ipe only");
-        assert!(scope.is_relevant(&dir.join("Unread.ipe")), "still watched");
-    }
-
-    /// More loaded files than [`MAX_WATCHED_FILES`] refuse the loose-file scope.
-    #[test]
-    fn loose_file_refuses_too_many_loaded_files() {
-        let dir = tmp_dir("loose_too_many");
-        let entry = dir.join("Main.ipe");
-        let loaded: Vec<PathBuf> = (0..MAX_WATCHED_FILES)
-            .map(|i| PathBuf::from(format!("M{i}.ipe")))
-            .collect();
-        let refused = WatchScope::loose_file(&entry, &[], &loaded);
-        assert!(matches!(
-            refused,
-            Err(ScopeError::TooManyFiles { found, max: MAX_WATCHED_FILES })
-                if found == MAX_WATCHED_FILES + 1
-        ));
-        let (_, at_bound) = loaded.split_first().unwrap();
-        let at_bound = WatchScope::loose_file(&entry, &[], at_bound);
-        assert!(at_bound.is_ok_and(|scope| scope.file_count() == MAX_WATCHED_FILES));
     }
 
     #[test]

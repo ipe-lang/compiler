@@ -14,7 +14,6 @@ on:
       - 'src/stdlib/Ipe/**/*.ipe'
       - '.github/workflows/tree-sitter-ipe.yml'
   pull_request:
-  merge_group:
   workflow_dispatch: {}
 
 permissions:
@@ -24,16 +23,11 @@ jobs:
   grammar:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # A merge-group run needs history back to the queue base for the filter.
-          fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '1' }}
+      - uses: actions/checkout@v7
 
-      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
-          # A merge-group run diffs against the queue base, not the default branch.
-          base: ${{ github.event.merge_group.base_sha }}
           filters: |
             relevant:
               - 'editors/tree-sitter-ipe/**'
@@ -46,7 +40,7 @@ jobs:
 
       - name: Cache the tree-sitter CLI
         if: steps.filter.outputs.relevant == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/tree-sitter
           key: tree-sitter-cli-0.27.0

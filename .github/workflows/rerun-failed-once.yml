@@ -36,26 +36,18 @@ jobs:
     # retry it removes could never have turned the run green.
     if: >-
       github.event.workflow_run.conclusion == 'failure' &&
-      github.event.workflow_run.run_attempt == 1 &&
-      github.event.workflow_run.event != 'merge_group'
+      github.event.workflow_run.run_attempt == 1
     steps:
       # No `ref:` override — this checks out the default branch (the ref that
       # triggered THIS workflow_run event), never the completed run's own
       # head. A fork PR's head content must never gate a decision made by a
-      # workflow holding write access. Only the SSOT file and the tool that
-      # publishes it are materialised, and no credential is left in the git
-      # config.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # workflow holding write access. Only the SSOT file is materialised and
+      # no credential is left in the git config.
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
-          sparse-checkout: |
-            .github/ci/deterministic-checks.json
-            .github/ci/deterministic_checks_output.py
+          sparse-checkout: .github/ci/deterministic-checks.json
           sparse-checkout-cone-mode: false
-
-      - name: Publish the deterministic check pairs
-        id: ssot
-        run: python3 .github/ci/deterministic_checks_output.py
 
       - name: Skip the rerun when every failed job is red at its check step
         id: gate
@@ -63,7 +55,7 @@ jobs:
           GH_TOKEN: ${{ secrets.PROMOTE_TOKEN || secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
-          CHECKS: ${{ steps.ssot.outputs.checks }}
+          SSOT: .github/ci/deterministic-checks.json
         run: |
           set -uo pipefail
 
@@ -84,9 +76,9 @@ jobs:
           # Data-only exact match against the SSOT pairs. `all_matched` is
           # exactly `true` only when at least one job failed and each failed
           # job failed at its own check step; a jq error keeps the rerun.
-          all_matched="$(printf '%s\n' "$failed" | jq -rs --argjson ssot "$CHECKS" '
+          all_matched="$(printf '%s\n' "$failed" | jq -rs --slurpfile ssot "$SSOT" '
             [ .[] | . as $job
-              | any($ssot[]; .context == $job.name and (.step as $s | any($job.steps[]; . == $s)))
+              | any($ssot[0].checks[]; .context == $job.name and (.step as $s | any($job.steps[]; . == $s)))
             ] | length > 0 and all')" || all_matched=error
 
           if [ "$all_matched" = "true" ]; then

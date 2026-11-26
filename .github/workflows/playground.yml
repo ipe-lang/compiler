@@ -45,15 +45,10 @@ jobs:
     outputs:
       playground: ${{ steps.filter.outputs.playground }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          # A merge-group run needs history back to the queue base for the filter.
-          fetch-depth: ${{ github.event_name == 'merge_group' && '0' || '1' }}
-      - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v3
         id: filter
         with:
-          # A merge-group run diffs against the queue base, not the default branch.
-          base: ${{ github.event.merge_group.base_sha }}
           filters: |
             playground:
               - 'examples/wasm/language-playground/**'
@@ -67,15 +62,15 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.playground == 'true' || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
+    if: needs.changes.outputs.playground == 'true' || github.event_name != 'pull_request'
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-toolchain-pinned
         with:
           targets: wasm32-unknown-unknown
       - uses: ./.github/actions/sccache
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - uses: Swatinem/rust-cache@v2
 
       - name: Build ipe-wasm (wasm32-unknown-unknown)
         run: cargo build -p ipe-wasm --target wasm32-unknown-unknown --release
@@ -88,16 +83,16 @@ jobs:
   playground-jail:
     runs-on: ubuntu-latest
     needs: changes
-    if: needs.changes.outputs.playground == 'true' || (github.event_name != 'pull_request' && github.event_name != 'merge_group')
+    if: needs.changes.outputs.playground == 'true' || github.event_name != 'pull_request'
     timeout-minutes: 20
     env:
       IPE_RUNTIME_DIR: ${{ github.workspace }}/src/runtime/rust/src
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/rust-toolchain-pinned
       - uses: ./.github/actions/sccache
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - uses: taiki-e/install-action@23d41aa71228a2692ee31bb433f070fd4bdc6661 # nextest
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
 
       - name: Install bubblewrap
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends bubblewrap

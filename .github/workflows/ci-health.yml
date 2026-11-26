@@ -25,9 +25,6 @@ on:
       - "Static binaries"       # static.yml
       - "Install"               # install-smoke.yml
     types: [completed]
-    # A red merge-group run already ejects its PR from the queue; it is not a
-    # main-branch health signal. The queue's runs are on its temporary branches.
-    branches-ignore: ["gh-readonly-queue/**"]
   workflow_dispatch: {}
 
 permissions:
@@ -44,14 +41,14 @@ jobs:
     name: ci-health-surface
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: "3.x"
 
       - name: Install PyYAML
-        run: 'PIP_CONFIG_FILE=/dev/null python3 -m pip install --isolated --require-hashes --only-binary :all: -r "$GITHUB_WORKSPACE/.github/ci/requirements.txt"'
+        run: python3 -m pip install --quiet pyyaml
 
       - name: Surface advisory reds (dedup issue + summary)
         env:

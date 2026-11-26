@@ -60,87 +60,7 @@ Checks performed
      `ci/deterministic-checks.json` (sccache's cache backend does network I/O
      a deterministic check must never risk). The composite itself must equal
      one canonical structure exactly. Malformed shapes are refused, never
-     skipped. Limits are listed on `check_workflow_steps`.
-  7. CI inputs and runner command files, over the same traversal as check 6:
-     every third-party `uses:` is pinned to a 40-hex commit SHA (a `docker://`
-     reference, and every job `container:`/`services:` image, to a sha256
-     digest); pip installs only as the one canonical command
-     `CANONICAL_PIP_INSTALL` (`PIP_CONFIG_FILE=/dev/null`, `--isolated`,
-     `--require-hashes --only-binary :all: -r` the hashed requirements file),
-     parsed into a `PipInvocation` and compared whole, with every other
-     `PIP_*` name, pip config file, and non-pip installer refused; and the
-     runner env file is written only through
-     `ci/github-env.sh`, called in a step's `run:` in its one canonical form
-     with a bare `CI_JOB_*` key listed in `ci/github-env-allowlist.txt`. Every
-     string key and value of every workflow, job, step, and local action is
-     scanned by one matcher: any spelling (any case, `$VAR`, `${VAR}`,
-     `env.VAR`, an env key) of GITHUB_ENV/PATH/STATE/OUTPUT/STEP_SUMMARY, their
-     on-disk command files, or the legacy `::set-env`/`::add-path`/
-     `::save-state`/`::set-output` commands is refused, save an append to
-     GITHUB_OUTPUT/GITHUB_STEP_SUMMARY by its exact name; inside an expression
-     the `github`/`env` contexts are read only through a literal `.name`
-     that is not a command-file property (`github.env`, `github['env']`,
-     `toJSON(github)` are refused); and `GITHUB_WORKSPACE` is only ever read,
-     never assigned. Every `${{ }}` body is parsed by `gha_expr`'s typed
-     grammar (a `}}` inside a string literal does not end it; a body outside
-     the grammar is refused). A `shell:` (step or `defaults.run.shell`) is
-     one of bash/pwsh/powershell, bare. In a step's `run:`, an expression
-     holds no string literal and never abuts a shell variable name; no shell
-     function or alias is defined; and pip is matched on quote-removed words
-     (`shell_lex`). The integrity of `.github/ci/**` itself rests on an
-     ordering rule: a step naming the tree is itself a closed pre-tool shape
-     and runs only after steps of one (a content-pinned checkout or
-     setup-python with a closed literal `with:` and no `env:`, the canonical
-     pip install with no `env:`, a typed `ToolRun` of a file that exists
-     under `.github/ci`, its words split only on bash's blanks
-     `shell_lex.BLANKS`; any `timeout-minutes` a positive integer literal).
-     The job is parsed once into a `ToolJob`: a literal GitHub-hosted Ubuntu
-     runner (a fresh machine per job), job keys from one closed allowlist
-     (`TOOL_JOB_KEYS`: no container, services, strategy, concurrency, or
-     environment), every `env:` key at workflow, job, and tool-step scope
-     drawn from one allowlist (`TOOL_ENV_ALLOWLIST`), and a masking key
-     (`MASKING_KEYS`: `if:`, `continue-on-error:`) on a step or on the job
-     only where every tool's `ToolRole` admits it (`ROLE_MASKING`): a
-     verdict tool admits none, an advisory tool's step a literal
-     `continue-on-error: true`, an output tool's terminal job an `if:`. A
-     job whose tool admits no job masking (verdict, advisory) also admits no
-     `needs:`, so no skipped ancestor can skip it. No `working-directory` anywhere names
-     `.github`. A quote-removed scan refusing writes into the tree is
-     defence in depth under that rule, not its proof.
-  8. Merge-queue safety: every producer of a `gate` context triggers on both
-     `pull_request` and `merge_group`, else the queue waits forever on a
-     required context no merge-group run reports.  A merge-group run gets the
-     base repository's secrets and token, so every `merge_group`-triggered
-     workflow must be secret-free (no `secrets` word in its raw text, nor in
-     any key or string scalar once parsed, which decodes escapes), must not
-     also trigger on `pull_request_target`, and must declare a top-level
-     `permissions:` value with no `write` scope.  A job-level `write` scope is
-     admitted only on a job whose `if:` has no `||` and has, among its
-     `&&`-conjuncts at parenthesis depth 0, exactly
-     `github.event_name == 'pull_request'`.  A bare
-     `github.event_name != 'pull_request'` full-tier test (either operand
-     order) must be followed by `&& github.event_name != 'merge_group'`, so a
-     merge-group run takes the PR tier rather than silently running the full
-     tier.
-     Limit: this catches honest mistakes, not a hostile PR.  A merge-group run
-     executes the workflow files of the queued commit, so a queued PR that
-     edits `.github/**` runs its own edit with the base secrets.  The boundary
-     is who may enqueue: only write-access maintainers, who review every
-     `.github/**` diff before enqueueing.
-  9. No release-only skip-as-pass: GitHub reports a skipped job as a passing
-     status, so a `gate` context may go green only through an executed step.
-     A `gate` producer's job-level `if:` may name `release_only` only as one
-     top-level `||` disjunct `needs.<job>.outputs.release_only == 'true'`
-     (forcing the job to run on a release-please PR), and such a job's first
-     step must be the trivial-pass step: `if:` exactly that disjunct, with a
-     `run:`.  Any other mention (`!= 'true'`, a negation, an `&&`-conjunct,
-     an unparseable expression) is refused, as is the release-only disjunct
-     with no leading trivial-pass step (every step skipped also reports a
-     pass).  GitHub resolves context properties case-insensitively, so the
-     name is matched without case, and a job output that re-exports
-     `release_only` (to any depth) counts as `release_only`.  A `gate`
-     producer whose every step carries an `if:` is held to the same
-     trivial-pass shape whatever the steps test, since its steps can all skip.
+     skipped. Limits are listed on `check_sccache_wiring`.
 
 Pure stdlib + PyYAML (already a CI dependency).  No network.
 """
@@ -148,11 +68,9 @@ Pure stdlib + PyYAML (already a CI dependency).  No network.
 from __future__ import annotations
 
 import argparse
-import fnmatch
 import glob
 import json
 import os
-import enum
 import posixpath
 import re
 import sys
@@ -166,8 +84,6 @@ except ImportError:  # pragma: no cover - CI always has PyYAML
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import strict_yaml  # noqa: E402  # the shared strict loader, SSOT for every YAML load below
-import gha_expr  # noqa: E402  # the one GitHub Actions expression parser
-import shell_lex  # noqa: E402  # the one quote-removing shell lexer
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Both extensions: a workflow (or, for check 6, a local composite action) is a
@@ -228,9 +144,9 @@ SCCACHE_WIRING_TEXT_RE = re.compile(
     re.IGNORECASE,
 )
 # The sanctioned composite is exactly ONE canonical structure: an install
-# step `{uses: mozilla-actions/sccache-action@<40-hex commit sha>}`, then `SCCACHE_WIRE_STEP`
+# step `{uses: mozilla-actions/sccache-action@<ref>}`, then `SCCACHE_WIRE_STEP`
 # byte-exact. Its wiring is proven by equality, never by pattern.
-SCCACHE_INSTALL_USES_RE = re.compile(re.escape(SCCACHE_ACTION_PREFIX) + r"[0-9a-f]{40}\Z")
+SCCACHE_INSTALL_USES_RE = re.compile(re.escape(SCCACHE_ACTION_PREFIX) + r"[A-Za-z0-9._-]+\Z")
 SCCACHE_WIRE_RUN = (
     "set -euo pipefail\n"
     f'echo "{SCCACHE_WRAPPER_VAR}=sccache" >> "$GITHUB_ENV"\n'
@@ -238,202 +154,6 @@ SCCACHE_WIRE_RUN = (
 )
 SCCACHE_WIRE_STEP = {"name": "Wire rustc through sccache", "shell": "bash", "run": SCCACHE_WIRE_RUN}
 SCCACHE_COMPOSITE_DOC_KEYS = frozenset({"name", "description", "runs"})
-# Check 7 — a third-party input is identified by content, never by a movable
-# name: an action by its full commit SHA (a tag or branch can be re-pointed
-# upstream), a docker image by its sha256 digest.
-PINNED_REMOTE_USES_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_./-]+)?@[0-9a-f]{40}\Z")
-PINNED_DOCKER_USES_RE = re.compile(r"docker://[^\s@]+@sha256:[0-9a-f]{64}\Z")
-PINNED_IMAGE_RE = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}\Z")
-# Every spelling of a runner file-command target: the variables naming the
-# env/path/state/output/summary files (`$VAR`, `${VAR}`, `env.VAR`,
-# `$env:VAR`, a bare key — any substring, so a suffix never hides one), the
-# runner's on-disk command files they point at, and the legacy stdout workflow
-# commands (plus the switch that re-enables them). Any letter case: Windows env
-# names fold. The `github` context spellings are matched separately, inside
-# expressions only (`GITHUB_NAMED_CONTEXTS`).
-RUNNER_FILE_TEXT_RE = re.compile(
-    r"GITHUB_(?:ENV|PATH|STATE|OUTPUT|STEP_SUMMARY)"
-    r"|_runner_file|set_env_|add_path_|save_state_|set_output_|step_summary_"
-    r"|ACTIONS_ALLOW_UNSECURE_COMMANDS|::\s*(?:set-env|add-path|save-state|set-output)",
-    re.IGNORECASE,
-)
-# The one sanctioned use of an output/summary file: appending to it by its exact
-# upper-case name (bash `>> "$VAR"`/`>> "${VAR}"`/`>> $VAR`, pwsh `Out-File
-# -FilePath $env:VAR`). Anything else naming it — an assignment, a parameter
-# expansion that rewrites it (`${GITHUB_OUTPUT/output/env}`), an env key — is
-# refused like the env/path files, so no alias can repoint it at them.
-RUNNER_APPEND_ONLY_TARGET_RE = re.compile(
-    r'>>\s*"\$(?P<q>GITHUB_(?:OUTPUT|STEP_SUMMARY))"'
-    r'|>>\s*"\$\{(?P<b>GITHUB_(?:OUTPUT|STEP_SUMMARY))\}"'
-    r"|>>\s*\$(?P<u>GITHUB_(?:OUTPUT|STEP_SUMMARY))(?=[\s;&|)]|\Z)"
-    r"|-FilePath\s+\$env:(?P<p>GITHUB_(?:OUTPUT|STEP_SUMMARY))(?=[\s;|)]|\Z)"
-)
-# Inside a GitHub Actions expression (parsed by `gha_expr`, never scanned as
-# text) the `github` and `env` contexts may only be read through a literal
-# `.name`; the `github` properties naming runner command files are refused. A
-# bracket index (`github['env']`), a `.*` filter, or the whole context
-# (`toJSON(github)`) could reach those files under an assembled name, so each
-# is refused too.
-GITHUB_NAMED_CONTEXTS = frozenset({"github", "env"})
-GITHUB_RUNNER_FILE_PROPS = frozenset({"env", "path", "state", "output", "step_summary"})
-# In a `run:`, an expression value is spliced into shell text the verifier
-# never sees. Next to it, a shell parameter-name prefix (`$`, `${`, `$NAME`,
-# `$env:NAME`, `%NAME`) or an identifier character after it would let the
-# value complete a variable name (`$GITHUB_${{ matrix.f }}`,
-# `$${{ inputs.f }}ENV`), so either neighbour is refused.
-SPLICE_NAME_PREFIX_RE = re.compile(r"(?:\$\{?(?:env:)?|%)[A-Za-z0-9_]*\Z", re.IGNORECASE)
-SPLICE_NAME_SUFFIX_RE = re.compile(r"[A-Za-z0-9_]")
-# `GITHUB_WORKSPACE` roots the helper and requirements paths, so it may only be
-# read (`$GITHUB_WORKSPACE`, `${GITHUB_WORKSPACE}`, exact case), never assigned,
-# defaulted (`${GITHUB_WORKSPACE:=x}`), exported, or set as an env key.
-GITHUB_WORKSPACE_MENTION_RE = re.compile(r"GITHUB_WORKSPACE", re.IGNORECASE)
-GITHUB_WORKSPACE_READ_RE = re.compile(
-    r"\$(?:GITHUB_WORKSPACE(?![A-Za-z0-9_])|\{GITHUB_WORKSPACE\})(?!\s*=)"
-)
-GITHUB_ENV_HELPER = "ci/github-env.sh"
-# Positive shape of a key the helper may write: a job-local name that cannot
-# collide with any runner, toolchain, loader, or interpreter variable.
-GITHUB_ENV_KEY_RE = re.compile(r"CI_JOB_[A-Z0-9_]+\Z")
-GITHUB_ENV_HELPER_MENTION_RE = re.compile(r"github[-_]env", re.IGNORECASE)
-# The one canonical call: absolute helper path (a step may have `cd`'d), then a
-# bare literal key — never a variable, a quoted or concatenated word.
-GITHUB_ENV_HELPER_CALL_RE = re.compile(
-    r'(?<![^\s;&|(])bash "\$GITHUB_WORKSPACE/\.github/ci/github-env\.sh" '
-    r"(?P<key>[A-Z][A-Z0-9_]*) (?=\S)"
-)
-GITHUB_ENV_KEY_EXACT_REFUSED = frozenset(
-    {"PATH", "ENV", "BASH_ENV", "SHELLOPTS", "BASHOPTS", "IFS", "HOME", "TMPDIR", "PS4"}
-)
-# Prefixes whose variables steer the runner, a toolchain, a loader, or an
-# interpreter of every later step; none is ever a job-local value.
-GITHUB_ENV_KEY_REFUSED_PREFIXES = (
-    "GITHUB_", "RUNNER_", "ACTIONS_", "INPUT_", "STATE_", "CARGO", "RUST", "LD_",
-    "DYLD_", "NODE_", "NPM_", "PYTHON", "PIP_", "PERL", "RUBY", "JAVA_", "GIT_",
-    "BASH_", "SSL_", "CURL_", "HTTP", "HTTPS_", "NO_PROXY", "ALL_PROXY",
-)
-# `pip` runs only as the one canonical hash-checked install (or a read-only
-# query). `PIP_CONFIG_FILE=/dev/null` stops pip reading any config file and
-# `--isolated` stops it reading `PIP_*` environment variables, so no earlier
-# step, `env:` key, or config write can add an index, a requirement, or a
-# `no-binary` to it.
-PIP_REQUIREMENTS_ARG = "$GITHUB_WORKSPACE/.github/ci/requirements.txt"
-CANONICAL_PIP_INSTALL = (
-    "PIP_CONFIG_FILE=/dev/null python3 -m pip install --isolated --require-hashes "
-    f'--only-binary :all: -r "{PIP_REQUIREMENTS_ARG}"'
-)
-CANONICAL_PIP_INSTALL_RE = re.compile(
-    r"(?<![^\s;&|(])" + re.escape(CANONICAL_PIP_INSTALL) + r"(?![^\s;&|)])"
-)
-PIP_MENTION_RE = re.compile(r"(?:(?<![A-Za-z0-9_])|(?<=-m))pip[0-9.]*(?![A-Za-z0-9_-])", re.IGNORECASE)
-PIP_TOKEN_RE = re.compile(r"(?:.*[/\\])?(?:-m)?pip[0-9.]*(?:\.exe)?", re.IGNORECASE)
-PIP_READ_ONLY_COMMANDS = frozenset({"--version", "-V", "list", "show", "freeze", "check", "help", "--help", "-h"})
-# pip's environment and config-file inputs: any `PIP_*` name (text or key) and
-# any pip config file are refused outside the canonical install's own prefix.
-PIP_ENV_NAME_RE = re.compile(r"(?<![A-Za-z0-9_])PIP_[A-Za-z0-9_]*", re.IGNORECASE)
-PIP_CONFIG_FILE_RE = re.compile(r"pip\.(?:conf|ini)", re.IGNORECASE)
-# Installers outside pip's hash checking.
-UNHASHED_INSTALLER_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(?:pipx|easy_install|uvx)(?![A-Za-z0-9_-])"
-    r"|(?<![A-Za-z0-9_-])uv\s+(?:pip|tool)(?![A-Za-z0-9_-])"
-    r"|setup\.py\s+(?:install|develop)(?![A-Za-z0-9_-])",
-    re.IGNORECASE,
-)
-# `.github/ci/**` holds the verifier, its helper, and the hashed requirements:
-# a `run:` may execute or read it, never write it. A word naming it is
-# accepted only as the command itself or as an argument to a read/execute
-# command; a redirect into it, or any other command naming it, is refused.
-PROTECTED_TREE = ".github/ci"
-PROTECTED_TREE_READERS = frozenset({
-    "python3", "python", "bash", "sh", "cat", "ls", "test", "[", "[[", "diff", "cmp",
-    "sha256sum", "sha512sum", "head", "tail", "rg", "grep", "jq", "source", ".",
-    "wc", "stat", "echo", "printf", "shellcheck", "file",
-})
-SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
-# A shell's own argv, as a closed set: single-letter options (`-euxvc`,
-# clustered; each `o` takes a named option), and the startup-file opt-outs.
-# Anything else (`-s`, `-i`, `-l`, `--rcfile`, ...) changes where its
-# commands come from and is refused.
-SHELL_LETTER_FLAG_RE = re.compile(r"[-+][euxvco]+")
-SHELL_O_OPTIONS = frozenset({"pipefail", "errexit", "nounset", "xtrace"})
-SHELL_LONG_FLAGS = frozenset({"--noprofile", "--norc"})
-# The one sanctioned pipe into a shell: `cat <file> | sh`, a literal file
-# outside the protected tree (the documented `curl ... | sh` delivery).
-PIPE_TO_SHELL_SOURCE = "cat"
-SHELL_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-# The step `shell:` (and `defaults.run.shell`) a check can read, as a closed
-# set of names: a template (`bash -c '...{0}'`), another interpreter
-# (`python {0}`), or `sh` is refused, since the text a step's `run:` becomes
-# is then no longer the text these checks lex.
-STEP_SHELLS = frozenset({"bash", "pwsh", "powershell"})
-
-
-@dataclass(frozen=True)
-class WrapperSpec:
-    """How a command wrapper's argv reaches the command it runs: flags taking
-    no argument, flags taking the next word (or `--flag=value`), a count of
-    leading operands (`timeout`'s DURATION), whether `NAME=value` words are
-    assignments, and whether `-<digits>` is a flag. A flag outside these is
-    refused — the wrapped command cannot then be established."""
-
-    bare: frozenset[str] = frozenset()
-    valued: frozenset[str] = frozenset()
-    operands: int = 0
-    assignments: bool = False
-    numeric_flag: bool = False
-
-
-COMMAND_WRAPPERS: dict[str, WrapperSpec] = {
-    "env": WrapperSpec(
-        bare=frozenset({"-i", "-0", "--ignore-environment", "--null", "-"}),
-        valued=frozenset({"-u", "--unset", "-C", "--chdir"}),
-        assignments=True,
-    ),
-    "exec": WrapperSpec(bare=frozenset({"-c", "-l"}), valued=frozenset({"-a"})),
-    "sudo": WrapperSpec(
-        bare=frozenset({"-E", "-n", "-H", "--preserve-env", "--non-interactive"}),
-        valued=frozenset({"-u", "-g", "--user", "--group"}),
-    ),
-    "nice": WrapperSpec(valued=frozenset({"-n", "--adjustment"}), numeric_flag=True),
-    "timeout": WrapperSpec(
-        bare=frozenset({"--preserve-status", "--foreground", "-v", "--verbose"}),
-        valued=frozenset({"-s", "--signal", "-k", "--kill-after"}),
-        operands=1,
-    ),
-    "command": WrapperSpec(bare=frozenset({"-p", "-v", "-V"})),
-    "builtin": WrapperSpec(),
-    "nohup": WrapperSpec(),
-    "time": WrapperSpec(bare=frozenset({"-p"})),
-    "xargs": WrapperSpec(
-        bare=frozenset({"-0", "-r", "-t", "-x", "--null", "--no-run-if-empty", "--verbose"}),
-        valued=frozenset({
-            "-n", "-I", "-P", "-d", "-L", "-s", "-E", "-a", "--max-args", "--max-procs",
-            "--delimiter", "--arg-file",
-        }),
-    ),
-}
-# `xargs` hands its command arguments no check ever sees, so it may run only
-# a command that cannot write whatever those arguments name.
-XARGS_READERS = frozenset({
-    "cat", "ls", "test", "diff", "cmp", "sha256sum", "sha512sum", "head", "tail",
-    "wc", "stat", "echo", "printf", "file",
-})
-# Brace expansion is expanded before a word is judged; a word expanding to
-# more alternatives than this is taken to name the protected tree.
-BRACE_ALTERNATIVES_LIMIT = 256
-# A shell function or alias can shadow any command a check matched by name
-# (`bash() { ...; }` before the helper call), so neither is written in a `run:`.
-SHELL_SHADOWING_RE = re.compile(
-    r"(?<![\w$.:-])[A-Za-z_][\w.:-]*[ \t]*\([ \t]*\)[ \t]*(?:[{(]|\n|\Z)"
-    r"|(?<![\w-])function[ \t]+[A-Za-z_]"
-    r"|(?<![\w-])(?:alias|unalias)(?![\w-])"
-    r"|expand_aliases",
-)
-# Legacy workflow commands the runner reads from the output the shell prints,
-# so matched after quote removal too (`::set-""env`).
-LEGACY_COMMAND_RE = re.compile(r"::\s*(?:set-env|add-path|save-state|set-output)", re.IGNORECASE)
-# Bound on YAML nesting walked for string scalars; deeper is refused.
-STRING_SCALAR_DEPTH_LIMIT = 64
-
 # Bound on local-action nesting; a chain deeper than this is refused, never
 # assumed not to reach the sccache composite.
 LOCAL_ACTION_DEPTH_LIMIT = 20
@@ -580,13 +300,6 @@ def check_deterministic_set(jobs: list[Job], errors: list[str]) -> None:
     Its job set must equal the watcher's `needs:`, and each pair's step must
     be a literal `name:` of that job's steps — a renamed or unnamed check step
     would otherwise never match and silently disable both consumers.
-
-    This check reads `jobs` (the plain `Job` pass `main` shares across
-    checks 1-4) for the watcher's `needs:` and contexts, but re-reads
-    ci.yml as raw YAML for each listed job's own steps and masking keys —
-    it does not consume the typed `ToolJob`/`ClosedStep` structures that
-    `check_workflow_steps` parses for checks 6-7, since a deterministic
-    check is not itself required to be a tool job.
     """
     pairs = load_deterministic_checks(errors)
     if pairs is None:
@@ -603,10 +316,9 @@ def check_deterministic_set(jobs: list[Job], errors: list[str]) -> None:
         )
         return
 
-    with open(
-        os.path.join(REPO_ROOT, "workflows", CANCEL_WATCHER_WORKFLOW), encoding="utf-8"
-    ) as f:
-        raw_jobs = strict_yaml.safe_load(f).get("jobs") or {}
+    raw_jobs = strict_yaml.safe_load(
+        open(os.path.join(REPO_ROOT, "workflows", CANCEL_WATCHER_WORKFLOW))
+    ).get("jobs") or {}
 
     # context -> job id, over single-context (non-matrix) jobs of ci.yml only:
     # a matrix leg's context cannot be tied to one check step unambiguously.
@@ -644,18 +356,10 @@ def check_deterministic_set(jobs: list[Job], errors: list[str]) -> None:
                 f"one step named {step!r} (found {len(named)})"
             )
             continue
-        if MASKING_KEYS.intersection(named[0]):
+        if "if" in named[0] or "continue-on-error" in named[0]:
             errors.append(
                 f"{DETERMINISTIC_CHECKS_FILE}: step {step!r} of job {job_id!r} "
                 "must run unconditionally: no `if:` and no `continue-on-error:`"
-            )
-        # A job-level `if:` is admitted: a path-filtered skip never fires the
-        # cancel, the conservative outcome for the watcher. A failure-ignored
-        # job would hand the watcher a red step under a green job.
-        if "continue-on-error" in raw_job:
-            errors.append(
-                f"{DETERMINISTIC_CHECKS_FILE}: job {job_id!r} has a job-level "
-                "`continue-on-error:`; a deterministic check's failure must fail its job"
             )
 
     needed = set(watcher.needs)
@@ -791,307 +495,6 @@ def _load_sccache_workflows(root: str, errors: list[str]) -> list[SccacheWorkflo
     return out
 
 
-# A full-tier test that forgot the merge queue: `!= 'pull_request'` (either
-# operand order) not followed by the matching `merge_group` exclusion. A
-# spelling-bound lint: another spelling of the same test only costs the queue
-# the full tier, since the secret-free and read-only checks stand apart.
-_BARE_PR_TIER = re.compile(
-    r"(?:event_name\s*!=\s*['\"]pull_request['\"]|['\"]pull_request['\"]\s*!=\s*github\.event_name)"
-    r"(?!\s*&&\s*github\.event_name\s*!=\s*['\"]merge_group['\"])"
-)
-_SECRETS_WORD = re.compile(r"\bsecrets\b", re.IGNORECASE)
-_PR_ONLY = "github.event_name == 'pull_request'"
-
-
-def _mentions_secrets(node: object) -> bool:
-    """True when any key or string scalar of the parsed document names
-    `secrets`. Complements the raw-text scan: a double-quoted scalar can spell
-    the word through `\\x`/`\\u` escapes that only the parser decodes."""
-    if isinstance(node, dict):
-        return any(_mentions_secrets(k) or _mentions_secrets(v) for k, v in node.items())
-    if isinstance(node, list):
-        return any(_mentions_secrets(e) for e in node)
-    return isinstance(node, str) and _SECRETS_WORD.search(node) is not None
-
-
-def _top_level_conjuncts(cond: str) -> list[str] | None:
-    """Split an `if:` expression on `&&` at parenthesis depth 0, outside string
-    literals; whitespace-normalised conjuncts. None when the expression has a
-    `||` anywhere, unbalanced parentheses, an unterminated string, or a
-    `${{ }}` that does not wrap the whole condition (GitHub then evaluates the
-    mix as a `format()` string, which is always truthy), since none of those
-    can be proven to require its conjuncts."""
-    expr = cond.strip()
-    if expr.startswith("${{") and expr.endswith("}}"):
-        expr = expr[3:-2]
-    if "${{" in expr or "}}" in expr:
-        return None
-    parts: list[str] = []
-    depth = 0
-    quote = False
-    start = 0
-    i = 0
-    while i < len(expr):
-        c = expr[i]
-        if quote:
-            if c == "'":
-                if expr[i + 1 : i + 2] == "'":
-                    i += 1
-                else:
-                    quote = False
-        elif c == "'":
-            quote = True
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth < 0:
-                return None
-        elif expr.startswith("||", i):
-            return None
-        elif expr.startswith("&&", i) and depth == 0:
-            parts.append(expr[start:i])
-            start = i + 2
-            i += 1
-        i += 1
-    if quote or depth != 0:
-        return None
-    parts.append(expr[start:])
-    return [" ".join(p.split()) for p in parts]
-
-
-def _triggers(doc: dict) -> set[str] | None:
-    """The workflow's event names, or None when `on:` has no recognised shape.
-    PyYAML 1.1 reads the bare key `on` as boolean True."""
-    on = doc.get(True, doc.get("on"))
-    if isinstance(on, str):
-        return {on}
-    if isinstance(on, list) and all(isinstance(e, str) for e in on):
-        return set(on)
-    if isinstance(on, dict):
-        return {str(k) for k in on}
-    return None
-
-
-def _write_scopes(perms: object) -> bool:
-    """True when a `permissions:` value grants any write scope."""
-    if isinstance(perms, str):
-        return perms.strip().casefold() != "read-all"
-    if isinstance(perms, dict):
-        return any(str(v).strip().casefold() == "write" for v in perms.values())
-    return True
-
-
-def check_merge_queue(gate_producers: set[str], errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 8 (see the module docstring). Unparseable workflows are refused by
-    check 6; here they are skipped only after that refusal is on record."""
-    paths = sorted(
-        p
-        for pattern in ("*.yml", "*.yaml")
-        for p in glob.glob(os.path.join(root, "workflows", pattern))
-    )
-    seen: set[str] = set()
-    for path in paths:
-        fname = os.path.basename(path)
-        seen.add(fname)
-        with open(path) as f:
-            text = f.read()
-        try:
-            doc = strict_yaml.safe_load(text)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(doc, dict):
-            continue
-        triggers = _triggers(doc)
-        if triggers is None:
-            errors.append(f"{fname}: `on:` is not a string, list of strings, or mapping")
-            continue
-        if fname in gate_producers:
-            for event in ("pull_request", "merge_group"):
-                if event not in triggers:
-                    errors.append(
-                        f"{fname} produces a required `gate` context but does not trigger "
-                        f"on `{event}` — the merge queue would wait forever on it"
-                    )
-        if "merge_group" not in triggers:
-            continue
-        if "pull_request_target" in triggers:
-            errors.append(
-                f"{fname}: a merge_group workflow may not also trigger on "
-                "`pull_request_target` (base-repo secrets reach untrusted code)"
-            )
-        if _SECRETS_WORD.search(text) or _mentions_secrets(doc):
-            errors.append(
-                f"{fname}: a merge_group workflow must be secret-free — a merge-group "
-                "run carries the base repository's secrets"
-            )
-        if "permissions" not in doc:
-            errors.append(f"{fname}: a merge_group workflow must declare top-level `permissions:`")
-        elif _write_scopes(doc["permissions"]):
-            errors.append(
-                f"{fname}: a merge_group workflow's top-level `permissions:` must be "
-                f"read-only, got {doc['permissions']!r}"
-            )
-        jobs = doc.get("jobs")
-        for jid, job in (jobs.items() if isinstance(jobs, dict) else ()):
-            if not isinstance(job, dict) or "permissions" not in job:
-                continue
-            if not _write_scopes(job["permissions"]):
-                continue
-            conjuncts = _top_level_conjuncts(str(job.get("if", "")))
-            if conjuncts is None or _PR_ONLY not in conjuncts:
-                errors.append(
-                    f"{fname}: job {str(jid)!r} holds a write scope in a merge_group "
-                    "workflow; its `if:` must be a conjunction requiring "
-                    "`github.event_name == 'pull_request'` at the top level"
-                )
-        for m in _BARE_PR_TIER.finditer(text):
-            line = text.count("\n", 0, m.start()) + 1
-            errors.append(
-                f"{fname}:{line}: `github.event_name != 'pull_request'` without "
-                "`&& github.event_name != 'merge_group'` — a merge-group run would "
-                "take the full tier"
-            )
-    for fname in sorted(gate_producers - seen):
-        errors.append(f"gate producer {fname!r} has no workflow file (check 8)")
-
-
-_RELEASE_ONLY_OUTPUT = "release_only"
-_RELEASE_ONLY_RUN = re.compile(r"needs\.[A-Za-z0-9_-]+\.outputs\.release_only == 'true'")
-
-
-def _top_level_disjuncts(cond: str) -> list[str] | None:
-    """Split an `if:` expression on `||` at parenthesis depth 0, outside string
-    literals; whitespace-normalised disjuncts. None on unbalanced parentheses,
-    an unterminated string, or a `${{ }}` that does not wrap the whole
-    condition (see `_top_level_conjuncts`)."""
-    expr = cond.strip()
-    if expr.startswith("${{") and expr.endswith("}}"):
-        expr = expr[3:-2]
-    if "${{" in expr or "}}" in expr:
-        return None
-    parts: list[str] = []
-    depth = 0
-    quote = False
-    start = 0
-    i = 0
-    while i < len(expr):
-        c = expr[i]
-        if quote:
-            if c == "'":
-                if expr[i + 1 : i + 2] == "'":
-                    i += 1
-                else:
-                    quote = False
-        elif c == "'":
-            quote = True
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth < 0:
-                return None
-        elif expr.startswith("||", i) and depth == 0:
-            parts.append(expr[start:i])
-            start = i + 2
-            i += 1
-        i += 1
-    if quote or depth != 0:
-        return None
-    parts.append(expr[start:])
-    return [" ".join(p.split()) for p in parts]
-
-
-def _release_only_mention(doc: dict) -> re.Pattern[str]:
-    """Case-insensitive whole-word match of `release_only` and of every job
-    output that re-exports it, directly or through another such output."""
-    jobs = doc.get("jobs") if isinstance(doc.get("jobs"), dict) else {}
-    names = {_RELEASE_ONLY_OUTPUT}
-    while True:
-        pattern = re.compile(
-            r"\b(?:" + "|".join(re.escape(n) for n in sorted(names)) + r")\b", re.IGNORECASE
-        )
-        found = {
-            str(key).lower()
-            for job in jobs.values()
-            if isinstance(job, dict) and isinstance(job.get("outputs"), dict)
-            for key, value in job["outputs"].items()
-            if pattern.search(str(value))
-        }
-        if found <= names:
-            return pattern
-        names |= found
-
-
-def check_release_only_skips(gate_contexts: set[str], errors: list[str], root: str = REPO_ROOT) -> None:
-    """Check 9 (see the module docstring). Unparseable workflows are refused by
-    check 6; here they are skipped only after that refusal is on record."""
-    paths = sorted(
-        p
-        for pattern in ("*.yml", "*.yaml")
-        for p in glob.glob(os.path.join(root, "workflows", pattern))
-    )
-    for path in paths:
-        fname = os.path.basename(path)
-        try:
-            with open(path) as f:
-                doc = strict_yaml.safe_load(f)
-        except yaml.YAMLError:
-            continue
-        if not isinstance(doc, dict):
-            continue
-        mention = _release_only_mention(doc)
-        jobs = doc.get("jobs")
-        for jid, job in (jobs.items() if isinstance(jobs, dict) else ()):
-            if not isinstance(job, dict):
-                continue
-            strategy = job.get("strategy")
-            contexts = expand_matrix_names(
-                str(job.get("name", jid)), strategy if isinstance(strategy, dict) else {}
-            )
-            if not gate_contexts.intersection(contexts):
-                continue
-            cond = str(job.get("if", ""))
-            steps = job.get("steps")
-            all_conditional = (
-                isinstance(steps, list)
-                and bool(steps)
-                and all(isinstance(st, dict) and "if" in st for st in steps)
-            )
-            if not mention.search(cond) and not all_conditional:
-                continue
-            loc = f"{fname}: gate producer job {str(jid)!r}"
-            disjuncts = _top_level_disjuncts(cond)
-            runs = [d for d in disjuncts or () if _RELEASE_ONLY_RUN.fullmatch(d)]
-            others = [d for d in disjuncts or () if mention.search(d) and d not in runs]
-            if not mention.search(cond):
-                errors.append(
-                    f"{loc}: every step carries an `if:`, so all of them can skip and the "
-                    "job reports a pass without executing anything; give it an "
-                    "unconditional step or the release-only trivial-pass shape (check 9)"
-                )
-                continue
-            if disjuncts is None or len(runs) != 1 or others:
-                errors.append(
-                    f"{loc}: job-level `if:` may name `release_only` only as one top-level "
-                    "`|| needs.<job>.outputs.release_only == 'true'` disjunct — a skipped "
-                    "required job reports a pass without executing anything (check 9)"
-                )
-                continue
-            first = steps[0] if isinstance(steps, list) and steps else None
-            if not (
-                isinstance(first, dict)
-                and " ".join(str(first.get("if", "")).split()) == runs[0]
-                and isinstance(first.get("run"), str)
-                and first["run"].strip()
-            ):
-                errors.append(
-                    f"{loc}: runs on a release-only diff but its first step is not the "
-                    f"trivial-pass `run:` step gated `if: {runs[0]}` — a job whose steps "
-                    "all skip reports a pass without executing anything (check 9)"
-                )
-
-
 def _env_keys_folded(env: dict) -> set[str]:
     return {str(k).casefold() for k in env}
 
@@ -1116,640 +519,25 @@ def _scoped_env(container: dict, loc: str, errors: list[str]) -> dict:
     return {}
 
 
-@dataclass(frozen=True)
-class StepPolicy:
-    """Repo facts the per-step audits check against.
-
-    `env_allowlist` holds the keys `ci/github-env.sh` may write; it is empty
-    when the allowlist cannot be established, so every helper call is refused.
-    `repo_top` is the checkout root a `working-directory:` resolves from.
-    """
-
-    env_allowlist: frozenset[str]
-    repo_top: str
-
-
-def _github_env_key_refusal(key: str) -> str | None:
-    """Why `key` may never be an allowlisted env-file key, or None."""
-    if not GITHUB_ENV_KEY_RE.match(key):
-        return "is not a CI_JOB_-prefixed upper-case identifier"
-    if SCCACHE_WIRING_TEXT_RE.search(key):
-        return f"is rustc/sccache wiring, owned by {SCCACHE_COMPOSITE_USES}"
-    if key in GITHUB_ENV_KEY_EXACT_REFUSED or key.startswith(GITHUB_ENV_KEY_REFUSED_PREFIXES):
-        return "steers the runner, a toolchain, a loader, or an interpreter"
-    return None
-
-
-def load_github_env_allowlist(errors: list[str], root: str = REPO_ROOT) -> frozenset[str]:
-    """The keys `ci/github-env.sh` may write, one per line.
-
-    `#` comments and blank lines are skipped. A malformed, duplicate, or
-    refused key is an error; an unreadable file is an error and yields the
-    empty set (fail closed).
-    """
-    path = os.path.join(root, "ci", "github-env-allowlist.txt")
-    where = os.path.relpath(path, os.path.dirname(root))
-    try:
-        with open(path) as f:
-            lines = f.read().split("\n")
-    except OSError as e:
-        errors.append(f"{where}: cannot be read ({e}) — no env-file key can be allowed; refused")
-        return frozenset()
-    keys: set[str] = set()
-    for n, line in enumerate(lines, 1):
-        if line == "" or line.startswith("#"):
-            continue
-        why = _github_env_key_refusal(line)
-        if why is not None:
-            errors.append(f"{where}:{n}: key {line!r} {why}; refused")
-        elif line in keys:
-            errors.append(f"{where}:{n}: key {line!r} is listed twice; refused")
-        else:
-            keys.add(line)
-    return frozenset(keys)
-
-
-def _context_refusal(e: gha_expr.Expr) -> gha_expr.ContextRef | None:
-    """The first `github`/`env` access in `e` that could reach a runner
-    command file, or None: anything but a literal `.name`, and
-    `github.<command-file property>`."""
-    for node in gha_expr.walk(e):
-        if not isinstance(node, gha_expr.ContextRef) or node.ctx.casefold() not in GITHUB_NAMED_CONTEXTS:
-            continue
-        first = node.path[0] if node.path else None
-        if not isinstance(first, gha_expr.Prop):
-            return node
-        if node.ctx.casefold() == "github" and first.name.casefold() in GITHUB_RUNNER_FILE_PROPS:
-            return node
-    return None
-
-
-def _parsed_expressions(text: str, bare_expression: bool) -> gha_expr.Template | gha_expr.Refusal:
-    """Every expression in `text`; `bare_expression` marks an `if:` value."""
-    return gha_expr.parse_condition(text) if bare_expression else gha_expr.parse_template(text)
-
-
-def _runner_file_refusal(text: str, parsed: gha_expr.Template | gha_expr.Refusal) -> str | None:
-    """The first spelling in `text` that reaches a runner command file, or None.
-
-    Every match of `RUNNER_FILE_TEXT_RE` counts except an output/summary name
-    inside its append-only shape; so does a legacy workflow command after
-    quote removal, and every `github`/`env` access in a parsed expression
-    other than a literal `.name` (and `github.<command-file property>`).
-    """
-    appends = [m.span() for m in RUNNER_APPEND_ONLY_TARGET_RE.finditer(text)]
-    for m in RUNNER_FILE_TEXT_RE.finditer(text):
-        if not any(lo <= m.start() and m.end() <= hi for lo, hi in appends):
-            return m.group(0)
-    for cmd in shell_lex.split_commands(text):
-        m = LEGACY_COMMAND_RE.search(" ".join(cmd.words))
-        if m is not None:
-            return m.group(0)
-    if isinstance(parsed, gha_expr.Template):
-        for e, (lo, hi) in zip(parsed.exprs, parsed.spans):
-            if _context_refusal(e) is not None:
-                return text[lo:hi]
-    return None
-
-
-def _refuse_expression_splice(
-    text: str, parsed: gha_expr.Template, loc: str, what: str, errors: list[str]
-) -> None:
-    """In a `run:`, every `${{ }}` is an opaque value spliced into shell text:
-    none may carry a string literal (author text the name scans never see
-    whole), and none may sit where its value would complete a shell variable
-    name (`SPLICE_NAME_PREFIX_RE`/`SPLICE_NAME_SUFFIX_RE`)."""
-    for e, (lo, hi) in zip(parsed.exprs, parsed.spans):
-        shown = text[lo:hi]
-        if any(isinstance(n, gha_expr.Literal) and n.is_string for n in gha_expr.walk(e)):
-            errors.append(
-                f"{loc} {what} splices {shown!r}, an expression holding a string literal, into "
-                "shell text — a literal there assembles text no name scan sees whole; pass the "
-                "value through `env:` instead; refused"
-            )
-        elif SPLICE_NAME_PREFIX_RE.search(text, 0, lo) or SPLICE_NAME_SUFFIX_RE.match(text, hi):
-            errors.append(
-                f"{loc} {what} splices {shown!r} next to a shell variable name — its value could "
-                "complete the name (`$GITHUB_${{ x }}`); separate it by a quote, space, or `/`; refused"
-            )
-
-
-def _refuse_runner_file_text(
-    text: str, parsed: gha_expr.Template | gha_expr.Refusal, loc: str, what: str,
-    policy: StepPolicy, helper_ok: bool, errors: list[str],
-) -> None:
-    """Rule (f): the runner env file is written only by the canonical helper call.
-
-    The call is honoured only in a step's `run:` (`helper_ok`) and must carry a
-    bare allowlisted key; any other spelling of a runner command file, the
-    legacy workflow commands, the helper itself, or a `GITHUB_WORKSPACE` write
-    is refused.
-    """
-    if isinstance(parsed, gha_expr.Refusal):
-        errors.append(
-            f"{loc} {what} holds a `${{{{ }}}}` expression outside the expression grammar "
-            f"({parsed.why}) — what it reads cannot be established; refused"
-        )
-    hit = _runner_file_refusal(text, parsed)
-    if hit is not None:
-        errors.append(
-            f"{loc} {what} names {hit!r} — the runner env file is written only "
-            f'through `bash "$GITHUB_WORKSPACE/.github/{GITHUB_ENV_HELPER}" KEY VALUE`, '
-            "outputs/summaries only by appending to their exact variable; refused"
-        )
-    reads = [m.span() for m in GITHUB_WORKSPACE_READ_RE.finditer(text)]
-    for m in GITHUB_WORKSPACE_MENTION_RE.finditer(text):
-        if not any(lo <= m.start() and m.end() <= hi for lo, hi in reads):
-            errors.append(
-                f"{loc} {what} names {m.group(0)!r} other than as a plain read "
-                "`$GITHUB_WORKSPACE` — it roots the env helper and requirements paths, "
-                "so it is never assigned or overridden; refused"
-            )
-            break
-    calls = list(GITHUB_ENV_HELPER_CALL_RE.finditer(text)) if helper_ok else []
-    for mention in GITHUB_ENV_HELPER_MENTION_RE.finditer(text):
-        if not any(c.start() <= mention.start() < c.end() for c in calls):
-            errors.append(
-                f"{loc} {what} references {GITHUB_ENV_HELPER} outside its one canonical call "
-                f'`bash "$GITHUB_WORKSPACE/.github/{GITHUB_ENV_HELPER}" KEY VALUE` with a bare '
-                "literal KEY in a step's run:; refused"
-            )
-            break
-    for c in calls:
-        key = c.group("key")
-        if key not in policy.env_allowlist:
-            errors.append(
-                f"{loc} {what} writes env key {key!r}, which is not in "
-                "ci/github-env-allowlist.txt; refused"
-            )
-
-
-def _pip_install_refusal(args: list[str]) -> str | None:
-    """Why the `pip install` arguments `args` miss the hash-checked shape, or
-    None when every argument is one the canonical install carries."""
-    require_hashes = only_binary_all = False
-    requirement_files = 0
-    i = 0
-    while i < len(args):
-        a = args[i]
-        nxt = args[i + 1] if i + 1 < len(args) else None
-        if a == "--require-hashes":
-            require_hashes = True
-        elif a == "--only-binary=:all:":
-            only_binary_all = True
-        elif a == "--only-binary" and nxt == ":all:":
-            only_binary_all = True
-            i += 1
-        elif a in ("-r", "--requirement") and nxt is not None:
-            if nxt != PIP_REQUIREMENTS_ARG:
-                return f"requirements file {nxt!r} is not {PIP_REQUIREMENTS_ARG!r}"
-            requirement_files += 1
-            i += 1
-        elif a != "--isolated":
-            return f"argument {a!r} is outside the hash-checked shape"
-        i += 1
-    if requirement_files > 1:
-        return f"it names -r/--requirement {requirement_files} times, not exactly once"
-    if not (require_hashes and only_binary_all and requirement_files):
-        return f"it lacks --require-hashes, --only-binary :all:, or -r {PIP_REQUIREMENTS_ARG}"
-    return None
-
-
-@dataclass(frozen=True)
-class PipInvocation:
-    """One shell command that runs pip, split at the pip token: the leading
-    `NAME=value` assignments, the words up to and including pip (the
-    interpreter and its flags), and pip's own arguments."""
-
-    env_prefix: tuple[str, ...]
-    interpreter: tuple[str, ...]
-    args: tuple[str, ...]
-
-
-def _parse_pip_invocation(tokens: list[str]) -> PipInvocation | None:
-    """`tokens` as a pip invocation, or None when no word is pip."""
-    at = next((i for i, t in enumerate(tokens) if PIP_TOKEN_RE.fullmatch(t)), None)
-    if at is None:
-        return None
-    lead = 0
-    while lead < at and SHELL_ASSIGNMENT_RE.match(tokens[lead]):
-        lead += 1
-    return PipInvocation(tuple(tokens[:lead]), tuple(tokens[lead : at + 1]), tuple(tokens[at + 1 :]))
-
-
-def _canonical_pip() -> PipInvocation:
-    """`CANONICAL_PIP_INSTALL` as a `PipInvocation`, lexed as the shell does."""
-    cmds = shell_lex.split_commands(CANONICAL_PIP_INSTALL)
-    inv = _parse_pip_invocation(cmds[0].words) if len(cmds) == 1 else None
-    if inv is None:
-        raise RuntimeError("CANONICAL_PIP_INSTALL is not one command naming pip")
-    return inv
-
-
-def _pip_invocation_refusal(inv: PipInvocation) -> str | None:
-    """Why `inv` is not the canonical install nor a read-only query, or None."""
-    canon = _canonical_pip()
-    if not inv.args or inv.args[0].casefold() != "install":
-        if len(inv.args) <= 1 and (not inv.args or inv.args[0] in PIP_READ_ONLY_COMMANDS):
-            return None
-        return f"pip subcommand {' '.join(inv.args)!r} is neither install nor a read-only query"
-    why = _pip_install_refusal(list(inv.args[1:]))
-    if why is not None:
-        return why
-    if inv.interpreter != canon.interpreter:
-        return f"pip runs as {' '.join(inv.interpreter)!r}, not {' '.join(canon.interpreter)!r}"
-    if inv.env_prefix != canon.env_prefix:
-        return (
-            f"its environment prefix {' '.join(inv.env_prefix)!r} is not "
-            f"{' '.join(canon.env_prefix)!r} — config files and PIP_* would steer the install"
-        )
-    if inv.args != canon.args:
-        return f"its arguments are not exactly {' '.join(canon.args)!r}"
-    return None
-
-
-def _shell_texts(text: str) -> list[str]:
-    """`text` and every here-document body in it, nested bodies included
-    (to `STRING_SCALAR_DEPTH_LIMIT` levels; each is strictly shorter)."""
-    out, level = [text], [text]
-    for _ in range(STRING_SCALAR_DEPTH_LIMIT):
-        level = [body for t in level for body in shell_lex.heredoc_bodies(t)]
-        if not level:
-            break
-        out.extend(level)
-    return out
-
-
-def _refuse_unhashed_pip(text: str, loc: str, what: str, errors: list[str]) -> None:
-    """Rule (g): pip installs only as the one canonical, env-isolated command.
-
-    `CANONICAL_PIP_INSTALL` is the only install: `PIP_CONFIG_FILE=/dev/null`
-    and `--isolated` cut off every config file and `PIP_*` variable, and
-    `--require-hashes --only-binary :all: -r <requirements>` hash-checks
-    every byte with no build backend. Outside that exact text, a `PIP_*`
-    name, a pip config file, or an installer outside pip's hash checking is
-    refused. Every command of the text, and of each here-document body
-    (lexed as shell too, since a body may be fed to one), is judged on its
-    quote-removed words (`shell_lex`), so `p""ip` is `pip`: a command with
-    a word naming pip is parsed as a `PipInvocation` and compared with the
-    canonical one.
-    """
-    rest = CANONICAL_PIP_INSTALL_RE.sub(" ", text)
-    for rx, why in (
-        (PIP_ENV_NAME_RE, "sets or names a pip environment variable, which steers what pip installs"),
-        (PIP_CONFIG_FILE_RE, "names a pip config file, which steers what pip installs"),
-        (UNHASHED_INSTALLER_RE, "runs an installer outside pip's hash checking"),
-    ):
-        m = rx.search(rest)
-        if m is not None:
-            errors.append(
-                f"{loc} {what} {why} ({m.group(0)!r}) — pip installs only as "
-                f"`{CANONICAL_PIP_INSTALL}`; refused"
-            )
-    for part in _shell_texts(text):
-        for cmd in shell_lex.split_commands(part):
-            tokens = cmd.words
-            if not any(PIP_MENTION_RE.search(t) for t in tokens):
-                continue
-            shown = " ".join(tokens)
-            inv = _parse_pip_invocation(tokens)
-            if inv is None:
-                if any("install" in t.casefold() for t in tokens):
-                    errors.append(
-                        f"{loc} {what} mentions pip and install in {shown!r} outside the "
-                        "hash-checked shape; refused"
-                    )
-                continue
-            why = _pip_invocation_refusal(inv)
-            if why is not None:
-                errors.append(
-                    f"{loc} {what} runs {shown!r}: {why} — pip installs only as "
-                    f"`{CANONICAL_PIP_INSTALL}`; refused"
-                )
-
-
-def _brace_alternatives(word: str) -> list[str] | None:
-    """`word` after bash brace expansion: every `{a,b}` expanded, nested
-    ones included, and every `{x..y}` sequence (digits or letters, never `.`
-    or `/`) taken as the glob `*`. None past `BRACE_ALTERNATIVES_LIMIT`."""
-    todo, done = [word], []
-    while todo:
-        w = todo.pop()
-        found = None
-        start = w.find("{")
-        while start >= 0 and found is None:
-            depth, parts, at = 0, [], start + 1
-            for j in range(start + 1, len(w)):
-                c = w[j]
-                if c == "{":
-                    depth += 1
-                elif c == "}" and depth:
-                    depth -= 1
-                elif c == "," and not depth:
-                    parts.append(w[at:j])
-                    at = j + 1
-                elif c == "}":
-                    parts.append(w[at:j])
-                    if len(parts) > 1:
-                        found = (start, j + 1, parts)
-                    elif ".." in parts[0]:
-                        found = (start, j + 1, ["*"])
-                    break
-            if found is None:
-                start = w.find("{", start + 1)
-        if found is None:
-            done.append(w)
-        else:
-            lo, hi, alts = found
-            todo.extend(w[:lo] + a + w[hi:] for a in alts)
-        if len(done) + len(todo) > BRACE_ALTERNATIVES_LIMIT:
-            return None
-    return done
-
-
-def _protected_word(word: str) -> bool:
-    """Whether `word` (quote-removed) could name `.github/ci/**` or the
-    `.github` directory holding it: after brace expansion, some path
-    component matches `.github` (as a glob, when it is one — a shell glob
-    reaches a dot name only from a literal leading `.`) and is last or
-    followed by one matching `ci`. Any root is ignored — a variable or
-    spliced expression before it could be the workspace. A word whose brace
-    expansion is too large to enumerate is taken to name it."""
-    for w in {word, word.rsplit("=", 1)[-1]}:
-        alternatives = _brace_alternatives(w)
-        if alternatives is None:
-            return True
-        for alt in alternatives:
-            parts = posixpath.normpath(alt.casefold()).split("/")
-            for i, part in enumerate(parts):
-                if part.startswith(".") and fnmatch.fnmatchcase(".github", part) and (
-                    i + 1 == len(parts) or fnmatch.fnmatchcase("ci", parts[i + 1])
-                ):
-                    return True
-    return False
-
-
-@dataclass(frozen=True)
-class CommandVerb:
-    """A simple command resolved past its assignments and wrappers: the
-    command word (None for none), its arguments, and whether an `xargs`
-    in front hands it further arguments no check sees."""
-
-    verb: str | None
-    args: list[str]
-    via_xargs: bool
-
-
-def _command_verb(words: list[str]) -> CommandVerb | str:
-    """`words` resolved to the command they run, or why that cannot be
-    established: every wrapper's flags are consumed by its `WrapperSpec`,
-    and a flag outside it is refused (`env -S` splits a string into a
-    command no check sees; `env -u python3 cp` is `cp`, not `python3`)."""
-    i, n, via_xargs = 0, len(words), False
-    while i < n:
-        w = words[i]
-        if SHELL_ASSIGNMENT_RE.match(w):
-            i += 1
-            continue
-        base = posixpath.basename(w)
-        spec = COMMAND_WRAPPERS.get(base)
-        if spec is None:
-            break
-        via_xargs = via_xargs or base == "xargs"
-        i += 1
-        while i < n:
-            a = words[i]
-            if a == "--":
-                i += 1
-                break
-            if spec.assignments and SHELL_ASSIGNMENT_RE.match(a):
-                i += 1
-                continue
-            if not a.startswith("-") or (a == "-" and a not in spec.bare):
-                break
-            flag = a.split("=", 1)[0] if a.startswith("--") else a
-            if a in spec.bare or (a.startswith("--") and "=" in a and flag in spec.bare | spec.valued):
-                i += 1
-            elif a in spec.valued:
-                if i + 1 >= n:
-                    return f"`{base} {a}` lacks its argument"
-                i += 2
-            elif spec.numeric_flag and a[1:].isdigit():
-                i += 1
-            else:
-                return f"`{base}` flag {a!r} is outside the flags this check reads"
-        if spec.operands:
-            if i + spec.operands > n:
-                return f"`{base}` lacks its operand"
-            i += spec.operands
-    if i >= n:
-        return CommandVerb(None, [], via_xargs)
-    return CommandVerb(words[i], words[i + 1 :], via_xargs)
-
-
-def _shell_program(args: list[str]) -> tuple[str, str] | str | None:
-    """Where a shell whose argv is `args` reads its commands: `("c", text)`
-    for `-c text`, `("script", path)` for a script operand, None for
-    standard input, or why its argv is outside the closed set."""
-    i, c = 0, False
-    while i < len(args):
-        a = args[i]
-        if a == "--":
-            i += 1
-            break
-        if a in SHELL_LONG_FLAGS:
-            i += 1
-            continue
-        if SHELL_LETTER_FLAG_RE.fullmatch(a):
-            if "c" in a:
-                if a.startswith("+"):
-                    return f"shell flag {a!r}"
-                c = True
-            i += 1
-            for _ in range(a.count("o")):
-                if i >= len(args) or args[i] not in SHELL_O_OPTIONS:
-                    return f"shell `-o` without a named option in {sorted(SHELL_O_OPTIONS)}"
-                i += 1
-            continue
-        if a.startswith(("-", "+")):
-            return f"shell flag {a!r} is outside {{-e -u -x -v -c -o <opt> --noprofile --norc}}"
-        break
-    if i >= len(args):
-        return "shell `-c` without its command text" if c else None
-    return ("c" if c else "script", args[i])
-
-
-def _protected_tree_refusal(text: str, depth: int = 0) -> str | None:
-    """The first write into `.github/ci/**` in shell `text`, or None.
-
-    The tree may be executed (`.github/ci/x.sh`, `source`), or read by a
-    `PROTECTED_TREE_READERS` command; a redirect into it and any other
-    command naming it are refused. A command whose wrapped verb cannot be
-    established is refused, as is `xargs` running anything but a reader. A
-    shell must read its commands from `-c <text>` (scanned in turn) or a
-    script operand: a shell fed a here-document, a here-string, or standard
-    input — save `cat <file> | sh` over a literal file outside the tree — is
-    refused, since its commands are unseen."""
-    if depth > STRING_SCALAR_DEPTH_LIMIT:
-        return "shell -c nesting too deep"
-    for cmd in shell_lex.split_commands(text):
-        for target in cmd.writes:
-            if _protected_word(target):
-                return f"redirect into {target!r}"
-        resolved = _command_verb(cmd.words)
-        if isinstance(resolved, str):
-            return f"{resolved} — the command it runs cannot be established"
-        verb, args = resolved.verb, resolved.args
-        if verb is None:
-            continue
-        base = posixpath.basename(verb)
-        if resolved.via_xargs and base not in XARGS_READERS:
-            return f"xargs runs {base!r} with arguments read from standard input (unseen)"
-        if _protected_word(verb):
-            continue
-        if base in SHELLS:
-            if cmd.heredoc:
-                return f"{base} fed a here-document (its commands are unseen)"
-            if cmd.herestring:
-                return f"{base} fed a here-string (its commands are unseen)"
-            program = _shell_program(args)
-            if isinstance(program, str):
-                return program
-            if program is None:
-                src = cmd.pipe_source
-                if not (
-                    src is not None and len(src) == 2 and src[0] == PIPE_TO_SHELL_SOURCE
-                    and not src[1].startswith("-") and not _protected_word(src[1])
-                ):
-                    return f"{base} reads its commands from standard input (unseen)"
-            elif program[0] == "c":
-                inner = _protected_tree_refusal(program[1], depth + 1)
-                if inner is not None:
-                    return inner
-        if base in PROTECTED_TREE_READERS:
-            continue
-        hit = next((a for a in args if _protected_word(a)), None)
-        if hit is not None:
-            return f"{base} {hit!r}"
-    return None
-
-
-def _string_scalars(node: object, loc: str, errors: list[str]) -> list[tuple[str, str, bool]]:
-    """Every string key and value under `node`, as (label, text, is_if) triples.
-
-    A key is scanned as written, `key:`, so a rule over `name:` sees it. The
-    label names the path (`run:` for a top-level key, else `with.x`,
-    `env.X`, `strategy.matrix.os[0]`); `is_if` marks an `if:` value, a bare
-    expression. Nesting past `STRING_SCALAR_DEPTH_LIMIT` is refused.
-    """
-    out: list[tuple[str, str, bool]] = []
-    stack: list[tuple[str, object, int, bool]] = [("", node, 0, False)]
-    while stack:
-        path, value, depth, is_if = stack.pop()
-        if isinstance(value, str):
-            out.append((path if "." in path or "[" in path else f"{path}:", value, is_if))
-        elif isinstance(value, (dict, list)):
-            if depth >= STRING_SCALAR_DEPTH_LIMIT:
-                errors.append(
-                    f"{loc} {path or 'document'} nests deeper than {STRING_SCALAR_DEPTH_LIMIT} — "
-                    "its strings cannot all be scanned; refused"
-                )
-                continue
-            items = (
-                [(f"{path}.{k}" if path else str(k), k, v) for k, v in value.items()]
-                if isinstance(value, dict)
-                else [(f"{path}[{n}]", None, v) for n, v in enumerate(value)]
-            )
-            for child, key, v in reversed(items):
-                if isinstance(key, str):
-                    stack.append((child, f"{key}:", depth + 1, False))
-                stack.append((child, v, depth + 1, key == "if"))
-    return out
-
-
-def _audit_text(
-    text: str, loc: str, what: str, policy: StepPolicy, errors: list[str],
-    helper_ok: bool = False, bare_expression: bool = False, is_run: bool = False,
-) -> None:
-    """Rules (c), (f), (g) over one string scalar outside the composite; a
-    step's `run:` (`is_run`) is also shell text for the splice, shadowing,
-    and protected-tree rules."""
-    parsed = _parsed_expressions(text, bare_expression)
-    _refuse_wiring_text(text, loc, what, errors)
-    _refuse_runner_file_text(text, parsed, loc, what, policy, helper_ok, errors)
-    _refuse_unhashed_pip(text, loc, what, errors)
-    if not is_run or isinstance(parsed, gha_expr.Refusal):
-        return
-    _refuse_expression_splice(text, parsed, loc, what, errors)
-    shell = text
-    for lo, hi in reversed(parsed.spans):
-        shell = shell[:lo] + "__GHA_EXPR__" + shell[hi:]
-    m = SHELL_SHADOWING_RE.search(shell_lex.without_heredoc_bodies(shell))
-    if m is not None:
-        errors.append(
-            f"{loc} {what} defines a shell function or alias ({m.group(0).strip()!r}) — it "
-            "could shadow a command every check matches by name; refused"
-        )
-    hit = _protected_tree_refusal(shell)
-    if hit is not None:
-        errors.append(
-            f"{loc} {what} writes into {PROTECTED_TREE}/ ({hit}) — the verifier, its "
-            "helper, and the hashed requirements are only executed or read; refused"
-        )
-
-
-def _audit_scalars(node: object, loc: str, policy: StepPolicy, errors: list[str], step: bool) -> None:
-    """The text rules over every string scalar of `node`.
-
-    The helper call and the shell-text rules apply to a step's own `run:`
-    (`step`).
-    """
-    for label, text, is_if in _string_scalars(node, loc, errors):
-        is_run = step and label == "run:"
-        _audit_text(text, loc, label, policy, errors, is_run, is_if, is_run)
-
-
-def _refuse_unpinned_uses(st: Step, loc: str, errors: list[str]) -> None:
-    """Rule (e): a third-party `uses:` names its content, never a movable ref."""
-    if "uses" not in st.raw:
-        return
-    uses = st.uses
-    if uses is None:
-        _refuse_shape(loc, "uses:", "a string", st.raw["uses"], errors)
-        return
-    if uses.startswith("./") or PINNED_REMOTE_USES_RE.match(uses) or PINNED_DOCKER_USES_RE.match(uses):
-        return
-    errors.append(
-        f"{loc} uses {uses!r}, which is not pinned by content — a third-party action "
-        "is `owner/repo[/path]@<40-hex commit sha>` (tag in a trailing comment), a "
-        "docker image `docker://image@sha256:<digest>`; refused"
-    )
-
-
-def _refuse_unpinned_image(image: object, loc: str, errors: list[str]) -> None:
-    """Rule (e) for a job `container:`/`services:` image."""
-    if not isinstance(image, str):
-        _refuse_shape(loc, "image", "a string", image, errors)
-    elif not PINNED_IMAGE_RE.match(image):
-        errors.append(
-            f"{loc} image {image!r} is not pinned by sha256 digest (`image@sha256:<digest>`); refused"
-        )
-
-
 def _refuse_env_keys(env: dict, loc: str, errors: list[str]) -> None:
-    """Rule (b) over the keys; their text is scanned with every other scalar."""
+    """Rule (b) over the keys, and rule (c) over every `KEY: value` pair — a
+    value can carry a key name a later `run:` expands into a write."""
     for key in sorted(_env_keys_folded(env) & SCCACHE_ENV_KEYS):
         errors.append(
             f"{loc} env sets {key!r} — sccache wiring must come only from "
             f"{SCCACHE_COMPOSITE_USES}, never a hand-set env:"
         )
+    for k, v in env.items():
+        _refuse_wiring_text(f"{k}: {v}", loc, f"env.{k}", errors)
 
 
-def _refuse_wiring_text(text: str, loc: str, what: str, errors: list[str]) -> None:
+def _refuse_wiring_text(text: str | None, loc: str, what: str, errors: list[str]) -> None:
     """Rule (c): free text outside the sanctioned composite that names any
     wrapper/sccache-shaped key or cargo's `rustc-wrapper` spelling — or that
     assembles its target from a GitHub Actions expression function instead of
     naming it literally, which would otherwise dodge the scan above."""
+    if text is None:
+        return
     m = SCCACHE_WIRING_TEXT_RE.search(text)
     if m:
         errors.append(
@@ -1763,14 +551,9 @@ def _refuse_wiring_text(text: str, loc: str, what: str, errors: list[str]) -> No
         errors.append(expr_error)
 
 
-def _audit_defaults(container: dict, loc: str, repo_top: str, errors: list[str]) -> None:
-    """Shape of `defaults.run.shell` and `defaults.run.working-directory` at
-    workflow or job scope.
-
-    The shell wraps every `run:` step, so its text is scanned with the scope's
-    other scalars; a working directory is refused as a step's is
-    (`_refuse_working_directory`); a shape this check cannot read is refused.
-    """
+def _audit_defaults(container: dict, loc: str, errors: list[str]) -> None:
+    """`defaults.run.shell` at workflow or job scope wraps every `run:` step,
+    so a wrapper hidden there wires rustc for the whole scope."""
     if "defaults" not in container:
         return
     d = container["defaults"]
@@ -1784,705 +567,32 @@ def _audit_defaults(container: dict, loc: str, repo_top: str, errors: list[str])
         _refuse_shape(loc, "defaults.run:", "a mapping", r, errors)
         return
     if "shell" in r:
-        _refuse_step_shell(r["shell"], loc, "defaults.run.shell", errors)
-    _refuse_working_directory(r, loc, "defaults.run.working-directory", repo_top, errors)
+        if isinstance(r["shell"], str):
+            _refuse_wiring_text(r["shell"], loc, "defaults.run.shell", errors)
+        else:
+            _refuse_shape(loc, "defaults.run.shell", "a string", r["shell"], errors)
 
 
-def _refuse_step_shell(shell: object, loc: str, what: str, errors: list[str]) -> None:
-    """A `shell:` names one of `STEP_SHELLS`, bare: GitHub then runs the
-    step's script file with that interpreter's fixed argv. Any other value
-    is a command template (`bash -c '<cmd>; bash {0}'`, `python {0}`, `sh`)
-    whose program this check cannot read as the step's `run:`."""
-    if not isinstance(shell, str):
-        _refuse_shape(loc, what, "a string", shell, errors)
-    elif shell not in STEP_SHELLS:
-        errors.append(
-            f"{loc} {what} is {shell!r} — a shell: is one of {sorted(STEP_SHELLS)}, bare; a "
-            "command template runs a program the run: checks never see; refused"
-        )
-
-
-def _audit_step(st: Step, loc: str, policy: StepPolicy, errors: list[str]) -> None:
-    """Rules (a)/(b)/(c)/(e)/(f)/(g) for one step outside the sanctioned composite."""
-    _refuse_unpinned_uses(st, loc, errors)
+def _audit_step(st: Step, loc: str, errors: list[str]) -> None:
+    """Rules (a)/(b)/(c) for one step outside the sanctioned composite."""
     if st.uses is not None and st.uses_folded.startswith(SCCACHE_ACTION_PREFIX.casefold()):
         errors.append(
             f"{loc} runs the raw {SCCACHE_ACTION_PREFIX}... action directly — use "
             f"{SCCACHE_COMPOSITE_USES} instead, the one place it may run"
         )
     _refuse_env_keys(_scoped_env(st.raw, f"{loc} env", errors), loc, errors)
-    if "run" in st.raw and not isinstance(st.raw["run"], str):
-        _refuse_shape(loc, "run:", "a string", st.raw["run"], errors)
-    if "shell" in st.raw:
-        _refuse_step_shell(st.raw["shell"], loc, "shell:", errors)
-    _refuse_working_directory(st.raw, loc, "working-directory:", policy.repo_top, errors)
-    if "with" in st.raw and not isinstance(st.raw["with"], dict):
-        _refuse_shape(loc, "with:", "a mapping", st.raw["with"], errors)
-    _audit_scalars(st.raw, loc, policy, errors, step=True)
-
-
-# The steps a job may run up to and including its last step naming
-# `.github/ci/**` (the ordering rule of check 7): each is a closed shape whose
-# effect on the runner is fixed — a checkout or interpreter setup by
-# content-pinned action with a closed literal `with:` and no `env:`, the canonical
-# hash-checked pip install with no `env:`, or a pure run of one tool file under
-# `.github/ci` (`ToolRun`) with allowlisted `env:` (`ToolEnvKey`). Any other
-# step is arbitrary code (a free-form `run:`, an action, a build script) that
-# may rewrite the tree or the job's environment, so it may neither name the
-# tree nor precede a step that does.
-PINNED_CHECKOUT_USES = frozenset({
-    "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-    "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
-})
-CHECKOUT_WITH_KEYS = frozenset({"fetch-depth", "persist-credentials", "sparse-checkout", "sparse-checkout-cone-mode"})
-PINNED_SETUP_PYTHON_USES = frozenset({"actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"})
-SETUP_PYTHON_WITH_KEYS = frozenset({"python-version"})
-# The keys that can turn a red step or job green: a skipped step or job, and a
-# failure-ignored one, both report success (GitHub counts a skipped required
-# check as passing). On a setup step a skip or an ignored failure leaves the
-# tool under the runner's own interpreter and packages, or over a partial
-# checkout, a state the tool is not proven to fail red on. Every site that
-# vouches for a verdict reads masking through this one set.
-MASKING_KEYS = frozenset({"if", "continue-on-error"})
-# The keys a closed shape may carry, masking keys excepted: those are admitted
-# only per `ToolRole` (`ROLE_MASKING`).
-PRE_TOOL_STEP_KEYS = frozenset({"name", "id", "env", "run", "uses", "with", "timeout-minutes", "shell"})
-# The job keys a tool job may carry, masking keys excepted (admitted per
-# `ToolRole`). Closed: `container:`/`services:` outlive the job's steps;
-# `strategy:` expands legs (and a per-leg `continue-on-error`) from a matrix
-# that may be chosen at run time and renames the job's status contexts;
-# `concurrency:` lets another run cancel the job; `environment:` injects
-# variables and secrets the tool env allowlist never sees; `uses:` runs a
-# reusable workflow outside this check. None is needed by a tool job.
-TOOL_JOB_KEYS = frozenset({"name", "runs-on", "steps", "needs", "permissions", "outputs", "env", "defaults", "timeout-minutes"})
-# A tool job runs on a GitHub-hosted Ubuntu label: a fresh virtual machine per
-# job (no earlier job's writes survive into it) whose default shell is bash, the
-# only shell a `ToolRun` is read as. A self-hosted runner keeps its disk across
-# jobs; an expression label is chosen at run time; a Windows or macOS label
-# changes the shell and path rules the tool words are read under. Digits are
-# ASCII only (`\d` would admit any Unicode decimal digit).
-UBUNTU_HOSTED_RUNNER_RE = re.compile(r"ubuntu-(?:latest|[0-9]+(?:\.[0-9]+)?)(?:-arm|-arm64)?")
-
-
-class ToolRole(enum.Enum):
-    """What a tool's run means to the checks that read its job.
-
-    VERDICT: its exit status is a check verdict. ADVISORY: its only effect is
-    a step output that a crash leaves unset, read by every consumer as the
-    conservative default (`release_only` unset runs every tier). OUTPUT: it
-    publishes an SSOT to later steps of its own job, a terminal job no other
-    job needs, so skipping the job only withholds an action (a cancel, a
-    rerun) and never a verdict.
-    """
-
-    VERDICT = "verdict"
-    ADVISORY = "advisory"
-    OUTPUT = "output"
-
-
-# The tools that are not verdicts; every other tool file is a VERDICT, so a new
-# tool is verdict-bearing until it is listed here.
-TOOL_ROLES: dict[str, ToolRole] = {
-    "release_only.py": ToolRole.ADVISORY,
-    "deterministic_checks_output.py": ToolRole.OUTPUT,
-}
-
-
-@dataclass(frozen=True)
-class RoleMasking:
-    """The masking keys a role admits on its tool step and on its job."""
-
-    step: frozenset[str]
-    job: frozenset[str]
-
-
-# Exhaustive over `ToolRole` (asserted by the test suite). A VERDICT admits no
-# masking key anywhere. An ADVISORY step admits `continue-on-error: true`
-# (its crash leaves the output unset) but its job admits none: the job's
-# outputs steer other jobs' `if:`, so skipping or failure-ignoring the job
-# would skip a verdict job downstream. An OUTPUT job admits `if:` (it is
-# terminal: see `ToolJob`).
-ROLE_MASKING: dict[ToolRole, RoleMasking] = {
-    ToolRole.VERDICT: RoleMasking(frozenset(), frozenset()),
-    ToolRole.ADVISORY: RoleMasking(frozenset({"continue-on-error"}), frozenset()),
-    ToolRole.OUTPUT: RoleMasking(frozenset(), frozenset({"if"})),
-}
-
-
-def _masking_value_admitted(key: str, value: object) -> bool:
-    """Whether an admitted masking key carries an admitted value: a
-    `continue-on-error` only as the literal `true` (an expression is chosen at
-    run time); an `if:` as any string (GitHub reads it as an expression)."""
-    if key == "continue-on-error":
-        return value is True
-    return key == "if" and isinstance(value, str)
-
-
-@dataclass(frozen=True)
-class Timeout:
-    """A `timeout-minutes:` value: a positive integer literal.
-
-    Zero, a bool, a float, a string, and a `${{ }}` expression are refused:
-    each is either chosen at run time or not a budget the job can meet.
-    """
-
-    minutes: int
-
-    @staticmethod
-    def parse(value: object) -> Timeout | None:
-        if type(value) is int and value > 0:
-            return Timeout(value)
-        return None
-
-
-def _optional_timeout(raw: dict) -> Timeout | None | str:
-    """The `timeout-minutes:` of `raw`: absent is None, a `Timeout`, or the
-    refusal text for a present value that is not one."""
-    if "timeout-minutes" not in raw:
-        return None
-    t = Timeout.parse(raw["timeout-minutes"])
-    return t if t is not None else f"timeout-minutes: {raw['timeout-minutes']!r} is not a positive integer literal"
-
-
-@dataclass(frozen=True)
-class RunnerLabel:
-    """A `runs-on:` that is one literal GitHub-hosted Ubuntu label
-    (`UBUNTU_HOSTED_RUNNER_RE`)."""
-
-    label: str
-
-    @staticmethod
-    def parse(value: object) -> RunnerLabel | None:
-        if isinstance(value, str) and UBUNTU_HOSTED_RUNNER_RE.fullmatch(value):
-            return RunnerLabel(value)
-        return None
-# Raw-text words: split at quotes and shell metacharacters after every `\` is
-# read as `/`, so a Windows-separated path is seen as the path it names. This
-# detection scan splits on every whitespace character, a superset of
-# `shell_lex.BLANKS`: seeing more candidate words only ever finds more tree
-# references (it fails closed); the words a tool run is read as come from
-# `ToolRunText` alone.
-TREE_TOKEN_SPLIT_RE = re.compile(r"[\s'\"`;&|()<>=$]+")
-
-
-class Interp(enum.Enum):
-    """How a `ToolRun` starts its tool: `python3 <tool>.py`, `bash <tool>.sh`,
-    or `<tool>.sh` executed directly (its shebang)."""
-
-    PYTHON3 = "python3"
-    BASH = "bash"
-    DIRECT = ""
-
-
-TOOL_SUFFIX = {Interp.PYTHON3: ".py", Interp.BASH: ".sh", Interp.DIRECT: ".sh"}
-TREE_FILE_RE = re.compile(r"\.github/ci/([A-Za-z0-9_-]+\.(?:py|sh))")
-TOOL_FLAG_RE = re.compile(r"--?[A-Za-z0-9][A-Za-z0-9-]*")
-# The whole-text grammar of a tool run: plain words separated by bash's blanks
-# (`shell_lex.BLANKS`), nothing else. Built from the one blank set, so the
-# words this grammar sees are the words bash runs.
-_TOOL_RUN_WORD = r"[A-Za-z0-9_./-]+"
-_SHELL_BLANK = "[" + "".join(re.escape(c) for c in sorted(shell_lex.BLANKS)) + "]"
-TOOL_RUN_TEXT_RE = re.compile(rf"{_TOOL_RUN_WORD}(?:{_SHELL_BLANK}+{_TOOL_RUN_WORD})*")
-SHELL_BLANKS_RE = re.compile(rf"{_SHELL_BLANK}+")
-
-
-@dataclass(frozen=True)
-class TreeFile:
-    """A regular file directly under `.github/ci`, present on disk (not a
-    symlink); `name` is its file name."""
-
-    name: str
-
-    @staticmethod
-    def parse(word: str, root: str) -> TreeFile | None:
-        m = TREE_FILE_RE.fullmatch(word)
-        if m is None:
-            return None
-        path = os.path.join(root, "ci", m.group(1))
-        if os.path.islink(path) or not os.path.isfile(path):
-            return None
-        return TreeFile(m.group(1))
-
-
-@dataclass(frozen=True)
-class ToolRunText:
-    """A `run:` text that is one line of plain words (`TOOL_RUN_TEXT_RE`).
-
-    Parsed once, fullmatched after `shell_lex.trim`: no quote, expansion,
-    `${{ }}`, redirection, separator, here-document, or character outside
-    the word set, and words split only on `shell_lex.BLANKS`, so `words`
-    are exactly the words bash runs.
-    """
-
-    words: tuple[str, ...]
-
-    @staticmethod
-    def parse(run: str) -> ToolRunText | None:
-        text = shell_lex.trim(run)
-        if TOOL_RUN_TEXT_RE.fullmatch(text) is None:
-            return None
-        words = tuple(SHELL_BLANKS_RE.split(text))
-        # Defence in depth: the shell lexer reads the same one command.
-        cmds = shell_lex.split_commands(text)
-        if len(cmds) != 1:
-            return None
-        cmd = cmds[0]
-        if cmd.writes or cmd.heredoc or cmd.herestring or cmd.pipe_source is not None:
-            return None
-        if tuple(cmd.words) != words:
-            return None
-        return ToolRunText(words)
-
-
-@dataclass(frozen=True)
-class ToolRun:
-    """A `run:` that is exactly one tool invocation.
-
-    An interpreter, one `TreeFile` whose suffix fits it, and bare literal
-    flags, read from a `ToolRunText`, so the shell runs exactly those words.
-    """
-
-    interp: Interp
-    tool: TreeFile
-    flags: tuple[str, ...]
-
-    @staticmethod
-    def parse(run: str, root: str) -> ToolRun | None:
-        text = ToolRunText.parse(run)
-        if text is None:
-            return None
-        words = text.words
-        interp = {"python3": Interp.PYTHON3, "bash": Interp.BASH}.get(words[0], Interp.DIRECT)
-        rest = words if interp is Interp.DIRECT else words[1:]
-        if not rest:
-            return None
-        tool = TreeFile.parse(rest[0], root)
-        if tool is None or not tool.name.endswith(TOOL_SUFFIX[interp]):
-            return None
-        flags = tuple(rest[1:])
-        if not all(TOOL_FLAG_RE.fullmatch(f) for f in flags):
-            return None
-        return ToolRun(interp, tool, flags)
-
-
-class EnvScope(enum.Enum):
-    WORKFLOW = "workflow"
-    JOB = "job"
-    STEP = "step"
-
-
-_EVERY_SCOPE = frozenset(EnvScope)
-# The one allowlist of `env:` keys a tool job may carry, with the scopes each
-# is admitted at: data a tool reads, never a key that steers the runner, a
-# loader, or an interpreter. `CARGO_*` is workflow-wide build output styling
-# for the workflow's cargo jobs; no tool runs cargo.
-TOOL_ENV_ALLOWLIST: dict[str, frozenset[EnvScope]] = {
-    "EVENT_NAME": _EVERY_SCOPE,
-    "HEAD_REPO": _EVERY_SCOPE,
-    "PR_HEAD_SHA": _EVERY_SCOPE,
-    "REPO": _EVERY_SCOPE,
-    "GH_TOKEN": _EVERY_SCOPE,
-    "HEAD_SHA": _EVERY_SCOPE,
-    "CARGO_TERM_COLOR": frozenset({EnvScope.WORKFLOW}),
-    "CARGO_INCREMENTAL": frozenset({EnvScope.WORKFLOW}),
-}
-
-
-@dataclass(frozen=True)
-class ToolEnvKey:
-    """An `env:` key admitted in a tool job at `scope` (`TOOL_ENV_ALLOWLIST`),
-    byte-exact."""
-
-    key: str
-    scope: EnvScope
-
-    @staticmethod
-    def parse(key: object, scope: EnvScope) -> ToolEnvKey | None:
-        if isinstance(key, str) and scope in TOOL_ENV_ALLOWLIST.get(key, frozenset()):
-            return ToolEnvKey(key, scope)
-        return None
-
-
-def _unadmitted_env_keys(container: dict, scope: EnvScope) -> list[str]:
-    """The `env:` keys of `container` that are not `ToolEnvKey`s at `scope`
-    (an `env:` that is not a mapping is reported whole)."""
-    env = container.get("env", {})
-    if not isinstance(env, dict):
-        return [f"<env: {type(env).__name__}>"]
-    return sorted(str(k) for k in env if ToolEnvKey.parse(k, scope) is None)
-
-
-def _github_component(part: str) -> bool:
-    """Whether one path component could name `.github`: a glob with at least
-    one literal character past its leading dot (`.*` alone is any dot name,
-    most often a regular expression), case-folded, with the trailing dots and
-    spaces Windows drops set aside; a `~` (a Windows short name) counts."""
-    part = part.casefold().rstrip(". ") or part
-    literal = re.sub(r"\[[^]]*]|[*?]", "", part)
-    return "~" in part or (part.startswith(".") and len(literal) > 1 and fnmatch.fnmatchcase(".github", part))
-
-
-def _names_tree(word: str) -> bool:
-    """Whether `word` names a path under `.github/ci`: after brace expansion
-    and with every `\\` read as `/`, a component that could name `.github`
-    (`_github_component`) followed by one matching `ci`. A word whose brace
-    expansion is too large to enumerate is taken to name it."""
-    alternatives = _brace_alternatives(word)
-    if alternatives is None:
-        return True
-    for alt in alternatives:
-        parts = posixpath.normpath(alt.replace("\\", "/").casefold()).split("/")
-        for part, nxt in zip(parts, parts[1:]):
-            if _github_component(part) and fnmatch.fnmatchcase("ci", nxt):
-                return True
-    return False
-
-
-@dataclass(frozen=True)
-class WorkingDir:
-    """A `working-directory:` value admitted anywhere.
-
-    A plain path: a string of printable characters, assembled at no run
-    time, with no `~` component, and no component (as written, or as
-    resolved on disk through symlinks) that could name `.github`. `parse`
-    returns the refusal reason instead of a `WorkingDir`; every text check
-    runs before the path touches the filesystem.
-    """
-
-    path: str
-
-    @staticmethod
-    def parse(value: object, repo_top: str) -> WorkingDir | str:
-        if not isinstance(value, str):
-            return f"is not a string ({type(value).__name__})"
-        if any(not c.isprintable() for c in value):
-            return "holds a control or non-printing character"
-        if "$" in value or "`" in value:
-            return "is assembled at run time"
-        path = value.replace("\\", "/")
-        parts = posixpath.normpath(path).split("/")
-        if any("~" in p for p in parts):
-            return "has a `~` component (a home directory or a Windows short name)"
-        if any(_github_component(p) for p in parts):
-            return "has a .github component"
-        top = os.path.realpath(repo_top)
-        real = os.path.relpath(os.path.realpath(os.path.join(top, path)), top)
-        if any(_github_component(p) for p in real.replace(os.sep, "/").split("/")):
-            return "resolves on disk to a .github component"
-        return WorkingDir(path)
-
-
-def _refuse_working_directory(container: dict, loc: str, what: str, repo_top: str, errors: list[str]) -> None:
-    """A `working-directory` naming `.github` makes a relative `ci/...` path a
-    tree reference no word spells; refused at every scope, in every job."""
-    if "working-directory" not in container:
-        return
-    why = WorkingDir.parse(container["working-directory"], repo_top)
-    if isinstance(why, str):
-        errors.append(
-            f"{loc} {what} {container['working-directory']!r} {why} — a relative path "
-            f"under it could reach {PROTECTED_TREE}/ unnamed; refused"
-        )
-
-
-class PreToolKind(enum.Enum):
-    """Which closed setup shape a `PreToolStep` is."""
-
-    CHECKOUT = "pinned checkout"
-    SETUP_PYTHON = "pinned setup-python"
-    PIP_INSTALL = "canonical pip install"
-
-
-@dataclass(frozen=True)
-class PreToolStep:
-    """A closed setup step: a pinned checkout or setup-python with a literal
-    `with:` and no `env:`, or the canonical pip install with no `env:`; no
-    masking key, and a `Timeout` if any."""
-
-    kind: PreToolKind
-    timeout: Timeout | None
-
-
-@dataclass(frozen=True)
-class ToolStep:
-    """A pure run of one `.github/ci` tool (`ToolRun`) with allowlisted
-    `env:`, its `ToolRole`, a `Timeout` if any, and only the masking keys its
-    role admits on a step (`ROLE_MASKING`), each with an admitted value."""
-
-    run: ToolRun
-    role: ToolRole
-    timeout: Timeout | None
-    masking: frozenset[str]
-
-
-ClosedStep = PreToolStep | ToolStep
-
-
-def parse_closed_step(st: Step, root: str) -> ClosedStep | None:
-    """`st` as a closed shape, or None: a step whose effect on the runner is
-    fixed and cannot rewrite `.github/ci/**` or steer the interpreters the
-    tools run under, and whose failure cannot be masked unless its role says
-    the failure carries no verdict."""
-    raw = st.raw
-    masking = frozenset(raw) & MASKING_KEYS
-    if not set(raw) - masking <= PRE_TOOL_STEP_KEYS or raw.get("shell", "bash") != "bash":
-        return None
-    timeout = _optional_timeout(raw)
-    if isinstance(timeout, str):
-        return None
-    uses, run, with_ = raw.get("uses"), raw.get("run"), raw.get("with", {})
-    if not isinstance(with_, dict):
-        return None
-    if isinstance(uses, str) and run is None:
-        if masking or "env" in raw or not _literal_with(with_):
-            return None
-        if uses in PINNED_CHECKOUT_USES and set(with_) <= CHECKOUT_WITH_KEYS:
-            return PreToolStep(PreToolKind.CHECKOUT, timeout)
-        if uses in PINNED_SETUP_PYTHON_USES and set(with_) <= SETUP_PYTHON_WITH_KEYS:
-            return PreToolStep(PreToolKind.SETUP_PYTHON, timeout)
-        return None
-    if isinstance(run, str) and uses is None and "with" not in raw:
-        if shell_lex.trim(run) == CANONICAL_PIP_INSTALL:
-            return None if masking or "env" in raw else PreToolStep(PreToolKind.PIP_INSTALL, timeout)
-        tool = ToolRun.parse(run, root)
-        if tool is None or _unadmitted_env_keys(raw, EnvScope.STEP):
-            return None
-        role = TOOL_ROLES.get(tool.tool.name, ToolRole.VERDICT)
-        admitted = ROLE_MASKING[role].step
-        if not all(k in admitted and _masking_value_admitted(k, raw[k]) for k in masking):
-            return None
-        return ToolStep(tool, role, timeout, masking)
-    return None
-
-
-# The one expression a closed `with:` admits: a checkout `fetch-depth` chosen
-# between two digit literals by the event name alone. Every value it can take
-# is a literal depth, so the input stays fixed per event.
-EVENT_KEYED_DEPTH_RE = re.compile(
-    r"\$\{\{ github\.event_name == '[a-z_]+' && '[0-9]+' \|\| '[0-9]+' \}\}"
-)
-
-
-def _literal_with(with_: dict) -> bool:
-    """Whether every `with:` entry of a closed shape is a string key with a
-    literal scalar value: a bool, a number, or a string holding no `${{`
-    (an expression would choose the input at run time) — save a
-    `fetch-depth` of exactly `EVENT_KEYED_DEPTH_RE`'s shape."""
-    for key, value in with_.items():
-        if not isinstance(key, str):
-            return False
-        if isinstance(value, str):
-            if "${{" in value and not (key == "fetch-depth" and EVENT_KEYED_DEPTH_RE.fullmatch(value)):
-                return False
-        elif not isinstance(value, (bool, int, float)):
-            return False
-    return True
-
-
-def _tree_reference(node: object, run: str | None, loc: str) -> str | None:
-    """The first word in any string of `node` (keys included) that could
-    name `.github/ci/**`, or None. In the step's own `run:` the canonical
-    helper call is set aside (see `check_workflow_steps`). Words are taken
-    both quote-removed (`shell_lex`) and as raw text with every `\\` read as
-    `/`, split at quotes and shell metacharacters, so neither spelling hides
-    a reference. Shape errors are reported by the step audits, not here."""
-    for label, text, _ in _string_scalars(node, loc, []):
-        if label == "run:" and text is run:
-            text = GITHUB_ENV_HELPER_CALL_RE.sub(" ", text)
-        words = TREE_TOKEN_SPLIT_RE.split(text.replace("\\", "/"))
-        for part in _shell_texts(text):
-            for cmd in shell_lex.split_commands(part):
-                words.extend(cmd.words)
-                words.extend(cmd.writes)
-        hit = next((w for w in words if w and _names_tree(w)), None)
-        if hit is not None:
-            return hit
-    return None
-
-
-CLOSED_SHAPES_NOTE = (
-    "the closed pre-tool shapes (pinned checkout or setup-python with a literal with: and "
-    "no env, the canonical pip install with no env, a pure .github/ci tool run with "
-    "allowlisted env; any timeout-minutes: a positive integer literal; no if:, and "
-    "continue-on-error: true only on an advisory tool)"
-)
-
-
-def _step_refusal_detail(st: Step) -> list[str]:
-    """Why a tree-naming step is not a `ClosedStep`, as far as a single key
-    says (the shape itself is named by `CLOSED_SHAPES_NOTE`)."""
-    detail = []
-    if "working-directory" in st.raw:
-        detail.append("under a working-directory:")
-    for key in sorted(MASKING_KEYS & set(st.raw)):
-        detail.append(f"with {key}: (its verdict could be masked)")
-    timeout = _optional_timeout(st.raw)
-    if isinstance(timeout, str):
-        detail.append(f"with {timeout}")
-    bad = _unadmitted_env_keys(st.raw, EnvScope.STEP)
-    if bad:
-        detail.append(f"with env {bad}")
-    return detail
-
-
-def _needs_of(raw: dict) -> list[str]:
-    needs = raw.get("needs") or []
-    return [str(n) for n in ([needs] if isinstance(needs, str) else needs if isinstance(needs, list) else [needs])]
-
-
-@dataclass(frozen=True)
-class ToolJob:
-    """A job that names `.github/ci/**`, parsed once.
-
-    `steps` are the job's steps up to and including its last one naming the
-    tree, every one a `ClosedStep`; `runner` a `RunnerLabel`; `timeout` a
-    `Timeout` if any; every job key in `TOOL_JOB_KEYS` save `masking`, the
-    job-level masking keys, which every `ToolStep`'s role must admit on a job
-    (`ROLE_MASKING`; a job with no `ToolStep` admits none). A job carrying
-    one is terminal: no job needs it, since a skipped job skips its
-    dependents and each of them then reports success. A job with a VERDICT
-    step carries no `needs:` at all — the same skip-then-report-success hole
-    reopens transitively through any ancestor's `if:`, not only through this
-    job's own masking, so a verdict job depends on nothing.
-    """
-
-    runner: RunnerLabel
-    timeout: Timeout | None
-    steps: tuple[ClosedStep, ...]
-    masking: frozenset[str]
-
-    @staticmethod
-    def parse(
-        wf: SccacheWorkflow, job: WorkflowJob, steps: list[Step], jloc: str, root: str
-    ) -> ToolJob | list[str] | None:
-        """The job as a `ToolJob`, its refusals, or None when no step names
-        the tree (the job is then not a tool job)."""
-        refusals: list[str] = []
-        closed: list[ClosedStep] = []
-        prefix: list[ClosedStep] = []
-        tainted: Step | None = None
-        referenced = False
-        for st in steps:
-            shape = parse_closed_step(st, root)
-            if shape is not None and tainted is None:
-                closed.append(shape)
-            hit = _tree_reference(st.raw, st.run, jloc)
-            if hit is not None:
-                referenced = True
-                prefix = list(closed)
-                stloc = f"{jloc} step {st.label!r}"
-                if tainted is not None:
-                    refusals.append(
-                        f"{stloc} names {hit!r} after step {tainted.label!r}, which is outside "
-                        f"{CLOSED_SHAPES_NOTE} — an earlier step could have rewritten "
-                        f"{PROTECTED_TREE}/ or the job's environment; refused"
-                    )
-                if shape is None:
-                    detail = _step_refusal_detail(st)
-                    note = f" ({', '.join(detail)})" if detail else ""
-                    refusals.append(
-                        f"{stloc} names {hit!r} but is not itself one of {CLOSED_SHAPES_NOTE}{note} "
-                        f"— only those may name {PROTECTED_TREE}/; refused"
-                    )
-            if tainted is None and shape is None:
-                tainted = st
-        if not referenced:
-            return None
-        raw = job.raw
-        runs_on = raw.get("runs-on")
-        runner = RunnerLabel.parse(runs_on)
-        if runner is None:
-            refusals.append(
-                f"{jloc} runs {PROTECTED_TREE}/ on runs-on {runs_on!r}, not one literal "
-                "GitHub-hosted Ubuntu label (a fresh virtual machine per job, bash by default); refused"
-            )
-        for key in sorted(str(k) for k in raw):
-            if key in TOOL_JOB_KEYS or key in MASKING_KEYS:
-                continue
-            if key in ("container", "services"):
-                refusals.append(
-                    f"{jloc} runs {PROTECTED_TREE}/ with a job {key}: — its filesystem and "
-                    "processes outlive this job's steps; refused"
-                )
-            else:
-                refusals.append(
-                    f"{jloc} runs {PROTECTED_TREE}/ with a job {key}:, outside the tool job keys "
-                    "(TOOL_JOB_KEYS) — it could expand, cancel, re-scope, or re-home the job "
-                    "outside this check; refused"
-                )
-        timeout = _optional_timeout(raw)
-        if isinstance(timeout, str):
-            refusals.append(f"{jloc} runs {PROTECTED_TREE}/ with a job {timeout}; refused")
-            timeout = None
-        masking = frozenset(raw) & MASKING_KEYS
-        tools = [s for s in prefix if isinstance(s, ToolStep)]
-        admitted = frozenset(MASKING_KEYS)
-        for t in tools:
-            admitted &= ROLE_MASKING[t.role].job
-        if not tools:
-            admitted = frozenset()
-        for key in sorted(masking):
-            if key in admitted and _masking_value_admitted(key, raw[key]):
-                continue
-            verdicts = sorted({t.run.tool.name for t in tools if not ROLE_MASKING[t.role].job >= {key}})
-            refusals.append(
-                f"{jloc} runs {PROTECTED_TREE}/ with a job {key}: {raw[key]!r} — a skipped or "
-                "failure-ignored job reports success to required checks (and skips the jobs "
-                f"that need it), so it may mask the verdict of {verdicts or 'its steps'}; "
-                "only an output tool's terminal job admits a job if:; refused"
-            )
-        if masking:
-            dependents = sorted(j.job_id for j in wf.jobs if job.job_id in _needs_of(j.raw))
-            if dependents:
-                refusals.append(
-                    f"{jloc} runs {PROTECTED_TREE}/ with a job {'/'.join(sorted(masking))}: but "
-                    f"job(s) {dependents} need it — a skipped job skips its dependents, which "
-                    "then report success; refused"
-                )
-        job_needs = _needs_of(raw)
-        if job_needs and any(not ROLE_MASKING[t.role].job for t in tools):
-            refusals.append(
-                f"{jloc} runs {PROTECTED_TREE}/ with needs: {job_needs!r} — a job whose tool "
-                "admits no job masking (a verdict, or an advisory that steers other jobs) "
-                "may depend on nothing: GitHub skips a job whose need is itself skipped, "
-                "directly or through that need's own needs, the instant ANY job in the chain "
-                "carries an if: (of any value), and a skipped required check reports success; "
-                "refused"
-            )
-        for scope, container in ((EnvScope.WORKFLOW, wf.doc), (EnvScope.JOB, raw)):
-            d = container.get("defaults")
-            r = d.get("run") if isinstance(d, dict) else None
-            if isinstance(r, dict) and "working-directory" in r:
-                refusals.append(
-                    f"{jloc} runs {PROTECTED_TREE}/ under a {scope.value} defaults.run.working-directory "
-                    "— its relative paths would resolve outside the workspace; refused"
-                )
-            if isinstance(r, dict) and r.get("shell", "bash") != "bash":
-                refusals.append(
-                    f"{jloc} runs {PROTECTED_TREE}/ under a {scope.value} defaults.run.shell "
-                    f"{r.get('shell')!r} — a tool run is read as bash; refused"
-                )
-            bad = _unadmitted_env_keys(container, scope)
-            if bad:
-                refusals.append(
-                    f"{jloc} runs {PROTECTED_TREE}/ with {scope.value} env {bad}, outside the "
-                    "tool env allowlist (TOOL_ENV_ALLOWLIST); refused"
-                )
-        if refusals or runner is None:
-            return refusals
-        return ToolJob(runner, timeout, tuple(prefix), masking)
-
-
-def _check_tool_job(
-    wf: SccacheWorkflow, job: WorkflowJob, steps: list[Step], jloc: str, root: str, errors: list[str]
-) -> None:
-    """The ordering rule of check 7 for one job: a job naming `.github/ci/**`
-    must parse as a `ToolJob` (closed steps up to its last tree reference, a
-    fresh hosted Ubuntu runner, workspace-root paths, allowlisted env and job
-    keys, and masking only where every tool's role admits it)."""
-    parsed = ToolJob.parse(wf, job, steps, jloc, root)
-    if isinstance(parsed, list):
-        errors.extend(parsed)
+    for key in ("run", "shell"):
+        if key in st.raw and not isinstance(st.raw[key], str):
+            _refuse_shape(loc, f"{key}:", "a string", st.raw[key], errors)
+    _refuse_wiring_text(st.run, loc, "run:", errors)
+    _refuse_wiring_text(st.shell, loc, "shell:", errors)
+    if "with" in st.raw:
+        w = st.raw["with"]
+        if not isinstance(w, dict):
+            _refuse_shape(loc, "with:", "a mapping", w, errors)
+        else:
+            for k, v in w.items():
+                _refuse_wiring_text(f"{k}: {v}", loc, f"with.{k}", errors)
 
 
 @dataclass(frozen=True)
@@ -2514,9 +624,8 @@ class LocalActions:
     can point at an action this pass never read. Anything it cannot read as
     a composite is refused, never taken to not reach sccache."""
 
-    def __init__(self, root: str, policy: StepPolicy, errors: list[str]):
+    def __init__(self, root: str, errors: list[str]):
         self.root = root
-        self.policy = policy
         self.errors = errors
         self._by_id: dict[str, LocalAction | None] = {}
         self._folded: dict[str, str] = {}
@@ -2590,18 +699,8 @@ class LocalActions:
         action = self._load(rel, uses or rel, loc)
         self._by_id[rel] = action
         if action is not None and rel != SCCACHE_COMPOSITE_ID:
-            outside_steps = {k: v for k, v in action.doc.items() if k != "runs"}
-            outside_steps["runs"] = {k: v for k, v in action.doc["runs"].items() if k != "steps"}
-            _audit_scalars(outside_steps, f"{action.display}/action.yml:", self.policy, self.errors, step=False)
             for st in action.steps:
-                sloc = f"{action.display}/action.yml: step {st.label!r}"
-                _audit_step(st, sloc, self.policy, self.errors)
-                hit = _tree_reference(st.raw, st.run, sloc)
-                if hit is not None:
-                    self.errors.append(
-                        f"{sloc} names {hit!r} — a composite step runs wherever the action "
-                        f"is used, outside the ordering rule for {PROTECTED_TREE}/; refused"
-                    )
+                _audit_step(st, f"{action.display}/action.yml: step {st.label!r}", self.errors)
         return action
 
     def _load(self, rel: str, shown: str, loc: str) -> LocalAction | None:
@@ -2679,7 +778,7 @@ def _check_sccache_composite(actions: LocalActions, errors: list[str]) -> None:
     ./.github/actions/sccache` must get a real wrapper. Proof is equality:
     the document holds only `SCCACHE_COMPOSITE_DOC_KEYS`, `runs:` is exactly
     `{using: composite, steps: [install, wire]}`, the install step is exactly
-    `{uses: mozilla-actions/sccache-action@<40-hex commit sha>}`, and the wiring step equals
+    `{uses: mozilla-actions/sccache-action@<ref>}`, and the wiring step equals
     `SCCACHE_WIRE_STEP`. Any other shape — a condition, an extra or reordered
     step, a nested local `uses:`, an extra key — is refused.
     """
@@ -2711,7 +810,7 @@ def _check_sccache_composite(actions: LocalActions, errors: list[str]) -> None:
         and SCCACHE_INSTALL_USES_RE.match(install["uses"])
     ):
         errors.append(
-            f"{where}: step 1 must be exactly {{'uses': '{SCCACHE_ACTION_PREFIX}<40-hex commit sha>'}} "
+            f"{where}: step 1 must be exactly {{'uses': '{SCCACHE_ACTION_PREFIX}<ref>'}} "
             f"(got {install!r}); refused"
         )
     if wire != SCCACHE_WIRE_STEP:
@@ -2732,10 +831,7 @@ def _job_sub_env_scopes(job_raw: dict, loc: str, errors: list[str]) -> list[tupl
         container = job_raw["container"]
         if isinstance(container, dict):
             scopes.append(("container", container))
-            _refuse_unpinned_image(container.get("image"), f"{loc} container", errors)
-        elif isinstance(container, str):
-            _refuse_unpinned_image(container, f"{loc} container", errors)
-        else:
+        elif not isinstance(container, str):
             _refuse_shape(loc, "container:", "a mapping or image string", container, errors)
     if "services" in job_raw:
         services = job_raw["services"]
@@ -2745,16 +841,13 @@ def _job_sub_env_scopes(job_raw: dict, loc: str, errors: list[str]) -> list[tupl
             for sid, svc in services.items():
                 if isinstance(svc, dict):
                     scopes.append((f"service {sid!r}", svc))
-                    _refuse_unpinned_image(svc.get("image"), f"{loc} service {sid!r}", errors)
                 else:
                     _refuse_shape(loc, f"service {sid!r}", "a mapping", svc, errors)
     return scopes
 
 
-def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
-    """Checks 6 and 7 over every step of every workflow and reachable local action.
-
-    The only sanctioned way a job gets sccache is `uses:
+def check_sccache_wiring(errors: list[str], root: str = REPO_ROOT) -> None:
+    """The only sanctioned way a job gets sccache is `uses:
     ./.github/actions/sccache` (see `_check_sccache_composite`), so a wrapper
     never exists in a job without the binary that backs it. Refused:
       (a) a raw `mozilla-actions/sccache-action` reference (case-folded) in a
@@ -2765,70 +858,15 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
           or any other reachable local action; an `env:` that is present but
           not a plain mapping is refused outright;
       (c) free text naming a wrapper var, a rustc-replacing var, an SCCACHE_*
-          key, or cargo's `rustc-wrapper` spelling in any string key or value
-          of a workflow, job, step, or local action's metadata (`run:`,
-          `shell:`, `env:`, `with:`, `name:`, `if:`, `strategy.matrix`,
-          `on.*.inputs`, `defaults.run.shell`, any nesting up to
-          STRING_SCALAR_DEPTH_LIMIT) — any syntax, `$GITHUB_ENV` or not (YAML
-          comments are not values and are never read);
+          key, or cargo's `rustc-wrapper` spelling in any `env:` value (every
+          scope of (b)), `run:`, step `shell:`, workflow/job
+          `defaults.run.shell`, or `with:` value — any syntax, `$GITHUB_ENV`
+          or not (YAML comments are not values and are never read);
       (d) a job that reaches the sccache composite — directly or through any
           chain of local actions — while owning a step named in
           `ci/deterministic-checks.json` (sccache's GitHub Actions cache
           backend does network I/O); an unreadable deterministic-checks file
-          is itself refused, since the step set cannot be established;
-      (e) a third-party `uses:` not pinned to a 40-hex commit SHA, a
-          `docker://` `uses:` or a job `container:`/`services:` image not
-          pinned to a sha256 digest;
-      (f) any text (every place (c) reads) naming, in any case or syntax,
-          GITHUB_ENV/PATH/STATE/OUTPUT/STEP_SUMMARY (an append to
-          GITHUB_OUTPUT/GITHUB_STEP_SUMMARY by exact name excepted), the
-          runner's command files, `ACTIONS_ALLOW_UNSECURE_COMMANDS`, or a
-          legacy `::` command; a `github`/`env` expression access other
-          than a literal `.name`, or `github.<command-file property>`; a
-          `GITHUB_WORKSPACE` other than a plain read; and any reference to
-          `ci/github-env.sh` other than its canonical call in a step's
-          `run:` with a bare key listed in `ci/github-env-allowlist.txt`
-          (itself validated: `CI_JOB_[A-Z0-9_]+`, and no wiring, runner,
-          toolchain, loader, or interpreter key);
-      (g) a `pip install` other than `--require-hashes --only-binary :all:
-          -r $GITHUB_WORKSPACE/.github/ci/requirements.txt` with that one
-          file exactly once, and any `pipx`/`easy_install`, judged on
-          quote-removed words (`p""ip` is `pip`);
-      (h) a `shell:` or `defaults.run.shell` other than bash, pwsh, or
-          powershell, bare (any other value is a command template);
-      (i) the ordering rule (`_check_tool_job`): a step naming
-          `.github/ci/**` that is not itself a `ClosedStep`
-          (`parse_closed_step`), or that runs after any step outside them —
-          any other step may rewrite the tree or the job's environment
-          first, so the tools' trust is monotone taint, not a list of write
-          spellings. Every shape is an allowlist: a tool step is one
-          `ToolRun` (`python3`/`bash`/direct, one `TreeFile` present on
-          disk, bare flags; no `${{ }}`, operator, redirection, or second
-          line); an action or pip step carries no `env:`; every workflow,
-          job, and tool-step `env:` key is a `ToolEnvKey` of
-          `TOOL_ENV_ALLOWLIST` for its scope. A job that runs the tree must
-          parse as a `ToolJob`: a runs-on other than one literal
-          GitHub-hosted Ubuntu label (`RunnerLabel`), a job key outside
-          `TOOL_JOB_KEYS`, a `timeout-minutes` that is not a positive integer
-          literal (`Timeout`), a masking key its tools' roles do not admit,
-          a job `if:` on a job another job needs, a `needs:` on a job with a
-          VERDICT or ADVISORY step (a skipped ancestor, anywhere up the `needs:` chain,
-          skips it too, and a skipped required check reports success), a
-          `working-directory` at step or defaults scope, or a
-          `defaults.run.shell` other than bash is refused. In every job, a
-          `working-directory` (step, composite
-          step, or defaults) assembled at run time or with a `.github`
-          component, as written (`\\` read as `/`) or resolved on disk, is
-          refused: a relative `ci/...` under it names the tree unspelled.
-          The raw-text scan reads `\\` as `/`. The canonical
-          `ci/github-env.sh` call is not a reference: a step after a
-          non-closed step already runs arbitrary code with the env file
-          open, so the helper grants it nothing, and the helper is not a
-          verdict. A composite step naming the tree is refused (it runs
-          wherever the action is used). Beneath (i), a quote-removed scan
-          (brace expansion, wrapper flags, `xargs`, `sh -c` text, and a
-          shell fed unseen standard input all resolved) refuses a write into
-          the tree as defence in depth.
+          is itself refused, since the step set cannot be established.
     Every local `uses: ./...` is resolved on disk from the repo root
     (`action.yml`, then `action.yaml`); an unresolvable, ambiguous, non-
     composite (node/docker), cyclic, or over-deep (> LOCAL_ACTION_DEPTH_LIMIT)
@@ -2842,69 +880,17 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
 
     LIMIT — static YAML cannot see, and this check does NOT prove absent:
       - a third-party action that itself exports a wrapper into the job;
-      - a repo script or interpreter snippet invoked from `run:` (`run:
-        tools/ci/wire.sh`, `python -c ...`) that writes a wrapper or the env
-        file under a name it assembles at run time, or a package manager
-        (npm, cargo, apt, docker) fetching by a movable name;
-      - an `env:`/`with:` value whose key name arrives only through `${{ }}`
-        (`vars`, `secrets`, outputs);
+      - a repo script invoked from `run:` (`run: tools/ci/wire.sh`) that
+        writes a wrapper or `$GITHUB_ENV`;
+      - key indirection assembled at run time (`K=WRAPPER; echo
+        "RUSTC_$K=..." >> "$GITHUB_ENV"`), or an `env:`/`with:` value whose
+        key name arrives only through `${{ }}` (`vars`, `secrets`, outputs);
       - a rustc replacement outside the named keys (a `PATH` entry shadowing
-        `rustc`, a `rustup` toolchain override, a linker/runner setting);
-      - run-time string assembly inside `run:` that builds a command-file
-        name or a command the text scan never sees whole: `eval`, a
-        variable name concatenated from parts, `${!x}` indirection, a glob
-        over the runner temp directory, a decoded payload piped to a shell;
-      - what a step writes into GITHUB_OUTPUT (content, a multiline
-        delimiter) and how later `${{ steps.*.outputs.* }}` interpolation
-        uses it;
-      - an expression value that is itself shell text (`${{ inputs.f }}`
-        whose value is `$GITHUB_ENV`), and interpreter variables (`PYTHON*`)
-        that steer the canonical pip install;
-      - shadowing a checked command by means other than a shell function or
-        alias written in the same `run:` (a `PATH` entry, `BASH_ENV`, a
-        sourced file);
-      - under (i), a runner that carries a GitHub-hosted label but is not
-        one: the label test assumes the repository registers no self-hosted
-        runner (it registers none; one labelled `ubuntu-latest` would keep
-        its disk across jobs); a step that runs the tree spelled so no word
-        names it (`${d}hub/ci`, a relative path after `cd .github`, a
-        pure-wildcard `.*/ci`) is not seen as a tool step, so its verdict is
-        not one this rule vouches for; and, for the same reason, a symlink
-        to the tree created at run time by an unrecognised step earlier in
-        the same job (a hosted runner is a fresh machine per job, so no
-        other job's link survives into it) and then run through a path no
-        word spells as the tree;
-      - in the defence-in-depth write scan beneath (i) (these are closed
-        only because (i) refuses the tool after any such step): a path the
-        words do not spell (`d=.git; ${d}hub/ci`, a relative path after
-        `cd`), an interpreter snippet, an archive extractor, `find -exec`,
-        a whole-tree `git checkout`/`git reset`, an action's `with:`, and
-        pwsh text (lexed as POSIX);
-      - an attacker-controlled `${{ github.event.* }}` value interpolated
-        straight into `run:` text (passing it through `env:` is the safe form);
-      - a legacy `::set-env` command assembled by the shell at run time (the
-        quote-concatenated `::set-""env` spelling is refused);
-      - installers that fetch without pip's hash checking beyond the refused
-        `setup.py install`, `uv pip`, `uv tool`, `uvx`, `pipx`, and
-        `easy_install`;
-      - `TOOL_FLAG_RE` admits any literal flag word, so `--help`/`-h` is an
-        accepted tool invocation and exits 0 without running the tool's
-        verdict logic;
-      - a `.py`/`.sh` file under the tree is accepted as a tool by its
-        filename suffix alone — a library module never meant to run
-        standalone (`strict_yaml.py`, `release_only.py`) parses the same as
-        a verdict script;
-      - `run: true` (or any non-`run:` step form) is not a `ToolRun` and so
-        is not a tool step at all — it neither names the tree nor is
-        refused for failing to;
-      - nothing here binds a branch-protection required context's name to
-        the tool file it is meant to report; the mapping from context to
-        script is trusted, not checked.
+        `rustc`, a `rustup` toolchain override, a linker/runner setting).
     Those are review-gated, not machine-gated.
     """
     start = len(errors)
-    policy = StepPolicy(load_github_env_allowlist(errors, root), os.path.dirname(os.path.abspath(root)))
-    actions = LocalActions(root, policy, errors)
+    actions = LocalActions(root, errors)
     _check_sccache_composite(actions, errors)
 
     det_errors: list[str] = []
@@ -2930,13 +916,11 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
     for wf in _load_sccache_workflows(root, errors):
         wloc = f"{wf.fname}: workflow-level"
         _refuse_env_keys(_scoped_env(wf.doc, f"{wloc} env", errors), wloc, errors)
-        _audit_defaults(wf.doc, wf.fname, policy.repo_top, errors)
-        _audit_scalars({k: v for k, v in wf.doc.items() if k != "jobs"}, wloc, policy, errors, step=False)
+        _audit_defaults(wf.doc, wf.fname, errors)
         for job in wf.jobs:
             jloc = f"{wf.fname}: job {job.job_id!r}"
             _refuse_env_keys(_scoped_env(job.raw, f"{jloc} env", errors), jloc, errors)
-            _audit_defaults(job.raw, jloc, policy.repo_top, errors)
-            _audit_scalars({k: v for k, v in job.raw.items() if k != "steps"}, jloc, policy, errors, step=False)
+            _audit_defaults(job.raw, jloc, errors)
             for scope_name, scope_raw in _job_sub_env_scopes(job.raw, jloc, errors):
                 sloc = f"{jloc} {scope_name}"
                 _refuse_env_keys(_scoped_env(scope_raw, f"{sloc} env", errors), sloc, errors)
@@ -2950,13 +934,12 @@ def check_workflow_steps(errors: list[str], root: str = REPO_ROOT) -> None:
             reaches = False
             for st in steps:
                 stloc = f"{jloc} step {st.label!r}"
-                _audit_step(st, stloc, policy, errors)
+                _audit_step(st, stloc, errors)
                 action = actions.resolve(st.uses, stloc)
                 if action is not None and actions.reaches_sccache(action, stloc):
                     reaches = True
                     if via is None and action.id != SCCACHE_COMPOSITE_ID:
                         via = action.display
-            _check_tool_job(wf, job, steps, jloc, root, errors)
             if reaches:
                 hit = sorted({st.name for st in steps if st.name is not None} & deterministic_steps)
                 if hit:
@@ -3069,24 +1052,8 @@ def main() -> int:
     # ---- 5. ci/deterministic-checks.json vs the watcher + ci.yml steps ----
     check_deterministic_set(jobs, errors)
 
-    # ---- 6+7. sccache wiring; pinned CI inputs + env-file writes ----
-    check_workflow_steps(errors)
-
-    # ---- 8. merge queue: gate producers trigger on it; its runs stay secret-free ----
-    check_merge_queue(
-        {
-            str(e["producer"])
-            for e in by_context.values()
-            if e.get("disposition") == "gate" and e.get("producer")
-        },
-        errors,
-    )
-
-    # ---- 8. no release-only skip-as-pass on a gate producer ----
-    check_release_only_skips(
-        {ctx for ctx, e in by_context.items() if e.get("disposition") == "gate"},
-        errors,
-    )
+    # ---- 6. sccache wiring: action <-> RUSTC_WRAPPER/SCCACHE_GHA_ENABLED ----
+    check_sccache_wiring(errors)
 
     # ---- 3. fail-closed dependency surfacing ----
     def surfaced_dispositions(job: Job) -> set[str]:

@@ -38,8 +38,6 @@ use crate::{CliError, io_err, text};
 
 pub(crate) mod held;
 mod proven;
-#[cfg(any(windows, test))]
-mod win32_name;
 
 use proven::{ProvenOutPath, prove_parent_steps};
 
@@ -157,12 +155,7 @@ pub enum OutputRefusal {
     ///
     /// A Windows drive-relative path (`C:x`) depends on a per-drive working
     /// directory, and a `/` inside a verbatim (`\\?\`) component is a separator
-    /// on some platforms and part of a name on others. A `.` or `..` inside a
-    /// verbatim path is a literal name there, not a step; a device namespace
-    /// (`\\.\pipe`) or another non-disk verbatim root (`\\?\GLOBALROOT`)
-    /// names no directory tree; and Windows opens a name with a trailing `.` or
-    /// space, a `:`, or a device stem (`NUL`, `COM1`) as some other entry than
-    /// the one spelled.
+    /// on some platforms and part of a name on others.
     Unplaceable(PathBuf),
     /// An ejected project must go to a fresh (absent or empty) directory.
     ///
@@ -1502,7 +1495,7 @@ fn resolve_through_existing(path: &Path) -> Option<PathBuf> {
 mod tests {
     #[cfg(windows)]
     use super::proven::drive_of;
-    use super::proven::{Cwd, prove_parent_steps_from};
+    use super::proven::prove_parent_steps_from;
     #[cfg(windows)]
     use super::test_links::junction_in_place;
     use super::test_links::plant_link;
@@ -1560,17 +1553,6 @@ mod tests {
         PathBuf::from(raw)
     }
 
-    /// `path` spelled without a verbatim `\\?\X:` prefix, where `.` and `..` are steps.
-    ///
-    /// Under a verbatim prefix a `.` or `..` is a literal name, so a test that
-    /// spells one as a step spells it onto the plain form of its base.
-    fn unverbatim(path: &Path) -> PathBuf {
-        let text = path.to_string_lossy();
-        text.strip_prefix(r"\\?\")
-            .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
-            .map_or_else(|| path.to_path_buf(), PathBuf::from)
-    }
-
     /// A manifest-shaped project: `<base>/proj/{package.ipe,src/Main.ipe}`.
     fn project(base: &Path) -> ProjectPaths {
         let root = base.join("proj");
@@ -1624,7 +1606,7 @@ mod tests {
     fn project_root_is_refused() {
         let base = scratch("root");
         let proj = project(&base);
-        for raw in [proj.root.clone(), spelled(&unverbatim(&proj.root), &["."])] {
+        for raw in [proj.root.clone(), spelled(&proj.root, &["."])] {
             let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
             assert!(
                 matches!(refused(&result), Some(OutputRefusal::ProjectRoot(_))),
@@ -1664,10 +1646,7 @@ mod tests {
     fn ancestor_of_the_project_is_refused() {
         let base = scratch("ancestor");
         let proj = project(&base);
-        for raw in [
-            base.clone(),
-            spelled(&unverbatim(&proj.root), &["src", "..", ".."]),
-        ] {
+        for raw in [base.clone(), spelled(&proj.root, &["src", "..", ".."])] {
             let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
             assert!(
                 matches!(
@@ -1686,7 +1665,7 @@ mod tests {
     fn dot_dot_through_a_missing_tail_is_refused() {
         let base = scratch("dotdot");
         let proj = project(&base);
-        let raw = spelled(&unverbatim(&base), &["missing", "..", "elsewhere"]);
+        let raw = spelled(&base, &["missing", "..", "elsewhere"]);
         let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
         assert!(
             matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
@@ -1699,7 +1678,7 @@ mod tests {
     fn dot_dot_over_a_missing_level_is_refused_at_any_depth() {
         let base = scratch("dotdot-deep");
         let proj = project(&base);
-        let existing = unverbatim(&base).join("existing");
+        let existing = base.join("existing");
         std::fs::create_dir_all(&existing).expect("make existing");
         for raw in [
             spelled(&existing, &["missing", "..", "elsewhere"]),
@@ -1724,7 +1703,7 @@ mod tests {
         let base = scratch("dotdot-file");
         let proj = project(&base);
         std::fs::write(base.join("file"), "keep").expect("write file");
-        let raw = spelled(&unverbatim(&base), &["file", "..", "elsewhere"]);
+        let raw = spelled(&base, &["file", "..", "elsewhere"]);
         let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
         assert!(
             matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
@@ -1742,7 +1721,7 @@ mod tests {
         std::fs::create_dir_all(&victim).expect("make victim");
         let link = base.join("link");
         plant_link(&victim, &link);
-        let raw = spelled(&unverbatim(&link), &["..", "elsewhere"]);
+        let raw = spelled(&link, &["..", "elsewhere"]);
         let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
         assert!(
             matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
@@ -1764,11 +1743,10 @@ mod tests {
         let base = scratch("dotdot-plain");
         let proj = project(&base);
         std::fs::create_dir_all(base.join("existing")).expect("make existing");
-        let plain = unverbatim(&base);
-        let raw = spelled(&plain, &["existing", "..", "elsewhere"]);
+        let raw = spelled(&base, &["existing", "..", "elsewhere"]);
         let out = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj)
             .expect("a `..` out of a plain directory is honoured");
-        assert_eq!(out.path(), plain.join("elsewhere"), "the `..` is resolved");
+        assert_eq!(out.path(), base.join("elsewhere"), "the `..` is resolved");
         out.claim().expect("claim root");
         assert!(
             base.join("elsewhere").is_dir(),
@@ -1787,7 +1765,7 @@ mod tests {
         std::fs::create_dir_all(victim.join("x")).expect("make victim");
         let link = base.join("link");
         plant_link(&victim, &link);
-        let raw = spelled(&unverbatim(&link), &["x", "..", "..", "elsewhere"]);
+        let raw = spelled(&link, &["x", "..", "..", "elsewhere"]);
         let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
         assert!(
             matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
@@ -1809,7 +1787,7 @@ mod tests {
     fn a_trailing_dot_dot_resolves_only_out_of_a_plain_level() {
         let base = scratch("dotdot-trailing");
         let proj = project(&base);
-        let existing = unverbatim(&base).join("existing");
+        let existing = base.join("existing");
         OutputRoot::resolve(Some(&existing.to_string_lossy()), &proj)
             .and_then(|root| root.claim())
             .expect("claim the output root");
@@ -1824,7 +1802,7 @@ mod tests {
         let link = base.join("link");
         plant_link(&victim, &link);
         for raw in [
-            spelled(&unverbatim(&link), &[".."]),
+            spelled(&link, &[".."]),
             spelled(&existing, &["missing", ".."]),
         ] {
             let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
@@ -1841,7 +1819,7 @@ mod tests {
     fn cur_dir_beside_dot_dot_changes_nothing() {
         let base = scratch("dotdot-curdir");
         let proj = project(&base);
-        let existing = unverbatim(&base).join("existing");
+        let existing = base.join("existing");
         std::fs::create_dir_all(existing.join("sub")).expect("make sub");
         let raw = spelled(&existing, &[".", "sub", ".", "..", ".", "elsewhere"]);
         let out = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj)
@@ -1863,8 +1841,7 @@ mod tests {
     fn dot_dot_at_the_root_is_refused() {
         let base = scratch("dotdot-root");
         let proj = project(&base);
-        let plain = unverbatim(&base);
-        let root = plain.ancestors().last().expect("a root").to_path_buf();
+        let root = base.ancestors().last().expect("a root").to_path_buf();
         for raw in [spelled(&root, &[".."]), spelled(&root, &["..", "x"])] {
             let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
             assert!(
@@ -1893,7 +1870,7 @@ mod tests {
             &[".", "link", ".", "..", "x"][..],
         ] {
             let raw = spelled(Path::new(""), segments);
-            let result = prove_parent_steps_from(&raw, &Cwd::assumed(base.clone()));
+            let result = prove_parent_steps_from(&raw, &base);
             assert!(
                 matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
                 "--out {} against {} must be refused, got {result:?}",
@@ -1902,27 +1879,36 @@ mod tests {
             );
         }
         let raw = spelled(Path::new(""), &["existing", "..", "x"]);
-        let proven = prove_parent_steps_from(&raw, &Cwd::assumed(base.clone()))
-            .expect("a plain `..` is honoured");
+        let proven = prove_parent_steps_from(&raw, &base).expect("a plain `..` is honoured");
         assert_eq!(proven.as_path(), base.join("x"), "the `..` is resolved");
         assert!(!base.join("x").exists(), "the proof creates nothing");
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A relative request against a verbatim `\\?\` working directory has
-    /// its `..` proven by the walk, never collapsed by a join onto that base.
+    /// A relative request against a verbatim `\\?\` working directory:
+    /// `Path::join` there would collapse `link\..` to the working directory
+    /// unproven; the walk refuses it.
     #[cfg(windows)]
     #[test]
     fn a_relative_dot_dot_against_a_verbatim_working_directory_is_proven() {
         let base = scratch("dotdot-verbatim-cwd");
-        let verbatim = verbatim_of(&base);
-        let verbatim_cwd = Cwd::assumed(verbatim.clone());
+        let verbatim = if base.to_string_lossy().starts_with(r"\\?\") {
+            base.clone()
+        } else {
+            PathBuf::from(format!(r"\\?\{}", base.display()))
+        };
         let victim = base.join("victim").join("inner");
         std::fs::create_dir_all(&victim).expect("make victim");
         plant_link(&victim, &base.join("link"));
         std::fs::create_dir_all(base.join("existing")).expect("make existing");
         for raw in [PathBuf::from(r"link\..\x"), PathBuf::from(r"missing\..\x")] {
-            let result = prove_parent_steps_from(&raw, &verbatim_cwd);
+            assert_eq!(
+                verbatim.join(&raw),
+                verbatim.join("x"),
+                "a join onto the verbatim base collapses {} unproven",
+                raw.display()
+            );
+            let result = prove_parent_steps_from(&raw, &verbatim);
             assert!(
                 matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),
                 "--out {} against {} must be refused, got {result:?}",
@@ -1931,11 +1917,10 @@ mod tests {
             );
         }
         let raw = PathBuf::from(r"existing\..\x");
-        let proven =
-            prove_parent_steps_from(&raw, &verbatim_cwd).expect("a plain `..` is honoured");
+        let proven = prove_parent_steps_from(&raw, &verbatim).expect("a plain `..` is honoured");
         assert_eq!(proven.as_path(), verbatim.join("x"), "the `..` is resolved");
         for raw in [PathBuf::from(r"existing\a:b"), PathBuf::from(r"C:x")] {
-            let result = prove_parent_steps_from(&raw, &verbatim_cwd);
+            let result = prove_parent_steps_from(&raw, &verbatim);
             assert!(
                 matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
                 "--out {} against {} must be refused, got {result:?}",
@@ -1944,161 +1929,13 @@ mod tests {
             );
         }
         let drive = drive_of(&verbatim).expect("the working directory has a drive");
-        let rooted = prove_parent_steps_from(Path::new(r"\x"), &verbatim_cwd)
+        let rooted = prove_parent_steps_from(Path::new(r"\x"), &verbatim)
             .expect("a rooted request lands on the working directory's drive");
         assert_eq!(
             rooted.as_path(),
             PathBuf::from(format!(r"{}\x", drive.display())),
             "a rooted request keeps only the working directory's drive"
         );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// `base` under a verbatim `\\?\` prefix.
-    #[cfg(windows)]
-    fn verbatim_of(base: &Path) -> PathBuf {
-        if base.to_string_lossy().starts_with(r"\\?\") {
-            base.to_path_buf()
-        } else {
-            PathBuf::from(format!(r"\\?\{}", base.display()))
-        }
-    }
-
-    /// A name Win32 rewrites on open (a trailing `.` or space, a `:` stream
-    /// alias, a DOS device stem) names another entry, so it is refused
-    /// against a plain and a verbatim working directory alike, and as the
-    /// last name of an absolute request.
-    #[cfg(windows)]
-    #[test]
-    fn a_name_win32_rewrites_is_unplaceable() {
-        let base = scratch("win32-names");
-        let proj = project(&base);
-        std::fs::create_dir_all(base.join("existing")).expect("make existing");
-        let names = [
-            "out.",
-            "out ",
-            "a:b",
-            "out::$INDEX_ALLOCATION",
-            "nul",
-            "con.txt",
-            "COM1",
-            "lpt9.log",
-        ];
-        for cwd in [unverbatim(&base), verbatim_of(&base)] {
-            for name in names {
-                let raw = spelled(Path::new(""), &["existing", name]);
-                let result = prove_parent_steps_from(&raw, &Cwd::assumed(cwd.clone()));
-                assert!(
-                    matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                    "--out {} against {} must be refused, got {result:?}",
-                    raw.display(),
-                    cwd.display()
-                );
-                let absolute = spelled(&cwd, &["existing", name]);
-                let result = OutputRoot::resolve(Some(&absolute.to_string_lossy()), &proj);
-                assert!(
-                    matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                    "--out {} must be refused, got {result:?}",
-                    absolute.display()
-                );
-            }
-        }
-        assert!(
-            std::fs::read_dir(base.join("existing"))
-                .expect("read existing")
-                .next()
-                .is_none(),
-            "nothing created"
-        );
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A `.` or `..` inside a verbatim `\\?\` path is a literal name to the
-    /// OS, not a step, so it is refused rather than dropped or popped.
-    #[cfg(windows)]
-    #[test]
-    fn a_dot_inside_a_verbatim_path_is_unplaceable() {
-        let base = scratch("verbatim-dot");
-        let proj = project(&base);
-        std::fs::create_dir_all(base.join("existing")).expect("make existing");
-        let verbatim = verbatim_of(&base);
-        for raw in [
-            PathBuf::from(r"\\?\C:\a\.\b"),
-            PathBuf::from(format!(r"{}\existing\.\x", verbatim.display())),
-            PathBuf::from(format!(r"{}\.", verbatim.display())),
-            PathBuf::from(r"\\?\C:\a\..\b"),
-            PathBuf::from(format!(r"{}\existing\..\x", verbatim.display())),
-            PathBuf::from(format!(r"{}\existing\..", verbatim.display())),
-        ] {
-            let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
-            assert!(
-                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                "--out {} must be refused, got {result:?}",
-                raw.display()
-            );
-        }
-        let plain = spelled(&unverbatim(&base), &["existing", ".", "x"]);
-        let out = OutputRoot::resolve(Some(&plain.to_string_lossy()), &proj)
-            .expect("a `.` outside a verbatim path is a step");
-        assert_eq!(
-            out.path(),
-            unverbatim(&base).join("existing").join("x"),
-            "the `.` is dropped as a step"
-        );
-        assert!(!base.join("x").exists(), "nothing created");
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A device namespace or a non-disk verbatim root names no directory
-    /// tree, so it is refused whether absolute or as the working directory.
-    #[cfg(windows)]
-    #[test]
-    fn a_device_or_object_manager_prefix_is_unplaceable() {
-        let base = scratch("device-prefix");
-        let proj = project(&base);
-        for raw in [
-            PathBuf::from(r"\\.\pipe\x"),
-            PathBuf::from(r"\\.\NUL"),
-            PathBuf::from(r"\\.\C:\x"),
-            PathBuf::from(r"\\?\GLOBALROOT\Device\HarddiskVolume1\x"),
-            PathBuf::from(r"\\?\pipe\x"),
-        ] {
-            let result = OutputRoot::resolve(Some(&raw.to_string_lossy()), &proj);
-            assert!(
-                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                "--out {} must be refused, got {result:?}",
-                raw.display()
-            );
-            let result = prove_parent_steps_from(Path::new("x"), &Cwd::assumed(raw.clone()));
-            assert!(
-                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                "x against {} must be refused, got {result:?}",
-                raw.display()
-            );
-        }
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// A name that is not valid Unicode cannot be checked against the Win32
-    /// rules, so it is refused.
-    #[cfg(windows)]
-    #[test]
-    fn a_non_unicode_name_is_unplaceable() {
-        use std::os::windows::ffi::OsStringExt as _;
-        let base = scratch("non-unicode");
-        std::fs::create_dir_all(base.join("existing")).expect("make existing");
-        let mut raw = std::ffi::OsString::from(r"existing\");
-        raw.push(std::ffi::OsString::from_wide(&[0xD800, 0x61]));
-        let raw = PathBuf::from(raw);
-        for cwd in [unverbatim(&base), base.clone()] {
-            let result = prove_parent_steps_from(&raw, &Cwd::assumed(cwd.clone()));
-            assert!(
-                matches!(refused(&result), Some(OutputRefusal::Unplaceable(_))),
-                "--out {} against {} must be refused, got {result:?}",
-                raw.display(),
-                cwd.display()
-            );
-        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -2128,7 +1965,11 @@ mod tests {
                 | Component::Normal(_) => None,
             })
             .expect("scratch sits on a drive");
-        let verbatim = verbatim_of(&base);
+        let verbatim = if base.to_string_lossy().starts_with(r"\\?\") {
+            base.clone()
+        } else {
+            PathBuf::from(format!(r"\\?\{}", base.display()))
+        };
         for raw in [
             PathBuf::from(format!(r"{drive}:..\x")),
             PathBuf::from(format!(r"{drive}:x")),
@@ -3605,7 +3446,7 @@ mod tests {
         std::fs::create_dir_all(&victim).expect("make victim");
         plant_link(&victim, &base.join("link"));
         for segments in [&["link", "..", "x"][..], &["missing", "..", "x"][..]] {
-            let raw = spelled(&unverbatim(&base), segments);
+            let raw = spelled(&base, segments);
             let result = OwnedDir::claim(&raw);
             assert!(
                 matches!(refused(&result), Some(OutputRefusal::ParentTraversal(_))),

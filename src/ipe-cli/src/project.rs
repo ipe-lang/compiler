@@ -677,10 +677,7 @@ pub const MAX_DISCOVERY_ENTRIES: usize = 1_000_000;
 ///
 /// Files whose path contains a non-module-segment (e.g. lowercase first char
 /// or characters outside `[A-Za-z0-9_]`) are silently skipped — they may be
-/// build artefacts or editor swap files. A well-formed segment that is a
-/// Windows reserved device name (`Aux.ipe`) is refused instead: the parser
-/// accepts `module Aux`, so skipping it would silently drop a real module.
-/// Symlinks are never followed: a
+/// build artefacts or editor swap files. Symlinks are never followed: a
 /// symlinked file or directory is skipped, and each module found is read
 /// later by [`crate::io_bounded::read_walked_source`], which refuses a final
 /// symlink swapped in since.
@@ -699,7 +696,6 @@ pub const MAX_DISCOVERY_ENTRIES: usize = 1_000_000;
 /// [`CliError::DiscoveryLimitReached`] on a symlink cycle, a tree deeper
 /// than [`MAX_DISCOVERY_DEPTH`], more than [`MAX_DISCOVERED_MODULES`]
 /// modules or more than [`MAX_DISCOVERY_ENTRIES`] entries.
-/// [`CliError::DeviceNamedModule`] when a module path uses a device name.
 ///
 /// [`SourceRefusal::AccessDenied`]: crate::io_bounded::SourceRefusal::AccessDenied
 /// [`SourceRefusal::NotRegularFile`]: crate::io_bounded::SourceRefusal::NotRegularFile
@@ -764,7 +760,7 @@ pub fn discover_modules(src_root: &Path) -> Result<Vec<DiscoveredModule>, CliErr
             if file_type.is_symlink() || path.extension().and_then(|e| e.to_str()) != Some("ipe") {
                 continue;
             }
-            let Some(m) = file_to_module(src_root, &path)? else {
+            let Some(m) = file_to_module(src_root, &path) else {
                 continue;
             };
             if !file_type.is_file() {
@@ -789,99 +785,33 @@ pub fn discover_modules(src_root: &Path) -> Result<Vec<DiscoveredModule>, CliErr
     Ok(result)
 }
 
-/// Map a `.ipe` file path to a [`DiscoveredModule`].
-///
-/// `Ok(None)` when the path is no module path at all (an artefact the walk
-/// skips), per [`module_path_shape`].
-///
-/// # Errors
-/// [`CliError::DeviceNamedModule`] when the path is well formed but a
-/// segment is a Windows reserved device name.
-fn file_to_module(src_root: &Path, path: &Path) -> Result<Option<DiscoveredModule>, CliError> {
-    let Ok(rel) = path.strip_prefix(src_root) else {
-        return Ok(None);
-    };
+/// Map a `.ipe` file path to a [`DiscoveredModule`], or `None` when the path
+/// contains a non-module segment.
+fn file_to_module(src_root: &Path, path: &Path) -> Option<DiscoveredModule> {
+    // Strip the src_root prefix and the .ipe extension.
+    let rel = path.strip_prefix(src_root).ok()?;
     let without_ext = rel.with_extension("");
-    let Some(segments) = without_ext
-        .components()
-        .map(|component| component.as_os_str().to_str())
-        .collect::<Option<Vec<&str>>>()
-    else {
-        return Ok(None);
-    };
-    match module_path_shape(&segments) {
-        ModulePathShape::NotModule => Ok(None),
-        ModulePathShape::DeviceNamed(segment) => Err(CliError::DeviceNamedModule {
-            path: path.to_path_buf(),
-            segment: segment.to_owned(),
-        }),
-        ModulePathShape::Module => Ok(Some(DiscoveredModule::user(
-            path.to_path_buf(),
-            segments.iter().copied().map(str::to_owned).collect(),
-        ))),
+    // Split into segments using the OS path separator.
+    let mut segments: Vec<String> = Vec::new();
+    for component in without_ext.components() {
+        let s = component.as_os_str().to_str()?;
+        if !is_module_segment(s) {
+            return None;
+        }
+        segments.push(s.to_owned());
     }
-}
-
-/// What a candidate module path is, the one rule package discovery and loose-file imports share.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum ModulePathShape<'s> {
-    /// Non-empty, and every segment is a module segment.
-    Module,
-    /// Empty, or some segment is not well formed: no user module at all.
-    NotModule,
-    /// Every segment is well formed, but this one is a Windows reserved device name.
-    DeviceNamed(&'s str),
-}
-
-/// Classify `segments` as a module path.
-///
-/// Well-formedness is decided over every segment before any device name,
-/// so a path that is no module at all (`Aux/notes`) is never refused for a
-/// device-named segment.
-pub(crate) fn module_path_shape<S: AsRef<str>>(segments: &[S]) -> ModulePathShape<'_> {
-    if segments.is_empty()
-        || !segments
-            .iter()
-            .all(|segment| is_well_formed_segment(segment.as_ref()))
-    {
-        return ModulePathShape::NotModule;
+    if segments.is_empty() {
+        return None;
     }
-    segments
-        .iter()
-        .map(AsRef::<str>::as_ref)
-        .find(|segment| is_windows_device_name(segment))
-        .map_or(ModulePathShape::Module, ModulePathShape::DeviceNamed)
+    Some(DiscoveredModule::user(path.to_path_buf(), segments))
 }
 
-/// Whether `s` is a legal Ipê module path segment.
-///
-/// It must be well formed ([`is_well_formed_segment`]) and not a Windows
-/// reserved device name: a segment names a file or directory, and the same
-/// source tree must map to the same module set on every platform.
+/// A Ipê module path segment must start with an ASCII uppercase letter and
+/// contain only ASCII alphanumerics and `_`.
 pub(crate) fn is_module_segment(s: &str) -> bool {
-    is_well_formed_segment(s) && !is_windows_device_name(s)
-}
-
-/// Whether `s` starts with an ASCII uppercase letter and holds only ASCII alphanumerics and `_`.
-fn is_well_formed_segment(s: &str) -> bool {
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_uppercase() => chars.all(|c| c.is_ascii_alphanumeric() || c == '_'),
-        _ => false,
-    }
-}
-
-/// Whether `name` is a Windows reserved device name, with or without extension.
-///
-/// Windows resolves `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9` and
-/// `LPT0`–`LPT9` to devices case-insensitively and regardless of any
-/// extension, so `con.ipe` opens the console rather than a file.
-fn is_windows_device_name(name: &str) -> bool {
-    let stem = name.split_once('.').map_or(name, |(stem, _)| stem);
-    let upper = stem.to_ascii_uppercase();
-    match upper.as_bytes() {
-        b"CON" | b"PRN" | b"AUX" | b"NUL" => true,
-        [b'C', b'O', b'M', digit] | [b'L', b'P', b'T', digit] => digit.is_ascii_digit(),
         _ => false,
     }
 }
@@ -1043,161 +973,6 @@ mod tests {
         assert!(!is_module_segment("123"));
         assert!(!is_module_segment(""));
         assert!(!is_module_segment("_Foo"));
-    }
-
-    #[test]
-    fn windows_device_names_are_not_module_segments() {
-        for name in ["CON", "Con", "PRN", "Prn", "AUX", "Aux", "NUL", "Nul"] {
-            assert!(!is_module_segment(name), "{name} names a device");
-        }
-        for n in 0..=9 {
-            for prefix in ["COM", "Com", "LPT", "Lpt"] {
-                let name = format!("{prefix}{n}");
-                assert!(!is_module_segment(&name), "{name} names a device");
-            }
-        }
-    }
-
-    #[test]
-    fn windows_device_names_match_any_case_and_extension() {
-        for name in [
-            "con",
-            "CON.ipe",
-            "nul.txt",
-            "Aux.tar.gz",
-            "prn",
-            "com1.ipe",
-            "LPT9.x",
-            "lpt5",
-            "com0",
-            "LPT0.ipe",
-        ] {
-            assert!(is_windows_device_name(name), "{name} names a device");
-        }
-    }
-
-    #[test]
-    fn device_name_near_misses_are_module_segments() {
-        for name in [
-            "CONSOLE",
-            "Console",
-            "Conn",
-            "Nulls",
-            "Auxiliary",
-            "Printer",
-            "COM",
-            "COM10",
-            "LPT",
-            "LPT10",
-            "Com1x",
-        ] {
-            assert!(is_module_segment(name), "{name} is an ordinary segment");
-        }
-    }
-
-    /// An empty source root unique to this test process.
-    #[allow(clippy::expect_used)] // test fixture: an unwritable temp dir IS the failure
-    fn device_walk_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ipe_device_{name}_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("create source root");
-        root
-    }
-
-    #[test]
-    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
-    fn a_device_named_module_file_is_refused_not_skipped() {
-        let root = device_walk_root("file");
-        fs::write(root.join("Main.ipe"), "module Main exposing (..)\n").expect("write Main");
-        fs::write(root.join("Aux.ipe"), "module Aux exposing (..)\n").expect("write Aux");
-        let found = discover_modules(&root);
-        let _ = fs::remove_dir_all(&root);
-        assert!(
-            matches!(
-                &found,
-                Err(CliError::DeviceNamedModule { path, segment })
-                    if segment == "Aux" && *path == root.join("Aux.ipe")
-            ),
-            "a device-named module must be refused: {found:?}"
-        );
-    }
-
-    #[test]
-    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
-    fn a_device_named_module_directory_is_refused_not_skipped() {
-        let root = device_walk_root("dir");
-        fs::create_dir_all(root.join("Com0")).expect("mk device dir");
-        fs::write(
-            root.join("Com0").join("Port.ipe"),
-            "module Com0.Port exposing (..)\n",
-        )
-        .expect("write Port");
-        let found = discover_modules(&root);
-        let _ = fs::remove_dir_all(&root);
-        assert!(
-            matches!(
-                &found,
-                Err(CliError::DeviceNamedModule { segment, .. }) if segment == "Com0"
-            ),
-            "a device-named directory segment must be refused: {found:?}"
-        );
-    }
-
-    /// The module paths `discover_modules` finds under `root`, `None` on a refusal.
-    fn discovered_paths(root: &Path) -> Option<Vec<Vec<String>>> {
-        discover_modules(root)
-            .ok()
-            .map(|found| found.into_iter().map(|m| m.module_path).collect())
-    }
-
-    #[test]
-    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
-    fn a_non_module_file_is_still_skipped() {
-        let root = device_walk_root("skip");
-        fs::write(root.join("Main.ipe"), "module Main exposing (..)\n").expect("write Main");
-        fs::write(root.join("scratch.ipe"), "junk").expect("write artefact");
-        let paths = discovered_paths(&root);
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(paths, Some(vec![vec!["Main".to_owned()]]));
-    }
-
-    #[test]
-    #[allow(clippy::expect_used)] // test fixture: a failed write IS the failure
-    fn a_non_module_file_under_a_device_named_directory_is_skipped() {
-        let root = device_walk_root("device-dir-artefact");
-        fs::write(root.join("Main.ipe"), "module Main exposing (..)\n").expect("write Main");
-        fs::create_dir_all(root.join("Aux")).expect("mk device dir");
-        fs::write(root.join("Aux").join("notes.ipe"), "junk").expect("write artefact");
-        let paths = discovered_paths(&root);
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(paths, Some(vec![vec!["Main".to_owned()]]));
-    }
-
-    #[test]
-    fn well_formedness_is_decided_before_device_names() {
-        assert_eq!(module_path_shape(&["Main"]), ModulePathShape::Module);
-        assert_eq!(module_path_shape(&["Lib", "Util"]), ModulePathShape::Module);
-        assert_eq!(module_path_shape::<&str>(&[]), ModulePathShape::NotModule);
-        assert_eq!(
-            module_path_shape(&["Aux", "notes"]),
-            ModulePathShape::NotModule
-        );
-        assert_eq!(
-            module_path_shape(&["notes", "Aux"]),
-            ModulePathShape::NotModule
-        );
-        assert_eq!(
-            module_path_shape(&["Lib", ".."]),
-            ModulePathShape::NotModule
-        );
-        assert_eq!(
-            module_path_shape(&["Aux"]),
-            ModulePathShape::DeviceNamed("Aux")
-        );
-        assert_eq!(
-            module_path_shape(&["Lib", "Com0", "Nul"]),
-            ModulePathShape::DeviceNamed("Com0")
-        );
     }
 
     #[test]

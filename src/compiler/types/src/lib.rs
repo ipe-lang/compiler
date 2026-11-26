@@ -28,7 +28,6 @@
 mod constrain;
 mod doc;
 mod exhaust;
-mod homed;
 mod pairing;
 mod solve;
 pub(crate) mod super_bounds;
@@ -48,7 +47,6 @@ use ipe_intern::{Interner, Symbol};
 
 pub use constrain::{Builtins, kernel_type_table, resolve_scheme};
 pub use doc::{VarNamer, canon_type_to_doc, letters, ty_to_doc};
-pub use homed::{HomedDiagnostic, HomedWarning};
 pub use pairing::{ArgPairs, ConHead, EmittedHeads, HeadIdentity, TyPairs, paired_ty_children};
 pub use solve::{BUDGET_ENV, Budget, DEFAULT_SOLVER_BUDGET};
 pub use ty::{
@@ -121,14 +119,13 @@ pub struct SolvedTypes {
     /// generic parameter.
     pub bounds: BTreeMap<(Vec<Symbol>, Symbol), BTreeMap<Symbol, TyBounds>>,
     /// Non-fatal diagnostics collected during type-checking (e.g. IPE-T0011
-    /// `RedundantCaseBranch`, IPE-L0124), each paired with its owning module.
-    ///
-    /// A [`HomedWarning`] is Warning-severity and homed by construction: callers
-    /// MUST print each against the source file of its [`HomedWarning::home`] and
-    /// MUST NOT treat it as a compilation failure. A finding of any other
-    /// severity is refused at construction and returned as the inference error,
-    /// so a `SolvedTypes` witnesses a program that compiles.
-    pub warnings: Vec<HomedWarning>,
+    /// `RedundantCaseBranch`, IPE-L0124). Every diagnostic reaching this field
+    /// is [`Severity::Warning`]: callers MUST print them but MUST NOT treat them
+    /// as compilation failures. Error-severity diagnostics collected during the
+    /// same passes (IPE-T0018 over a closed union) never reach here — [`infer`]
+    /// converts any collected `Severity::Error` into a returned `Err` before
+    /// building this value, so a `SolvedTypes` witnesses a program that compiles.
+    pub warnings: Vec<Diagnostic>,
     /// Per-typed-binding map from union-find representative id to annotation
     /// variable symbol, keyed by `(home, def_name)`.
     ///
@@ -218,7 +215,6 @@ pub fn infer(m: &canon::Module, interner: &mut Interner) -> DResult<SolvedTypes>
 ///
 /// On a non-solver error (constraint generation, field-access pass, etc.) the
 /// returned home is `Vec::new()` and callers should fall back to the heuristic.
-/// Every warning in the result carries its home ([`HomedWarning`]).
 ///
 /// # Errors
 /// Same conditions as [`infer`]; on failure the tuple carries both the
@@ -515,11 +511,14 @@ fn infer_core(
         &generated.route_witness_checks
     ));
 
-    // Warnings collected during the post-solve deferred passes and the
-    // exhaustiveness pass (IPE-L0124, IPE-T0011), each homed at construction.
-    // The sink holds only `HomedWarning`s, so an Error-severity finding cannot
-    // enter it: the producing pass returns it as the inference error instead.
-    let mut warnings: Vec<HomedWarning> = Vec::new();
+    // Diagnostics collected during the post-solve deferred passes and the
+    // exhaustiveness pass. Most are `Severity::Warning` (IPE-L0124, IPE-T0011)
+    // and stay in `SolvedTypes::warnings` for the caller to print. The
+    // exhaustiveness pass may also collect a `Severity::Error` (IPE-T0018 over a
+    // closed union); those are partitioned out below and promoted to a returned
+    // `Err`, so the collected channel that survives into `SolvedTypes` carries
+    // only warnings.
+    let mut warnings: Vec<Diagnostic> = Vec::new();
 
     // For routed `Web.tea` calls: if the now-settled Model type has a `page`
     // field, the `notFound` type must match that field's type.  Non-routed
@@ -528,7 +527,7 @@ fn infer_core(
     // and we emit the IPE-L0124 warning (usually a mis-named `page` field). See
     // the `RoutedWebCheck` doc comment for the full rationale.
     let has_routes = !generated.route_witness_checks.is_empty();
-    resolve_routed_web_checks(
+    lift!(resolve_routed_web_checks(
         &mut uf,
         budget,
         interner,
@@ -536,7 +535,7 @@ fn infer_core(
         has_routes,
         generated.route_witness_checks.len(),
         &mut warnings,
-    )?;
+    ));
 
     // A read-back of every region's resolved type, taken HERE (before the final
     // `SolvedTypes` assembly) so the exhaustiveness pass can consult a `case`
@@ -558,19 +557,31 @@ fn infer_core(
     // contract a genuinely unreachable compiler-bug case.
     // The pass collects into `warnings` rather than early-returning on the first
     // finding, so all offending sites are reported in one run. IPE-T0011 is a
-    // Warning and must not abort; IPE-T0018 over a closed union is an Error the
-    // pass returns (after scanning every definition). IPE-T0010
-    // (non-exhaustive) early-returns `Err` from inside the pass.
-    // Every error the pass returns carries its owning definition's home, so the
-    // driver frames it against that module's source rather than guessing a file
-    // from byte offsets that every linked module shares.
-    exhaust::check(
+    // Warning and must not abort; IPE-T0018 over a closed union is an Error.
+    // IPE-T0010 (non-exhaustive) still early-returns `Err` from inside the pass.
+    lift!(exhaust::check(
         m,
         &dep_unions,
         &regions_for_exhaust,
         interner,
-        &mut warnings,
-    )?;
+        &mut warnings
+    ));
+
+    // Fail-closed promotion: a diagnostic collected above is only a compilation
+    // failure if it is Error-severity. Partition the sink — Warning-severity
+    // diagnostics ride on in `SolvedTypes::warnings`; the first Error-severity
+    // diagnostic (IPE-T0018 over a closed union) is returned as `Err`, failing
+    // compilation. Without this, an Error pushed onto `warnings` would render
+    // but the program would still compile — the exact silent-accept this feature
+    // exists to prevent. All Error sites are already collected; returning the
+    // first still reports every warning-severity finding and fails the build.
+    let first_error = warnings
+        .iter()
+        .position(|d| d.severity() == ipe_diagnostics::Severity::Error);
+    if let Some(idx) = first_error {
+        let err = warnings.swap_remove(idx);
+        return Err((err, Vec::new()));
+    }
 
     // Scoped solve only: reify every exported UNTYPED binding's promoted
     // scheme for the module's typed interface. Must run HERE — after the
@@ -2704,8 +2715,6 @@ fn resolve_route_witness_checks(
 /// The detection criterion (`page` field presence) mirrors `emit_web.rs`'s
 /// `routed_page_field` helper: both agree on what "routed" means, ensuring the
 /// type-check gate and the emit gate fire on exactly the same programs.
-///
-/// Every error and warning carries the home of the `Web.tea` call it concerns.
 fn resolve_routed_web_checks(
     uf: &mut UnionFind<Content>,
     budget: &mut Budget,
@@ -2713,15 +2722,14 @@ fn resolve_routed_web_checks(
     checks: &[RoutedWebCheck],
     has_routes: bool,
     route_count: usize,
-    warnings: &mut Vec<HomedWarning>,
-) -> Result<(), HomedDiagnostic> {
+    warnings: &mut Vec<Diagnostic>,
+) -> DResult<()> {
     for check in checks {
-        let homed = |d: Diagnostic| (d, check.home.clone());
         // Find the settled root of the Model type variable.
-        let model_root = uf.find(check.model_var).map_err(homed)?;
+        let model_root = uf.find(check.model_var)?;
         // Clone the content to avoid borrowing `uf` across the subsequent
         // `unify` call.
-        let model_content = uf.content(model_root).map_err(homed)?;
+        let model_content = uf.content(model_root)?;
         // Extract the `page` field's VarId from the settled Model Record, if
         // any.  A non-Record descriptor (Flex, Con, etc.) or a Record without
         // a `page` field means this is a non-routed app — silently skip.
@@ -2742,8 +2750,7 @@ fn resolve_routed_web_checks(
                 check.span,
                 check.not_found_var,
                 page_var,
-            )
-            .map_err(homed)?;
+            )?;
         } else if has_routes {
             // Non-routed Model (no `page` field) BUT the program declared a
             // non-empty `routes` list: the routes are forwarded to the
@@ -2757,13 +2764,10 @@ fn resolve_routed_web_checks(
             // equals this app's route count exactly; the rare multi-app case
             // (only sub-apps, which are separate binaries in practice) could
             // over-count, but the warning stays advisory — the build proceeds.
-            warnings.push(HomedWarning::new(
-                Diagnostic::Lower {
-                    span: check.span,
-                    msg: LowerError::RoutedAppMissingPageField { route_count },
-                },
-                &check.home,
-            )?);
+            warnings.push(Diagnostic::Lower {
+                span: check.span,
+                msg: LowerError::RoutedAppMissingPageField { route_count },
+            });
         }
         // Non-routed with no routes → genuinely non-routed → silently skip.
     }
@@ -4082,11 +4086,7 @@ mod tests {
             "expected exactly one warning, got {:?}",
             types.warnings
         );
-        let warning = types
-            .warnings
-            .first()
-            .map(HomedWarning::diagnostic)
-            .expect("len==1 asserted above");
+        let warning = types.warnings.first().expect("len==1 asserted above");
         assert!(
             matches!(
                 warning,
@@ -4176,7 +4176,6 @@ mod tests {
         let redundant: Vec<_> = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4210,7 +4209,6 @@ mod tests {
         let redundant = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4349,115 +4347,6 @@ mod tests {
         }
     }
 
-    /// A closed-union catch-all in a NON-entry module is returned with that
-    /// module's home and the span of the `_` arm itself.
-    ///
-    /// Linked spans are file-local byte offsets, so the home is the only thing
-    /// that tells the driver which file to frame the error against; without it
-    /// the error was framed against whichever module's definition enclosed the
-    /// same offsets (an embedded stdlib module, in practice).
-    #[test]
-    fn closed_union_catch_all_error_carries_owning_module_home_and_arm_span() {
-        let lib_src = "module Lib exposing (Color(..), isRed)\n\n\
-                       type Color = Red | Green | Blue\n\n\
-                       isRed : Color -> Bool\n\
-                       isRed c =\n    case c of\n        Red ->\n            True\n\n        \
-                       _ ->\n            False\n";
-        let main_src = "module Main exposing (main)\n\n\
-                        import Lib exposing (Color(..), isRed)\n\n\
-                        main =\n    if isRed Green then 1 else 0\n";
-        #[allow(clippy::expect_used)] // a fixture that fails to link is a broken test, never a skip
-        let (m, mut i) = link_modules(&[("Lib", lib_src), ("Main", main_src)])
-            .expect("fixture modules parse, canonicalise, and link");
-        let r = infer_attributed(&m, &mut i);
-        assert!(r.is_err(), "a closed-union catch-all must fail compilation");
-        let Err((err, home)) = r else {
-            return;
-        };
-        let Ok(lib) = i.intern("Lib") else {
-            return;
-        };
-        assert_eq!(
-            home,
-            vec![lib],
-            "the error must carry the owning module's home, not an empty one"
-        );
-        assert!(
-            matches!(
-                &err,
-                Diagnostic::Type {
-                    msg: TypeError::WildcardCoversKnownConstructors { .. },
-                    ..
-                }
-            ),
-            "expected IPE-T0018 WildcardCoversKnownConstructors, got {err:?}"
-        );
-        let Diagnostic::Type { span, .. } = &err else {
-            return;
-        };
-        let arm_offset = lib_src.find("_ ->").and_then(|o| u32::try_from(o).ok());
-        assert_eq!(
-            Some(span.lo),
-            arm_offset,
-            "the error must point at the `_` arm in Lib"
-        );
-    }
-
-    /// A redundant branch (IPE-T0011) in a NON-entry module is a warning homed
-    /// at that module and spanned at the redundant arm's pattern.
-    #[test]
-    fn redundant_branch_warning_in_imported_module_carries_its_home_and_arm_span() {
-        let lib_src = "module Lib exposing (Color(..), label)\n\n\
-                       type Color = Red | Green\n\n\
-                       label : Color -> Int\n\
-                       label c =\n    case c of\n        Red ->\n            1\n\n        \
-                       Green ->\n            2\n\n        \
-                       Red ->\n            3\n";
-        let main_src = "module Main exposing (main)\n\n\
-                        import Lib exposing (Color(..), label)\n\n\
-                        main =\n    label Green\n";
-        #[allow(clippy::expect_used)] // a fixture that fails to link is a broken test, never a skip
-        let (m, mut i) = link_modules(&[("Lib", lib_src), ("Main", main_src)])
-            .expect("fixture modules parse, canonicalise, and link");
-        #[allow(clippy::expect_used)] // a redundant branch is a warning; an `Err` fails the test
-        let types = infer_attributed(&m, &mut i).expect("a redundant branch is only a warning");
-        #[allow(clippy::expect_used)] // interning a short literal cannot exhaust the interner
-        let lib = i.intern("Lib").expect("intern Lib");
-        assert_eq!(
-            types.warnings.len(),
-            1,
-            "expected exactly one warning, got {:?}",
-            types.warnings
-        );
-        let Some(warning) = types.warnings.first() else {
-            return;
-        };
-        assert_eq!(
-            warning.home(),
-            [lib].as_slice(),
-            "the warning must carry the owning module's home"
-        );
-        assert!(
-            matches!(
-                warning.diagnostic(),
-                Diagnostic::Type {
-                    msg: TypeError::RedundantCaseBranch { .. },
-                    ..
-                }
-            ),
-            "expected IPE-T0011 RedundantCaseBranch, got {warning:?}"
-        );
-        let Diagnostic::Type { span, .. } = warning.diagnostic() else {
-            return;
-        };
-        let arm_offset = lib_src.rfind("Red ->").and_then(|o| u32::try_from(o).ok());
-        assert_eq!(
-            Some(span.lo),
-            arm_offset,
-            "the warning must point at the redundant `Red` arm in Lib"
-        );
-    }
-
     /// FAIL-CLOSED, MULTI-SITE: a module with more than one closed-union
     /// catch-all still FAILS compilation. The pass collects every offending site
     /// before the promotion (better UX than aborting on the first), and the
@@ -4523,7 +4412,6 @@ mod tests {
         let t0018: Vec<_> = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4542,7 +4430,6 @@ mod tests {
         let t0011 = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4578,7 +4465,6 @@ mod tests {
         let t0018: Vec<_> = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4614,7 +4500,6 @@ mod tests {
         let t0018: Vec<_> = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4648,7 +4533,6 @@ mod tests {
         let t0018 = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4682,7 +4566,6 @@ mod tests {
         let t0018 = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4765,7 +4648,6 @@ mod tests {
         let t0018 = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4813,7 +4695,6 @@ mod tests {
         let redundant: Vec<_> = types
             .warnings
             .iter()
-            .map(HomedWarning::diagnostic)
             .filter(|w| {
                 matches!(
                     w,
@@ -4858,14 +4739,12 @@ mod tests {
             .expect("fresh model var");
         let not_found_var = uf.fresh(Content::Flex).expect("fresh notFound var");
 
-        let home = vec![interner.intern("Main").expect("intern Main")];
         let check = RoutedWebCheck {
             model_var,
             not_found_var,
             span: Span::DUMMY,
-            home: home.clone(),
         };
-        let mut warnings: Vec<HomedWarning> = Vec::new();
+        let mut warnings: Vec<Diagnostic> = Vec::new();
         resolve_routed_web_checks(
             &mut uf,
             &mut budget,
@@ -4882,13 +4761,7 @@ mod tests {
             1,
             "expected exactly one IPE-L0124 warning, got {warnings:?}"
         );
-        let homed = warnings.first().expect("len==1 asserted above");
-        assert_eq!(
-            homed.home(),
-            home.as_slice(),
-            "the warning carries the home of its `Web.tea` call"
-        );
-        let w = homed.diagnostic();
+        let w = warnings.first().expect("len==1 asserted above");
         assert!(
             matches!(
                 w,
@@ -4926,9 +4799,8 @@ mod tests {
             model_var,
             not_found_var,
             span: Span::DUMMY,
-            home: vec![interner.intern("Main").expect("intern Main")],
         };
-        let mut warnings: Vec<HomedWarning> = Vec::new();
+        let mut warnings: Vec<Diagnostic> = Vec::new();
         resolve_routed_web_checks(
             &mut uf,
             &mut budget,
@@ -4942,52 +4814,6 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "empty-routes non-routed app must be silent, got {warnings:?}"
-        );
-    }
-
-    /// An IPE-L0124 finding on a `Web.tea` check with no owning module is
-    /// refused as a compiler bug rather than surfacing as an unframeable warning.
-    #[test]
-    fn routed_app_warning_without_home_is_refused() {
-        let mut interner = Interner::new();
-        let count_sym = interner.intern("count").expect("intern count");
-        let mut budget = Budget::unbounded();
-        let mut uf = UnionFind::new();
-
-        let count_var = uf.fresh(Content::Flex).expect("fresh count var");
-        let ext = uf
-            .fresh(Content::Structure(FlatType::EmptyRecord))
-            .expect("fresh ext");
-        let mut fields = BTreeMap::new();
-        fields.insert(count_sym, count_var);
-        let model_var = uf
-            .fresh(Content::Structure(FlatType::Record(fields, ext)))
-            .expect("fresh model var");
-        let not_found_var = uf.fresh(Content::Flex).expect("fresh notFound var");
-
-        let check = RoutedWebCheck {
-            model_var,
-            not_found_var,
-            span: Span::DUMMY,
-            home: Vec::new(),
-        };
-        let mut warnings: Vec<HomedWarning> = Vec::new();
-        let result = resolve_routed_web_checks(
-            &mut uf,
-            &mut budget,
-            &interner,
-            &[check],
-            /* has_routes */ true,
-            /* route_count */ 1,
-            &mut warnings,
-        );
-        assert!(
-            matches!(result, Err((Diagnostic::CompilerBug { .. }, _))),
-            "a homeless warning must be refused, got {result:?}"
-        );
-        assert!(
-            warnings.is_empty(),
-            "nothing reaches the sink, got {warnings:?}"
         );
     }
 
@@ -5050,11 +4876,7 @@ mod tests {
             "expected exactly one warning, got {:?}",
             types.warnings
         );
-        let warning = types
-            .warnings
-            .first()
-            .map(HomedWarning::diagnostic)
-            .expect("len==1 asserted above");
+        let warning = types.warnings.first().expect("len==1 asserted above");
         assert!(
             matches!(
                 warning,

@@ -635,10 +635,6 @@ lint: findings remain at or above the gate severity (see above)
 
 {path}: permission denied — grant read access to the file (and read and search access to its directory) to compile it
 
-## cli-source-symlink
-
-{path}: reached through a symlink — ipe never follows a symlink while walking a loose file's imports; replace the link with the real file or directory
-
 ## cli-path-escape
 
 manifest path {raw} was rejected: {reason}
@@ -650,10 +646,6 @@ output directory refused: {refusal}
 ## cli-discovery-limit-reached
 
 module-discovery walk aborted: {detail}
-
-## cli-device-named-module
-
-{path}: module segment `{segment}` is a reserved Windows device name, so this file cannot be the same module on every platform — rename it
 
 ## cli-advisory-vulnerable
 
@@ -926,7 +918,7 @@ the source root {path} cannot be resolved — ipe cannot prove the output stays 
 
 ## output-unplaceable
 
-{path} does not name one absolute place on every platform (a drive-relative path, a device path such as `\\.\pipe`, a `/`, `.` or `..` inside a `\\?\` path, or a name Windows rewrites: a trailing `.` or space, a `:`, a device name such as `NUL` or `COM1`) — name the directory by its full path
+{path} does not name one absolute place on every platform (a drive-relative path, or a `/` inside a `\\?\` path) — name the directory by its full path
 
 ## output-not-fresh
 

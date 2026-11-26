@@ -911,16 +911,12 @@ messages! {
     cli_source_not_regular_file(path) = "cli-source-not-regular-file";
     /// A source file or directory could not be opened for lack of permission.
     cli_source_access_denied(path) = "cli-source-access-denied";
-    /// A module path was reached through a symlink the no-follow walk refuses.
-    cli_source_symlink(path) = "cli-source-symlink";
     /// A manifest path escaped the project directory.
     cli_path_escape(raw, reason) = "cli-path-escape";
     /// A build-output location was refused.
     cli_output_refused(refusal) = "cli-output-refused";
     /// The module-discovery walk hit its depth ceiling or a symlink cycle.
     cli_discovery_limit_reached(detail) = "cli-discovery-limit-reached";
-    /// A discovered source file names a Windows reserved device as a module segment.
-    cli_device_named_module(path, segment) = "cli-device-named-module";
     /// A locked dependency falls within an advisory's affected range.
     cli_advisory_vulnerable(package, version, severity, id, description, fixed_in) =
         "cli-advisory-vulnerable";

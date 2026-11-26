@@ -2,9 +2,8 @@ name: Install the pinned Rust toolchain
 description: >-
   Install the exact toolchain channel declared in `rust-toolchain.toml`, so CI
   always runs the same compiler a lane runs locally. The channel is read from
-  the file (never restated here), then handed to the commit-pinned
-  `dtolnay/rust-toolchain` action with an explicit `toolchain`, so there is no
-  floating `@stable` tag to drift.
+  the file (never restated here), then handed to `dtolnay/rust-toolchain@master`
+  with an explicit `toolchain`, so there is no floating `@stable` tag to drift.
   Extra `components`/`targets` a job needs are forwarded; the toolchain's own
   declared set is a rustup default, this installs what a job additionally links.
 
@@ -43,7 +42,7 @@ runs:
         echo "channel=${channel}" >> "$GITHUB_OUTPUT"
 
     - name: Install the pinned toolchain
-      uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+      uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ steps.channel.outputs.channel }}
         components: ${{ inputs.components }}

@@ -468,8 +468,6 @@ pub(crate) enum ScopeSpec {
         entry: PathBuf,
         /// Every probed module file, relative to the entry's directory.
         module_files: Vec<PathBuf>,
-        /// Every module file the build loaded, relative to the entry's directory.
-        loaded_files: Vec<PathBuf>,
     },
 }
 
@@ -486,8 +484,7 @@ impl ScopeSpec {
             Self::LooseFile {
                 entry,
                 module_files,
-                loaded_files,
-            } => ipe_watch::WatchScope::loose_file(entry, module_files, loaded_files),
+            } => ipe_watch::WatchScope::loose_file(entry, module_files),
         }
     }
 }
@@ -575,7 +572,6 @@ pub(crate) fn resolve_project_sources(
         scope: ScopeSpec::LooseFile {
             entry: entry.to_path_buf(),
             module_files: loaded.probed_files,
-            loaded_files: loaded.loaded_files,
         },
     })
 }
@@ -4127,11 +4123,6 @@ mod tests {
         };
         let before = before.expect("loose file resolves");
         let after = after.expect("loose file re-resolves");
-        assert_eq!(
-            after_scope.file_count(),
-            after.sources.len(),
-            "the watch count is the build's read set"
-        );
         assert_eq!(modules(&before), vec![vec!["Main".to_owned()]]);
         assert_eq!(
             modules(&after),
@@ -4144,7 +4135,6 @@ mod tests {
             ScopeSpec::LooseFile {
                 entry: entry.clone(),
                 module_files: vec![PathBuf::from("Helper.ipe")],
-                loaded_files: vec![PathBuf::from("Helper.ipe")],
             }
         );
         assert_eq!(after.blame_path, entry);
