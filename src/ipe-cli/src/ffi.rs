@@ -2980,13 +2980,16 @@ pub fn run_add(rest: &[String]) -> Result<(), CliError> {
 /// # Errors
 /// [`CliError`] on misuse or a cache-delete failure.
 pub fn run_remove(rest: &[String]) -> Result<(), CliError> {
-    let [raw] = rest else {
+    let named = match rest {
+        [raw] => ipe_ffi::pkginfo::PackageName::parse(raw)
+            .ok()
+            .and_then(|name| ipe_ffi::driver::FfiSlug::of(&name).ok())
+            .map(|slug| (raw, slug)),
+        _ => None,
+    };
+    let Some((raw, slug)) = named else {
         return Err(CliError::Usage(text::msg::rust_remove_usage()));
     };
-    let slug = ipe_ffi::pkginfo::PackageName::parse(raw)
-        .ok()
-        .and_then(|name| ipe_ffi::driver::FfiSlug::of(&name).ok())
-        .ok_or_else(|| CliError::Usage(text::msg::rust_remove_usage()))?;
     let cache = FfiCache::at_project_root(Path::new("."));
     cache
         .remove_package(&slug)
