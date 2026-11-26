@@ -2675,6 +2675,71 @@ fn enum_ctor_with_float_keyed_set_reports_ctor_span() -> DResult<()> {
     Ok(())
 }
 
+/// A union's constructor refusal is homed to the union's own module, never
+/// the entry module its span would otherwise be read against.
+#[test]
+fn enum_ctor_refusal_is_homed_to_the_union_module() -> DResult<()> {
+    let mut i = Interner::new();
+    let lib = i.intern("Lib")?;
+    let t = i.intern("T")?;
+    let c = i.intern("C")?;
+    let set = i.intern("Set")?;
+    let float = i.intern("Float")?;
+    let ctor_span = Span::new(9, 20);
+    let union = canon::Union {
+        home: vec![lib],
+        name: t,
+        name_span: Span::new(5, 6),
+        vars: Vec::new(),
+        ctors: vec![canon::Ctor {
+            name: c,
+            index: 0,
+            arity: 1,
+            args: vec![canon::Type::Con {
+                home: Vec::new(),
+                name: set,
+                args: vec![canon::Type::Con {
+                    home: Vec::new(),
+                    name: float,
+                    args: Vec::new(),
+                }],
+            }],
+            span: ctor_span,
+        }],
+    };
+    let m = canon::Module {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        name: Vec::new(),
+        unions: vec![union],
+        defs: Vec::new(),
+    };
+    let types = SolvedTypes {
+        env: BTreeMap::new(),
+        regions: BTreeMap::new(),
+        expected: BTreeMap::new(),
+        bounds: BTreeMap::new(),
+        warnings: Vec::new(),
+        poly_var_map: BTreeMap::new(),
+        untyped_type_params: BTreeMap::new(),
+        msg_defaulted_vars: BTreeMap::new(),
+        signature_wildcards: BTreeMap::new(),
+    };
+    let res = lower(&m, &types, &mut i, "", "", ipe_lower::Roots::Entry);
+    assert!(
+        matches!(
+            &res,
+            Err((Diagnostic::Lower {
+                span,
+                msg: LowerError::Unsupported(Feature::FloatKeyedCollection),
+            }, home)) if *span == ctor_span && *home == [lib]
+        ),
+        "a ctor refusal reports at the ctor in the union's module, got {:?}",
+        res.as_ref().err()
+    );
+    Ok(())
+}
+
 /// A `main` whose type is not a runnable entry is refused at `main`'s name.
 #[test]
 fn non_entry_main_reports_main_span() -> DResult<()> {

@@ -10048,8 +10048,8 @@ const PROGRAM_CARRIER: &str = "Program";
 
 /// A `Program` carrier's shape tag: the one table from its spelling to its app leaf.
 ///
-/// The spellings are the `Ipe.Tea` builtin types of `ipe_kernels`; a unit
-/// test asserts the two sets agree.
+/// The spellings are the `Ipe.Tea` builtin types of `ipe_kernels`: a
+/// compile-time assertion below fails the build when the two disagree.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ProgramShapeTag {
     Web,
@@ -10086,7 +10086,245 @@ impl ProgramShapeTag {
             Self::Worker => IrType::WorkerApp,
         }
     }
+
+    /// This tag's position in [`Self::ALL`].
+    const fn index(self) -> usize {
+        match self {
+            Self::Web => 0,
+            Self::Tui => 1,
+            Self::Cli => 2,
+            Self::Worker => 3,
+        }
+    }
+
+    /// The kernel registry tag of this shape's builtin type.
+    const fn kernel_tag(self) -> ipe_kernels::BuiltinTag {
+        use ipe_kernels::BuiltinTag;
+        match self {
+            Self::Web => BuiltinTag::ProgramShapeWeb,
+            Self::Tui => BuiltinTag::ProgramShapeTui,
+            Self::Cli => BuiltinTag::ProgramShapeCli,
+            Self::Worker => BuiltinTag::ProgramShapeWorker,
+        }
+    }
+
+    /// The shape a kernel registry tag names, if it names one.
+    ///
+    /// The match is exhaustive with no wildcard arm, so a registry tag added
+    /// later is classified here before it compiles.
+    #[allow(clippy::too_many_lines)] // one exhaustive `BuiltinTag` match
+    const fn of_kernel_tag(tag: ipe_kernels::BuiltinTag) -> Option<Self> {
+        use ipe_kernels::BuiltinTag;
+        match tag {
+            BuiltinTag::ProgramShapeWeb => Some(Self::Web),
+            BuiltinTag::ProgramShapeTui => Some(Self::Tui),
+            BuiltinTag::ProgramShapeCli => Some(Self::Cli),
+            BuiltinTag::ProgramShapeWorker => Some(Self::Worker),
+            BuiltinTag::Maybe
+            | BuiltinTag::Result
+            | BuiltinTag::List
+            | BuiltinTag::Set
+            | BuiltinTag::Dict
+            | BuiltinTag::Int
+            | BuiltinTag::Float
+            | BuiltinTag::Bool
+            | BuiltinTag::String
+            | BuiltinTag::Char
+            | BuiltinTag::Bytes
+            | BuiltinTag::Order
+            | BuiltinTag::Error
+            | BuiltinTag::ErrorKind
+            | BuiltinTag::ErrorDetails
+            | BuiltinTag::BackoffStrategy
+            | BuiltinTag::TaskStep
+            | BuiltinTag::Decimal
+            | BuiltinTag::Task
+            | BuiltinTag::Cmd
+            | BuiltinTag::Sub
+            | BuiltinTag::Topic
+            | BuiltinTag::Decoder
+            | BuiltinTag::Db
+            | BuiltinTag::SqlValue
+            | BuiltinTag::SqlField
+            | BuiltinTag::SqlFragment
+            | BuiltinTag::ProjectionTerm
+            | BuiltinTag::ProjectionOperand
+            | BuiltinTag::Secret
+            | BuiltinTag::Path
+            | BuiltinTag::Regex
+            | BuiltinTag::Url
+            | BuiltinTag::UrlRelative
+            | BuiltinTag::Dsn
+            | BuiltinTag::DbLocation
+            | BuiltinTag::Connection
+            | BuiltinTag::ConnReadOnly
+            | BuiltinTag::ConnReadWrite
+            | BuiltinTag::Setting
+            | BuiltinTag::ShapeWeb
+            | BuiltinTag::ShapeWebView
+            | BuiltinTag::ShapeTerminal
+            | BuiltinTag::Program
+            | BuiltinTag::HostMode
+            | BuiltinTag::LogLevel
+            | BuiltinTag::CsrfMode
+            | BuiltinTag::RevocationMode
+            | BuiltinTag::Locale
+            | BuiltinTag::HttpMethod
+            | BuiltinTag::RedirectPolicy
+            | BuiltinTag::DbFailure
+            | BuiltinTag::AuthError
+            | BuiltinTag::Duration
+            | BuiltinTag::CryptoKey
+            | BuiltinTag::CryptoMac
+            | BuiltinTag::EmailAddress
+            | BuiltinTag::Principal
+            | BuiltinTag::Claims
+            | BuiltinTag::Algorithm
+            | BuiltinTag::JsonValue
+            | BuiltinTag::StreamId
+            | BuiltinTag::StreamWriter
+            | BuiltinTag::WsServer
+            | BuiltinTag::WsServerCfg
+            | BuiltinTag::ServerRequest
+            | BuiltinTag::ServerCookie
+            | BuiltinTag::ServerRoute
+            | BuiltinTag::AuthConfig
+            | BuiltinTag::TokenSource
+            | BuiltinTag::UiAttribute
+            | BuiltinTag::HtmlAttribute
+            | BuiltinTag::View
+            | BuiltinTag::UiElement
+            | BuiltinTag::Cells
+            | BuiltinTag::TuiAttr
+            | BuiltinTag::CliLines
+            | BuiltinTag::CliAttr
+            | BuiltinTag::Color
+            | BuiltinTag::ColorError
+            | BuiltinTag::TermProfile
+            | BuiltinTag::AnsiColor
+            | BuiltinTag::WcagLevel
+            | BuiltinTag::TextSize
+            | BuiltinTag::Deficiency
+            | BuiltinTag::CustomElement
+            | BuiltinTag::Html
+            | BuiltinTag::UiLength
+            | BuiltinTag::UiColor
+            | BuiltinTag::UiDescription
+            | BuiltinTag::UiPseudoClass
+            | BuiltinTag::InputLabel
+            | BuiltinTag::InputPlaceholder
+            | BuiltinTag::InputRadioOption
+            | BuiltinTag::WebReq
+            | BuiltinTag::SessionHandle
+            | BuiltinTag::WebRoute
+            | BuiltinTag::EmailProvider
+            | BuiltinTag::WebApp
+            | BuiltinTag::TuiApp
+            | BuiltinTag::CliApp
+            | BuiltinTag::DbStore
+            | BuiltinTag::DbDraft
+            | BuiltinTag::DbJoined
+            | BuiltinTag::DbSelect
+            | BuiltinTag::DbPolicy
+            | BuiltinTag::DbCond
+            | BuiltinTag::DbPred
+            | BuiltinTag::DbSecured
+            | BuiltinTag::DbOrder
+            | BuiltinTag::Codec
+            | BuiltinTag::Remote
+            | BuiltinTag::RemoteAuth => None,
+        }
+    }
 }
+
+/// The module every `Program` shape builtin is declared in.
+const PROGRAM_SHAPE_HOME: &str = "Ipe.Tea";
+
+/// Whether `a` and `b` are the same bytes, in a `const` context.
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.split_first(), b.split_first()) {
+            (None, None) => return true,
+            (Some((x, a_tail)), Some((y, b_tail))) if *x == *y => {
+                a = a_tail;
+                b = b_tail;
+            }
+            (Some(_), _) | (None, Some(_)) => return false,
+        }
+    }
+}
+
+/// Whether `shape` sits at its own index in [`ProgramShapeTag::ALL`] and its
+/// kernel tag classifies back to it.
+const fn shape_round_trips(shape: ProgramShapeTag) -> bool {
+    let mut all: &[ProgramShapeTag] = &ProgramShapeTag::ALL;
+    let mut at = 0_usize;
+    let mut listed = false;
+    while let Some((listed_shape, tail)) = all.split_first() {
+        if at == shape.index() {
+            listed = listed_shape.index() == at;
+        }
+        all = tail;
+        at = at.saturating_add(1);
+    }
+    listed
+        && matches!(
+            ProgramShapeTag::of_kernel_tag(shape.kernel_tag()),
+            Some(back) if back.index() == shape.index()
+        )
+}
+
+/// Whether [`ProgramShapeTag`] agrees with the kernel registry `rows`:
+/// * every shape in [`ProgramShapeTag::ALL`] is listed at its own index and
+///   its kernel tag classifies back to it (the registry's own assertion makes
+///   that tag name exactly one row);
+/// * every row whose tag classifies as a shape is that shape's builtin: it is
+///   spelled as the shape and declared in [`PROGRAM_SHAPE_HOME`], and the
+///   shape round-trips.
+const fn program_shape_tags_agree(mut rows: &[ipe_kernels::BuiltinRow]) -> bool {
+    let mut all: &[ProgramShapeTag] = &ProgramShapeTag::ALL;
+    while let Some((shape, tail)) = all.split_first() {
+        if !shape_round_trips(*shape) {
+            return false;
+        }
+        all = tail;
+    }
+    while let Some((row, tail)) = rows.split_first() {
+        if !shape_row_agrees(row.tag(), row.home(), row.name()) {
+            return false;
+        }
+        rows = tail;
+    }
+    true
+}
+
+/// Whether one registry row (its `tag`, `home` and `name`) agrees with
+/// [`ProgramShapeTag`]: a row whose tag is no shape agrees vacuously; a shape
+/// row is spelled as its shape, declared in [`PROGRAM_SHAPE_HOME`], and its
+/// shape round-trips.
+const fn shape_row_agrees(
+    tag: Option<ipe_kernels::BuiltinTag>,
+    home: ipe_kernels::KernelHome,
+    name: &str,
+) -> bool {
+    let Some(tag) = tag else {
+        return true;
+    };
+    let Some(shape) = ProgramShapeTag::of_kernel_tag(tag) else {
+        return true;
+    };
+    matches!(home, ipe_kernels::KernelHome::Module(path) if const_str_eq(path, PROGRAM_SHAPE_HOME))
+        && const_str_eq(name, shape.spelling())
+        && shape_round_trips(shape)
+}
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `ProgramShapeTag` drifts from the kernel registry's `Program` shape builtins [ledger #boundary]
+#[allow(clippy::assertions_on_constants)] // the constant IS the tripwire
+const _: () = assert!(
+    program_shape_tags_agree(ipe_kernels::BUILTIN_TYPES),
+    "ProgramShapeTag must name exactly the kernel registry's `Ipe.Tea` Program shape builtins",
+);
 
 /// The program entry the roots name: its lowered function and its `main`'s name span.
 ///
@@ -37152,6 +37390,180 @@ mod tests {
         });
     }
 
+    /// The names the record-collection tests intern, in order.
+    const RECORD_NAMES: [&str; 7] = ["Dict", "Float", "Int", "field", "x", "Lib", "Main"];
+
+    /// Run `check` on the record types collected by a lowerer over `build`'s
+    /// defs and solved types, `build` reading the [`RECORD_NAMES`] symbols.
+    fn collect_records_over(
+        build: impl FnOnce(&[ipe_intern::Symbol]) -> (Vec<canon::Def>, SolvedTypes),
+        check: impl FnOnce(
+            Result<Vec<IrType>, (super::Diagnostic, Vec<ipe_intern::Symbol>)>,
+            &[ipe_intern::Symbol],
+        ),
+    ) {
+        let mut interner = Interner::new();
+        let builtins = build_test_builtin_ctors(&mut interner);
+        let syms: Vec<ipe_intern::Symbol> = RECORD_NAMES
+            .iter()
+            .map(|n| interner.intern(n).unwrap())
+            .collect();
+        let (defs, types) = build(&syms);
+        let module = canon::Module {
+            imports_unsafe_submodule: false,
+            imported_web_capabilities: BTreeSet::new(),
+            name: vec![],
+            unions: vec![],
+            defs,
+        };
+        let lowerer = Lowerer::new(
+            &module,
+            &types,
+            &interner,
+            SymbolPools {
+                eta_params: vec![],
+                cap_params: vec![],
+                param_binders: vec![],
+                any_param_binders: vec![],
+                projection_decode_binders: vec![],
+                destructure_thunk_binders: vec![],
+                nested_cons_binders: vec![],
+                nested_strlit_binders: vec![],
+                tuple_elem_binders: vec![],
+                wildcard_marker: super::WildcardMarker(ipe_intern::Symbol::from_raw(u32::MAX)),
+            },
+            &builtins,
+            "",
+            "",
+        );
+        check(lowerer.collect_record_types(), &syms);
+    }
+
+    /// `{ field : Dict Float Int }`: a ground record that refuses to lower.
+    fn float_keyed_record(
+        dict: ipe_intern::Symbol,
+        float: ipe_intern::Symbol,
+        int: ipe_intern::Symbol,
+        field: ipe_intern::Symbol,
+    ) -> Ty {
+        let keyed = Ty::Con {
+            module: vec![],
+            name: dict,
+            args: vec![builtin_leaf(float), builtin_leaf(int)],
+        };
+        Ty::Record(BTreeMap::from([(field, keyed)]), super::RowTail::Closed)
+    }
+
+    /// An untyped def named `name` in `home`, its name at `at`.
+    fn untyped_def(home: ipe_intern::Symbol, name: ipe_intern::Symbol, at: Span) -> canon::Def {
+        canon::Def::Untyped {
+            home: vec![home],
+            name: Located::new(at, name),
+            patterns: vec![],
+            body: Located::new(
+                Span::new(at.hi, at.hi.saturating_add(1)),
+                canon::Expr_::Unit,
+            ),
+        }
+    }
+
+    /// A region whose record refuses reports at the region's span, in its own module.
+    #[test]
+    fn collect_record_types_homes_a_region_refusal_at_its_span() {
+        let region_span = Span::new(40, 52);
+        collect_records_over(
+            |syms| {
+                let [dict, float, int, field, _, lib, _] = syms else {
+                    return (vec![], empty_solved_types());
+                };
+                let mut types = empty_solved_types();
+                types.regions.insert(
+                    (vec![*lib], region_span),
+                    float_keyed_record(*dict, *float, *int, *field),
+                );
+                (vec![], types)
+            },
+            |got, syms| {
+                let [.., lib, _] = syms else { return };
+                assert!(
+                    matches!(
+                        &got,
+                        Err((super::Diagnostic::Lower {
+                            span,
+                            msg: super::LowerError::Unsupported(super::Feature::FloatKeyedCollection),
+                        }, home)) if *span == region_span && *home == [*lib]
+                    ),
+                    "a region refusal reports at the region in its module, got {got:?}"
+                );
+            },
+        );
+    }
+
+    /// An env binding whose record refuses reports at its own def's name span,
+    /// in its own module: never a same-named def of another module.
+    #[test]
+    fn collect_record_types_homes_an_env_refusal_at_its_def_name() {
+        let lib_name = Span::new(7, 9);
+        let main_name = Span::new(1, 2);
+        collect_records_over(
+            |syms| {
+                let [dict, float, int, field, x, lib, main] = syms else {
+                    return (vec![], empty_solved_types());
+                };
+                let mut types = empty_solved_types();
+                types.env.insert(
+                    (vec![*lib], *x),
+                    float_keyed_record(*dict, *float, *int, *field),
+                );
+                let defs = vec![
+                    untyped_def(*main, *x, main_name),
+                    untyped_def(*lib, *x, lib_name),
+                ];
+                (defs, types)
+            },
+            |got, syms| {
+                let [.., lib, _] = syms else { return };
+                assert!(
+                    matches!(
+                        &got,
+                        Err((super::Diagnostic::Lower {
+                            span,
+                            msg: super::LowerError::Unsupported(super::Feature::FloatKeyedCollection),
+                        }, home)) if *span == lib_name && *home == [*lib]
+                    ),
+                    "an env refusal reports at its own def's name in its module, got {got:?}"
+                );
+            },
+        );
+    }
+
+    /// An env binding with no def in the linked module is a compiler bug homed
+    /// to the binding's module, never a refusal at an invented span.
+    #[test]
+    fn collect_record_types_refuses_an_env_binding_without_a_def() {
+        collect_records_over(
+            |syms| {
+                let [_, _, int, _, x, lib, main] = syms else {
+                    return (vec![], empty_solved_types());
+                };
+                let mut types = empty_solved_types();
+                types.env.insert((vec![*lib], *x), builtin_leaf(*int));
+                (vec![untyped_def(*main, *x, Span::new(1, 2))], types)
+            },
+            |got, syms| {
+                let [.., lib, _] = syms else { return };
+                assert!(
+                    matches!(
+                        &got,
+                        Err((super::Diagnostic::CompilerBug { where_, .. }, home))
+                            if *where_ == "ipe_lower::collect_record_types" && *home == [*lib]
+                    ),
+                    "a def-less env binding is a compiler bug in its module, got {got:?}"
+                );
+            },
+        );
+    }
+
     /// A projection wider than five columns refuses at the projection's span.
     #[test]
     fn projection_decode_lambda_wider_than_five_reports_at() {
@@ -37249,6 +37661,55 @@ mod tests {
     /// Every tag round-trips through its spelling, names an `Ipe.Tea` builtin,
     /// and lowers `Program <tag> String` to its app leaf from an annotation
     /// and from a solved type alike; every `Ipe.Tea` shape builtin is a tag.
+    /// The build-time registry agreement refuses each drift one step past the
+    /// legal row: a shape row spelled as another shape, declared outside
+    /// `Ipe.Tea`, or at the empty home; a non-shape row agrees whatever it is.
+    #[test]
+    fn program_shape_row_agreement_refuses_each_drift() {
+        use ipe_kernels::{BuiltinTag, KernelHome};
+        let tea = KernelHome::Module(super::PROGRAM_SHAPE_HOME);
+        assert!(super::program_shape_tags_agree(ipe_kernels::BUILTIN_TYPES));
+        for shape in super::ProgramShapeTag::ALL {
+            let tag = Some(shape.kernel_tag());
+            assert!(super::shape_row_agrees(tag, tea, shape.spelling()));
+            assert!(
+                !super::shape_row_agrees(tag, tea, &format!("{}x", shape.spelling())),
+                "a `{}` row spelled otherwise is drift",
+                shape.spelling()
+            );
+            assert!(
+                !super::shape_row_agrees(tag, tea, shape.spelling().get(1..).unwrap_or("")),
+                "a `{}` row spelled as a prefix-shortened name is drift",
+                shape.spelling()
+            );
+            assert!(
+                !super::shape_row_agrees(tag, KernelHome::Module("Ipe.Ui"), shape.spelling()),
+                "a `{}` row outside `Ipe.Tea` is drift",
+                shape.spelling()
+            );
+            assert!(
+                !super::shape_row_agrees(tag, KernelHome::Module("Ipe.Te"), shape.spelling()),
+                "a `{}` row in a module prefixing `Ipe.Tea` is drift",
+                shape.spelling()
+            );
+            assert!(
+                !super::shape_row_agrees(tag, KernelHome::Builtin, shape.spelling()),
+                "a `{}` row at the empty home is drift",
+                shape.spelling()
+            );
+        }
+        assert!(
+            !super::shape_row_agrees(Some(BuiltinTag::ProgramShapeWeb), tea, "Tui"),
+            "a Web-tagged row spelled `Tui` is drift"
+        );
+        assert!(super::shape_row_agrees(
+            Some(BuiltinTag::Int),
+            KernelHome::Builtin,
+            "Int"
+        ));
+        assert!(super::shape_row_agrees(None, KernelHome::Builtin, "Web"));
+    }
+
     #[test]
     fn program_shape_tag_agrees_with_kernel_registry() {
         let registry_shapes: BTreeSet<&str> = ipe_kernels::BUILTIN_TYPES
@@ -37259,6 +37720,19 @@ mod tests {
             })
             .map(ipe_kernels::BuiltinRow::name)
             .collect();
+        let classified_shapes: BTreeSet<&str> = ipe_kernels::BUILTIN_TYPES
+            .iter()
+            .filter(|row| {
+                row.tag()
+                    .and_then(super::ProgramShapeTag::of_kernel_tag)
+                    .is_some()
+            })
+            .map(ipe_kernels::BuiltinRow::name)
+            .collect();
+        assert_eq!(
+            registry_shapes, classified_shapes,
+            "`ProgramShapeTag::of_kernel_tag` classifies exactly the registry's `ProgramShape*` tags"
+        );
         let table_shapes: BTreeSet<&str> = super::ProgramShapeTag::ALL
             .iter()
             .map(|tag| tag.spelling())

@@ -2,15 +2,22 @@
 //!
 //! A lowering refusal is reported at the span of the node it lowers, which
 //! the helper takes as a parameter. A refusal minted at `Span::DUMMY` (or its
-//! spellings `Span::new(0, 0)` and `Span { lo: 0, hi: 0 }`) reaches the user
-//! with no caret, so every such spelling outside test-only code is refused,
-//! keyed by the function it appears in, except the exact allowlist below.
+//! spellings `Span::new(0, 0)`, `Span::from_start_width(0, 0)` and
+//! `Span { lo: 0, hi: 0 }`) reaches the user with no caret, so every such
+//! spelling outside test-only code is refused, keyed by the function it
+//! appears in, except the exact allowlist below. A `DUMMY` read through any
+//! qualifier (`Self::DUMMY`, a renamed import) and a renamed `Span` (`use ...
+//! Span as S`, `type S = Span`) are refused alike, so no alias spells the
+//! dummy past the scan.
 
 use std::collections::BTreeMap;
 
 use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
-use syn::{Expr, ImplItem, ImplItemFn, Item, ItemFn, Lit, Macro, Member, Token, TraitItem};
+use syn::{
+    Expr, ImplItem, ImplItemFn, Item, ItemFn, ItemType, Lit, Macro, Member, Token, TraitItem, Type,
+    UseRename,
+};
 
 use crate::cfg_scan::{cfg_test_only, expr_attrs, impl_item_attrs, item_attrs, trait_item_attrs};
 use crate::source_tree::rust_sources;
@@ -33,17 +40,36 @@ fn ends_with_span(path: &syn::Path, last: &str) -> bool {
     rev.next().is_some_and(|s| s.ident == last) && rev.next().is_some_and(|s| s.ident == "Span")
 }
 
-/// Whether `expr` is the integer literal `0`.
+/// Whether `expr` is an integer literal of value zero, under any parentheses or cast.
 fn is_zero(expr: &Expr) -> bool {
-    matches!(expr, Expr::Lit(lit) if matches!(&lit.lit, Lit::Int(n) if n.base10_digits() == "0"))
+    match expr {
+        Expr::Lit(lit) => {
+            matches!(&lit.lit, Lit::Int(n) if n.base10_parse::<u128>().is_ok_and(|v| v == 0))
+        }
+        Expr::Paren(inner) => is_zero(&inner.expr),
+        Expr::Group(inner) => is_zero(&inner.expr),
+        Expr::Cast(cast) => is_zero(&cast.expr),
+        _ => false,
+    }
+}
+
+/// Whether `path` names an associated `DUMMY`, through any qualifier.
+fn names_dummy(path: &syn::Path) -> bool {
+    path.segments.len() > 1 && path.segments.last().is_some_and(|s| s.ident == "DUMMY")
+}
+
+/// Whether `ty` names `Span`.
+fn names_span(ty: &Type) -> bool {
+    matches!(ty, Type::Path(p) if p.path.segments.last().is_some_and(|s| s.ident == "Span"))
 }
 
 /// Whether `expr` itself spells a synthetic span.
 fn is_synthetic_span(expr: &Expr) -> bool {
     match expr {
-        Expr::Path(p) => ends_with_span(&p.path, "DUMMY"),
+        Expr::Path(p) => names_dummy(&p.path),
         Expr::Call(call) => {
-            matches!(call.func.as_ref(), Expr::Path(p) if ends_with_span(&p.path, "new"))
+            matches!(call.func.as_ref(), Expr::Path(p)
+                if ends_with_span(&p.path, "new") || ends_with_span(&p.path, "from_start_width"))
                 && call.args.len() == 2
                 && call.args.iter().all(is_zero)
         }
@@ -101,6 +127,22 @@ impl<'ast> Visit<'ast> for Scan {
         }
     }
 
+    /// A renamed `Span` import would spell the dummy as `S::new(0, 0)`.
+    fn visit_use_rename(&mut self, rename: &'ast UseRename) {
+        if rename.ident == "Span" {
+            self.record();
+        }
+        visit::visit_use_rename(self, rename);
+    }
+
+    /// A `Span` type alias would spell the dummy as `S { lo: 0, hi: 0 }`.
+    fn visit_item_type(&mut self, item: &'ast ItemType) {
+        if names_span(&item.ty) {
+            self.record();
+        }
+        visit::visit_item_type(self, item);
+    }
+
     fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
         self.fns.push(item.sig.ident.to_string());
         visit::visit_impl_item_fn(self, item);
@@ -147,7 +189,7 @@ impl<'ast> Visit<'ast> for Scan {
     }
 
     /// A macro body that parses as comma-separated expressions is scanned as
-    /// such; any other body is scanned token by token for `Span::DUMMY`.
+    /// such; any other body is scanned token by token for a qualified `DUMMY`.
     fn visit_macro(&mut self, mac: &'ast Macro) {
         match mac.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
             Ok(args) => args.iter().for_each(|arg| self.visit_expr(arg)),
@@ -161,15 +203,15 @@ impl<'ast> Visit<'ast> for Scan {
     }
 }
 
-/// How many `Span :: DUMMY` runs `tokens` spells, at every group depth.
+/// How many `:: DUMMY` runs `tokens` spells, at every group depth.
 fn dummy_token_runs(tokens: proc_macro2::TokenStream) -> usize {
     use proc_macro2::TokenTree;
     let trees: Vec<TokenTree> = tokens.into_iter().collect();
     let here = trees
-        .windows(4)
+        .windows(3)
         .filter(|w| {
-            matches!(w, [TokenTree::Ident(span), TokenTree::Punct(a), TokenTree::Punct(b), TokenTree::Ident(dummy)]
-                if span == "Span" && a.as_char() == ':' && b.as_char() == ':' && dummy == "DUMMY")
+            matches!(w, [TokenTree::Punct(a), TokenTree::Punct(b), TokenTree::Ident(dummy)]
+                if a.as_char() == ':' && b.as_char() == ':' && dummy == "DUMMY")
         })
         .count();
     trees.iter().fold(here, |n, tree| match tree {
@@ -223,6 +265,14 @@ fn each_spelling_in_a_plain_fn_is_caught() {
         "Span::new(0, 0)",
         "Span { lo: 0, hi: 0 }",
         "vec![Span::DUMMY]",
+        "Span::from_start_width(0, 0)",
+        "Span::new(0x0, 0_u32)",
+        "Span::new((0), 0 as u32)",
+        "Span { hi: 00, lo: 0 }",
+        "Self::DUMMY",
+        "S::DUMMY",
+        "ipe_diagnostics::Span::DUMMY",
+        "m!(@ S::DUMMY)",
     ] {
         let src = format!("fn refuse() -> Span {{ {body} }}");
         assert_eq!(
@@ -235,7 +285,29 @@ fn each_spelling_in_a_plain_fn_is_caught() {
 
 #[test]
 fn a_real_span_is_admitted() {
-    let src = "fn real(at: Span) -> Span { let _ = Span::new(0, 1); at }";
+    let src =
+        "fn real(at: Span) -> Span { let _ = (Span::new(0, 1), Span::from_start_width(0, 1)); at }";
+    assert!(fixture_hits(src).is_empty());
+}
+
+#[test]
+fn a_renamed_span_is_caught() {
+    for src in [
+        "use ipe_diagnostics::Span as S;",
+        "use ipe_diagnostics::{Located, Span as S};",
+        "type S = ipe_diagnostics::Span;",
+    ] {
+        assert_eq!(
+            fixture_hits(src),
+            BTreeMap::from([(OUTSIDE_FN.to_owned(), 1)]),
+            "`{src}` renames `Span` past the spelling scan"
+        );
+    }
+}
+
+#[test]
+fn a_plain_span_import_is_admitted() {
+    let src = "use ipe_diagnostics::{Located, Span}; type Spans = Vec<Span>;";
     assert!(fixture_hits(src).is_empty());
 }
 
