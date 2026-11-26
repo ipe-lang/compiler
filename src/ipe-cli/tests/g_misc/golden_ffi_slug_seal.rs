@@ -77,18 +77,23 @@ fn cached_names(project_root: &Path) -> Vec<String> {
     )
 }
 
+/// Build the `Match` fixture into a fresh `out_dir`, returning the emitted crate's root.
+fn built_match(out_dir: &str) -> PathBuf {
+    let runtime = e2e_support::require_runtime().into_path_buf();
+    let fixture = match_fixture();
+    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(out_dir);
+    e2e_support::scratch::fresh(&out);
+    let built = ipe::build_fixture(&fixture, &out, &runtime);
+    assert!(built.is_ok(), "the `Match` fixture must build: {built:?}");
+    out
+}
+
 /// `Match` folds to the escaped slug `match_`: its bindings module is `match_`,
 /// and its asserted call names the lib identifier `Match`, never the slug.
 #[test]
 #[allow(clippy::expect_used)] // test fixture: a failed build or read IS the failure
 fn an_escaped_slug_names_the_module_and_the_lib_ident_names_the_call() {
-    let runtime = e2e_support::require_runtime().into_path_buf();
-    let fixture = match_fixture();
-    let out = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ffi_slug_seal_out");
-    e2e_support::scratch::fresh(&out);
-    let built = ipe::build_fixture(&fixture, &out, &runtime);
-    assert!(built.is_ok(), "the `Match` fixture must build: {built:?}");
-
+    let out = built_match("ffi_slug_seal_out");
     let ffi_rs = fs::read_to_string(out.join("src/ffi.rs")).expect("emitted src/ffi.rs");
     assert!(
         ffi_rs.contains("pub mod match_ {"),
@@ -102,10 +107,17 @@ fn an_escaped_slug_names_the_module_and_the_lib_ident_names_the_call() {
         !ffi_rs.contains("::match_::"),
         "no call names the slug as a crate:\n{ffi_rs}"
     );
+}
 
+/// SEAL proof under `IPE_E2E=1`: the emitted crate builds against the real
+/// `Match` crate under its escaped slug and runs.
+#[test]
+#[allow(clippy::expect_used)] // test fixture: a failed build, write or run IS the failure
+fn an_escaped_slug_crate_builds_and_runs() {
     if e2e_support::e2e_tier() == e2e_support::Tier::Unit {
         return;
     }
+    let out = built_match("ffi_slug_seal_e2e_out");
     let tmp = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("ipec_ffi_slug_seal_e2e");
     e2e_support::scratch::fresh(&tmp);
     let crate_dir = tmp.join("Match");
