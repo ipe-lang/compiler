@@ -1610,9 +1610,9 @@ pub const fn default_ro_binds() -> Vec<CanonicalPath> {
 /// ([`Self::host_homes`]), and the jail's [`ToolchainHomes`] is resolved from
 /// the same value, so the host steps and the jail never name two homes. The
 /// toolchain rustup selects travels the same way: the host steps inherit the
-/// invoker's `RUSTUP_TOOLCHAIN`, and the POSIX jail exports the value read here
-/// ([`JailToolchain`]), so the jailed build never falls back to rustup's
-/// default while the host steps honour the override.
+/// invoker's `RUSTUP_TOOLCHAIN`, and the jail exports the value read here, so
+/// the jailed build never falls back to rustup's default while the host steps
+/// honour the override.
 #[cfg(any(
     all(
         target_os = "linux",
@@ -1629,31 +1629,25 @@ struct ToolchainRoots {
     // The Windows jail exports no toolchain env, so only POSIX reads them.
     #[cfg_attr(target_os = "windows", allow(dead_code))]
     user: Option<crate::env_dir::HomeDir>,
-    #[cfg(not(target_os = "windows"))]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     toolchain: Option<RustupToolchain>,
 }
 
 /// The toolchain rustup selects for a Tier-2 step, as `RUSTUP_TOOLCHAIN` names it.
 ///
-/// rustup reads a value holding a path separator as a toolchain directory and
-/// any other value as a toolchain name. The jail scrubs its environment, so a
-/// jailed build that is not handed the selection resolves rustup's default
-/// toolchain instead.
+/// The jail scrubs its environment, so a jailed build that is not handed this
+/// value resolves rustup's default toolchain instead.
 #[cfg(any(
     all(
         target_os = "linux",
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
     target_os = "macos",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "windows"
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RustupToolchain {
-    /// A toolchain name, which rustup resolves inside its home.
-    Named(OsString),
-    /// A toolchain directory, as the invoker spelled it.
-    Path(PathBuf),
-}
+pub struct RustupToolchain(OsString);
 
 #[cfg(any(
     all(
@@ -1661,107 +1655,19 @@ pub enum RustupToolchain {
         any(target_arch = "x86_64", target_arch = "aarch64")
     ),
     target_os = "macos",
-    target_os = "freebsd"
+    target_os = "freebsd",
+    target_os = "windows"
 ))]
 impl RustupToolchain {
-    /// `value` as rustup reads it; `None` when empty, which selects none.
+    /// `name` as a toolchain selection; `None` when empty, which names none.
     #[must_use]
-    pub fn parse(value: OsString) -> Option<Self> {
-        if value.is_empty() {
-            return None;
-        }
-        let names_a_path = value
-            .as_encoded_bytes()
-            .iter()
-            .any(|byte| matches!(byte, b'/' | b'\\'));
-        Some(if names_a_path {
-            Self::Path(PathBuf::from(value))
-        } else {
-            Self::Named(value)
-        })
+    pub fn named(name: OsString) -> Option<Self> {
+        (!name.is_empty()).then_some(Self(name))
     }
 
     /// The invoker's `RUSTUP_TOOLCHAIN`, when set and non-empty.
     fn of_invoker() -> Option<Self> {
-        ipe_env::var_os("RUSTUP_TOOLCHAIN").and_then(Self::parse)
-    }
-}
-
-/// The `RUSTUP_TOOLCHAIN` the POSIX jail exports: a toolchain name, or a
-/// toolchain directory inside the Rustup home in the canonical form the jail
-/// binds that home at.
-///
-/// A directory anywhere else is no toolchain the jail can reach, so it never
-/// becomes one: [`Self::resolve`] refuses it.
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    target_os = "macos",
-    target_os = "freebsd"
-))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum JailToolchain {
-    Named(OsString),
-    Path(CanonicalPath),
-}
-
-#[cfg(any(
-    all(
-        target_os = "linux",
-        any(target_arch = "x86_64", target_arch = "aarch64")
-    ),
-    target_os = "macos",
-    target_os = "freebsd"
-))]
-impl JailToolchain {
-    /// `selected` as the jail can resolve it, under the canonical `rustup_home`.
-    ///
-    /// # Errors
-    /// [`CliError::PackageAudit`] carrying a [`Check::NativeTier2`]
-    /// [`Rejection`] when `selected` names a directory that is not absolute,
-    /// does not resolve, or does not lie inside `rustup_home` (or there is no
-    /// Rustup home): the jail binds no other toolchain directory.
-    fn resolve(
-        selected: RustupToolchain,
-        rustup_home: Option<&CanonicalPath>,
-    ) -> Result<Self, CliError> {
-        match selected {
-            RustupToolchain::Named(name) => Ok(Self::Named(name)),
-            RustupToolchain::Path(dir) => {
-                let canonical = if dir.is_absolute() {
-                    CanonicalPath::resolve(&dir).ok()
-                } else {
-                    None
-                };
-                match (canonical, rustup_home) {
-                    (Some(canonical), Some(home))
-                        if canonical.as_path().starts_with(home.as_path()) =>
-                    {
-                        Ok(Self::Path(canonical))
-                    }
-                    _ => Err(CliError::PackageAudit(Rejection {
-                        check: Check::NativeTier2,
-                        message: format!(
-                            "refusing `RUSTUP_TOOLCHAIN={}` for the Tier-2 jail: a toolchain \
-                             directory must be an absolute path inside the Rustup home, the \
-                             only toolchain directory the jail binds — install the toolchain \
-                             there and select it by name.",
-                            dir.display()
-                        ),
-                    })),
-                }
-            }
-        }
-    }
-
-    /// The value the payload exports as `RUSTUP_TOOLCHAIN`.
-    fn value(&self) -> &std::ffi::OsStr {
-        match self {
-            Self::Named(name) => name,
-            Self::Path(dir) => dir.as_path().as_os_str(),
-        }
+        ipe_env::var_os("RUSTUP_TOOLCHAIN").and_then(Self::named)
     }
 }
 
@@ -1787,7 +1693,6 @@ impl ToolchainRoots {
             cargo: crate::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")?,
             rustup: crate::env_dir::tool_home("RUSTUP_HOME", user_home.as_ref(), ".rustup")?,
             user: user_home,
-            #[cfg(not(target_os = "windows"))]
             toolchain: RustupToolchain::of_invoker(),
         })
     }
@@ -1834,7 +1739,7 @@ pub struct ToolchainHomes {
     env: Vec<(&'static str, CanonicalPath)>,
     /// The toolchain the POSIX payload exports as `RUSTUP_TOOLCHAIN`.
     #[cfg(not(target_os = "windows"))]
-    toolchain: Option<JailToolchain>,
+    toolchain: Option<RustupToolchain>,
 }
 
 #[cfg(any(
@@ -1872,14 +1777,13 @@ impl ToolchainHomes {
 
     /// The toolchain over the given homes, each resolved to its canonical form
     /// once; an absent home is skipped. `toolchain` is exported as
-    /// `RUSTUP_TOOLCHAIN` when present, per [`JailToolchain::resolve`].
+    /// `RUSTUP_TOOLCHAIN` when present.
     ///
     /// # Errors
     /// [`CliError::PackageAudit`] carrying a [`Check::NativeTier2`]
-    /// [`Rejection`] when a present home does not resolve, a bind equals or
+    /// [`Rejection`] when a present home does not resolve, or a bind equals or
     /// contains the cargo home (a Rustup home at or above it), which would
-    /// expose `credentials.toml` inside the jail, or `toolchain` names a
-    /// directory outside the Rustup home.
+    /// expose `credentials.toml` inside the jail.
     pub fn from_homes(
         cargo_home: Option<crate::env_dir::ToolHome>,
         rustup_home: Option<crate::env_dir::ToolHome>,
@@ -1889,9 +1793,6 @@ impl ToolchainHomes {
         let cargo_home = existing_jail_path(cargo_home.map(|home| home.as_path().to_path_buf()))?;
         let rustup_home = existing_jail_path(rustup_home.map(|home| home.as_path().to_path_buf()))?;
         let user_home = existing_jail_path(user_home.map(|home| home.as_path().to_path_buf()))?;
-        let toolchain = toolchain
-            .map(|selected| JailToolchain::resolve(selected, rustup_home.as_ref()))
-            .transpose()?;
         let mut ro_binds = Vec::new();
         if let Some(cargo) = &cargo_home {
             for dir in CARGO_HOME_TOOL_DIRS {
@@ -1926,7 +1827,7 @@ impl ToolchainHomes {
     }
 
     /// The toolchain the payload exports as `RUSTUP_TOOLCHAIN`, if any.
-    const fn toolchain(&self) -> Option<&JailToolchain> {
+    const fn toolchain(&self) -> Option<&RustupToolchain> {
         self.toolchain.as_ref()
     }
 }
@@ -2443,8 +2344,8 @@ impl JailProbeRunner<'_> {
             for (name, home) in toolchain.env() {
                 invocation_prefix.push(assignment(name, home.as_path().as_os_str()));
             }
-            if let Some(selected) = toolchain.toolchain() {
-                invocation_prefix.push(assignment("RUSTUP_TOOLCHAIN", selected.value()));
+            if let Some(RustupToolchain(name)) = toolchain.toolchain() {
+                invocation_prefix.push(assignment("RUSTUP_TOOLCHAIN", name));
             }
         }
         invocation_prefix.push(OsString::from("/bin/sh"));
@@ -2477,7 +2378,7 @@ impl JailProbeRunner<'_> {
     /// own the exit the decoder reads.
     ///
     /// The toolchain homes a real `cargo build` needs (`CARGO_HOME`/`RUSTUP_HOME`)
-    /// and the `RUSTUP_TOOLCHAIN` selection are NOT injected here: the Windows jail's own env scrub carries `SystemRoot`
+    /// are NOT injected here: the Windows jail's own env scrub carries `SystemRoot`
     /// / `PATH` / `TMP` / `TEMP`, and a real Windows Tier-2 build would allowlist
     /// the toolchain homes through the declared `env` axis. The wrapper-probe-only
     /// and offline-probe shapes the CI E2E exercises need none.
@@ -3833,87 +3734,13 @@ mod tests {
                 cargo: None,
                 rustup: None,
                 user: None,
-                toolchain: RustupToolchain::parse(OsString::from(toolchain)),
+                toolchain: RustupToolchain::named(OsString::from(toolchain)),
             };
             assert_eq!(
                 exported_toolchains(&roots("1.98.1")),
                 ["RUSTUP_TOOLCHAIN=1.98.1"]
             );
             assert!(exported_toolchains(&roots("")).is_empty());
-        }
-
-        /// rustup reads a value holding a path separator as a toolchain
-        /// directory, so the parse does too.
-        #[test]
-        fn a_selection_with_a_path_separator_names_a_directory() {
-            for value in ["/opt/tc", "tc/sub", "a\\b"] {
-                assert_eq!(
-                    RustupToolchain::parse(OsString::from(value)),
-                    Some(RustupToolchain::Path(PathBuf::from(value))),
-                    "{value:?}"
-                );
-            }
-            assert_eq!(
-                RustupToolchain::parse(OsString::from("1.98.1")),
-                Some(RustupToolchain::Named(OsString::from("1.98.1")))
-            );
-            assert_eq!(RustupToolchain::parse(OsString::new()), None);
-        }
-
-        /// The jail binds the Rustup home at its canonical path, so a toolchain
-        /// directory inside it is exported in that form, whatever the spelling.
-        #[test]
-        fn a_toolchain_directory_in_the_rustup_home_is_exported_as_the_jail_binds_it() {
-            let tree = tree();
-            let spelled = tree.link.join("rustup").join("toolchains").join("pinned");
-            std::fs::create_dir_all(&spelled).expect("create toolchain dir");
-            let roots = ToolchainRoots {
-                cargo: None,
-                rustup: Some(tool(&tree.link.join("rustup"))),
-                user: None,
-                toolchain: Some(RustupToolchain::Path(spelled)),
-            };
-            let bound = tree.real.join("rustup").join("toolchains").join("pinned");
-            assert_eq!(
-                exported_toolchains(&roots),
-                [format!("RUSTUP_TOOLCHAIN={}", bound.display())]
-            );
-        }
-
-        /// A toolchain directory the jail cannot reach — outside the Rustup
-        /// home, relative, absent, or with no Rustup home at all — is refused
-        /// rather than handed to a jailed build that cannot resolve it.
-        #[test]
-        fn a_toolchain_directory_the_jail_cannot_reach_is_refused() {
-            let tree = tree();
-            let rustup = tree.link.join("rustup");
-            std::fs::create_dir_all(rustup.join("toolchains").join("pinned"))
-                .expect("create toolchain dir");
-            let cases = [
-                (Some(&rustup), tree.link.join("worktree")),
-                (Some(&rustup), PathBuf::from("rustup/toolchains/pinned")),
-                (Some(&rustup), rustup.join("toolchains").join("absent")),
-                (None, rustup.join("toolchains").join("pinned")),
-            ];
-            for (home, dir) in cases {
-                let roots = ToolchainRoots {
-                    cargo: None,
-                    rustup: home.map(|home| tool(home)),
-                    user: None,
-                    toolchain: Some(RustupToolchain::Path(dir.clone())),
-                };
-                let refused = ToolchainHomes::from_roots(&roots);
-                assert!(
-                    matches!(
-                        refused,
-                        Err(CliError::PackageAudit(Rejection {
-                            check: Check::NativeTier2,
-                            ..
-                        }))
-                    ),
-                    "{dir:?} under {home:?} must refuse: {refused:?}"
-                );
-            }
         }
     }
 
