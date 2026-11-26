@@ -10015,6 +10015,89 @@ fn body_uses_kernel_where(expr: &Expr, wanted: impl Fn(KernelFn) -> bool + Copy)
     }
 }
 
+/// Whether a type position may default a phantom variable to the binder carrier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Slot {
+    /// The emitted type does not depend on this position's phantom.
+    Defaultable,
+    /// The position fixes the emitted carrier: a function arrow's operands, a `Program` shape tag.
+    FixesCarrier,
+}
+
+/// Whether a phantom-pinning copy replaced any phantom type variable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pinned {
+    /// No phantom was replaced; the copy equals the input.
+    Untouched,
+    /// At least one phantom was defaulted to the carrier.
+    Defaulted,
+}
+
+impl Pinned {
+    /// `Defaulted` when either side defaulted a phantom.
+    const fn or(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Untouched, Self::Untouched) => Self::Untouched,
+            (Self::Defaulted, _) | (_, Self::Defaulted) => Self::Defaulted,
+        }
+    }
+}
+
+/// The builtin `Program shape msg` carrier's constructor name.
+const PROGRAM_CARRIER: &str = "Program";
+
+/// A `Program` carrier's shape tag: the one table from its spelling to its app leaf.
+///
+/// The spellings are the `Ipe.Tea` builtin types of `ipe_kernels`; a unit
+/// test asserts the two sets agree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProgramShapeTag {
+    Web,
+    Tui,
+    Cli,
+    Worker,
+}
+
+impl ProgramShapeTag {
+    /// Every shape tag, in declaration order.
+    const ALL: [Self; 4] = [Self::Web, Self::Tui, Self::Cli, Self::Worker];
+
+    /// The tag's source spelling.
+    const fn spelling(self) -> &'static str {
+        match self {
+            Self::Web => "Web",
+            Self::Tui => "Tui",
+            Self::Cli => "Cli",
+            Self::Worker => "Worker",
+        }
+    }
+
+    /// The tag a source spelling names, if any.
+    fn parse(spelled: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tag| tag.spelling() == spelled)
+    }
+
+    /// The opaque app leaf a `Program` carrier of this shape erases to.
+    const fn app_leaf(self) -> IrType {
+        match self {
+            Self::Web => IrType::WebApp,
+            Self::Tui => IrType::TuiApp,
+            Self::Cli => IrType::CliApp,
+            Self::Worker => IrType::WorkerApp,
+        }
+    }
+}
+
+/// The program entry the roots name: its lowered function and its `main`'s name span.
+///
+/// One value, so an entry without a source anchor for its admissibility
+/// diagnostic (`IPE-L0136`) has no representation.
+#[derive(Clone, Copy)]
+struct EntryRoot {
+    id: FuncId,
+    span: Span,
+}
+
 /// The set of [`FuncId`]s transitively reachable from `entry` and any
 /// `extra_roots` over the `Callee::Func`/[`Expr::FuncValue`] call graph of
 /// `funcs`. `extra_roots` are externally-invoked exports (e.g. the wasm-hydrate
@@ -15407,8 +15490,9 @@ impl<'a> Lowerer<'a> {
     /// The text reader is `projectionReadText : Int -> Row -> Result Error String`,
     /// so its second parameter is the `Row` alias the readers consume, already
     /// expanded by resolution. Deriving the decode's binder type from it keeps the
-    /// emitted lambda and the stdlib reader on one definition of `Row`.
-    fn projection_row_ir_type(&self) -> DResult<IrType> {
+    /// emitted lambda and the stdlib reader on one definition of `Row`. `at` is
+    /// the projection being decoded.
+    fn projection_row_ir_type(&self, at: Span) -> DResult<IrType> {
         let id = self.store_named_func_id(ProjColKind::Text.reader())?;
         let idx = usize::try_from(id.as_raw()).unwrap_or(usize::MAX);
         let Some(canon::Def::Typed {
@@ -15427,7 +15511,7 @@ impl<'a> Lowerer<'a> {
                 "Store projection reader annotation takes no `Row`",
             ));
         };
-        self.ir_type_from_canon(row, &[])
+        self.ir_type_from_canon(row, &[], at)
     }
 
     /// Look up the `FuncId` of a named `Ipe.Db.Store` helper by its exact identity.
@@ -16514,7 +16598,7 @@ impl<'a> Lowerer<'a> {
         let lowered_select = self.lower_expr(select_arg)?;
 
         // `\row -> <decode row into the projected value>` : Row -> Result Error row.
-        let (decode_lambda, _value_ty) = self.projection_decode_lambda(&cols)?;
+        let (decode_lambda, _value_ty) = self.projection_decode_lambda(&cols, select_arg.span)?;
 
         // The stdlib helper runs `selectRows` and threads `decode` over the rows
         // (`selectDecodeList` / `selectDecodeMaybe`), keeping the `List.map` /
@@ -16573,9 +16657,14 @@ impl<'a> Lowerer<'a> {
     /// Every stdlib binding the decode names — the `projectionRead*` readers and
     /// the `projectionDecode*` combinators — lives in `Ipe.Db.Store`, referenced
     /// only through the (kept) `Store` helpers, so the emitted decode pulls no
-    /// binding the whole-program reachability pass could have pruned.
-    fn projection_decode_lambda(&self, cols: &[ProjectedColumn]) -> DResult<(Expr, IrType)> {
-        let row_ty = self.projection_row_ir_type()?;
+    /// binding the whole-program reachability pass could have pruned. `at` is
+    /// the projection (`Store.select …`) a refusal is reported against.
+    fn projection_decode_lambda(
+        &self,
+        cols: &[ProjectedColumn],
+        at: Span,
+    ) -> DResult<(Expr, IrType)> {
+        let row_ty = self.projection_row_ir_type(at)?;
         let row_binder = self.fresh_projection_decode_binder()?;
         // `projectionRead<kind> i row` — read the cell at output position `i`.
         let read_at = |i: usize, col: &ProjectedColumn, row: Symbol| -> DResult<Expr> {
@@ -16608,7 +16697,7 @@ impl<'a> Lowerer<'a> {
                         // combinator has no monomorphic threading — fail closed
                         // rather than emit an unsupported decode.
                         return Err(unsupported_store_select(
-                            Span::DUMMY,
+                            at,
                             StoreSelectProjectionDefect::UnsupportedProjectionBody,
                         ));
                     }
@@ -17033,11 +17122,8 @@ impl<'a> Lowerer<'a> {
             // instead (mirrors the reference's `runtimeOpaqueTypes` mapping). We
             // still call `lower_enum` for its side effect of validating the ctor
             // payload (a `Task`-arity / polymorphism error must still surface).
-            // Union lowering carries no per-def home; a failure here is homeless
-            // (empty `Vec`) → driver heuristic fallback. In practice a union home
-            // equals its defining module, but the lowerer does not thread it here
-            // and enum-shape errors are rare + already span-precise.
-            let def = self.lower_enum(u).map_err(|d| (d, Vec::new()))?;
+            // A failure is homed to the union's own source module.
+            let def = self.lower_enum(u).map_err(|d| (d, u.home.clone()))?;
             if self.is_runtime_bridged_union(u) {
                 continue;
             }
@@ -17092,11 +17178,7 @@ impl<'a> Lowerer<'a> {
         // own `main`, chosen by home by the one selector canon's entry
         // closure shares — never the last def spelled `main`.
         let entry_def = roots.entry_def(self.m, self.interner);
-        let mut entry = None;
-        // The `main` def's name span, for a source-anchored entry-admissibility
-        // diagnostic (`IPE-L0136`). Captured from the canonical def alongside the
-        // entry `FuncId`, since a lowered `Func` carries no span.
-        let mut entry_span: Option<Span> = None;
+        let mut entry_root: Option<EntryRoot> = None;
         // Each def's user-function references with their solved
         // instantiations, for the cross-call bound propagation below.
         let mut callee_instances: std::collections::HashMap<FuncId, Vec<CalleeInstance>> =
@@ -17157,8 +17239,10 @@ impl<'a> Lowerer<'a> {
                 .map_err(|d| (d, def.home().to_vec()))?;
             callee_instances.insert(func.id, self.callee_instances.take());
             if entry_def == Some(idx) {
-                entry = Some(func.id);
-                entry_span = Some(def.name().span);
+                entry_root = Some(EntryRoot {
+                    id: func.id,
+                    span: def.name().span,
+                });
             }
             funcs.push(func);
         }
@@ -17238,6 +17322,7 @@ impl<'a> Lowerer<'a> {
         // every function is kept — the fail-closed direction (never
         // under-report a capability reachable only from an exposed but
         // locally uncalled function).
+        let entry = entry_root.map(|root| root.id);
         let prune_dead = entry.is_some();
         if let Some(main_fn) = entry.and_then(|e| funcs.iter().find(|f| f.id == e))
             && main_fn.home != ModPath(self.m.name.clone())
@@ -17265,8 +17350,8 @@ impl<'a> Lowerer<'a> {
         // whenever the roots name an entry, whatever other program's `main` is
         // linked beside it; the whole-API audit runs no program and is not
         // gated on any `main`'s shape.
-        if prune_dead
-            && let Some(main_fn) = entry.and_then(|e| funcs.iter().find(|f| f.id == e))
+        if let Some(root) = entry_root
+            && let Some(main_fn) = funcs.iter().find(|f| f.id == root.id)
             && (!main_fn.params.is_empty() || !main_ret_is_runnable_entry(&main_fn.ret))
         {
             // A `main` that takes arguments is a function, not the single effect a
@@ -17278,7 +17363,7 @@ impl<'a> Lowerer<'a> {
             };
             return Err((
                 Diagnostic::Lower {
-                    span: entry_span.unwrap_or(Span::DUMMY),
+                    span: root.span,
                     msg: LowerError::NonEntryMain { found },
                 },
                 self.m.name.clone(),
@@ -17309,7 +17394,7 @@ impl<'a> Lowerer<'a> {
         // cross-module HOF), rendering the variant's field type needs the
         // `SqlValue` Rust name, so the injection must follow type mentions too —
         // the same defense the `server`/`http` type-mention scans apply.
-        let mut records = self.collect_record_types().map_err(|d| (d, Vec::new()))?;
+        let mut records = self.collect_record_types()?;
 
         // A body-local record literal whose shape carries a type variable — a
         // GENERIC record that lives only inside a function body, appearing in no
@@ -18262,7 +18347,7 @@ impl<'a> Lowerer<'a> {
                 if !vars.iter().all(|v| gate_params.contains(v)) {
                     return Err(unsupported(ctor.span, Feature::Polymorphism));
                 }
-                let ir = self.ir_type_from_canon(arg, &gate_params)?;
+                let ir = self.ir_type_from_canon(arg, &gate_params, ctor.span)?;
                 // Carrier normalization (Phase 2, enum payloads): a function
                 // DIRECTLY in a constructor payload is carried on the
                 // `Arc<dyn Fn>` carrier ([`IrType::SharedFun`]) so the enum is
@@ -18310,32 +18395,60 @@ impl<'a> Lowerer<'a> {
     ///
     /// Determinism: both maps walked are `BTreeMap`s, and duplicates are dropped
     /// by full structural equality, so the output order is fixed.
-    fn collect_record_types(&self) -> DResult<Vec<IrType>> {
+    ///
+    /// A refusal is homed to the entry that reached it: a region at its own
+    /// span, an env binding at its def's name span, each in its own module.
+    fn collect_record_types(&self) -> Result<Vec<IrType>, (Diagnostic, Vec<Symbol>)> {
         let mut out: Vec<IrType> = Vec::new();
         // O(1) dedup gate alongside the ordered Vec: an `out.contains(&ir)`
         // check would be an O(n²) scan over
         // every region/env record shape. `out` keeps the same ordering and
         // the same element set — the set only gates insertion.
         let mut seen: std::collections::HashSet<IrType> = std::collections::HashSet::new();
-        for ty in self.types.regions.values().chain(self.types.env.values()) {
-            self.collect_records_in_ty(ty, &mut out, &mut seen)?;
+        for ((home, span), ty) in &self.types.regions {
+            self.collect_records_in_ty(ty, *span, &mut out, &mut seen)
+                .map_err(|d| (d, home.clone()))?;
+        }
+        let def_name_spans: BTreeMap<(&[Symbol], Symbol), Span> = self
+            .m
+            .defs
+            .iter()
+            .map(|def| {
+                let name = def.name();
+                ((def.home(), name.value), name.span)
+            })
+            .collect();
+        for ((home, name), ty) in &self.types.env {
+            let Some(span) = def_name_spans.get(&(home.as_slice(), *name)) else {
+                return Err((
+                    bug(
+                        "ipe_lower::collect_record_types",
+                        "a solved env binding has no def in the linked module",
+                    ),
+                    home.clone(),
+                ));
+            };
+            self.collect_records_in_ty(ty, *span, &mut out, &mut seen)
+                .map_err(|d| (d, home.clone()))?;
         }
         Ok(out)
     }
 
     /// Walk a solved [`Ty`], pushing every distinct record shape it contains
     /// (nested records first) into `out`. Non-record shapes recurse into their
-    /// children; leaves contribute nothing.
+    /// children; leaves contribute nothing. `at` is the source span whose solved
+    /// type `ty` is part of; a record that refuses to lower is reported there.
     fn collect_records_in_ty(
         &self,
         ty: &Ty,
+        at: Span,
         out: &mut Vec<IrType>,
         seen: &mut std::collections::HashSet<IrType>,
     ) -> DResult<()> {
         match ty {
             Ty::Record(fields, _tail) => {
                 for field_ty in fields.values() {
-                    self.collect_records_in_ty(field_ty, out, seen)?;
+                    self.collect_records_in_ty(field_ty, at, out, seen)?;
                 }
                 // `RetryPolicy e` is the one stdlib record whose type parameter
                 // `e` may remain a free `Ty::Var` (the solver leaves it
@@ -18371,7 +18484,7 @@ impl<'a> Lowerer<'a> {
                 // `func.ret` prepass) or a body slot
                 // (`collect_body_record_shapes`).
                 if let Some(ground) = GroundTy::new(ty) {
-                    let ir = self.ir_type_from_ground(ground)?;
+                    let ir = self.ir_type_from_ground(ground, at)?;
                     // G-b gate: skip records whose IR carries a function type.
                     // The `Web.tea` cfg record has function-typed fields
                     // (init/update/view/subscriptions); emitting a Rust struct
@@ -18389,16 +18502,16 @@ impl<'a> Lowerer<'a> {
             }
             Ty::Tuple(elems) => {
                 for e in elems {
-                    self.collect_records_in_ty(e, out, seen)?;
+                    self.collect_records_in_ty(e, at, out, seen)?;
                 }
             }
             Ty::Fun(a, b) => {
-                self.collect_records_in_ty(a, out, seen)?;
-                self.collect_records_in_ty(b, out, seen)?;
+                self.collect_records_in_ty(a, at, out, seen)?;
+                self.collect_records_in_ty(b, at, out, seen)?;
             }
             Ty::Con { args, .. } => {
                 for a in args {
-                    self.collect_records_in_ty(a, out, seen)?;
+                    self.collect_records_in_ty(a, at, out, seen)?;
                 }
             }
             Ty::Var(_) | Ty::Wildcard | Ty::Unit => {}
@@ -19492,14 +19605,16 @@ impl<'a> Lowerer<'a> {
                     var: *row_var,
                     fields: fields
                         .iter()
-                        .map(|(fname, fty)| Ok((*fname, self.ir_type_from_canon(fty, generics)?)))
+                        .map(|(fname, fty)| {
+                            Ok((*fname, self.ir_type_from_canon(fty, generics, sig_span)?))
+                        })
                         .collect::<DResult<_>>()?,
                     updated_fields: BTreeSet::new(),
                     bounds: BoundSet::UNBOUNDED,
                 });
                 IrType::RowGeneric(*row_var)
             } else {
-                self.ir_type_from_canon(arg, generics)?
+                self.ir_type_from_canon(arg, generics, pat.span)?
             };
             // Per-occurrence `any`: every wildcard occurrence — bare (`any`)
             // OR nested inside a container (`List any`, `Maybe any`,
@@ -19563,7 +19678,9 @@ impl<'a> Lowerer<'a> {
             // Any other return-position open-row form is still unsupported.
             return Err(unsupported(sig_span, Feature::RowPolyRecordAnnotation));
         } else {
-            self.ir_type_from_canon(cur, generics)?
+            // The trailing type is the return type, or the arrows an eta-reduced
+            // def leaves unbound; neither has a parameter pattern to home it.
+            self.ir_type_from_canon(cur, generics, sig_span)?
         };
         // The trailing type is the return type.
         Ok((
@@ -19781,11 +19898,16 @@ impl<'a> Lowerer<'a> {
     /// `IrType::Generic(wildcard_marker)`, the marker the return-type
     /// substitution in `lower_def` keys on to swap in the body's SOLVED concrete
     /// message type (`Html<Msg>`), never `Html<()>` or `Html<HashMap<..>>`.
-    fn ir_ui_msg_from_canon(&self, t: &canon::Type, generics: &[Symbol]) -> DResult<IrType> {
+    fn ir_ui_msg_from_canon(
+        &self,
+        t: &canon::Type,
+        generics: &[Symbol],
+        at: Span,
+    ) -> DResult<IrType> {
         if matches!(t, canon::Type::Wildcard) {
             return Ok(IrType::Generic(self.wildcard_marker));
         }
-        self.ir_type_from_canon(t, generics)
+        self.ir_type_from_canon(t, generics, at)
     }
 
     /// Whether `(home, name)` is the builtin type of that name.
@@ -19836,6 +19958,7 @@ impl<'a> Lowerer<'a> {
         name: Symbol,
         args: &[canon::Type],
         generics: &[Symbol],
+        at: Span,
     ) -> DResult<IrType> {
         let mut ir_args = Vec::with_capacity(args.len());
         for a in self.emitted_type_args(home, name, args)? {
@@ -19851,7 +19974,7 @@ impl<'a> Lowerer<'a> {
             // derived `Clone` fails on the non-`Clone` `Box`). The
             // flip is a no-op for every non-function argument.
             ir_args.push(normalize_enum_payload_fun_carrier(
-                self.ir_type_from_canon(a, generics)?,
+                self.ir_type_from_canon(a, generics, at)?,
             ));
         }
         let home = ModPath(home.to_vec());
@@ -20051,7 +20174,12 @@ impl<'a> Lowerer<'a> {
     }
 
     #[allow(clippy::too_many_lines)] // declarative type-constructor dispatch — each builtin listed explicitly for safety
-    fn ir_type_from_canon(&self, t: &canon::Type, generics: &[Symbol]) -> DResult<IrType> {
+    fn ir_type_from_canon(
+        &self,
+        t: &canon::Type,
+        generics: &[Symbol],
+        at: Span,
+    ) -> DResult<IrType> {
         match t {
             // A type-constructor application. A builtin (`Int`, `Bool`, …) carries
             // no args; a user enum carries its type arguments, each lowered under
@@ -20061,15 +20189,13 @@ impl<'a> Lowerer<'a> {
                 // `Ipe.Remote`'s endpoint types have no lowering: an annotation
                 // naming one fails closed here, before its compiled-source union
                 // would lower as a program enum.
-                _ if self.is_remote_head(home, *name)? => {
-                    Err(unsupported(Span::DUMMY, Feature::Kernels))
-                }
+                _ if self.is_remote_head(home, *name)? => Err(unsupported(at, Feature::Kernels)),
                 // A program union that is NOT the builtin of its name (a user ADT,
                 // or a stdlib union listed as its own head) lowers by its
                 // `(home, name)` identity before any bare-name builtin arm below,
                 // so a same-named builtin carrier can never hijack it.
                 _ if self.is_distinct_program_union(home, *name) => {
-                    self.program_enum_from_canon(home, *name, args, generics)
+                    self.program_enum_from_canon(home, *name, args, generics, at)
                 }
                 // The closed config-tag ADTs (`HostMode` / `LogLevel` / `CsrfMode` /
                 // `RevocationMode`) erase to the raw `Int` tag their constructor kernels
@@ -20182,34 +20308,52 @@ impl<'a> Lowerer<'a> {
                 // The built-in `Maybe a` / `Result e a` map to dedicated IR
                 // types, ahead of the user-enum lookup.
                 "Maybe" if args.len() == 1 => {
-                    let elem =
-                        self.ir_type_from_canon(args.first().ok_or_else(maybe_arg_bug)?, generics)?;
+                    let elem = self.ir_type_from_canon(
+                        args.first().ok_or_else(maybe_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     Ok(IrType::Maybe(Box::new(elem)))
                 }
                 "Result" if args.len() == 2 => {
-                    let err = self
-                        .ir_type_from_canon(args.first().ok_or_else(result_arg_bug)?, generics)?;
-                    let ok =
-                        self.ir_type_from_canon(args.get(1).ok_or_else(result_arg_bug)?, generics)?;
+                    let err = self.ir_type_from_canon(
+                        args.first().ok_or_else(result_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
+                    let ok = self.ir_type_from_canon(
+                        args.get(1).ok_or_else(result_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     Ok(IrType::Result(Box::new(err), Box::new(ok)))
                 }
                 "List" if args.len() == 1 => {
-                    let elem =
-                        self.ir_type_from_canon(args.first().ok_or_else(list_arg_bug)?, generics)?;
+                    let elem = self.ir_type_from_canon(
+                        args.first().ok_or_else(list_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     Ok(IrType::List(Box::new(flip_fun_in_storage_element(elem))))
                 }
                 "Dict" if args.len() == 2 => {
-                    let k =
-                        self.ir_type_from_canon(args.first().ok_or_else(dict_arg_bug)?, generics)?;
-                    let v =
-                        self.ir_type_from_canon(args.get(1).ok_or_else(dict_arg_bug)?, generics)?;
+                    let k = self.ir_type_from_canon(
+                        args.first().ok_or_else(dict_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
+                    let v = self.ir_type_from_canon(
+                        args.get(1).ok_or_else(dict_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     // `Dict Float v` type-checks in Ipê but the Rust backing
                     // `HashMap<f64, V>` cannot exist: `f64` is neither `Hash`
                     // nor `Eq`. Reject via the shared predicate so both
                     // lowering entry-points (`ir_type_from_ty` and this
                     // annotation-driven path) apply the same gate.
                     if float_key_rejected(&k) {
-                        return Err(unsupported(Span::DUMMY, Feature::FloatKeyedCollection));
+                        return Err(unsupported(at, Feature::FloatKeyedCollection));
                     }
                     // A `Dict` VALUE is a storage position (Arc carrier); the KEY
                     // must stay `Ord`/`Hash`, so it is left unflipped.
@@ -20219,13 +20363,16 @@ impl<'a> Lowerer<'a> {
                     ))
                 }
                 "Set" if args.len() == 1 => {
-                    let elem =
-                        self.ir_type_from_canon(args.first().ok_or_else(set_arg_bug)?, generics)?;
+                    let elem = self.ir_type_from_canon(
+                        args.first().ok_or_else(set_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     // `Set Float` type-checks but its Rust backing `BTreeSet<f64>`
                     // cannot exist: `f64` is not `Ord`. Same shared predicate as
                     // the `ir_type_from_ty` path.
                     if float_key_rejected(&elem) {
-                        return Err(unsupported(Span::DUMMY, Feature::FloatKeyedCollection));
+                        return Err(unsupported(at, Feature::FloatKeyedCollection));
                     }
                     Ok(IrType::Set(Box::new(elem)))
                 }
@@ -20234,15 +20381,21 @@ impl<'a> Lowerer<'a> {
                 // the success type (arg 1). The IR discards the error type since
                 // it is always `IpeError = String` at the Rust level.
                 "Task" if args.len() == 2 => {
-                    let inner =
-                        self.ir_type_from_canon(args.get(1).ok_or_else(task_arg_bug)?, generics)?;
+                    let inner = self.ir_type_from_canon(
+                        args.get(1).ok_or_else(task_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     Ok(IrType::Task(Box::new(inner)))
                 }
                 // `Task a` — rare single-arg form (e.g. inside a user type alias
                 // that already applied the error parameter).
                 "Task" if args.len() == 1 => {
-                    let inner =
-                        self.ir_type_from_canon(args.first().ok_or_else(task_arg_bug)?, generics)?;
+                    let inner = self.ir_type_from_canon(
+                        args.first().ok_or_else(task_arg_bug)?,
+                        generics,
+                        at,
+                    )?;
                     Ok(IrType::Task(Box::new(inner)))
                 }
                 "Task" => Err(bug(
@@ -20263,6 +20416,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Decoder(Box::new(inner)))
                 }
@@ -20291,6 +20445,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Cmd(Box::new(inner)))
                 }
@@ -20303,6 +20458,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Sub(Box::new(inner)))
                 }
@@ -20324,6 +20480,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::Html,
@@ -20363,6 +20520,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor,
@@ -20379,6 +20537,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::Element,
@@ -20395,6 +20554,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::Cells,
@@ -20420,6 +20580,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     let is_html = home.iter().any(|s| self.resolve(*s).ok() == Some("Html"));
                     let ctor = if is_html {
@@ -20442,6 +20603,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::TuiAttribute,
@@ -20458,6 +20620,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::CliLines,
@@ -20474,6 +20637,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::CliAttribute,
@@ -20492,6 +20656,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::HtmlEvent,
@@ -20513,21 +20678,22 @@ impl<'a> Lowerer<'a> {
                 // `Program shape msg` annotation — twin of the inferred (ty) arm:
                 // the phantom shape tag (`Web`/`Tui`/`Cli`) selects the shape's
                 // opaque app leaf; the `msg` arg is dropped.
-                "Program" if home.is_empty() => match args.first() {
-                    Some(canon::Type::Con { name: tag, .. }) => match self.resolve(*tag)? {
-                        "Web" => Ok(IrType::WebApp),
-                        "Tui" => Ok(IrType::TuiApp),
-                        "Cli" => Ok(IrType::CliApp),
-                        "Worker" => Ok(IrType::WorkerApp),
-                        other => Err(bug(
-                            "ipe_lower::ir_type_from_annotation",
-                            format!("Program carrier with unknown shape tag `{other}`"),
-                        )),
-                    },
+                PROGRAM_CARRIER if home.is_empty() => match args.first() {
+                    Some(canon::Type::Con { name: tag, .. }) => {
+                        let spelled = self.resolve(*tag)?;
+                        ProgramShapeTag::parse(spelled)
+                            .map(ProgramShapeTag::app_leaf)
+                            .ok_or_else(|| {
+                                bug(
+                                    "ipe_lower::ir_type_from_annotation",
+                                    format!("Program carrier with unknown shape tag `{spelled}`"),
+                                )
+                            })
+                    }
                     // A shape-generic annotation (`Program shape msg`) names no
-                    // single app leaf to emit; this arm carries no span.
+                    // single app leaf to emit; refused at the annotation's span.
                     Some(canon::Type::Var(_) | canon::Type::Wildcard) => {
-                        Err(unsupported(Span::DUMMY, Feature::Polymorphism))
+                        Err(unsupported(at, Feature::Polymorphism))
                     }
                     _ => Err(bug(
                         "ipe_lower::ir_type_from_annotation",
@@ -20599,6 +20765,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::WebRoute(Box::new(page)))
                 }
@@ -20612,6 +20779,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::Label,
@@ -20627,6 +20795,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::Placeholder,
@@ -20642,6 +20811,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::Ui {
                         ctor: UiCtor::RadioOption,
@@ -20664,6 +20834,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     let up = self.ir_type_from_canon(
                         args.get(1).ok_or_else(|| {
@@ -20673,6 +20844,7 @@ impl<'a> Lowerer<'a> {
                             )
                         })?,
                         generics,
+                        at,
                     )?;
                     Ok(IrType::CustomElement {
                         down: Box::new(down),
@@ -20683,7 +20855,7 @@ impl<'a> Lowerer<'a> {
                     .enum_variants
                     .contains_key(&(ModPath(home.clone()), *name)) =>
                 {
-                    self.program_enum_from_canon(home, *name, args, generics)
+                    self.program_enum_from_canon(home, *name, args, generics, at)
                 }
                 // The opaque JSON value type (`Value = any` in Ipê). Placed AFTER
                 // the `enum_variants` guard so a user-declared `type Value = …`
@@ -20750,10 +20922,10 @@ impl<'a> Lowerer<'a> {
                 let mut params = Vec::new();
                 let mut cur = t;
                 while let canon::Type::Lambda(arg, rest) = cur {
-                    params.push(self.ir_type_from_canon(arg, generics)?);
+                    params.push(self.ir_type_from_canon(arg, generics, at)?);
                     cur = rest.as_ref();
                 }
-                let ret = self.ir_type_from_canon(cur, generics)?;
+                let ret = self.ir_type_from_canon(cur, generics, at)?;
                 Ok(IrType::Fun(params, Box::new(ret)))
             }
             // A type variable in an annotation (`id : a -> a`). When the
@@ -20798,7 +20970,7 @@ impl<'a> Lowerer<'a> {
                 let mut ir_elems = Vec::with_capacity(elems.len());
                 for e in elems {
                     ir_elems.push(flip_fun_in_storage_element(
-                        self.ir_type_from_canon(e, generics)?,
+                        self.ir_type_from_canon(e, generics, at)?,
                     ));
                 }
                 Ok(IrType::Tuple(ir_elems))
@@ -20886,7 +21058,7 @@ impl<'a> Lowerer<'a> {
                 }
                 let mut ir_fields = BTreeMap::new();
                 for (name, fty) in fields {
-                    ir_fields.insert(*name, self.ir_type_from_canon(fty, generics)?);
+                    ir_fields.insert(*name, self.ir_type_from_canon(fty, generics, at)?);
                 }
                 // Carrier normalization (annotation path — twin of the solved-`Ty`
                 // flip in `ir_type_from_ty`): a function DIRECTLY in a record field
@@ -20941,15 +21113,14 @@ impl<'a> Lowerer<'a> {
             name,
             args: Vec::new(),
         });
-        let mut pinned = false;
         let pinned_ty = carrier
             .as_ref()
-            .and_then(|c| self.pin_phantom_vars(ty, c, false, &mut pinned));
+            .and_then(|c| self.pin_phantom_vars(ty, c, Slot::Defaultable));
         match pinned_ty {
-            Some(p) if pinned => self
+            Some((p, Pinned::Defaulted)) => self
                 .ir_type_from_ty(&p, span)
                 .map(|t| Some(BinderType::Phantom(t))),
-            _ => self
+            Some((_, Pinned::Untouched)) | None => self
                 .ir_type_from_ty(ty, span)
                 .map(|t| Some(BinderType::Resolved(t))),
         }
@@ -20957,62 +21128,70 @@ impl<'a> Lowerer<'a> {
 
     /// Copy `ty` with each phantom type variable replaced by `carrier`.
     ///
-    /// Sets `pinned` when a phantom was replaced. `no_default` marks a
-    /// position whose type fixes the emitted carrier: a function arrow's
-    /// operands, and a `Program` shape tag. A phantom there makes the whole
-    /// copy `None`, so type lowering sees it unpinned and refuses it.
-    fn pin_phantom_vars(
-        &self,
-        ty: &Ty,
-        carrier: &Ty,
-        no_default: bool,
-        pinned: &mut bool,
-    ) -> Option<Ty> {
+    /// The [`Pinned`] half says whether any phantom was replaced. `slot` is
+    /// [`Slot::FixesCarrier`] at a position whose type fixes the emitted
+    /// carrier: a function arrow's operands, and a `Program` shape tag. A
+    /// phantom there makes the whole copy `None`, so type lowering sees it
+    /// unpinned and refuses it.
+    fn pin_phantom_vars(&self, ty: &Ty, carrier: &Ty, slot: Slot) -> Option<(Ty, Pinned)> {
         match ty {
-            Ty::Var(_) | Ty::Wildcard if self.ty_is_unbound_free(ty) => {
-                if no_default {
-                    return None;
-                }
-                *pinned = true;
-                Some(carrier.clone())
+            Ty::Var(_) | Ty::Wildcard if self.ty_is_unbound_free(ty) => match slot {
+                Slot::FixesCarrier => None,
+                Slot::Defaultable => Some((carrier.clone(), Pinned::Defaulted)),
+            },
+            Ty::Var(_) | Ty::Wildcard | Ty::Unit => Some((ty.clone(), Pinned::Untouched)),
+            Ty::Fun(arg, res) => {
+                let (arg, arg_pinned) = self.pin_phantom_vars(arg, carrier, Slot::FixesCarrier)?;
+                let (res, res_pinned) = self.pin_phantom_vars(res, carrier, Slot::FixesCarrier)?;
+                Some((
+                    Ty::Fun(Box::new(arg), Box::new(res)),
+                    arg_pinned.or(res_pinned),
+                ))
             }
-            Ty::Var(_) | Ty::Wildcard | Ty::Unit => Some(ty.clone()),
-            Ty::Fun(arg, res) => Some(Ty::Fun(
-                Box::new(self.pin_phantom_vars(arg, carrier, true, pinned)?),
-                Box::new(self.pin_phantom_vars(res, carrier, true, pinned)?),
-            )),
             Ty::Con { module, name, args } => {
                 let shape_tagged =
-                    module.is_empty() && self.interner.resolve(*name) == Some("Program");
-                Some(Ty::Con {
-                    module: module.clone(),
-                    name: *name,
-                    args: args
-                        .iter()
-                        .enumerate()
-                        .map(|(i, a)| {
-                            let tag_slot = shape_tagged && i == 0;
-                            self.pin_phantom_vars(a, carrier, no_default || tag_slot, pinned)
-                        })
-                        .collect::<Option<Vec<_>>>()?,
-                })
+                    module.is_empty() && self.interner.resolve(*name) == Some(PROGRAM_CARRIER);
+                let mut pinned = Pinned::Untouched;
+                let mut pinned_args = Vec::with_capacity(args.len());
+                for (i, a) in args.iter().enumerate() {
+                    let arg_slot = if shape_tagged && i == 0 {
+                        Slot::FixesCarrier
+                    } else {
+                        slot
+                    };
+                    let (a, a_pinned) = self.pin_phantom_vars(a, carrier, arg_slot)?;
+                    pinned = pinned.or(a_pinned);
+                    pinned_args.push(a);
+                }
+                Some((
+                    Ty::Con {
+                        module: module.clone(),
+                        name: *name,
+                        args: pinned_args,
+                    },
+                    pinned,
+                ))
             }
-            Ty::Tuple(elems) => Some(Ty::Tuple(
-                elems
-                    .iter()
-                    .map(|e| self.pin_phantom_vars(e, carrier, no_default, pinned))
-                    .collect::<Option<Vec<_>>>()?,
-            )),
-            Ty::Record(fields, tail) => Some(Ty::Record(
-                fields
-                    .iter()
-                    .map(|(k, f)| {
-                        self.pin_phantom_vars(f, carrier, no_default, pinned)
-                            .map(|f| (*k, f))
-                    })
-                    .collect::<Option<BTreeMap<_, _>>>()?,
-                tail.clone(),
-            )),
+            Ty::Tuple(elems) => {
+                let mut pinned = Pinned::Untouched;
+                let mut pinned_elems = Vec::with_capacity(elems.len());
+                for e in elems {
+                    let (e, e_pinned) = self.pin_phantom_vars(e, carrier, slot)?;
+                    pinned = pinned.or(e_pinned);
+                    pinned_elems.push(e);
+                }
+                Some((Ty::Tuple(pinned_elems), pinned))
+            }
+            Ty::Record(fields, tail) => {
+                let mut pinned = Pinned::Untouched;
+                let mut pinned_fields = BTreeMap::new();
+                for (k, f) in fields {
+                    let (f, f_pinned) = self.pin_phantom_vars(f, carrier, slot)?;
+                    pinned = pinned.or(f_pinned);
+                    pinned_fields.insert(*k, f);
+                }
+                Some((Ty::Record(pinned_fields, tail.clone()), pinned))
+            }
         }
     }
 
@@ -22026,8 +22205,9 @@ impl<'a> Lowerer<'a> {
     /// [`Self::ir_type_from_ty`] it reaches consults the generic map, the row
     /// parameters, or the read site: the result is the same inside and
     /// outside every def. A pass with no def scope lowers only through here.
-    fn ir_type_from_ground(&self, ground: GroundTy<'_>) -> DResult<IrType> {
-        self.ir_type_from_ty(ground.ty(), Span::DUMMY)
+    /// `at` is the source span whose solved type `ground` is.
+    fn ir_type_from_ground(&self, ground: GroundTy<'_>, at: Span) -> DResult<IrType> {
+        self.ir_type_from_ty(ground.ty(), at)
     }
 
     /// Lower `ty` as part of the current def's emitted signature ([`ReadSite::Signature`]).
@@ -22502,17 +22682,18 @@ impl<'a> Lowerer<'a> {
                 // keyed under its own home falls through to its own enum.
                 // A shape tag the solver left a variable names no single app
                 // leaf to emit: refused as IPE-L0102, like any unresolved type.
-                "Program" if module.is_empty() => match args.first() {
-                    Some(Ty::Con { name: tag, .. }) => match self.resolve(*tag)? {
-                        "Web" => Ok(IrType::WebApp),
-                        "Tui" => Ok(IrType::TuiApp),
-                        "Cli" => Ok(IrType::CliApp),
-                        "Worker" => Ok(IrType::WorkerApp),
-                        other => Err(bug(
-                            "ipe_lower::ir_type_from_ty",
-                            format!("Program carrier with unknown shape tag `{other}`"),
-                        )),
-                    },
+                PROGRAM_CARRIER if module.is_empty() => match args.first() {
+                    Some(Ty::Con { name: tag, .. }) => {
+                        let spelled = self.resolve(*tag)?;
+                        ProgramShapeTag::parse(spelled)
+                            .map(ProgramShapeTag::app_leaf)
+                            .ok_or_else(|| {
+                                bug(
+                                    "ipe_lower::ir_type_from_ty",
+                                    format!("Program carrier with unknown shape tag `{spelled}`"),
+                                )
+                            })
+                    }
                     Some(Ty::Var(_) | Ty::Wildcard) => {
                         Err(unsupported(span, Feature::Polymorphism))
                     }
@@ -24498,7 +24679,7 @@ impl<'a> Lowerer<'a> {
                 let mut ok = true;
                 for ctor in &u.ctors {
                     for arg in &ctor.args {
-                        if let Ok(ir) = self.ir_type_from_canon(arg, &u.vars) {
+                        if let Ok(ir) = self.ir_type_from_canon(arg, &u.vars, ctor.span) {
                             fields.push(ir);
                         } else {
                             ok = false;
@@ -25061,7 +25242,7 @@ impl<'a> Lowerer<'a> {
                 // (outside an `existsIn` lambda) — fail closed, exactly as a bare
                 // `Store.literal`/`Store.upper` does.
                 Callee::Kernel(KernelFn::StoreCorrelate) => {
-                    let span = args.first().map_or(Span::DUMMY, |a| a.span);
+                    let span = args.first().map_or(call_span, |a| a.span);
                     return Err(unsupported_store_select(
                         span,
                         StoreSelectProjectionDefect::UnsupportedProjectionBody,
@@ -36572,7 +36753,7 @@ mod tests {
         let mut out = Vec::new();
         let mut seen = std::collections::HashSet::new();
         assert_eq!(
-            lowerer.collect_records_in_ty(ty, &mut out, &mut seen),
+            lowerer.collect_records_in_ty(ty, Span::new(1, 2), &mut out, &mut seen),
             Ok(()),
             "the pre-pass walk never fails on a well-formed type"
         );
@@ -36707,7 +36888,7 @@ mod tests {
             let ground = super::GroundTy::new(&closed);
             assert!(ground.is_some(), "a closed record of a builtin is ground");
             let Some(ground) = ground else { return };
-            let outside = lowerer.ir_type_from_ground(ground);
+            let outside = lowerer.ir_type_from_ground(ground, Span::new(1, 2));
             let inside = lowerer.with_poly_tvars(Some(row_poly(*r)), BTreeSet::from([*r]), || {
                 lowerer.ir_type_from_ty(&closed, Span::DUMMY)
             });
@@ -41270,7 +41451,7 @@ mod tests {
                     args: declared_args(row, web),
                 };
                 matches!(
-                    lowerer.ir_type_from_canon(&ty, &[]),
+                    lowerer.ir_type_from_canon(&ty, &[], Span::new(1, 2)),
                     Err(ipe_diagnostics::Diagnostic::CompilerBug { .. })
                 )
             })
@@ -41404,6 +41585,7 @@ mod tests {
                         args,
                     },
                     &[],
+                    Span::new(1, 2),
                 )
             };
             let by_ty = |last_fn: bool| {
@@ -42248,6 +42430,7 @@ mod tests {
                     args: vec![],
                 },
                 &[],
+                Span::new(1, 2),
             );
             let ty_ir = lowerer.ir_type_from_ty(
                 &Ty::Con {
