@@ -1335,10 +1335,15 @@ mod real_jail {
         );
         String::from_utf8_lossy(&out.stdout)
             .lines()
-            // A path package prints its directory, ` (/…)`; a registry one does not.
-            .filter(|line| !line.contains(" ("))
             .filter_map(|line| {
-                let (name, version) = line.trim().split_once(" v")?;
+                // `name vX.Y.Z`, then a path package's directory ` (/…)`, a
+                // proc macro's ` (proc-macro)` or a repeat's ` (*)`.
+                let mut words = line.split_whitespace();
+                let name = words.next()?;
+                let version = words.next()?.strip_prefix('v')?;
+                if words.any(|word| word.starts_with("(/")) {
+                    return None;
+                }
                 Some(format!("{name}-{version}.crate"))
             })
             .collect()
