@@ -406,7 +406,7 @@ pub fn inject_interfaces(
         if sources.contains_key(&mod_path) {
             return Err(FfiPrepError::ModuleClaimed {
                 module: c.module_name.clone(),
-                slug: c.slug.clone(),
+                slug: c.slug.to_string(),
             });
         }
         let pseudo_path = cache_root_hint.join(format!("{}.ipe", c.slug));
@@ -432,6 +432,8 @@ pub struct AssembledEmit {
 /// the combined `src/ffi.rs` (one `pub mod <slug>` per crate).
 ///
 /// # Errors
+/// [`FfiPrepError::SlugCollision`] when two installed crates share one module
+/// slug, so their `pub mod <slug>` would collide;
 /// [`FfiPrepError::DefineOpaqueCollision`] when a define type and an opaque
 /// type of one crate share a name; [`FfiPrepError::DependencyMerge`] when two
 /// installed crates pin the SAME dependency name to versions that cannot share
@@ -445,6 +447,16 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
     use std::fmt::Write as _;
     if catalog.is_empty() {
         return Ok(None);
+    }
+    let mut slug_holders: BTreeMap<&ipe_ffi::driver::FfiSlug, &InstalledCrate> = BTreeMap::new();
+    for c in catalog {
+        if let Some(first) = slug_holders.insert(&c.slug, c) {
+            return Err(FfiPrepError::SlugCollision {
+                slug: c.slug.to_string(),
+                first: crate_label(first),
+                second: crate_label(c),
+            });
+        }
     }
     let mut foreign_types: BTreeMap<String, String> = BTreeMap::new();
     let mut wrapper_glue: BTreeMap<String, ipe_backend_rust::FfiWrapperGlue> = BTreeMap::new();
@@ -472,7 +484,7 @@ pub fn assemble_emit(catalog: &[InstalledCrate]) -> Result<Option<AssembledEmit>
             // rename one; the two nominals are genuinely different Rust types.
             if foreign_types.contains_key(&key) {
                 return Err(FfiPrepError::DefineOpaqueCollision {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                     name: name.clone(),
                 });
             }
@@ -541,6 +553,13 @@ pub fn hold_wrapper_deps(
     Ok(())
 }
 
+/// The name a refusal shows for `c`: its package name, else its module name.
+fn crate_label(c: &InstalledCrate) -> String {
+    c.package_name
+        .as_ref()
+        .map_or_else(|| c.module_name.clone(), |name| name.as_str().to_owned())
+}
+
 /// Every refusal FFI prep returns, one variant per cause.
 ///
 /// It reaches [`CliError`] only as [`CliError::FfiPrep`], so a consumer (the
@@ -554,6 +573,12 @@ pub enum FfiPrepError {
     ReservedModuleExists,
     /// The shims appended for asserted calls name a crate the table leaves out.
     AssertedShimSeal(SealRefusal),
+    /// Two installed crates share one module slug.
+    SlugCollision {
+        slug: String,
+        first: String,
+        second: String,
+    },
     /// A define type and an opaque type share one name in one crate.
     DefineOpaqueCollision { slug: String, name: String },
     /// The merged `[dependencies]` table cannot be built.
@@ -612,6 +637,11 @@ impl FfiPrepError {
                 text::msg::ffi_reserved_module_exists(&ipe_canon::asserted::ASSERTED_MODULE)
             }
             Self::AssertedShimSeal(refusal) | Self::CatalogSeal(refusal) => refusal.message(),
+            Self::SlugCollision {
+                slug,
+                first,
+                second,
+            } => text::msg::ffi_slug_collision(slug, first, second),
             Self::DefineOpaqueCollision { slug, name } => {
                 text::msg::ffi_define_opaque_collision(slug, name)
             }
@@ -802,12 +832,12 @@ fn assemble_wrapper_glue(
         let glue_ty = |name: &str| -> Result<ipe_backend_rust::FfiGlueType, FfiPrepError> {
             let t = c.transparent_types.get(name).ok_or_else(|| {
                 FfiPrepError::TransparentWithoutShape {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                     name: name.to_owned(),
                     binding: b.ref_name.clone(),
                 }
             })?;
-            Ok(glue_type_of(&c.module_name, &c.slug, t))
+            Ok(glue_type_of(&c.module_name, c.slug.as_str(), t))
         };
         let mut params = Vec::with_capacity(b.transparent_params.slots().len());
         for p in b.transparent_params.slots() {
@@ -1091,7 +1121,7 @@ pub fn prepare(
         if c.module_name == ipe_canon::asserted::ASSERTED_MODULE {
             return Err(CliError::TrustRefused(
                 owner_trust::TrustRefusal::FfiReservedModule {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                 },
             ));
         }
@@ -1102,7 +1132,7 @@ pub fn prepare(
         {
             return Err(CliError::TrustRefused(
                 owner_trust::TrustRefusal::FfiReservedWrapperPrefix {
-                    slug: c.slug.clone(),
+                    slug: c.slug.to_string(),
                     ident: ident.clone(),
                 },
             ));
@@ -2953,8 +2983,11 @@ pub fn run_remove(rest: &[String]) -> Result<(), CliError> {
     let [raw] = rest else {
         return Err(CliError::Usage(text::msg::rust_remove_usage()));
     };
+    let slug = ipe_ffi::pkginfo::PackageName::parse(raw)
+        .ok()
+        .and_then(|name| ipe_ffi::driver::FfiSlug::of(&name).ok())
+        .ok_or_else(|| CliError::Usage(text::msg::rust_remove_usage()))?;
     let cache = FfiCache::at_project_root(Path::new("."));
-    let slug = ipe_ffi::driver::slugify(raw);
     cache
         .remove_package(&slug)
         .map_err(|diag| CliError::Usage(crate::text::Message::relay(&diag)))?;
@@ -4358,6 +4391,11 @@ mod tests {
     /// The project-relative FFI cache directory.
     const CACHE_REL: &str = ipe_ffi::driver::FFI_CACHE_REL;
 
+    /// The module slug spelled `raw`.
+    fn test_slug(raw: &str) -> ipe_ffi::driver::FfiSlug {
+        ipe_ffi::driver::FfiSlug::parse_canonical(raw).expect("a fixture slug")
+    }
+
     #[test]
     fn ffi_proc_cap_override_refuses_zero_and_overflow() {
         use ipe_sandbox::run_jail::{ProcCap, ProcCapError};
@@ -5225,7 +5263,7 @@ version = \"1\"
     #[test]
     fn conflicting_dep_pins_are_refused() {
         let mk = |slug: &str, line: &str| InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -5273,7 +5311,7 @@ version = \"1\"
         // (as a transitive dep) and with features by another (its own self-line).
         // Same version → Cargo-style feature union, NOT a conflict.
         let mk = |slug: &str, line: &str| InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -5720,7 +5758,7 @@ version = \"1\"
             .to_string();
             let pkg = ipe_ffi::pkginfo::PkgInfo::decode_json(&doc).expect("decodes");
             ipe_ffi::driver::installed_crate_from_pkg(
-                name.to_owned(),
+                test_slug(name),
                 &pkg,
                 &FfiCache::at_project_root(Path::new(".")),
             )
@@ -5753,7 +5791,7 @@ version = \"1\"
             })
             .collect();
         InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -6174,7 +6212,7 @@ version = \"1\"
     /// A one-crate `InstalledCrate` with the given opaque + define type maps.
     fn crate_with_types(slug: &str, opaque: &[(&str, &str)], define: &[&str]) -> InstalledCrate {
         InstalledCrate {
-            slug: slug.to_owned(),
+            slug: test_slug(slug),
             module_name: format!("Rust.{slug}"),
             kernel_name: format!("Rust_{slug}"),
             interface_source: String::new(),
@@ -6258,6 +6296,28 @@ version = \"1\"
         // A transparent define is a native app type — never a foreign-path
         // mapping.
         assert!(!emit.foreign_types.contains_key("Rust.demo.Counter"));
+    }
+
+    #[test]
+    fn two_installed_crates_on_one_slug_are_refused_before_emission() {
+        // `a-b` and `a_b` both fold to `a_b`: their two `pub mod a_b` would
+        // collide in `src/ffi.rs`, so assembly refuses rather than emit either.
+        let named = |package: &str| InstalledCrate {
+            package_name: ipe_ffi::pkginfo::PackageName::parse(package).ok(),
+            ..crate_with_types("a_b", &[], &[])
+        };
+        let got = emit_of(&[named("a-b"), named("a_b")]);
+        assert!(
+            refused_as(
+                &got,
+                &FfiPrepError::SlugCollision {
+                    slug: "a_b".to_owned(),
+                    first: "a-b".to_owned(),
+                    second: "a_b".to_owned(),
+                }
+            ),
+            "a shared slug must refuse: {got:?}"
+        );
     }
 
     #[test]
@@ -6374,7 +6434,7 @@ version = \"1\"
             ident: "syn".to_owned(),
             site: "src/ffi.rs".to_owned(),
         };
-        let cases: [(FfiPrepError, text::Message); 9] = [
+        let cases: [(FfiPrepError, text::Message); 10] = [
             (
                 FfiPrepError::ModuleClaimed {
                     module: "Rust.a".to_owned(),
@@ -6389,6 +6449,14 @@ version = \"1\"
             (
                 FfiPrepError::AssertedShimSeal(dropped()),
                 text::msg::ffi_dropped_transitive(&"syn", &"syn", &"src/ffi.rs"),
+            ),
+            (
+                FfiPrepError::SlugCollision {
+                    slug: "a_b".to_owned(),
+                    first: "a-b".to_owned(),
+                    second: "a_b".to_owned(),
+                },
+                text::msg::ffi_slug_collision(&"a_b", &"a-b", &"a_b"),
             ),
             (
                 FfiPrepError::DefineOpaqueCollision {

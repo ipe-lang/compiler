@@ -1638,6 +1638,8 @@ messages! {
     ffi_module_clash(module, krate) = "ffi-module-clash";
     /// An FFI define type collides with an inspected opaque type.
     ffi_define_opaque_collision(krate, name) = "ffi-define-opaque-collision";
+    /// Two installed FFI crates share one module slug.
+    ffi_slug_collision(slug, first, second) = "ffi-slug-collision";
     /// Installed FFI crates bind one dependency name to two different sources.
     ffi_dependency_source_conflict(name, first, second) = "ffi-dependency-source-conflict";
     /// Installed FFI crates pin one dependency to two versions.

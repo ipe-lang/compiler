@@ -37,6 +37,38 @@ use crate::driver::{InspectedSig, InstalledCrate};
 use crate::pkginfo::Effect;
 use crate::unify::UnifyReport;
 
+/// The module the asserted-call shims are emitted into (`crate::ffi::ipe_asserted`).
+///
+/// It and every crate-module slug share `crate::ffi`, so the slug grammar
+/// reserves its whole namespace ([`crate::driver::FfiSlug`]).
+pub const ASSERTED_SHIM_MODULE: &str = "ipe_asserted";
+
+/// The module the asserted native-constant reads are emitted into.
+pub const ASSERTED_CONST_SHIM_MODULE: &str = "ipe_asserted_const";
+
+// IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if a shim module or the wrapper prefix leaves the reserved slug namespace [ledger #boundary]
+const _: () = assert!(
+    has_prefix(ASSERTED_CONST_SHIM_MODULE, ASSERTED_SHIM_MODULE)
+        && has_prefix(
+            ipe_canon::asserted::ASSERTED_WRAPPER_PREFIX,
+            ASSERTED_SHIM_MODULE
+        )
+);
+
+/// Whether `text` begins with `prefix`, byte for byte.
+const fn has_prefix(text: &str, prefix: &str) -> bool {
+    let mut rest = text.as_bytes();
+    let mut want = prefix.as_bytes();
+    while let [w, want_tail @ ..] = want {
+        match rest {
+            [got, after @ ..] if *got == *w => rest = after,
+            _ => return false,
+        }
+        want = want_tail;
+    }
+    true
+}
+
 /// A foreign opaque type identified by its home module, never by its spelling.
 ///
 /// The only constructor is [`CarrierScope`]'s resolution against the target
@@ -143,7 +175,10 @@ impl<'a> CarrierScope<'a> {
     }
 
     fn target(&self, path: &AssertedPath) -> Option<&'a InstalledCrate> {
-        self.catalog.iter().find(|c| c.slug == path.crate_ident())
+        self.catalog.iter().find(|c| {
+            c.lib_ident()
+                .is_some_and(|ident| ident.as_str() == path.crate_ident())
+        })
     }
 
     /// Resolve an opaque name through the target crate to its home.
@@ -872,7 +907,7 @@ pub fn emit_asserted_shims(specs: &[AssertedSpec]) -> String {
     let mut ordered: Vec<&AssertedSpec> = specs.iter().collect();
     ordered.sort_unstable_by(|a, b| a.wrapper_ident.cmp(&b.wrapper_ident));
     let mut lines: Vec<String> = vec![
-        "pub mod ipe_asserted {".to_owned(),
+        format!("pub mod {ASSERTED_SHIM_MODULE} {{"),
         "    //! Author-asserted foreign-call shims (`Rust.Ffi.call`): the exact".to_owned(),
         "    //! declared carriers, no numeric coercion, every call inside the".to_owned(),
         "    //! panic boundary.".to_owned(),
@@ -932,7 +967,7 @@ pub fn emit_asserted_shims(specs: &[AssertedSpec]) -> String {
         lines.push("    }".to_owned());
     }
     lines.push("}".to_owned());
-    lines.push("pub use ipe_asserted::*;".to_owned());
+    lines.push(format!("pub use {ASSERTED_SHIM_MODULE}::*;"));
     let mut out = lines.join("\n");
     out.push('\n');
     out
@@ -1107,7 +1142,7 @@ pub fn emit_const_shims(specs: &[ConstSpec]) -> String {
     let mut ordered: Vec<&ConstSpec> = specs.iter().collect();
     ordered.sort_unstable_by(|a, b| a.wrapper_ident.cmp(&b.wrapper_ident));
     let mut lines: Vec<String> = vec![
-        "pub mod ipe_asserted_const {".to_owned(),
+        format!("pub mod {ASSERTED_CONST_SHIM_MODULE} {{"),
         "    //! Author-asserted native-constant reads (`Rust.const`): a bare".to_owned(),
         "    //! value read of the inspected scalar type, no panic boundary and".to_owned(),
         "    //! no fallible wrapper (a constant cannot fail).".to_owned(),
@@ -1143,7 +1178,7 @@ pub fn emit_const_shims(specs: &[ConstSpec]) -> String {
         lines.push("    }".to_owned());
     }
     lines.push("}".to_owned());
-    lines.push("pub use ipe_asserted_const::*;".to_owned());
+    lines.push(format!("pub use {ASSERTED_CONST_SHIM_MODULE}::*;"));
     let mut out = lines.join("\n");
     out.push('\n');
     out
@@ -1216,6 +1251,11 @@ mod tests {
         out
     }
 
+    /// The slug spelled `raw`.
+    fn fixture_slug(raw: &str) -> crate::driver::FfiSlug {
+        crate::driver::FfiSlug::parse_canonical(raw).expect("a fixture slug")
+    }
+
     fn semver_crate() -> InstalledCrate {
         let doc = serde_json::json!({
             "pkg": "semver", "name": "semver", "version": "1.0.26",
@@ -1254,7 +1294,7 @@ mod tests {
         .to_string();
         let pkg = PkgInfo::decode_json(&doc).expect("decodes");
         crate::driver::installed_crate_from_pkg(
-            "semver".to_owned(),
+            fixture_slug("semver"),
             &pkg,
             &crate::driver::FfiCache::at_project_root(std::path::Path::new(".")),
         )
@@ -1385,6 +1425,64 @@ mod tests {
                 } if crate_ident == "nope"
             ),
             "{err}"
+        );
+    }
+
+    /// A crate whose lib identifier (`foo`) differs from its module slug
+    /// (`foo_rs`): the package `foo-rs` declares the lib name `foo`.
+    fn renamed_lib_crate() -> InstalledCrate {
+        let doc = serde_json::json!({
+            "pkg": "foo-rs", "name": "foo-rs", "version": "0.1.0",
+            "functions": [{
+                "name": "f",
+                "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
+                "results": [{"name": "", "type": "Int", "rustType": "i64"}],
+                "effect": "pure"
+            }],
+            "errors": [],
+            "transitiveDeps": [{"ident": "foo", "name": "foo-rs", "version": "0.1.0"}]
+        })
+        .to_string();
+        let pkg = PkgInfo::decode_json(&doc).expect("decodes");
+        crate::driver::installed_crate_from_pkg(
+            fixture_slug("foo_rs"),
+            &pkg,
+            &crate::driver::FfiCache::at_project_root(std::path::Path::new(".")),
+        )
+        .expect("installs")
+    }
+
+    #[test]
+    fn an_asserted_path_names_its_crate_by_lib_ident_never_by_slug() {
+        let catalog = [renamed_lib_crate()];
+        let unify = UnifyReport::default();
+        let locals = LocalTypeNames::default();
+        let by_slug = validated_in(
+            &["Int", "Result Error Int"],
+            "foo_rs::f",
+            &catalog,
+            &unify,
+            &locals,
+        );
+        assert!(
+            matches!(
+                &by_slug,
+                Err(AssertedRefusal {
+                    defect: AssertedDefect::TargetCrateNotInstalled { crate_ident }, ..
+                }) if crate_ident == "foo_rs"
+            ),
+            "the slug spelling names no crate: {by_slug:?}"
+        );
+        let by_ident = validated_in(
+            &["Int", "Result Error Int"],
+            "foo::f",
+            &catalog,
+            &unify,
+            &locals,
+        );
+        assert!(
+            by_ident.is_ok(),
+            "the lib identifier resolves: {by_ident:?}"
         );
     }
 
@@ -1711,7 +1809,9 @@ mod tests {
         InstalledCrate {
             kernel_name: module.replace('.', "_"),
             module_name: module.to_owned(),
-            slug: slug.to_owned(),
+            slug: fixture_slug(slug),
+            package_name: crate::pkginfo::PackageName::parse(slug).ok(),
+            dep_idents: BTreeMap::new(),
             interface_source: String::new(),
             opaque_types: types
                 .iter()
@@ -1975,7 +2075,7 @@ mod tests {
         .to_string();
         let pkg = PkgInfo::decode_json(&doc).expect("decodes");
         crate::driver::installed_crate_from_pkg(
-            slug.to_owned(),
+            fixture_slug(slug),
             &pkg,
             &crate::driver::FfiCache::at_project_root(std::path::Path::new(".")),
         )

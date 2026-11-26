@@ -165,7 +165,8 @@ const fn ffi_prep_load_error(refusal: &FfiPrepError, detail: String) -> LoadErro
         FfiPrepError::ModuleClaimed { .. }
         | FfiPrepError::ReservedModuleExists
         | FfiPrepError::AssertedShimSeal(_) => LoadError::Pipeline(detail),
-        FfiPrepError::DefineOpaqueCollision { .. }
+        FfiPrepError::SlugCollision { .. }
+        | FfiPrepError::DefineOpaqueCollision { .. }
         | FfiPrepError::DependencyMerge(_)
         | FfiPrepError::CatalogSeal(_)
         | FfiPrepError::TransparentWithoutShape { .. }
@@ -829,12 +830,13 @@ mod tests {
     ///
     /// The exhaustive match over a witness value makes a new variant a build
     /// error here until it joins the list.
-    fn every_ffi_prep_error() -> [FfiPrepError; 8] {
+    fn every_ffi_prep_error() -> [FfiPrepError; 9] {
         let witness = FfiPrepError::ReservedModuleExists;
         match witness {
             FfiPrepError::ModuleClaimed { .. }
             | FfiPrepError::ReservedModuleExists
             | FfiPrepError::AssertedShimSeal(_)
+            | FfiPrepError::SlugCollision { .. }
             | FfiPrepError::DefineOpaqueCollision { .. }
             | FfiPrepError::DependencyMerge(_)
             | FfiPrepError::CatalogSeal(_)
@@ -853,6 +855,11 @@ mod tests {
             },
             FfiPrepError::ReservedModuleExists,
             FfiPrepError::AssertedShimSeal(dropped()),
+            FfiPrepError::SlugCollision {
+                slug: "a_b".to_owned(),
+                first: "a-b".to_owned(),
+                second: "a_b".to_owned(),
+            },
             FfiPrepError::DefineOpaqueCollision {
                 slug: "a".to_owned(),
                 name: "T".to_owned(),
