@@ -2782,10 +2782,14 @@ mod tests {
         assert!(coverage.contains("Dropped bindings: 1"), "{coverage}");
         assert!(coverage.contains("contradictory shape flags"), "{coverage}");
         assert!(coverage.contains("facade guidance"), "{coverage}");
-        cache.remove_package("semver").expect("removes");
+        cache
+            .remove_package(&FfiSlug::parse_canonical("semver").expect("a slug"))
+            .expect("removes");
         assert!(!paths.ipei.exists());
         // Idempotent: removing again is fine.
-        cache.remove_package("semver").expect("idempotent");
+        cache
+            .remove_package(&FfiSlug::parse_canonical("semver").expect("a slug"))
+            .expect("idempotent");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

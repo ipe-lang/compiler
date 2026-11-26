@@ -1140,21 +1140,9 @@ impl fmt::Display for UnsanitizedWireDefect<'_> {
             ),
             WireDefect::LegacyDependencyLine { got } => wire_text::legacy_line(f, got),
             WireDefect::CacheRootUnanchored { got } => wire_text::cache_unanchored(f, got),
-            WireDefect::SlugFileName { got, defect } => write!(
-                f,
-                "{got:?} is not a module slug ({defect}); remove the file, then re-run \
-                 `ipe rust add` for the crate it belongs to"
-            ),
-            WireDefect::SlugMismatch { slug, name } => write!(
-                f,
-                "the cache holds package {name:?} under slug {slug:?}, which is not the slug \
-                 that name maps to; re-run `ipe rust add {name}`"
-            ),
-            WireDefect::InspectionMissing { slug } => write!(
-                f,
-                "crate slug {slug:?} has no inspection document; remove its cache files and \
-                 reinstall the crate with `ipe rust add`"
-            ),
+            WireDefect::SlugFileName { got, defect } => wire_text::slug_file_name(f, got, *defect),
+            WireDefect::SlugMismatch { slug, name } => wire_text::slug_mismatch(f, slug, name),
+            WireDefect::InspectionMissing { slug } => wire_text::inspection_missing(f, slug),
             WireDefect::Json { detail } => write!(f, "{detail}"),
         }
     }
@@ -1251,6 +1239,34 @@ mod wire_text {
         write!(
             f,
             "a type string nests past the depth ceiling of {max} on foreign types"
+        )
+    }
+
+    pub(super) fn slug_file_name(
+        f: &mut fmt::Formatter<'_>,
+        got: &str,
+        defect: crate::driver::SlugDefect,
+    ) -> fmt::Result {
+        write!(
+            f,
+            "{got:?} is not a module slug ({defect}); remove the file, then re-run \
+             `ipe rust add` for the crate it belongs to"
+        )
+    }
+
+    pub(super) fn slug_mismatch(f: &mut fmt::Formatter<'_>, slug: &str, name: &str) -> fmt::Result {
+        write!(
+            f,
+            "the cache holds package {name:?} under slug {slug:?}, which is not the slug \
+             that name maps to; re-run `ipe rust add {name}`"
+        )
+    }
+
+    pub(super) fn inspection_missing(f: &mut fmt::Formatter<'_>, slug: &str) -> fmt::Result {
+        write!(
+            f,
+            "crate slug {slug:?} has no inspection document; remove its cache files and \
+             reinstall the crate with `ipe rust add`"
         )
     }
 
