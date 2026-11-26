@@ -123,8 +123,7 @@ addMillis : Int -> Timestamp -> Timestamp
 
 `addMillis ms t` — shift instant `t` by `ms` raw milliseconds.  Prefer
 `add (Duration.millis ms)` for new code; this is provided for callers that
-already hold a raw millisecond delta.  A shifted instant outside the
-64-bit `Int` range ends in a typed `InvalidInput` error, as `+` does.
+already hold a raw millisecond delta.
 
 ## `diffMillis`
 
@@ -133,8 +132,7 @@ diffMillis : Timestamp -> Timestamp -> Int
 ```
 
 `diffMillis a b` — raw milliseconds from instant `b` to instant `a`.
-Prefer `Duration.toMillis (diff a b)` for new code.  A difference outside
-the 64-bit `Int` range ends in a typed `InvalidInput` error, as `-` does.
+Prefer `Duration.toMillis (diff a b)` for new code.
 
 ## `every`
 

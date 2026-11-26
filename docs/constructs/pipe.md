@@ -16,13 +16,13 @@ order the steps happen, without nesting function calls inside one another.
 
 ## Basic form
 
-```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
+```ipe
 value |> function
 ```
 
 is exactly the same as:
 
-```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
+```ipe
 function value
 ```
 
@@ -31,8 +31,6 @@ function value
 Without `|>` you read inside-out:
 
 ```ipe
-import Ipe.String as String
-
 result : String
 result =
     String.toUpper (String.trim (String.replace "o" "0" "  hello world  "))
@@ -41,8 +39,6 @@ result =
 With `|>` you read top-to-bottom:
 
 ```ipe
-import Ipe.String as String
-
 result : String
 result =
     "  hello world  "
@@ -58,12 +54,9 @@ Both expressions produce the same value.
 `|>` is the standard way to sequence `Task` effects without a `do` block:
 
 ```ipe
-import Ipe.Io as Io
-import Ipe.Task as Task
-
 main : Task Error ()
 main =
-    Io.readLine ()
+    Io.readLine
         |> Task.andThen (\line -> Io.println ("You typed: " ++ line))
 ```
 
@@ -75,8 +68,6 @@ See [`effects`](effects) and [`do`](do) for the full effect-sequencing picture.
 the "data last" convention so they chain naturally:
 
 ```ipe
-import Ipe.List as List
-
 -- data-last: list comes last
 keepPositive : List Int -> List Int
 keepPositive xs =

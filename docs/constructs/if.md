@@ -16,7 +16,7 @@ a value.
 
 ## Basic form
 
-```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
+```ipe
 if condition then
     trueResult
 else

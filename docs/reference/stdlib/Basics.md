@@ -12,10 +12,6 @@ type-checker's `Comparable`/`Number` obligation rejects a function, record,
 list, or tuple argument. `sqrt` is monomorphically `Float -> Float`. The
 builtin `Order` is exposed so `Basics.Order` names it.
 
-`Int` is 64-bit. An `Int` result outside that range — from `+`, `-`, `*`,
-`//` (the least `Int` divided by `-1`), `negate`, or `abs` — ends in a
-typed `InvalidInput` error, never a wrapped number.
-
 ## `identity`
 
 ```ipe
@@ -143,9 +139,6 @@ negate 0 --> 0
 negate 2.5 --> -2.5
 ```
 
-`negate` of the least `Int`, `-9223372036854775808`, has no `Int` result and
-ends in a typed `InvalidInput` error.
-
 ## `abs`
 
 ```ipe
@@ -162,9 +155,6 @@ abs 7 --> 7
 abs 0 --> 0
 abs (-3.14) --> 3.14
 ```
-
-`abs` of the least `Int`, `-9223372036854775808`, has no `Int` result and
-ends in a typed `InvalidInput` error.
 
 ## `sqrt`
 

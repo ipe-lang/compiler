@@ -7,13 +7,11 @@ readable text without a chain of `++`.
 
 ## Syntax
 
-```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
-"""
-<text, spanning as many lines as you like>
-{{<simple-ref>}}   -- substitutes the value, stringified
-\{{                -- a literal `{{` (no interpolation)
-"""
-```
+    """
+    <text, spanning as many lines as you like>
+    {{<simple-ref>}}   -- substitutes the value, stringified
+    \{{                -- a literal `{{` (no interpolation)
+    """
 
 The opening-line margin is stripped: the block's indentation lays out the source
 but does not enter the value. Each `{{…}}` body is trimmed, wrapped in
@@ -21,12 +19,10 @@ the internal interpolation renderer, and the whole literal is joined with `++`.
 
 An interpolation body may be one of exactly **four simple shapes**:
 
-```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
-{{name}}           -- a bare identifier
-{{record.field}}   -- a field access
-{{Module.value}}   -- a qualified name
-{{fn arg}}         -- a single function application
-```
+    {{name}}           -- a bare identifier
+    {{record.field}}   -- a field access
+    {{Module.value}}   -- a qualified name
+    {{fn arg}}         -- a single function application
 
 Anything more complex — operators, multi-argument calls, parenthesised
 expressions — is left as **literal `{{…}}` text**, a deliberate signal that only

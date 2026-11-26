@@ -65,13 +65,13 @@ emptyMap =
 To use a type's constructors unqualified, include `TypeName(..)`:
 
 ```ipe
-import Ipe.Palette exposing (Shade(..))
+import Geometry exposing (Shape(..))
 
-myColor : String
-myColor =
-    case Dark of
-        Dark -> "#000"
-        Light -> "#fff"
+myArea : Float
+myArea =
+    case Circle 5.0 of
+        Circle r -> 3.14159 * r * r
+        Square s -> s * s
 ```
 
 ## Importing a standard-library module you omitted

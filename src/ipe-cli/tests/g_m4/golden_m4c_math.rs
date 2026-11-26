@@ -140,18 +140,17 @@ fn math_pow() {
     assert_runs_and_matches_oracle("math_pow");
 }
 
-// ── round — a tie goes toward +∞ (Elm), both signs ───────────────────────────
+// ── round — half-away-from-zero, both signs ───────────────────────────────────
 
-/// `Math.round 2.5` → `3`. A positive tie goes up.
+/// `Math.round 2.5` → `3`. IEEE 754 round-half-away-from-zero rounds halves away from zero.
 #[test]
-fn math_round_tie_goes_up() {
+fn math_round_half_away() {
     assert_runs_and_matches_oracle("math_round");
 }
 
-/// `Math.round (-2.5)` → `-2`. A negative tie also goes up, toward +∞ — never
-/// away from zero.
+/// `Math.round (-2.5)` → `-3`. Half-away-from-zero on the negative side.
 #[test]
-fn math_round_negative_tie_goes_up() {
+fn math_round_negative_half_away() {
     assert_runs_and_matches_oracle("math_round_neg");
 }
 

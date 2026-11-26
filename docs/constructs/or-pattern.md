@@ -16,7 +16,7 @@ of `->`.
 
 ## Basic form
 
-```ipe ipe:skip a syntax shape with placeholder names, not valid Ipê
+```ipe
 case value of
     PatternA | PatternB ->
         sharedResult
@@ -67,10 +67,6 @@ badMatch e =
 ```
 
 ```ipe
-type Expr
-    = Lit Int
-    | Neg Int
-
 -- Correct: both alternatives bind the same variable name
 goodMatch : Expr -> Int
 goodMatch e =
