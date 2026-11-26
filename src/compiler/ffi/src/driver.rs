@@ -669,6 +669,41 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 #[cfg(windows)]
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 
+/// The longest an install waits for another holder of the cache's install lock.
+///
+/// A holder keeps the lock only across local artifact writes, so a wait this
+/// long means a stopped or wedged holder; the install is refused, never hung.
+const INSTALL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often a waiting install retries the install lock.
+const INSTALL_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Take `held`'s exclusive lock, retrying until `wait` has passed.
+///
+/// A lock still held elsewhere after `wait` is a `TimedOut` error.
+fn lock_within(held: &std::fs::File, wait: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now().checked_add(wait);
+    loop {
+        match held.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "another install held the cache's install lock for {} seconds; \
+                             retry once it finishes",
+                            wait.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(INSTALL_LOCK_POLL);
+            }
+        }
+    }
+}
+
 /// The name of a fresh temporary sibling of the entry `name`, unique to this call within this process.
 fn temp_name(name: &str) -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -750,16 +785,16 @@ impl CacheDir {
         Ok(Some(Self { dir: level }))
     }
 
-    /// Take the cache's exclusive install lock, waiting while another holder has it.
+    /// Take the cache's exclusive install lock, waiting at most `wait` while another holder has it.
     ///
     /// The lock is held on the cache directory's own handle, so no lock file
     /// is created in the cache.
-    fn lock(&self) -> std::io::Result<InstallLock> {
+    fn lock(&self, wait: std::time::Duration) -> std::io::Result<InstallLock> {
         // A fresh open of the directory, never a duplicate of the held handle:
         // the lock belongs to this guard alone and is released when it drops.
         let held = rustix::fs::openat(&self.dir, ".", Self::dir_flags(), rustix::fs::Mode::empty())
             .map(std::fs::File::from)?;
-        held.lock()?;
+        lock_within(&held, wait)?;
         Ok(InstallLock { _held: held })
     }
 
@@ -886,11 +921,11 @@ impl CacheDir {
         Ok(Some(Self { dir: level }))
     }
 
-    /// Take the cache's exclusive install lock, waiting while another holder has it.
+    /// Take the cache's exclusive install lock, waiting at most `wait` while another holder has it.
     ///
     /// The lock is held on [`INSTALL_LOCK_NAME`], opened as the entry itself,
     /// never through a link.
-    fn lock(&self) -> std::io::Result<InstallLock> {
+    fn lock(&self, wait: std::time::Duration) -> std::io::Result<InstallLock> {
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
         #[cfg(windows)]
@@ -899,7 +934,7 @@ impl CacheDir {
             FILE_FLAG_OPEN_REPARSE_POINT,
         );
         let held = options.open(self.dir.join(INSTALL_LOCK_NAME))?;
-        held.lock()?;
+        lock_within(&held, wait)?;
         Ok(InstallLock { _held: held })
     }
 
@@ -1093,9 +1128,10 @@ impl FfiCache {
     ///
     /// # Errors
     ///
-    /// `IPE-F4412` naming a cache level that is a link or not a directory, or
-    /// the first path that could not be written; a wire-defect diagnostic when
-    /// the cache is not anchored at a project root; `IPE-F4416` when the
+    /// `IPE-F4412` naming a cache level that is a link or not a directory, the
+    /// first path that could not be written, or the cache root when another
+    /// install holds the install lock past [`INSTALL_LOCK_WAIT`]; a wire-defect
+    /// diagnostic when the cache is not anchored at a project root; `IPE-F4416` when the
     /// package name folds to no legal slug; `IPE-F4416` when another package
     /// already holds the slug, or its occupant's inspection document does not
     /// decode.
@@ -1116,7 +1152,9 @@ impl FfiCache {
         let dir = CacheDir::open(self.project_root()?, true)
             .map_err(level_err)?
             .ok_or_else(|| io_err(&self.root, &std::io::ErrorKind::NotFound.into()))?;
-        let _install = dir.lock().map_err(|e| io_err(&self.root, &e))?;
+        let _install = dir
+            .lock(INSTALL_LOCK_WAIT)
+            .map_err(|e| io_err(&self.root, &e))?;
         let names = ArtifactNames::for_slug(&slug);
         let paths = self.artifact_paths(&slug);
         // The occupant probe reads the exact `<slug>.pkg.json` the write below
@@ -1178,8 +1216,9 @@ impl FfiCache {
     /// # Errors
     ///
     /// `IPE-F4412` naming a cache level that is a link or not a directory, or
-    /// the first artifact that exists but cannot be deleted; a wire-defect
-    /// diagnostic when the cache is not anchored at a project root.
+    /// the first artifact that exists but cannot be deleted, or the cache root
+    /// when another install holds the install lock past [`INSTALL_LOCK_WAIT`];
+    /// a wire-defect diagnostic when the cache is not anchored at a project root.
     pub fn remove_package(&self, slug: &FfiSlug) -> Result<(), Diagnostic> {
         let io_err = |path: &Path, e: &std::io::Error| Diagnostic::ArtifactIo {
             path: path.to_string_lossy().into_owned(),
@@ -1190,7 +1229,9 @@ impl FfiCache {
         else {
             return Ok(());
         };
-        let _install = dir.lock().map_err(|e| io_err(&self.root, &e))?;
+        let _install = dir
+            .lock(INSTALL_LOCK_WAIT)
+            .map_err(|e| io_err(&self.root, &e))?;
         let names = ArtifactNames::for_slug(slug);
         let paths = self.artifact_paths(slug);
         for (name, path) in [
@@ -3083,7 +3124,7 @@ mod tests {
             .ok()
             .flatten()
             .expect("cache opens");
-        let held = dir.lock().expect("lock");
+        let held = dir.lock(INSTALL_LOCK_WAIT).expect("lock");
         let (sent, received) = std::sync::mpsc::channel();
         let worker = std::thread::Builder::new()
             .spawn(move || {
@@ -3111,6 +3152,45 @@ mod tests {
                     if installed == "a-b"
             ),
             "the waiting install sees the committed record and refuses: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lock_held_past_its_wait_is_refused_never_waited_on_forever() {
+        let root = scratch_dir("slug-lock-wait");
+        let dir = CacheDir::open(&root, true)
+            .ok()
+            .flatten()
+            .expect("cache opens");
+        let held = dir.lock(INSTALL_LOCK_WAIT).expect("lock");
+        let waiter = CacheDir::open(&root, false)
+            .ok()
+            .flatten()
+            .expect("cache reopens");
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let outcome = waiter
+                    .lock(std::time::Duration::from_millis(200))
+                    .map(drop)
+                    .map_err(|e| e.kind());
+                let _ = sent.send(outcome);
+            })
+            .expect("spawn the waiting lock");
+        let outcome = received
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a held lock refuses within its wait, never blocks forever");
+        assert_eq!(
+            outcome,
+            Err(std::io::ErrorKind::TimedOut),
+            "a lock another holder keeps past the wait is a typed refusal"
+        );
+        worker.join().expect("the waiting lock's thread");
+        drop(held);
+        assert!(
+            dir.lock(std::time::Duration::from_millis(200)).is_ok(),
+            "a released lock is taken again"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
