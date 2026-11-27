@@ -2,7 +2,7 @@ create:ok
 schema:ok
 insert-u1-g1:1
 dup-key:rejected
-insert-u1-g2:1
+insert-u1-g2:2
 null-key:rejected
 upsert-first:1
 upsert-second:1
