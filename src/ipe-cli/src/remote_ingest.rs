@@ -496,7 +496,7 @@ pub const LOCK_RESOLVE_LIMITS: LocalCeiling = LocalCeiling(LocalLimits {
     wall: LocalWall::of_secs::<120>(),
 });
 
-/// The ceilings of an offline `cargo fetch` unpacking a crate's locked sources
+/// The ceilings of an offline `cargo tree` unpacking the sources a crate's build reads
 /// from the local registry cache into the cargo home.
 ///
 /// Its stdout is held to 64 KiB and its run to ten minutes: unpacking a large
@@ -1366,7 +1366,7 @@ pub enum LocalSource {
     LockFetch,
     /// An offline `cargo update --workspace --locked` proving an emitted crate's lock replays.
     LockProbe,
-    /// An offline `cargo fetch` unpacking a crate's locked sources into the cargo home.
+    /// An offline `cargo tree` unpacking the sources a crate's build reads into the cargo home.
     SourceUnpack,
     /// A `cargo metadata --no-deps` reading a crate's target directory.
     CargoMetadata,

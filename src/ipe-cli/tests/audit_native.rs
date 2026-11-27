@@ -1058,15 +1058,18 @@ mod real_jail {
 
     /// The one provisioning step for an emitted crate's `--offline` builds.
     ///
-    /// The production probe build resolves its lock `--offline` and builds
-    /// `--offline --locked` inside the jail, from the registry cache alone. The
-    /// emitted manifest's universe is wider than the workspace's (its optional
-    /// allocator dependency `dlmalloc` resolves into every
-    /// lock), so a cache warmed by the workspace build, or by whichever
-    /// test ran first, does not hold it. A networked `cargo fetch`, outside any
-    /// jail, resolves the full graph into `dir/Cargo.lock` and downloads every
-    /// locked package; the `--offline --locked` re-fetch then proves the cache
-    /// holds the universe before any offline build runs.
+    /// The production probe build seeds its lock from the pinned set, narrows
+    /// it `--offline`, and builds `--offline --locked` inside the jail, from the
+    /// registry cache alone. The emitted manifest's universe is wider than the
+    /// workspace's (its optional allocator dependency `dlmalloc` resolves into
+    /// every lock), so a cache warmed by the workspace build, or by whichever
+    /// test ran first, does not hold it. The lock is seeded from the same pinned
+    /// bytes production seeds from, so the networked `cargo fetch`, outside any
+    /// jail, keeps every pinned version and resolves only the crate's own
+    /// additions into `dir/Cargo.lock`, downloading every locked package: the
+    /// versions production reads, never a fresh resolve's newer ones an empty
+    /// CI cache would then lack. The `--offline --locked` re-fetch proves the
+    /// cache holds the universe before any offline build runs.
     ///
     /// # Panics
     ///
@@ -1079,6 +1082,9 @@ mod real_jail {
     /// The networked fetch, then the `--offline --locked` proof, of the crate
     /// at `dir` into `cargo_home` (the invoker's when `None`).
     fn provision_into(dir: &std::path::Path, cargo_home: Option<&std::path::Path>) {
+        let pinned = ipe::pinned_deps::pinned_set().expect("the embedded pinned set parses");
+        std::fs::write(dir.join("Cargo.lock"), pinned.seed_bytes())
+            .expect("seed the emitted crate's lock from the pinned set");
         for mode in [Fetch::Networked, Fetch::OfflineLocked] {
             let out = cargo_fetch(dir, mode, cargo_home);
             assert!(
@@ -1223,12 +1229,17 @@ mod real_jail {
     }
 
     /// A cargo home at `staged` holding the invoker's registry index (copied),
-    /// archive cache and `bin` tools (hard-linked, copied across filesystems),
-    /// with NO unpacked `registry/src`: the shape a restored CI cache leaves.
-    /// The invoker's home is only read.
+    /// `bin` tools and, of its archive cache, exactly the `archives` named
+    /// (hard-linked, copied across filesystems), with NO unpacked
+    /// `registry/src`: the shape a restored CI cache, or a cache a build
+    /// filled, leaves. The invoker's home is only read.
     // A POSIX jail alone binds the cargo home read-only.
     #[cfg(not(target_os = "windows"))]
-    fn stage_cargo_home_without_sources(real: &std::path::Path, staged: &std::path::Path) {
+    fn stage_cargo_home_without_sources(
+        real: &std::path::Path,
+        staged: &std::path::Path,
+        archives: &BTreeSet<String>,
+    ) {
         let registry = staged.join("registry");
         copy_tree(
             &real.join("registry").join("index"),
@@ -1236,11 +1247,14 @@ mod real_jail {
             Stage::Copy,
             0,
         );
-        copy_tree(
+        let staged_archives = stage_archives(
             &real.join("registry").join("cache"),
             &registry.join("cache"),
-            Stage::Link,
-            0,
+            archives,
+        );
+        assert_eq!(
+            &staged_archives, archives,
+            "the invoker's registry cache must hold every archive the build reads"
         );
         copy_tree(&real.join("bin"), &staged.join("bin"), Stage::Link, 0);
         assert!(
@@ -1251,6 +1265,98 @@ mod real_jail {
             !registry.join("src").exists(),
             "the staged cargo home must start with no unpacked sources"
         );
+    }
+
+    /// Hard-link (copy across filesystems) each registry's archive under
+    /// `from` whose file name `archives` holds into the same registry under
+    /// `to`. Returns the names placed.
+    #[cfg(not(target_os = "windows"))]
+    fn stage_archives(
+        from: &std::path::Path,
+        to: &std::path::Path,
+        archives: &BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let mut placed = BTreeSet::new();
+        for registry in std::fs::read_dir(from).expect("read the registry cache") {
+            let registry = registry.expect("read a registry cache entry").path();
+            if !registry.is_dir() {
+                continue;
+            }
+            let name = registry
+                .file_name()
+                .expect("a registry cache directory name");
+            let into = to.join(name);
+            std::fs::create_dir_all(&into).expect("create a staged registry cache");
+            for archive in std::fs::read_dir(&registry).expect("read a registry's archives") {
+                let archive = archive.expect("read an archive entry").path();
+                let Some(file) = archive.file_name().and_then(|f| f.to_str()) else {
+                    continue;
+                };
+                if archives.contains(file) {
+                    let target = into.join(file);
+                    std::fs::hard_link(&archive, &target)
+                        .or_else(|_| std::fs::copy(&archive, &target).map(|_| ()))
+                        .expect("stage an archive");
+                    placed.insert(file.to_owned());
+                }
+            }
+        }
+        placed
+    }
+
+    /// The `.crate` archive names of the registry packages a target-less
+    /// `cargo build` of the crate at `dir` reads: its host-platform normal and
+    /// build edges under its lock, listed by `cargo tree` over the invoker's
+    /// cargo home.
+    #[cfg(not(target_os = "windows"))]
+    fn build_read_archives(dir: &std::path::Path) -> BTreeSet<String> {
+        let mut tree = std::process::Command::new(require_cargo());
+        tree.args([
+            "tree",
+            "--offline",
+            "--locked",
+            "--target",
+            "host-tuple",
+            "--edges",
+            "normal,build",
+            "--prefix",
+            "none",
+            "--format",
+            "{p}",
+            "--manifest-path",
+        ])
+        .arg(dir.join("Cargo.toml"))
+        .stdin(std::process::Stdio::null());
+        let out = e2e_support::require_host("cargo tree must run", super::run_child(tree));
+        assert!(
+            out.status.success(),
+            "listing the emitted crate's build graph must succeed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                // `name vX.Y.Z`, then a path package's directory ` (/…)`, a
+                // proc macro's ` (proc-macro)` or a repeat's ` (*)`.
+                let mut words = line.split_whitespace();
+                let name = words.next()?;
+                let version = words.next()?.strip_prefix('v')?;
+                if words.any(|word| word.starts_with("(/")) {
+                    return None;
+                }
+                Some(format!("{name}-{version}.crate"))
+            })
+            .collect()
+    }
+
+    /// The number of registry packages the lock of the crate at `dir` pins.
+    #[cfg(not(target_os = "windows"))]
+    fn locked_registry_packages(dir: &std::path::Path) -> usize {
+        std::fs::read_to_string(dir.join("Cargo.lock"))
+            .expect("the provisioned lock")
+            .lines()
+            .filter(|line| line.starts_with("source = \"registry+"))
+            .count()
     }
 
     /// How [`copy_tree`] places a file.
@@ -1355,8 +1461,20 @@ mod real_jail {
         let real_cargo = ipe::env_dir::tool_home("CARGO_HOME", user_home.as_ref(), ".cargo")
             .expect("an absolute CARGO_HOME")
             .expect("a cargo home");
+        // The staged cache holds only what the build reads, under the lock
+        // production derives: a fresh resolve's versions, a member's dev
+        // dependencies or an unreached optional allocator are absent, as from a
+        // cache a build filled or a CI cache the provisioning step filled.
+        let archives = build_read_archives(provisioned.dir());
+        let locked = locked_registry_packages(provisioned.dir());
+        assert!(
+            !archives.is_empty() && archives.len() < locked,
+            "the build reads a strict subset of the {locked} locked registry packages, \
+             saw {}",
+            archives.len()
+        );
         let staged = base.join("staged-cargo-home");
-        stage_cargo_home_without_sources(real_cargo.as_path(), &staged);
+        stage_cargo_home_without_sources(real_cargo.as_path(), &staged, &archives);
         let mut path = vec![staged.join("bin")];
         path.extend(std::env::split_paths(
             &ipe_env::var_os("PATH").unwrap_or_default(),
@@ -1389,10 +1507,12 @@ mod real_jail {
         // `.crate` archives but not their unpacked `registry/src` trees, and the
         // jail binds the cargo home read-only, so cargo inside it cannot unpack.
         // Drive the whole `native_tier2` entry with a staged cargo home in that
-        // shape as the invoker's (`CARGO_HOME` and `PATH`, set at the spawn of a
-        // re-exec of this test): the package must still certify, which only
-        // holds when every locked source is unpacked before the jail. The
-        // invoker's cargo home is never written.
+        // shape, holding only the archives the build reads, as the invoker's
+        // (`CARGO_HOME` and `PATH`, set at the spawn of a re-exec of this test):
+        // the package must still certify, which only holds when every source the
+        // build reads is unpacked before the jail and the unpack demands no
+        // archive the build does not read. The invoker's cargo home is never
+        // written.
         let Some(_tools) = e2e_tools() else { return };
         match ipe_env::var_os(STAGED_HOME_CHILD) {
             Some(base) => certify_over_the_staged_home(std::path::Path::new(&base)),
