@@ -180,15 +180,50 @@ const SESSION_LOST_BODY: &str = "session not found";
 
 // ─── Client assets ────────────────────────────────────────────────────────────
 
-/// The browser-side Ipe.Web client JS asset. The 12 header `%`-verb
-/// lines are replaced with static literals; the two `%%` CSS escapes are
-/// un-escaped to `%`.
+/// The browser-side Ipe.Web client source, served after its built-in text
+/// catalog (see [`client_js`]).
 #[cfg(feature = "web")]
 const CLIENT_JS: &str = include_str!("client.js");
 
+/// The served client asset, composed once: [`client_text_prelude`] then
+/// [`CLIENT_JS`].
+#[cfg(feature = "web")]
+static CLIENT_JS_SERVED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The client asset exactly as served and hashed.
+#[cfg(feature = "web")]
+fn client_js() -> &'static str {
+    CLIENT_JS_SERVED.get_or_init(|| {
+        let mut served = client_text_prelude();
+        served.push_str(CLIENT_JS);
+        served
+    })
+}
+
+/// The built-in text catalog the client draws from until its boot data is
+/// accepted: the default locale's client rows, as a frozen JSON object, and
+/// that locale's tag.
+#[cfg(feature = "web")]
+fn client_text_prelude() -> String {
+    use crate::runtime_text::{Locale, TextId};
+    let rows: serde_json::Map<String, serde_json::Value> = TextId::client()
+        .map(|id| {
+            (
+                id.wire().to_owned(),
+                serde_json::Value::String(Locale::DEFAULT.text(id).to_owned()),
+            )
+        })
+        .collect();
+    format!(
+        "var __IPE_TEXT_DEFAULT = Object.freeze({});\nvar __IPE_TEXT_DEFAULT_LANG = {};\n",
+        serde_json::Value::Object(rows),
+        serde_json::Value::String(Locale::DEFAULT.tag().to_owned()),
+    )
+}
+
 /// Content-addressing for the client asset: computed ONCE at first access via
 /// `OnceLock`. Holds `(hex16, base64full)` where:
-///   - `hex16` — first 16 hex chars of SHA-256(CLIENT_JS) → used in the URL
+///   - `hex16` — first 16 hex chars of SHA-256([`client_js`]) → used in the URL
 ///     (`/_ipe/client.<hex16>.js`) for cache-busting.
 ///   - `base64full` — standard base64 of the full 32-byte SHA-256 digest → the
 ///     `integrity="sha256-<base64full>"` SRI attribute value.
@@ -199,13 +234,13 @@ const CLIENT_JS: &str = include_str!("client.js");
 #[cfg(feature = "web")]
 static CLIENT_JS_HASH: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
 
-/// Return `(hex16, base64full)` for `CLIENT_JS`, computing once on first call.
+/// Return `(hex16, base64full)` for [`client_js`], computing once on first call.
 #[cfg(feature = "web")]
 fn client_js_hashes() -> &'static (String, String) {
     CLIENT_JS_HASH.get_or_init(|| {
         use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
         use sha2::{Digest, Sha256};
-        let digest: [u8; 32] = Sha256::digest(CLIENT_JS.as_bytes()).into();
+        let digest: [u8; 32] = Sha256::digest(client_js().as_bytes()).into();
         let hex16: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
         let base64full = B64.encode(digest);
         (hex16, base64full)
@@ -428,9 +463,25 @@ struct ClientConfig<'a> {
     banner_enabled: bool,
     swap_toast: bool,
     tuning: &'a ClientTuning,
-    msg_reconnecting: &'a str,
-    msg_updated: &'a str,
-    msg_offline: &'a str,
+    text: ClientText,
+    text_lang: &'static str,
+}
+
+/// The client rows of one locale's catalog, serialized as an object from
+/// each id's wire spelling to its text.
+#[cfg(feature = "web")]
+struct ClientText(crate::runtime_text::Locale);
+
+#[cfg(feature = "web")]
+impl serde::Serialize for ClientText {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut rows = serializer.serialize_map(None)?;
+        for id in crate::runtime_text::TextId::client() {
+            rows.serialize_entry(id.wire(), self.0.text(id))?;
+        }
+        rows.end()
+    }
 }
 
 #[cfg(feature = "web")]
@@ -441,9 +492,8 @@ impl<'a> ClientConfig<'a> {
             banner_enabled: web_banner_enabled(),
             swap_toast: web_swap_toast(),
             tuning,
-            msg_reconnecting: "Reconnecting…",
-            msg_updated: "updated ✓",
-            msg_offline: "Connection lost — refresh to retry",
+            text: ClientText(crate::runtime_text::Locale::DEFAULT),
+            text_lang: crate::runtime_text::Locale::DEFAULT.tag(),
         }
     }
 }
@@ -8101,8 +8151,8 @@ where
         .body_limit(body_limit);
 
     // Content-addressed client JS asset route. The URL is computed once at
-    // startup from SHA-256(CLIENT_JS) so the path changes when the file
-    // changes, making `Cache-Control: immutable` safe. This route is CSRF-
+    // startup from SHA-256 of the served bytes so the path changes when they
+    // change, making `Cache-Control: immutable` safe. This route is CSRF-
     // exempt (GET; the CSRF middleware only checks mutating verbs) and open
     // to all (it's a static public asset). It is registered BEFORE the
     // catch-all `/{*path}` route so it is matched first.
@@ -8117,7 +8167,7 @@ where
                 ),
                 (header::CACHE_CONTROL, "public, max-age=31536000, immutable"),
             ],
-            CLIENT_JS,
+            client_js(),
         )
     }
 
@@ -9464,9 +9514,8 @@ mod base_path_tests {
                 banner_enabled: true,
                 swap_toast: false,
                 tuning: &tuning,
-                msg_reconnecting: HOSTILE,
-                msg_updated: HOSTILE,
-                msg_offline: HOSTILE,
+                text: super::ClientText(crate::runtime_text::Locale::DEFAULT),
+                text_lang: HOSTILE,
             },
             frame_origins: vec![HOSTILE.to_owned()],
             frame_grants: Vec::new(),
@@ -9488,9 +9537,7 @@ mod base_path_tests {
             "/base",
             "/csrf",
             "/route",
-            "/cfg/msgReconnecting",
-            "/cfg/msgUpdated",
-            "/cfg/msgOffline",
+            "/cfg/textLang",
         ] {
             assert_eq!(
                 parsed.pointer(path).and_then(serde_json::Value::as_str),
@@ -9498,6 +9545,94 @@ mod base_path_tests {
                 "{path} must round-trip"
             );
         }
+    }
+
+    /// The boot block carries the default locale's client catalog: exactly one
+    /// row per client id, each that locale's text, and the locale's tag. No
+    /// notice travels as a loose configuration string.
+    #[test]
+    #[allow(clippy::expect_used)] // the default tuning resolves in a clean test env
+    fn boot_block_carries_the_client_catalog() {
+        use crate::runtime_text::{Locale, TextId};
+        let html = page(
+            "sid1",
+            &crate::encoding::MountBase::root(),
+            &page_epoch(),
+            "t",
+        );
+        let boot = boot_of(&html).expect("the page carries a boot block");
+        let text = boot
+            .pointer("/cfg/text")
+            .and_then(serde_json::Value::as_object)
+            .expect("cfg.text is an object");
+        assert_eq!(
+            text.len(),
+            TextId::client().count(),
+            "one row per client id"
+        );
+        for id in TextId::client() {
+            assert_eq!(
+                text.get(id.wire()).and_then(serde_json::Value::as_str),
+                Some(Locale::DEFAULT.text(id)),
+                "cfg.text.{} is the default locale's row",
+                id.wire()
+            );
+        }
+        assert_eq!(
+            boot.pointer("/cfg/textLang")
+                .and_then(serde_json::Value::as_str),
+            Some("en")
+        );
+        let cfg = boot
+            .pointer("/cfg")
+            .and_then(serde_json::Value::as_object)
+            .expect("cfg is an object");
+        assert!(
+            cfg.keys().all(|key| !key.starts_with("msg")),
+            "no notice travels outside the catalog: {cfg:?}"
+        );
+    }
+
+    /// The client is served as its built-in catalog then `client.js`, and the
+    /// URL hash and the SRI digest are both over exactly those served bytes.
+    #[test]
+    #[allow(clippy::expect_used)] // the prelude is the frozen JSON object it writes
+    fn served_client_is_hashed_over_its_catalog_and_source() {
+        use crate::runtime_text::{Locale, TextId};
+        use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+        use sha2::{Digest, Sha256};
+        let served = super::client_js();
+        let prelude = super::client_text_prelude();
+        assert_eq!(served, format!("{prelude}{}", super::CLIENT_JS));
+        let digest: [u8; 32] = Sha256::digest(served.as_bytes()).into();
+        let hex16: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        let (url_hash, sri) = super::client_js_hashes();
+        assert_eq!(url_hash, &hex16, "the URL names the served bytes");
+        assert_eq!(sri, &B64.encode(digest), "the SRI pins the served bytes");
+        assert_eq!(super::client_js_path(), format!("/_ipe/client.{hex16}.js"));
+        let source_digest: [u8; 32] = Sha256::digest(super::CLIENT_JS.as_bytes()).into();
+        assert_ne!(
+            sri,
+            &B64.encode(source_digest),
+            "the SRI is not the bare source's digest"
+        );
+        let mut lines = prelude.lines();
+        let catalog = lines
+            .next()
+            .and_then(|line| line.strip_prefix("var __IPE_TEXT_DEFAULT = Object.freeze("))
+            .and_then(|line| line.strip_suffix(");"))
+            .expect("the prelude freezes the built-in catalog");
+        let catalog: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(catalog).expect("the built-in catalog is a JSON object");
+        assert_eq!(catalog.len(), TextId::client().count());
+        for id in TextId::client() {
+            assert_eq!(
+                catalog.get(id.wire()).and_then(serde_json::Value::as_str),
+                Some(Locale::DEFAULT.text(id))
+            );
+        }
+        assert_eq!(lines.next(), Some("var __IPE_TEXT_DEFAULT_LANG = \"en\";"));
+        assert_eq!(lines.next(), None, "the prelude is two declarations");
     }
 
     /// A refused tuning value refuses the page; it never boots on defaults.
@@ -9576,7 +9711,11 @@ mod base_path_tests {
             .into_iter()
             .chain(required("__IPE_CFG_STRINGS"))
             .collect();
-        assert_eq!(keys_at("/cfg"), with(cfg_required, "tuning"));
+        assert_eq!(keys_at("/cfg"), with(with(cfg_required, "tuning"), "text"));
+        let client_ids: std::collections::BTreeSet<String> = crate::runtime_text::TextId::client()
+            .map(|id| id.wire().to_owned())
+            .collect();
+        assert_eq!(keys_at("/cfg/text"), client_ids);
         let tuning_keys: std::collections::BTreeSet<String> = super::CLIENT_TUNING_CEILINGS
             .iter()
             .map(|(key, _)| (*key).to_string())
@@ -9679,7 +9818,7 @@ mod base_path_tests {
         };
         let end = body_of("__ipeEndSession").unwrap_or_default();
         assert!(
-            end.contains("__ipeStatusMsgEl.textContent = notice;")
+            end.contains("__ipeSay(__ipeStatusMsgEl, notice);")
                 && end.contains("var notice = __ipeClosedNotice(tag);")
                 && !end.contains("innerHTML")
                 && !end.contains("insertAdjacentHTML"),
@@ -9693,7 +9832,7 @@ mod base_path_tests {
         );
         let notice = body_of("__ipeClosedNotice").unwrap_or_default();
         assert!(
-            notice.contains("    default:\n      return \""),
+            notice.contains("    default:\n      return __IPE_TEXT.CLOSED_OTHER;"),
             "a tag outside the set gets the generic notice"
         );
         assert!(

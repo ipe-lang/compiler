@@ -688,6 +688,10 @@ pub mod csp;
 // delegated: the delegation table, the `allow` parser, the registered policy.
 pub mod frames;
 
+// The text the runtime shows an end user, one row per id and locale. Always
+// declared, matching the emitted floor; it has no dependency of its own.
+pub mod runtime_text;
+
 // The runtime's one OS entropy source: every random mint draws through
 // `entropy::fill_entropy`, which refuses instead of panicking.
 pub mod entropy;

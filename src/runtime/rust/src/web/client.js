@@ -361,9 +361,33 @@ var __ipeNode = (function() {
     }
   };
 })();
+// The runtime texts the client draws, by the name the client calls each one:
+// the value is the text's id, the key of its row in the boot catalog
+// (`cfg.text`) and in the built-in catalog (`__IPE_TEXT_DEFAULT`). A notice
+// reaches the page only through `__ipeSay`, by one of these ids.
+var __IPE_TEXT = Object.freeze({
+  BOOT_FAILED: "boot-failed",
+  STALE: "stale",
+  RECONNECTING: "reconnecting",
+  OFFLINE: "offline",
+  SWAP_UPDATED: "swap-updated",
+  CLOSED_OVER_CEILING: "closed-over-ceiling",
+  CLOSED_REVOKED: "closed-revoked",
+  CLOSED_ENDED: "closed-ended",
+  CLOSED_OTHER: "closed-other",
+  REFUSED_TOO_LARGE: "refused-too-large",
+  REFUSED_BY_SERVER: "refused-by-server",
+  REFUSED_OTHER: "refused-other",
+  DEV_RECOMPILING: "dev-recompiling",
+  DEV_UPDATED: "dev-updated",
+  DEV_RECOMPILE_FAILED: "dev-recompile-failed"
+});
+// The longest row the boot catalog may carry.
+var __IPE_TEXT_MAX = 512;
+var __IPE_TEXT_LANG = /^[a-z]{2,3}(-[A-Za-z0-9]{1,8}){0,3}$/;
 var __IPE_BOOT_STRINGS = ["sid", "epoch", "base", "csrf"];
 var __IPE_CFG_BOOLEANS = ["bannerEnabled", "swapToast"];
-var __IPE_CFG_STRINGS = ["msgReconnecting", "msgUpdated", "msgOffline"];
+var __IPE_CFG_STRINGS = ["textLang"];
 var __IPE_TUNING_KEYS = [
   "RETRY_BASE_MS", "RETRY_MAX_MS", "RETRY_MAX_ATTEMPTS", "RETRY_FAST_MS",
   "RETRY_FAST_WINDOW_MS", "EVENT_QUEUE_MAX", "HELLO_TIMEOUT_MS", "HEARTBEAT_TTL_MS"
@@ -404,8 +428,24 @@ var __ipeBoot = (function() {
   requireType(data, "cfg", "object", "");
   var cfg = data["cfg"];
   if (!isObject(cfg)) refuse("cfg is not an object");
+  // The catalog holds exactly one row per id, each a text of bounded length;
+  // only those rows are copied, into an object with no prototype.
+  requireType(cfg, "text", "object", "cfg.");
+  var text = cfg["text"];
+  if (!isObject(text)) refuse("cfg.text is not an object");
+  var ids = Object.keys(__IPE_TEXT).map(function(name) { return __IPE_TEXT[name]; });
+  if (Object.keys(text).length !== ids.length) refuse("cfg.text is not the text catalog");
+  var catalog = Object.create(null);
+  ids.forEach(function(id) {
+    requireType(text, id, "string", "cfg.text.");
+    var row = text[id];
+    if (row.length === 0 || row.length > __IPE_TEXT_MAX) refuse("cfg.text." + id + " is not a text");
+    catalog[id] = row;
+  });
+  cfg["text"] = Object.freeze(catalog);
   __IPE_CFG_BOOLEANS.forEach(function(k) { requireType(cfg, k, "boolean", "cfg."); });
   __IPE_CFG_STRINGS.forEach(function(k) { requireType(cfg, k, "string", "cfg."); });
+  if (!__IPE_TEXT_LANG.test(cfg["textLang"])) refuse("cfg.textLang is not a language tag");
   requireType(cfg, "tuning", "object", "cfg.");
   var tuning = cfg["tuning"];
   if (!isObject(tuning)) refuse("cfg.tuning is not an object");
@@ -644,9 +684,10 @@ var __ipeRetryMaxAttempts = __ipeBootTuning["RETRY_MAX_ATTEMPTS"];
 var __ipeRetryFastMs = __ipeBootTuning["RETRY_FAST_MS"];
 var __ipeRetryFastWindowMs = __ipeBootTuning["RETRY_FAST_WINDOW_MS"];
 var __ipeEventQueueMax = __ipeBootTuning["EVENT_QUEUE_MAX"];
-var __ipeMsgReconnecting = __ipeBootCfg["msgReconnecting"];
-var __ipeMsgOffline = __ipeBootCfg["msgOffline"];
-var __ipeMsgUpdated = __ipeBootCfg["msgUpdated"];
+// The boot catalog and its language. Until boot accepts them, `__ipeSay`
+// draws from the built-in catalog.
+var __ipeText = __ipeBootCfg["text"];
+var __ipeTextLang = __ipeBootCfg["textLang"];
 var __ipeHelloTimeoutMs = __ipeBootTuning["HELLO_TIMEOUT_MS"];
 var __ipeHeartbeatTtlMs = __ipeBootTuning["HEARTBEAT_TTL_MS"];
 // Dev-watch blue-green cutover mode. Set by the `ipe dev watch` blue-green server
@@ -2040,7 +2081,7 @@ function __ipeShowReconnecting() {
   // window (a genuine connection loss), we fall through to the amber banner.
   if (__ipeSwapToast && __ipeInFastReconnect()) return;
   if (__ipeConnectionStatus() === "connected") {
-    __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
+    __ipeSetStatus("reconnecting", __IPE_TEXT.RECONNECTING);
   }
 }
 // True while still inside the fast-reconnect window after a drop. Starts the
@@ -2069,7 +2110,7 @@ function __ipeScheduleRetry() {
     delay = __ipeJitter(__ipeRetryFastMs);  // fast phase — not counted toward give-up
   } else {
     if (__ipeRetryAttempts >= __ipeRetryMaxAttempts) {
-      __ipeSetStatus("offline", __ipeMsgOffline);
+      __ipeSetStatus("offline", __IPE_TEXT.OFFLINE);
       return;
     }
     __ipeRetryAttempts++;
@@ -2730,7 +2771,9 @@ var __ipeBuildOkTimer = null;           // auto-hide timer for build-ok toast
 function __ipeConnectionStatus() {
   return __ipeStatus === "refused" ? "connected" : __ipeStatus;
 }
-function __ipeSetStatus(state, msg) {
+// Set the banner to `state`, saying text `id` (`""` says nothing) and then
+// `detail`, when given, as text.
+function __ipeSetStatus(state, id, detail) {
   // A stale document keeps its banner: no later state replaces it.
   if (__ipeStale) return;
   // A refusal that still stands keeps its notice over a recovered connection.
@@ -2752,9 +2795,17 @@ function __ipeSetStatus(state, msg) {
   classes.push("ipe-status--" + state);
   __ipeStatusEl.className = classes.join(" ");
   __ipeStatusEl.removeAttribute("data-ipe-refused");
-  if (__ipeStatusMsgEl && msg !== undefined) {
-    __ipeStatusMsgEl.textContent = msg;
+  if (__ipeStatusMsgEl && id !== undefined) {
+    __ipeSay(__ipeStatusMsgEl, id, detail);
   }
+}
+// The one sink for runtime text: `el` shows the row `id` names, then `detail`
+// when given, always as text. `""` clears `el`; an id outside `__IPE_TEXT`
+// draws nothing. Before boot accepts its catalog the built-in one answers.
+function __ipeSay(el, id, detail) {
+  var catalog = __ipeText || __IPE_TEXT_DEFAULT;
+  var row = id === "" ? "" : Object.prototype.hasOwnProperty.call(catalog, id) ? catalog[id] : "";
+  __ipeNode.setText(el, typeof detail === "string" ? row + detail : row);
 }
 
 // Show a transient green "Updated!" toast, then revert to connected.
@@ -2766,7 +2817,7 @@ function __ipeShowBuildOk() {
     clearTimeout(__ipeBuildOkTimer);
     __ipeBuildOkTimer = null;
   }
-  __ipeSetStatus("build-ok", "Updated!");
+  __ipeSetStatus("build-ok", __IPE_TEXT.DEV_UPDATED);
   var reducedMotion = window.matchMedia &&
     window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var holdMs = reducedMotion ? 2000 : 1500;
@@ -2792,7 +2843,7 @@ function __ipeInjectStatusBanner() {
 function __ipeShowBootFailure() {
   function show() {
     var built = __ipeBuildStatusEl("offline");
-    built.msgEl.textContent = "Page failed to start — reload to retry";
+    __ipeSay(built.msgEl, __IPE_TEXT.BOOT_FAILED);
     (__ipeDoc.body() || __ipeDoc.root()).appendChild(built.el);
   }
   if (__ipeDoc.body()) show();
@@ -2814,36 +2865,37 @@ function __ipeShowStale() {
       __ipeStatusMsgEl = built.msgEl;
     }
     __ipeStatusEl.className = "ipe-status ipe-status--offline";
-    __ipeStatusMsgEl.textContent = "Page is out of date \u2014 reload";
+    __ipeSay(__ipeStatusMsgEl, __IPE_TEXT.STALE);
   }
   if (__ipeDoc.body()) show();
   else __ipeDoc.on("DOMContentLoaded", show);
 }
 // The notice for a session the server closed, by the frame's tag. The text is
-// the client's own: the tag only picks it, and a tag outside this set gets the
-// generic notice.
+// the client's own: the tag only picks its id, and a tag outside this set gets
+// the generic notice.
 function __ipeClosedNotice(tag) {
   switch (tag) {
     case "over_ceiling":
-      return "This page grew past its session limit and was closed \u2014 reload to start over";
+      return __IPE_TEXT.CLOSED_OVER_CEILING;
     case "revoked":
-      return "Your sign-in is no longer valid \u2014 reload to sign in again";
+      return __IPE_TEXT.CLOSED_REVOKED;
     case "ended":
-      return "This session has ended \u2014 reload to start a new one";
+      return __IPE_TEXT.CLOSED_ENDED;
     default:
-      return "This session was closed \u2014 reload to start a new one";
+      return __IPE_TEXT.CLOSED_OTHER;
   }
 }
 // The notice for an event the server refused, by its answer kind. The text is
-// the client's own, and a kind outside this set gets the generic notice.
+// the client's own: the kind only picks its id, and a kind outside this set
+// gets the generic notice.
 function __ipeRefusedNotice(kind) {
   switch (kind) {
     case __IPE_EVENT_ANSWER.TOO_LARGE:
-      return "This change is too large to send and was not saved \u2014 shorten it and try again";
+      return __IPE_TEXT.REFUSED_TOO_LARGE;
     case __IPE_EVENT_ANSWER.REFUSED:
-      return "The server refused this action and did not apply it \u2014 reload the page";
+      return __IPE_TEXT.REFUSED_BY_SERVER;
     default:
-      return "The server did not apply this action \u2014 reload the page";
+      return __IPE_TEXT.REFUSED_OTHER;
   }
 }
 // Show the notice for a refused event. It ignores the banner setting: a write
@@ -2868,7 +2920,7 @@ function __ipeShowRefused(kind) {
     }
     __ipeStatusEl.className = "ipe-status ipe-status--offline";
     __ipeStatusEl.setAttribute("data-ipe-refused", kind);
-    __ipeStatusMsgEl.textContent = notice;
+    __ipeSay(__ipeStatusMsgEl, notice);
   }
   if (__ipeDoc.body()) show();
   else __ipeDoc.on("DOMContentLoaded", show);
@@ -2909,7 +2961,7 @@ function __ipeEndSession(tag) {
     }
     __ipeStatusEl.className = "ipe-status ipe-status--offline";
     __ipeStatusEl.setAttribute("data-ipe-closed", "1");
-    __ipeStatusMsgEl.textContent = notice;
+    __ipeSay(__ipeStatusMsgEl, notice);
   }
   if (__ipeDoc.body()) show();
   else __ipeDoc.on("DOMContentLoaded", show);
@@ -2923,6 +2975,8 @@ function __ipeBuildStatusEl(state) {
   el.className = "ipe-status ipe-status--" + state;
   el.setAttribute("role", "status");
   el.setAttribute("aria-live", "polite");
+  // The banner's text is in the catalog's language, which may not be the page's.
+  el.setAttribute("lang", __ipeText ? __ipeTextLang : __IPE_TEXT_DEFAULT_LANG);
   // Inline styles — no global stylesheet leak. Max z-index puts the
   // banner above any user fixed-position element. Fixed position
   // bottom-center; transitions for fade in/out feel less jarring.
@@ -2983,7 +3037,7 @@ function __ipeShowSwapToast() {
     __ipeDoc.body().appendChild(el);
     __ipeSwapToastEl = el;
   }
-  el.textContent = __ipeMsgUpdated;
+  __ipeSay(el, __IPE_TEXT.SWAP_UPDATED);
   // Force a style flush so the opacity transition runs on re-show.
   el.style.opacity = "0";
   void el.offsetWidth;
@@ -3105,7 +3159,7 @@ function __ipeOpenSSE() {
       // "updated ✓" toast takes over. A drop that outlasts the window is a real
       // outage and still paints the banner.
       if (__ipeSwapToast && __ipeInFastReconnect()) return;
-      __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
+      __ipeSetStatus("reconnecting", __IPE_TEXT.RECONNECTING);
     }, 500);
   });
 }
@@ -3292,9 +3346,9 @@ var __ipeLiveFrames = {
     if (data.phase === "recompiling") {
       // A rebuild is in flight — a multi-second silent window otherwise. Show a
       // soft-yellow "Recompiling app" banner until the ok/error result lands.
-      if (__ipeBannerEnabled) __ipeSetStatus("recompiling", "Recompiling app");
+      if (__ipeBannerEnabled) __ipeSetStatus("recompiling", __IPE_TEXT.DEV_RECOMPILING);
     } else if (data.ok === false && typeof data.error === "string") {
-      __ipeSetStatus("build-failed", "Recompilation failed \xB7 " + data.error);
+      __ipeSetStatus("build-failed", __IPE_TEXT.DEV_RECOMPILE_FAILED, data.error);
     } else if (data.ok === true) {
       // A successful rebuild or an appearance hot-swap that recovers from a prior
       // failure: show the green "Updated!" toast to confirm the change landed. A
@@ -3350,7 +3404,7 @@ function __ipeForceReopenSSE() {
   try { if (__ipeSSE) __ipeSSE.close(); } catch (_) {}
   __ipeSSE = null;
   if (__ipeConnectionStatus() === "connected") {
-    __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
+    __ipeSetStatus("reconnecting", __IPE_TEXT.RECONNECTING);
   }
   // Session-loss probe: when the SSE is wedged (typically a server
   // restart with the memory store, or a package.ipe [live] store change
@@ -3374,7 +3428,7 @@ function __ipeForceReopenSSE() {
   } else {
     __ipeRetryAttempts++;
     if (__ipeRetryAttempts >= __ipeRetryMaxAttempts && __ipeStatus !== "offline") {
-      __ipeSetStatus("offline", __ipeMsgOffline);
+      __ipeSetStatus("offline", __IPE_TEXT.OFFLINE);
     }
     delay = __ipeExpBackoffDelay();
   }
@@ -3599,8 +3653,8 @@ function __ipeLiveMirror(live, status) {
   if (status === mine) return;
   if (__ipeLiveStatuses.indexOf(status) < 0 || __ipeLiveStatuses.indexOf(mine) < 0) return;
   if (status === "connected") __ipeSetStatus("connected", "");
-  else if (status === "reconnecting") __ipeSetStatus("reconnecting", __ipeMsgReconnecting);
-  else __ipeSetStatus("offline", __ipeMsgOffline);
+  else if (status === "reconnecting") __ipeSetStatus("reconnecting", __IPE_TEXT.RECONNECTING);
+  else __ipeSetStatus("offline", __IPE_TEXT.OFFLINE);
 }
 // Every message is checked for its shape: any script of the origin can post
 // on the channel.
