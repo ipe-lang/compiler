@@ -56,12 +56,6 @@ const ALLOWED: &[(&str, &str, Breach, usize)] = &[
         1,
     ),
     ("project.rs", "apply_cargo_name", Breach::HandQuote, 1),
-    (
-        "project.rs",
-        "async_runtime_cargo_toml",
-        Breach::HandQuote,
-        1,
-    ),
     ("project.rs", "compression_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "config_cargo_toml", Breach::HandQuote, 1),
     ("project.rs", "crypto_cargo_toml", Breach::HandQuote, 1),

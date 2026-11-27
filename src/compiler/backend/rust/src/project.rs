@@ -310,9 +310,7 @@ url = "2"
 chrono = "=0.4.45"
 rust_decimal = { version = "1", features = ["serde"] }
 hmac = "0.12"
-sha1 = "0.10"
 sha2 = "0.10"
-md-5 = "0.10"
 subtle = "2"
 zeroize = "1"
 # Pinned exact to match `src/runtime/rust/Cargo.toml`'s own `wasm-bindgen` pin
@@ -1029,7 +1027,7 @@ const RUNTIME_MOD_RS_HTTP_CLIENT_APPEND: &str = "pub mod http_client;\npub use h
 
 /// Lines appended to `ipe_runtime/mod.rs` for the SSRF deny-private validators.
 ///
-/// `ssrf.rs` parses URLs with the `url` crate (unconditional base dep) and is
+/// `ssrf.rs` parses URLs with the `url` crate (added by [`url_cargo_toml`]) and is
 /// reqwest-free. Its validators are consumed by the `http_client`, `ws_client`,
 /// and `db` modules (the latter calls `VettedDial` in `VettedPool::connect` and
 /// `external_conn.rs` uses it unconditionally).
@@ -1258,8 +1256,9 @@ const RUNTIME_MOD_RS_ENCODING_APPEND: &str = "pub mod encoding;\npub use encodin
 /// `string_is_url` validator moved in from `string.rs` (the only other regex-crate
 /// user), so `String.isUrl` reaches it too. Declared only on demand — behind the
 /// `regex` feature, which [`runtime_features`] selects under the same
-/// [`EmitCtx::uses_regex`] condition and [`regex_cargo_toml`] adds the dep for. A
-/// standalone leaf: no surface implies it.
+/// [`EmitCtx::uses_regex`] condition; its [`MOD_APPENDS`] row names the `regex`
+/// crate, so the manifest declares it exactly when the module is. A standalone
+/// leaf: no surface implies it.
 const RUNTIME_MOD_RS_REGEX_APPEND: &str = "pub mod regex_kernel;\npub use regex_kernel::*;\n";
 
 // ── Ipe.Uuid — v4 / v7 / parse ──────────────────────────────────────────────
@@ -1273,8 +1272,9 @@ const RUNTIME_MOD_RS_REGEX_APPEND: &str = "pub mod regex_kernel;\npub use regex_
 ///
 /// `uuid_kernel.rs` exposes the `Ipe.Uuid` kernels. Declared only on demand —
 /// behind the `uuid` runtime feature, which [`runtime_features`] selects under the
-/// same [`EmitCtx::reaches_uuid`] condition. A bare Program that reaches none drops
-/// the crate.
+/// same [`EmitCtx::reaches_uuid`] condition. Its [`MOD_APPENDS`] row, and the
+/// `auth` row, name the `uuid` crate, so a bare Program that reaches neither
+/// declares no `uuid` dependency.
 const RUNTIME_MOD_RS_UUID_APPEND: &str = "pub mod uuid_kernel;\npub use uuid_kernel::*;\n";
 
 // ── Ipe.Random — non-cryptographic PRNG ─────────────────────────────────────
@@ -1331,7 +1331,8 @@ const RUNTIME_MOD_RS_JWT_APPEND: &str = "pub mod jwt;\npub use jwt::*;\n";
 /// kernels (`Auth.hashPassword` / `verifyPassword` / `signToken` /
 /// `verifyToken` / `register` / `login` / `setRole` etc.).
 ///
-/// `auth.rs` requires `bcrypt` (password hashing, an unconditional base dep) and
+/// `auth.rs` requires `bcrypt` (password hashing) and `uuid` (session ids), the
+/// two crates its [`MOD_APPENDS`] row names, and
 /// reaches `crate::jwt` for JWT signing/verification. The `jwt` module and its
 /// `jsonwebtoken` dependency are gated (see [`RUNTIME_MOD_RS_JWT_APPEND`] /
 /// [`jwt_cargo_toml`]), so the backend force-declares `jwt` alongside `auth`
@@ -1391,7 +1392,8 @@ const RUNTIME_MOD_RS_WEBSOCKET_APPEND: &str = "pub mod ws_client;\npub use ws_cl
 /// `ssrf_apply` request hardening), so `uses_email` also pulls the
 /// `http_client` module and the `reqwest` dep via the shared HTTP-client
 /// predicate in [`assemble_project_files`]. Its other crates (`base64` /
-/// `hmac` / `sha2` / `serde_json` / `url`) are unconditional base deps; `lettre`
+/// `hmac` / `sha2` / `serde_json`) are unconditional base deps, `url` comes with
+/// the `url` module it reaches; `lettre`
 /// (the SMTP transport) is the one extra dep added by [`email_cargo_toml`] when
 /// `uses_email` is set. No runtime feature flag is involved — the emitted crate
 /// vendors the source directly, so declaring the module + adding `lettre` is
@@ -2938,6 +2940,11 @@ struct ModAppend {
     gate: fn(&EmitCtx) -> bool,
     /// The lines appended to `ipe_runtime/mod.rs` when `gate` holds.
     append: &'static str,
+    /// The crates the appended modules compile against that no floor module
+    /// names: the vendored manifest declares each exactly when some row naming
+    /// it is declared, so a program never carries a dependency no compiled
+    /// module uses.
+    deps: &'static [crate_specs::CrateSpec],
 }
 
 /// The ordered vendored-runtime `pub mod` append walk, ONE row per module.
@@ -2963,65 +2970,80 @@ const MOD_APPENDS: &[ModAppend] = &[
                 .vendors(crate::runtime_features::RuntimeFeature::Encoding)
         },
         append: RUNTIME_MOD_RS_ENCODING_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_regex,
         append: RUNTIME_MOD_RS_REGEX_APPEND,
+        deps: &[crate_specs::REGEX],
     },
     ModAppend {
         gate: |ctx| ctx.reaches_uuid(),
         append: RUNTIME_MOD_RS_UUID_APPEND,
+        deps: &[crate_specs::UUID],
     },
     ModAppend {
         gate: |ctx| ctx.reaches_random(),
         append: RUNTIME_MOD_RS_RANDOM_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_db,
         append: RUNTIME_MOD_RS_DB_APPEND,
+        deps: &[],
     },
     // `url` before `http_client`/`ssrf`: both `use crate::url::…` / `use url::Url`.
     ModAppend {
         gate: |ctx| ctx.reaches_url(),
         append: RUNTIME_MOD_RS_URL_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.reaches_http_client(),
         append: RUNTIME_MOD_RS_HTTP_CLIENT_APPEND,
+        deps: &[],
     },
     // `http_stream` after `http_client` (it calls `crate::http_client::…`).
     ModAppend {
         gate: |ctx| ctx.uses_http,
         append: RUNTIME_MOD_RS_HTTP_STREAM_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.reaches_ssrf(),
         append: RUNTIME_MOD_RS_SSRF_APPEND,
+        deps: &[],
     },
     // `db_dsn` after `ssrf`/`url` (`external_conn.rs` reaches both).
     ModAppend {
         gate: |ctx| ctx.uses_db,
         append: RUNTIME_MOD_RS_DB_DSN_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_config,
         append: RUNTIME_MOD_RS_CONFIG_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_compression,
         append: RUNTIME_MOD_RS_COMPRESS_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_csv,
         append: RUNTIME_MOD_RS_CSV_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_crypto,
         append: RUNTIME_MOD_RS_CRYPTO_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.reaches_jwt(),
         append: RUNTIME_MOD_RS_JWT_APPEND,
+        deps: &[],
     },
     // `tea` before every render/effect surface whose module imports `IpeCmd`/`IpeSub`.
     ModAppend {
@@ -3035,18 +3057,22 @@ const MOD_APPENDS: &[ModAppend] = &[
                 || ctx.uses_webview
         },
         append: RUNTIME_MOD_RS_TEA_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.serves(),
         append: RUNTIME_MOD_RS_SERVER_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_websocket,
         append: RUNTIME_MOD_RS_WEBSOCKET_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_auth || ctx.reaches_jwt(),
         append: RUNTIME_MOD_RS_AUTH_APPEND,
+        deps: &[crate_specs::BCRYPT, crate_specs::UUID],
     },
     ModAppend {
         gate: |ctx| {
@@ -3057,57 +3083,70 @@ const MOD_APPENDS: &[ModAppend] = &[
                 || ctx.reaches_jwt()
         },
         append: RUNTIME_MOD_RS_PRINCIPAL_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.declares_revocation(),
         append: RUNTIME_MOD_RS_REVOCATION_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_email,
         append: RUNTIME_MOD_RS_EMAIL_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_locale,
         append: RUNTIME_MOD_RS_LOCALE_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_env_public,
         append: RUNTIME_MOD_RS_ENV_PUBLIC_APPEND,
+        deps: &[],
     },
     // Render stack, dependency order: `seal_codec` before `css` before `ui`.
     ModAppend {
         gate: |ctx| ctx.uses_ui || ctx.uses_tui || ctx.uses_web || ctx.uses_webview,
         append: RUNTIME_MOD_RS_SEAL_CODEC_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_ui || ctx.uses_css || ctx.uses_tui || ctx.uses_web || ctx.uses_webview,
         append: RUNTIME_MOD_RS_CSS_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_ui || ctx.uses_tui || ctx.uses_web || ctx.uses_webview,
         append: RUNTIME_MOD_RS_UI_APPEND,
+        deps: &[],
     },
     // `literal_table` before the render/web modules that `use crate::literal_table`.
     ModAppend {
         gate: |ctx| ctx.uses_web || ctx.uses_webview || ctx.uses_tui || ctx.uses_console,
         append: RUNTIME_MOD_RS_LITERAL_TABLE_APPEND,
+        deps: &[],
     },
     // `web_core` (the ONE real `web` module) before the served `web` surface.
     ModAppend {
         gate: |ctx| ctx.uses_web || ctx.uses_webview,
         append: RUNTIME_MOD_RS_WEB_CORE_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_web,
         append: RUNTIME_MOD_RS_WEB_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_tui || ctx.uses_console,
         append: RUNTIME_MOD_RS_TUI_APPEND,
+        deps: &[],
     },
     ModAppend {
         gate: |ctx| ctx.uses_webview,
         append: RUNTIME_MOD_RS_WEBVIEW_APPEND,
+        deps: &[],
     },
 ];
 
@@ -3468,7 +3507,7 @@ fn assemble_project_text(
     // are used. Db, TEA, and Server are independent features; a program may use
     // any combination. The order: db first, then server; both modify the same
     // base manifest so we chain the transformations.
-    // The async spine (`tokio` + `futures-util` + the `"tokio"` default feature)
+    // The async spine (`tokio` + the `"tokio"` default feature)
     // is off the base template and restored here whenever the program needs the
     // reactor. This runs FIRST, before every per-surface surgery, so their
     // `default = ["tokio", "json"]` anchor sees the restored spine.
@@ -3545,8 +3584,9 @@ fn assemble_project_text(
     };
     // Ipe.Email: `email.rs` needs the `lettre` crate for the SMTP transport
     // (`reqwest`, reached through `http_client`, is added by the HTTP-client
-    // step below; every other crate it uses — `base64` / `hmac` / `sha2` /
-    // `serde_json` / `url` — is already an unconditional base-manifest dep).
+    // step below; of the other crates it uses, `hmac` / `sha2` / `serde_json`
+    // are base-manifest deps, `base64` rides the `encoding` feature the
+    // runtime's `email` implies, and `url` comes with the `url` module row).
     // Add `lettre` only when the program uses `Email.send`.
     let cargo_toml = if ctx.uses_email {
         email_cargo_toml(&cargo_toml)?
@@ -3676,25 +3716,26 @@ fn assemble_project_text(
         &cargo_toml,
         &crate::runtime_features::runtime_features(ctx),
     )?;
-    // Foreign-crate FFI: append the bound crates' pinned [dependencies] lines
-    // (exact versions + effective feature sets, pre-merged by the driver).
-    let cargo_toml = if ctx.uses_ffi {
-        ffi_cargo_toml(&cargo_toml, ctx)?
-    } else {
-        cargo_toml
-    };
     // The vendored `ipe_runtime/mod.rs`: the base default plus one `pub mod`
     // append per reached module, in the dependency order fixed by `MOD_APPENDS`
-    // (a module is declared before any module that imports it).
+    // (a module is declared before any module that imports it). The manifest
+    // names the crates of exactly the declared rows.
+    let declared: Vec<&ModAppend> = MOD_APPENDS.iter().filter(|row| (row.gate)(ctx)).collect();
     let runtime_mod_rs = {
         let mut mod_rs = RUNTIME_MOD_RS.to_owned();
-        for append in MOD_APPENDS {
-            if (append.gate)(ctx) {
-                mod_rs.push_str(append.append);
-            }
+        for row in &declared {
+            mod_rs.push_str(row.append);
         }
         mod_rs
     };
+    // Foreign-crate FFI: the bound crates' pinned [dependencies] lines (exact
+    // versions + effective feature sets, pre-merged by the driver).
+    let ffi_dep_lines = if ctx.uses_ffi {
+        Some(ffi_emit(ctx)?.dep_lines.as_slice())
+    } else {
+        None
+    };
+    let cargo_toml = vendored_dependencies(&cargo_toml, &declared, ffi_dep_lines)?;
 
     let mut files = BTreeMap::new();
     // The emitted Rust source files: `src/main.rs` always, plus one
@@ -4463,6 +4504,30 @@ fn runtime_projection_cargo_toml(
         })
 }
 
+/// The key an entry line of a dependency table declares; `None` for a blank,
+/// comment, or header line.
+fn dependency_key(line: &str) -> Option<&str> {
+    let text = line.trim();
+    if text.is_empty() || text.starts_with('#') || text.starts_with('[') {
+        return None;
+    }
+    text.split_once('=').map(|(key, _)| key.trim())
+}
+
+/// Every key the `header` table of `manifest` declares.
+fn dependency_keys<'a>(manifest: &'a str, header: &str) -> std::collections::BTreeSet<&'a str> {
+    let mut keys = std::collections::BTreeSet::new();
+    let mut in_table = false;
+    for line in manifest.lines() {
+        if line.starts_with('[') {
+            in_table = line.trim() == header;
+        } else if in_table && let Some(key) = dependency_key(line) {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
 /// Append `deps` to the manifest's `[dependencies]` table, after its last entry.
 ///
 /// The insertion point is read from the table itself, never from the section
@@ -4509,6 +4574,21 @@ fn append_dependencies(base: &str, deps: &str, where_: &'static str) -> DResult<
     if entries.is_empty() {
         return Ok(base.to_owned());
     }
+    let mut keys = dependency_keys(base, HEADER);
+    for line in entries.lines() {
+        let Some(key) = dependency_key(line) else {
+            continue;
+        };
+        if !keys.insert(key) {
+            return Err(Diagnostic::CompilerBug {
+                where_,
+                detail: format!(
+                    "dependency `{key}` would be declared twice in `{HEADER}` — a duplicate \
+                     key cargo refuses"
+                ),
+            });
+        }
+    }
     let (head, tail) = base.split_at_checked(at).ok_or_else(drift)?;
     let mut out = String::with_capacity(base.len() + entries.len() + 2);
     out.push_str(head);
@@ -4521,17 +4601,49 @@ fn append_dependencies(base: &str, deps: &str, where_: &'static str) -> DResult<
     Ok(out)
 }
 
+/// Append the crates of the declared `rows` to the `[dependencies]` table.
+///
+/// Each crate is named once, in the order its first declaring row comes in
+/// [`MOD_APPENDS`], so the manifest is deterministic and a crate two declared
+/// modules share is not doubled.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the manifest does not carry exactly
+/// one `[dependencies]` header — a golden-drift invariant violation.
+fn module_deps_cargo_toml(base: &str, rows: &[&ModAppend]) -> DResult<String> {
+    let mut named: Vec<&str> = Vec::new();
+    let mut lines = String::new();
+    for spec in rows.iter().flat_map(|row| row.deps) {
+        if !named.contains(&spec.name) {
+            named.push(spec.name);
+            let pinned = crate_specs::PinnedCrate {
+                spec: *spec,
+                default_features: true,
+                features: &[],
+            };
+            lines.push_str(&pinned.dependency_line(&[]));
+            lines.push('\n');
+        }
+    }
+    append_dependencies(
+        base,
+        &lines,
+        "ipe_backend_rust::project::module_deps_cargo_toml",
+    )
+}
+
 /// Build the web-enabled `Cargo.toml` from the given base manifest by:
 ///
 /// 1. Adding `"web"` to the `default` feature list.
-/// 2. Inserting `async-trait` and `serde_urlencoded` as explicit dependencies
-///    to the `[dependencies]` table.
+/// 2. Inserting `async-trait` as an explicit dependency to the
+///    `[dependencies]` table.
 ///
-/// These two crates are required because the runtime's `web` feature enables
-/// code that imports them (`async-trait` in `web/store.rs` and
-/// `serde_urlencoded` in `web/form.rs`).  The emitted project vendors the
-/// runtime source directly, so these must appear as explicit `[dependencies]`
-/// in the emitted manifest.
+/// The crate is required because the runtime's `web` feature enables code
+/// that imports it (`web/store.rs`). The emitted project vendors the runtime
+/// source directly, so it must appear as an explicit `[dependencies]` entry in
+/// the emitted manifest. `serde_urlencoded` rides the `web-core` feature
+/// `web` implies.
 ///
 /// The base manifest already declares `web = []` as a non-default feature
 /// (present in the golden's `[features]` section).  This function promotes
@@ -4557,9 +4669,10 @@ fn web_cargo_toml(base: &str) -> DResult<String> {
     // cfg-gated declaration covers every need — adding it again would emit a
     // duplicate `rustix` key and produce invalid TOML.
     // Versions + names from the SSOT; this is a bare `name = "ver"` dep.
-    // `serde_urlencoded` is NOT appended here: it is an unconditional base
-    // manifest dep now (`dom/form.rs` is always vendored). `rustix` is NOT
-    // appended either — see the note above.
+    // `serde_urlencoded` is NOT appended here: the base manifest's `web-core`
+    // feature, which `web` implies, turns it on for its one user, the
+    // `web-core`-gated `dom/form.rs`. `rustix` is NOT appended either — see the
+    // note above.
     let web_deps = format!(
         "{} = \"{}\"\n\n",
         crate_specs::ASYNC_TRAIT.name,
@@ -4810,8 +4923,9 @@ fn replace_feature_line(
 /// 2. Appending `tokio-tungstenite` (the handshake only), `tokio-rustls`,
 ///    `rustls` and `webpki-roots` to the `[dependencies]` table, each rendered from its
 ///    [`crate_specs`] pin: the runtime owns the `wss://` TLS and trusts
-///    `webpki-roots` alone (`futures-util` and `url`, its other deps, are
-///    already in the base).
+///    `webpki-roots` alone (`futures-util`, its other dep, is the base
+///    template's optional entry the `websocket_client` feature turns on, and
+///    `url` comes with the `url` module row).
 ///
 /// # Errors
 ///
@@ -4942,9 +5056,10 @@ fn promote_default_feature(base: &str, feature: &str, where_: &'static str) -> D
 ///
 /// `email.rs` (the vendored `Ipe.Email` runtime module) needs `lettre` for the
 /// SMTP transport; `reqwest` (which it reaches through `http_client`) is added
-/// by [`http_client_cargo_toml`] under the shared HTTP-client predicate, and
-/// every other crate it uses (`base64` / `hmac` / `sha2` / `serde_json` /
-/// `url`) is already an unconditional base-manifest dependency. The emitted
+/// by [`http_client_cargo_toml`] under the shared HTTP-client predicate; of the
+/// other crates it uses, `hmac` / `sha2` / `serde_json` are base-manifest
+/// dependencies, `base64` rides the `encoding` feature the runtime's `email`
+/// implies, and `url` comes with the `url` module row. The emitted
 /// crate declares the `email` module through the `mod.rs` append; the `email`
 /// feature is promoted as well, mirroring the runtime crate, because the
 /// vendored `ssrf.rs` gates the dial helpers `email.rs` reaches on it.
@@ -5027,13 +5142,8 @@ fn locale_cargo_toml(base: &str) -> DResult<String> {
 /// Returns [`Diagnostic::CompilerBug`] if the `[dependencies]` table is absent —
 /// a golden-drift invariant violation (fail-loud, never a silent no-op).
 fn url_cargo_toml(base: &str) -> DResult<String> {
-    // `tinyvec` is a transitive dep of `idna` (pulled by `url 2.x`). Version
-    // 1.13+ uses `vec!` in a way that requires the `std` feature; without it
-    // the emitted project's `cargo build` fails with "cannot find macro `vec`
-    // in this scope". Declaring it here forces the feature on via cargo's
-    // feature-unification for every vendored emitted project that reaches url.
     let url_dep = format!(
-        "{} = \"{}\"\ntinyvec = {{ version = \"1\", features = [\"std\"] }}\n\n",
+        "{} = \"{}\"\n\n",
         crate_specs::URL.name,
         crate_specs::URL.version,
     );
@@ -5309,7 +5419,7 @@ fn vendored_tokio_for(
 ///
 /// The base template ships NO async runtime: a pure program (only `Io.println`,
 /// string / list / math / json computation, the pure `Task` monad ops) enters
-/// through the std-only `block_on` and links neither `tokio` nor `futures-util`.
+/// through the std-only `block_on` and links no `tokio`.
 /// A program that reaches ANY reactor-requiring kernel
 /// ([`EmitCtx::uses_async_runtime`]) restores the spine:
 ///
@@ -5320,16 +5430,17 @@ fn vendored_tokio_for(
 /// 2. write the `tokio` dependency as the first `[dependencies]` line (before
 ///    `dlmalloc`), enabling exactly the given `tokio` features — the one place
 ///    the line is written; no later step edits it.
-/// 3. re-add `futures-util` in its original slot (after the `bcrypt` base dep).
 ///
-/// The `tokio` / `futures-util` versions come from the [`crate_specs`] SSOT
-/// (drift-guarded against `runtime/Cargo.toml`).
+/// The `tokio` version comes from the [`crate_specs`] SSOT (drift-guarded
+/// against `runtime/Cargo.toml`). `futures-util` is not part of the spine: the
+/// template declares it optional, turned on by the features whose sources name
+/// it (`server`, `http_client`, `websocket_client`).
 ///
 /// # Errors
 ///
-/// Returns [`Diagnostic::CompilerBug`] if the `default = ["json"]`, `dlmalloc`,
-/// or `bcrypt` anchor is absent — a golden-drift invariant violation (fail-loud,
-/// never a silent no-op that would emit an async program without a runtime).
+/// Returns [`Diagnostic::CompilerBug`] if the `default = ["json"]` or `dlmalloc`
+/// anchor is absent — a golden-drift invariant violation (fail-loud, never a
+/// silent no-op that would emit an async program without a runtime).
 fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResult<String> {
     const DEFAULT_ANCHOR: &str = r#"default = ["json"]"#;
     const DEFAULT_RESTORED: &str = r#"default = ["tokio", "json"]"#;
@@ -5337,14 +5448,7 @@ fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResu
     // dependency. Anchor on the full `dlmalloc` dep spelling (not a bare
     // `dlmalloc = `, which also occurs inside the `alloc_dlmalloc` FEATURE line).
     const DLMALLOC_ANCHOR: &str = r#"dlmalloc = { version = "0.2""#;
-    // `futures-util` followed the `bcrypt` base dep.
-    const BCRYPT_ANCHOR: &str = "bcrypt = \"0.17\"\n";
     let tokio_dep = crate_specs::tokio_dependency_line(tokio) + "\n";
-    let futures_dep = format!(
-        "{} = \"{}\"\n",
-        crate_specs::FUTURES_UTIL.name,
-        crate_specs::FUTURES_UTIL.version,
-    );
 
     let bug = |anchor: &str| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::project::async_runtime_cargo_toml",
@@ -5361,21 +5465,11 @@ fn async_runtime_cargo_toml(base: &str, tokio: &BTreeSet<TokioFeature>) -> DResu
     let dl_at = step1
         .find(DLMALLOC_ANCHOR)
         .ok_or_else(|| bug(DLMALLOC_ANCHOR))?;
-    let mut step2 = String::with_capacity(step1.len() + tokio_dep.len() + futures_dep.len());
+    let mut step2 = String::with_capacity(step1.len() + tokio_dep.len());
     step2.push_str(step1.get(..dl_at).unwrap_or(""));
     step2.push_str(&tokio_dep);
     step2.push_str(step1.get(dl_at..).unwrap_or(""));
-
-    // Step 3 — restore the `futures-util` line after the `bcrypt` base dep.
-    let bc_at = step2
-        .find(BCRYPT_ANCHOR)
-        .map(|p| p + BCRYPT_ANCHOR.len())
-        .ok_or_else(|| bug(BCRYPT_ANCHOR))?;
-    let mut result = String::with_capacity(step2.len() + futures_dep.len());
-    result.push_str(step2.get(..bc_at).unwrap_or(""));
-    result.push_str(&futures_dep);
-    result.push_str(step2.get(bc_at..).unwrap_or(""));
-    Ok(result)
+    Ok(step2)
 }
 
 /// Build the heavy-`Ipe.Crypto`-enabled `Cargo.toml` by appending the five
@@ -5783,17 +5877,59 @@ fn json_string(s: &str) -> String {
 /// [`Diagnostic::CompilerBug`] when the FFI emission inputs are absent while
 /// the program uses FFI, or when the manifest anchor drifted.
 fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
-    let ffi = ctx.ffi.as_ref().ok_or_else(|| Diagnostic::CompilerBug {
+    ffi_dependencies_cargo_toml(base, &ffi_emit(ctx)?.dep_lines)
+}
+
+/// The FFI emission inputs of a program that lowers a foreign-wrapper call.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when the driver supplied none.
+fn ffi_emit<'c>(ctx: &'c EmitCtx<'_>) -> DResult<&'c crate::FfiEmit> {
+    ctx.ffi.as_ref().ok_or_else(|| Diagnostic::CompilerBug {
         where_: "ipe_backend_rust::project::ffi_cargo_toml",
         detail: "program lowers foreign-wrapper calls but the driver supplied no FFI \
                  emission inputs (RustBackend::with_ffi)"
             .to_owned(),
-    })?;
+    })
+}
+
+/// The vendored manifest's dependency tail: the crates of the declared
+/// [`MOD_APPENDS`] rows, then the bound FFI crates. The rows go first so a
+/// bound crate of the same name reuses the row's entry instead of declaring
+/// the key twice.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when an anchor is absent or a
+/// dependency key would be declared twice.
+fn vendored_dependencies(
+    base: &str,
+    rows: &[&ModAppend],
+    ffi_dep_lines: Option<&[String]>,
+) -> DResult<String> {
+    let with_rows = module_deps_cargo_toml(base, rows)?;
+    match ffi_dep_lines {
+        Some(lines) => ffi_dependencies_cargo_toml(&with_rows, lines),
+        None => Ok(with_rows),
+    }
+}
+
+/// Append the bound FFI crates' `dep_lines` to `base`.
+///
+/// # Errors
+///
+/// Returns [`Diagnostic::CompilerBug`] when an anchor is absent.
+fn ffi_dependencies_cargo_toml(base: &str, dep_lines: &[String]) -> DResult<String> {
+    const WHERE: &str = "ipe_backend_rust::project::ffi_cargo_toml";
     // Keys the base manifest already declares under a `[...dependencies]`
     // table: re-declaring one (uuid's transitive `futures-util`, say) is a
     // hard `cargo` duplicate-key error, so those lines are skipped — the
-    // base pin governs and cargo's resolver unifies the shared graph.
-    let mut base_keys: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    // base pin governs and cargo's resolver unifies the shared graph. A key
+    // the base declares `optional` is off unless a feature turns it on, so a
+    // bound crate of that name is switched on through `default` (`dep:`
+    // enables the crate alone, never the runtime feature of the same name).
+    let mut base_keys: std::collections::BTreeMap<&str, bool> = std::collections::BTreeMap::new();
     let mut in_deps = false;
     for raw in base.lines() {
         let line = raw.trim();
@@ -5801,25 +5937,33 @@ fn ffi_cargo_toml(base: &str, ctx: &EmitCtx) -> DResult<String> {
             in_deps = line.contains("dependencies");
             continue;
         }
-        if in_deps && let Some((name, _)) = line.split_once('=') {
-            base_keys.insert(name.trim());
+        if in_deps && let Some((name, value)) = line.split_once('=') {
+            let optional = value
+                .split([',', '{', '}'])
+                .any(|field| field.split_whitespace().collect::<String>() == "optional=true");
+            base_keys.insert(name.trim(), optional);
         }
     }
     let mut dep_block = String::new();
-    for line in &ffi.dep_lines {
+    let mut turned_on: Vec<&str> = Vec::new();
+    for line in dep_lines {
         let key = line.split('=').next().unwrap_or(line).trim();
-        if base_keys.contains(key) {
-            continue;
+        match base_keys.get(key) {
+            Some(true) => turned_on.push(key),
+            Some(false) => {}
+            None => {
+                dep_block.push_str(line);
+                dep_block.push('\n');
+            }
         }
-        dep_block.push_str(line);
-        dep_block.push('\n');
     }
     dep_block.push('\n');
-    append_dependencies(
-        base,
-        &dep_block,
-        "ipe_backend_rust::project::ffi_cargo_toml",
-    )
+    let base = turned_on
+        .into_iter()
+        .try_fold(base.to_owned(), |toml, key| {
+            promote_default_feature(&toml, &format!("dep:{key}"), WHERE)
+        })?;
+    append_dependencies(&base, &dep_block, WHERE)
 }
 
 /// Emit the `into_sql_param` impl for `SqlValue` and `into_field_param` impl
@@ -5930,6 +6074,9 @@ mod tests {
         insert_wasi_linker_config, jwt_cargo_toml, promote_default_feature, runtime_bindings,
         server_cargo_toml, shake_ffi_by_fn_ident, wasm_hydrate_entry, wasm_present_modules,
         wasm_runtime_bindings, web_cargo_toml, websocket_cargo_toml, wrapper_call_paths,
+    };
+    use super::{
+        MOD_APPENDS, ModAppend, append_dependencies, dependency_keys, vendored_dependencies,
     };
     use crate::DbDriver;
     use crate::crate_specs;
@@ -6125,7 +6272,7 @@ mod tests {
         );
         // Feature declaration must be present.
         assert!(
-            out.contains("server = []"),
+            out.lines().any(|l| l == r#"server = ["dep:futures-util"]"#),
             "manifest must declare the server feature: {out}"
         );
         // The tokio line is written once, by the async restore; the server
@@ -6187,7 +6334,7 @@ mod tests {
             "manifest must declare the db feature: {out}"
         );
         assert!(
-            out.contains("server = []"),
+            out.lines().any(|l| l == r#"server = ["dep:futures-util"]"#),
             "manifest must declare the server feature: {out}"
         );
         // sqlx dep (from db_cargo_toml) plus axum dep (from server_cargo_toml)
@@ -6835,10 +6982,106 @@ mod tests {
             default_line(&out)
         );
         assert!(
-            out.lines().any(|l| l == "http_client = []"),
+            out.lines()
+                .any(|l| l == r#"http_client = ["dep:futures-util"]"#),
             "the template must declare http_client"
         );
         assert!(out.contains("reqwest = {"), "reqwest must be added");
+    }
+
+    /// The `MOD_APPENDS` row whose crates include `name`.
+    fn row_naming(name: &str) -> Vec<&'static ModAppend> {
+        MOD_APPENDS
+            .iter()
+            .filter(|row| row.deps.iter().any(|d| d.name == name))
+            .take(1)
+            .collect()
+    }
+
+    /// How many entry lines of the `[dependencies]` table declare `key`.
+    fn declarations(manifest: &str, key: &str) -> usize {
+        let mut in_table = false;
+        manifest
+            .lines()
+            .filter(|line| {
+                if line.starts_with('[') {
+                    in_table = line.trim() == "[dependencies]";
+                    return false;
+                }
+                in_table && line.split_once('=').is_some_and(|(k, _)| k.trim() == key)
+            })
+            .count()
+    }
+
+    /// A bound FFI crate a declared module row also names keeps one entry,
+    /// never a duplicate key cargo refuses.
+    #[test]
+    fn a_bound_crate_a_module_row_names_is_declared_once() {
+        let rows = row_naming("regex");
+        assert_eq!(rows.len(), 1, "a MOD_APPENDS row names `regex`");
+        let lines = vec![r#"regex = "=1.11.1""#.to_owned()];
+        let out = vendored_dependencies(CARGO_TOML, &rows, Some(&lines));
+        assert!(
+            out.as_ref().is_ok_and(|m| declarations(m, "regex") == 1),
+            "regex declared exactly once: {out:?}"
+        );
+    }
+
+    /// A bound FFI crate the base declares `optional` is switched on through
+    /// `default`, never dropped while its feature stays off.
+    #[test]
+    fn a_bound_crate_the_base_declares_optional_is_turned_on() {
+        for key in [
+            "base64",
+            "futures-util",
+            "percent-encoding",
+            "serde_urlencoded",
+        ] {
+            assert!(
+                CARGO_TOML.lines().any(|l| l.starts_with(&format!("{key} = {{"))
+                    && l.contains("optional = true")),
+                "the template declares `{key}` optional"
+            );
+            let lines = vec![format!(r#"{key} = "=0.1.0""#)];
+            let out = vendored_dependencies(CARGO_TOML, &[], Some(&lines));
+            assert!(
+                out.as_ref()
+                    .is_ok_and(|m| default_line(m).contains(&format!("\"dep:{key}\""))
+                        && declarations(m, key) == 1),
+                "`{key}` turned on once through default: {out:?}"
+            );
+        }
+        let lines = vec![r#"serde_json = "=1.0.140""#.to_owned()];
+        let out = vendored_dependencies(CARGO_TOML, &[], Some(&lines));
+        assert!(
+            out.as_ref().is_ok_and(
+                |m| !default_line(m).contains("dep:") && declarations(m, "serde_json") == 1
+            ),
+            "a non-optional base key is reused as is: {out:?}"
+        );
+    }
+
+    /// Appending a key the `[dependencies]` table already declares, or one key
+    /// twice, is a compiler bug at emit time, never a cargo duplicate-key error.
+    /// A key only a target table declares is not a duplicate.
+    #[test]
+    fn a_duplicate_dependency_key_is_refused() {
+        const W: &str = "test";
+        assert!(dependency_keys(CARGO_TOML, "[dependencies]").contains("serde_json"));
+        for block in ["serde_json = \"1\"\n", "a = \"1\"\nb = \"1\"\na = \"2\"\n"] {
+            assert!(
+                matches!(
+                    append_dependencies(CARGO_TOML, block, W),
+                    Err(ipe_diagnostics::Diagnostic::CompilerBug { .. })
+                ),
+                "{block:?} must be refused"
+            );
+        }
+        let target_only = append_dependencies(CARGO_TOML, "rustix = \"1\"\n", W);
+        assert!(
+            target_only.is_ok_and(|m| declarations(&m, "rustix") == 1),
+            "a target-table key may also enter `[dependencies]`"
+        );
     }
 
     /// `email_cargo_toml` and `config_cargo_toml` promote their features, which

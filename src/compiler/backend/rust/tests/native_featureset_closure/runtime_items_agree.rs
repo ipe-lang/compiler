@@ -273,7 +273,7 @@ fn cfg_features(cfg: &Cfg, out: &mut BTreeSet<String>) {
             }
         }
         Cfg::Not(inner) => cfg_features(inner, out),
-        Cfg::Test | Cfg::Wasm | Cfg::Host => {}
+        Cfg::Test | Cfg::Wasm | Cfg::Host | Cfg::NativeHost => {}
     }
 }
 

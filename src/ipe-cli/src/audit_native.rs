@@ -1488,12 +1488,12 @@ fn emit_probe_and_build_argv(
     // The jail binds the cargo home read-only, and cargo unpacks a cached
     // archive into `registry/src` only on first use: a host whose cache holds
     // the archive but not its unpacked tree (a restored CI cache) would fail
-    // the jailed build on that write. Unpack every locked source here, before
+    // the jailed build on that write. Unpack every source that build reads here, before
     // the jail; one that cannot be unpacked refuses the audit now.
     let unpacked = match crate::cargo_step::unpack_locked_sources(&cargo, emitted_dir, &homes)? {
         crate::cargo_step::SourcesOutcome::Unpacked(unpacked) => unpacked,
-        crate::cargo_step::SourcesOutcome::Unavailable { code } => {
-            return Err(CliError::PackageAudit(sources_unavailable(code)));
+        crate::cargo_step::SourcesOutcome::Unavailable { code, stderr } => {
+            return Err(CliError::PackageAudit(sources_unavailable(code, &stderr)));
         }
     };
 
@@ -1536,7 +1536,8 @@ fn probe_build_argv(
 }
 
 /// The reject for a probe build whose locked sources cannot be unpacked from
-/// the local registry cache (`code` is cargo's exit, `None` on a signal).
+/// the local registry cache (`code` is cargo's exit, `None` on a signal), with
+/// cargo's own account of the failure (`stderr`, bounded and sanitised).
 #[cfg(any(
     all(
         target_os = "linux",
@@ -1546,15 +1547,16 @@ fn probe_build_argv(
     target_os = "freebsd",
     target_os = "windows"
 ))]
-fn sources_unavailable(code: Option<i32>) -> Rejection {
+fn sources_unavailable(code: Option<i32>, stderr: &crate::style::TerminalSafe) -> Rejection {
     let exit = code.map_or_else(|| "a signal".to_owned(), |code| format!("exit {code}"));
     Rejection {
         check: Check::NativeTier2,
         message: format!(
             "the Tier-2 probe build's locked dependency sources could not be unpacked from the \
-             local cargo registry cache (`cargo fetch --offline --locked` ended with {exit}). \
+             local cargo registry cache (`cargo tree --offline --locked` ended with {exit}). \
              The jail reads the cargo home read-only, so Tier-2 refuses before the jail rather \
-             than build from a source tree it did not materialise (fail-closed)."
+             than build from a source tree it did not materialise (fail-closed).\ncargo said:\n{}",
+            stderr.as_str().trim()
         ),
     }
 }
@@ -3632,5 +3634,51 @@ mod tests {
             assert!(toolchain.ro_binds().is_empty());
             assert!(toolchain.env().is_empty());
         }
+    }
+
+    /// A failed unpack carries cargo's own account, sanitised: the operator reads
+    /// which package the registry cache lacks, and an escape sequence cargo relayed
+    /// (from a package name or a registry message) never reaches the terminal.
+    #[cfg(any(
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "windows"
+    ))]
+    #[test]
+    fn an_unavailable_unpack_names_cargos_reason_sanitised() {
+        let stderr = crate::style::TerminalSafe::sanitize(
+            "error: failed to download `zstd v0.14.3`\n\nCaused by:\n  attempting to make an \
+             HTTP request, but --offline was specified\n\u{1b}]0;owned\u{7}\u{1b}[2J\n",
+        );
+        let rejection = sources_unavailable(Some(101), &stderr);
+        assert_eq!(rejection.check, Check::NativeTier2);
+        assert!(
+            rejection.message.contains("ended with exit 101"),
+            "{}",
+            rejection.message
+        );
+        assert!(
+            rejection
+                .message
+                .contains("failed to download `zstd v0.14.3`")
+                && rejection.message.contains("--offline was specified"),
+            "the rejection must carry cargo's reason: {}",
+            rejection.message
+        );
+        assert!(
+            !rejection.message.contains('\u{1b}') && !rejection.message.contains('\u{7}'),
+            "cargo's stderr reaches the rejection sanitised: {:?}",
+            rejection.message
+        );
+        let by_signal = sources_unavailable(None, &crate::style::TerminalSafe::sanitize(""));
+        assert!(
+            by_signal.message.contains("ended with a signal"),
+            "{}",
+            by_signal.message
+        );
     }
 }

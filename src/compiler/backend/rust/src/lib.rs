@@ -1432,7 +1432,7 @@ pub(crate) struct EmitCtx<'a> {
     ///   `fn main` that drives `ipe_main()` on a std-only executor
     ///   (`ipe_runtime::task::block_on`'s `#[cfg(not(feature = "tokio"))]`
     ///   park/unpark variant), and [`crate::project::assemble_project_files`]
-    ///   drops `tokio` + `futures-util` from the emitted `Cargo.toml` and the
+    ///   drops `tokio` from the emitted `Cargo.toml` and the
     ///   `"tokio"` default feature. A pure program (only `Io.println`, string /
     ///   list / math / json computation, the pure `Task` monad ops) sheds the
     ///   whole tokio subtree.
