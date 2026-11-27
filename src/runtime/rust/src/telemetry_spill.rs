@@ -154,15 +154,48 @@ const SPILL_MAX_CONNECTIONS: u32 = 4;
 /// [`crate::system::SQLITE_BUSY_TIMEOUT`] from its connect options. WAL is the
 /// only journal mode that lets the console child read while this process writes
 /// without each blocking the other; the console reader opens read-write to
-/// attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`).
-async fn open_spill_pool(path: &str) -> Result<SqlitePool, crate::db::DbConnectError> {
-    let url = crate::db::DbUrl::sqlite_path(path, crate::db::FileMode::CreateIfMissing)?;
+/// attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`). The switch waits
+/// out a held write lock ([`crate::db::switch_to_wal`]); a file that does not
+/// end in WAL is refused, and the in-RAM sink keeps serving alone.
+async fn open_spill_pool(path: &str) -> Result<SqlitePool, SpillOpenError> {
+    let url = crate::db::DbUrl::sqlite_path(path, crate::db::FileMode::CreateIfMissing)
+        .map_err(SpillOpenError::Connect)?;
     let pool = crate::db::VettedPool::<sqlx::Sqlite>::connect(&url, SPILL_MAX_CONNECTIONS)
-        .await?
+        .await
+        .map_err(SpillOpenError::Connect)?
         .into_pool();
-    let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await;
+    require_wal(&pool).await?;
     crate::db::own_pool(crate::db::PoolRole::TelemetrySpill, &pool);
     Ok(pool)
+}
+
+/// Switch the spill's `pool` to WAL, closing it when the file does not end in WAL.
+async fn require_wal(pool: &SqlitePool) -> Result<(), SpillOpenError> {
+    match crate::db::switch_to_wal(pool).await {
+        Ok(()) => Ok(()),
+        Err(refused) => {
+            pool.close().await;
+            Err(SpillOpenError::Journal(refused))
+        }
+    }
+}
+
+/// Why the spill file did not open.
+#[derive(Debug)]
+enum SpillOpenError {
+    /// The file's pool did not open.
+    Connect(crate::db::DbConnectError),
+    /// The file opened and did not end in WAL.
+    Journal(crate::db::WalSwitchRefused),
+}
+
+impl std::fmt::Display for SpillOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(refused) => write!(f, "{refused}"),
+            Self::Journal(refused) => write!(f, "{refused}"),
+        }
+    }
 }
 
 async fn write_entry(pool: &SqlitePool, svc: &str, entry: SpillEntry) -> Result<(), sqlx::Error> {
@@ -296,6 +329,28 @@ mod tests {
             );
         }
         assert!(rfc3339(1_700_000_000_000).starts_with("2023-11-14T22:13:20"));
+    }
+
+    /// A spill file SQLite keeps outside WAL is refused and its pool closed,
+    /// never written through in a journal mode the console reader cannot share.
+    #[tokio::test]
+    async fn a_spill_outside_wal_is_refused() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        let refused = require_wal(&pool).await;
+        assert!(
+            matches!(
+                refused,
+                Err(SpillOpenError::Journal(crate::db::WalSwitchRefused::Kept(
+                    crate::db::KeptJournal::Memory
+                )))
+            ),
+            "{refused:?}"
+        );
+        assert!(pool.is_closed(), "a refused spill's pool is closed");
     }
 
     /// The batcher's unit of work mapped onto the hub schema — schema creation +
