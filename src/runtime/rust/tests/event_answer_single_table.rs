@@ -2,9 +2,11 @@
 //!
 //! The browser client posts each event to `/_ipe/event` and reads the answer's
 //! status in exactly one function, `__ipeEventAnswer`, which maps it into the
-//! closed set `__IPE_EVENT_ANSWER`. The poster switches over that set with one
-//! arm per outcome and a `default` that throws, so a status no row names falls
-//! to the table's last row (`REFUSED`), never to the network-failure retry.
+//! closed set `__IPE_EVENT_ANSWER`. The answer handler switches over that set
+//! with one arm per outcome and a `default` that throws, so a status no row
+//! names falls to the table's last row (`REFUSED`), never to acceptance. Every
+//! post ends in one function, `__ipeSettle`, which frees the one event slot
+//! and sends the next event or queues this one again, once per attempt.
 //! These checks read `client.js` as text: its line comments are dropped first
 //! and whitespace runs are collapsed to one space, so a reflow keeps them true.
 #![cfg(not(target_arch = "wasm32"))]
@@ -17,8 +19,20 @@ const CLIENT_JS: &str = include_str!("../src/web/client.js");
 /// The one function that reads an event answer's status.
 const THE_TABLE: &str = "__ipeEventAnswer";
 
-/// The function that posts an event and dispatches on its answer.
+/// The function that posts an event.
 const THE_POSTER: &str = "__ipePostEvent";
+
+/// The function that dispatches on an event answer.
+const THE_ANSWER: &str = "__ipeOnEventAnswer";
+
+/// The one function that ends a post.
+const THE_SETTLE: &str = "__ipeSettle";
+
+/// A settle that sends the next event.
+const ANSWERED: &str = "__ipeSettle(attempt, __IPE_POST_SETTLED.ANSWERED)";
+
+/// A settle that queues the event again.
+const RETRY: &str = "__ipeSettle(attempt, __IPE_POST_SETTLED.RETRY);";
 
 /// The client source with `//` line comments dropped and whitespace collapsed.
 fn code() -> String {
@@ -174,17 +188,20 @@ fn outcome_keys(source: &str) -> BTreeSet<String> {
 #[test]
 fn the_poster_reads_no_status() {
     let source = code();
-    let poster = body_of(&source, THE_POSTER);
-    for field in ["status", "ok", "statusText"] {
-        let reads = field_reads(&poster, field);
-        assert!(
-            reads.is_empty(),
-            "`{THE_POSTER}` reads `.{field}` ({reads:?}); only `{THE_TABLE}` reads an answer's status"
-        );
+    for name in [THE_POSTER, THE_ANSWER] {
+        let body = body_of(&source, name);
+        for field in ["status", "ok", "statusText"] {
+            let reads = field_reads(&body, field);
+            assert!(
+                reads.is_empty(),
+                "`{name}` reads `.{field}` ({reads:?}); only `{THE_TABLE}` reads an answer's status"
+            );
+        }
     }
+    let answer = body_of(&source, THE_ANSWER);
     assert!(
-        poster.contains("var kind = __ipeEventAnswer(r); switch (kind) {"),
-        "`{THE_POSTER}` must dispatch on `{THE_TABLE}(r)`"
+        answer.contains("var kind = __ipeEventAnswer(r); switch (kind) {"),
+        "`{THE_ANSWER}` must dispatch on `{THE_TABLE}(r)`"
     );
 }
 
@@ -229,26 +246,26 @@ fn every_outcome_has_exactly_one_arm() {
     .collect();
     assert!(
         keys == expected,
-        "`__IPE_EVENT_ANSWER` names {keys:?}, the poster's arms cover {expected:?}"
+        "`__IPE_EVENT_ANSWER` names {keys:?}, the answer's arms cover {expected:?}"
     );
-    let poster = body_of(&source, THE_POSTER);
+    let answer = body_of(&source, THE_ANSWER);
     for key in &keys {
         let arm = format!("case __IPE_EVENT_ANSWER.{key}:");
-        let arms = poster.matches(&arm).count();
+        let arms = answer.matches(&arm).count();
         assert!(
             arms == 1,
-            "`{THE_POSTER}` has {arms} `{arm}` arms; every outcome has exactly one"
+            "`{THE_ANSWER}` has {arms} `{arm}` arms; every outcome has exactly one"
         );
     }
-    let cases = poster.matches("case ").count();
+    let cases = answer.matches("case ").count();
     assert!(
         cases == keys.len(),
-        "`{THE_POSTER}` has {cases} `case` arms for {} outcomes",
+        "`{THE_ANSWER}` has {cases} `case` arms for {} outcomes",
         keys.len()
     );
     assert!(
-        poster.contains("default: throw new Error("),
-        "`{THE_POSTER}`'s `default` arm must throw, never fall through to acceptance"
+        answer.contains("default: throw new Error("),
+        "`{THE_ANSWER}`'s `default` arm must throw, never fall through to acceptance"
     );
 }
 
@@ -295,21 +312,25 @@ fn the_table_returns_only_named_outcomes_and_ends_refused() {
 fn a_transient_answer_keeps_the_queue_order() {
     let source = code();
     let poster = body_of(&source, THE_POSTER);
-    let failures = poster
-        .matches("__ipeOnPostFailure(body, fromQueue);")
-        .count();
+    let answer = body_of(&source, THE_ANSWER);
+    let retries = answer.matches(RETRY.trim_end_matches(";")).count();
     assert!(
-        failures == 2,
-        "`{THE_POSTER}` reaches the retry path from {failures} sites; the `TRANSIENT` arm and the network failure are the two"
+        retries == 2,
+        "`{THE_ANSWER}` queues the event again from {retries} arms; `SESSION_LOST` and `TRANSIENT` are the two"
     );
     assert!(
-        poster.matches("__ipeOnPostFailure(").count() == failures,
-        "every retry in `{THE_POSTER}` must carry whether the body is the queue's head"
+        answer.matches("__ipeSettle(").count() == retries + answer.matches(ANSWERED).count(),
+        "every settle in `{THE_ANSWER}` must name the attempt it answers and a `__IPE_POST_SETTLED` outcome"
     );
-    let failure = body_of(&source, "__ipeOnPostFailure");
+    let settle = body_of(&source, THE_SETTLE);
     assert!(
-        failure.contains("__ipeEnqueue(body, fromQueue);"),
-        "`__ipeOnPostFailure` must put the queue's own head back at the head"
+        settle.contains("__ipeEnqueue(attempt.body, true);"),
+        "`{THE_SETTLE}` must put a failed event back at the head: every queued event was sent after it"
+    );
+    assert!(
+        source.matches("__ipeEnqueue(").count() == 3
+            && poster.contains("__ipeEnqueue(body, false);"),
+        "only `{THE_SETTLE}` (at the head) and `{THE_POSTER}` (at the tail) queue an event"
     );
     let enqueue = body_of(&source, "__ipeEnqueue");
     assert!(
@@ -320,8 +341,8 @@ fn a_transient_answer_keeps_the_queue_order() {
     );
     let drain = body_of(&source, "__ipeDrainQueue");
     assert!(
-        drain.contains("if (__ipeQueueInFlight) return;"),
-        "`__ipeDrainQueue` must post one queued event at a time"
+        drain.contains("if (__ipeEventInFlight) return;"),
+        "`__ipeDrainQueue` must post one event at a time"
     );
     assert!(
         drain.contains("__ipePostEvent(head, true);"),
@@ -329,29 +350,90 @@ fn a_transient_answer_keeps_the_queue_order() {
     );
     assert!(
         poster.contains(
-            "if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeQueueInFlight)) { __ipeEnqueue(body, false);"
+            "if (!fromQueue && (__ipeEventQueue.length > 0 || __ipeEventInFlight)) { __ipeEnqueue(body, false);"
         ),
-        "a live event posted while the queue holds or posts events must join its tail"
+        "an event posted while the queue holds events or an event is in flight must join its tail"
+    );
+}
+
+#[test]
+fn an_event_is_posted_after_every_edit_typed_before_it() {
+    let source = code();
+    let send = body_of(&source, "__ipeSend");
+    assert!(
+        send.contains("if (__ipeEnded) return; __ipeSendAllPendingInput();"),
+        "`__ipeSend` must post every pending debounced input before its own event"
+    );
+    assert!(
+        send.contains(
+            "__ipeSendAllPendingInput(); __ipeSendEvent(msgName, args, handlerId, opts); }"
+        ),
+        "`__ipeSend` must post its own event through `__ipeSendEvent` after the flush"
+    );
+    let event = body_of(&source, "__ipeSendEvent");
+    assert!(
+        !event.contains("PendingInput("),
+        "`__ipeSendEvent` must flush nothing: a pending input's sender orders the flush"
+    );
+    let all = body_of(&source, "__ipeSendAllPendingInput");
+    assert!(
+        all.contains("__ipeSendOnePendingInput(keys[i]);"),
+        "`__ipeSendAllPendingInput` must send each pending input"
+    );
+    let one = body_of(&source, "__ipeSendOnePendingInput");
+    assert!(
+        one.contains("clearTimeout(__ipeInputTimers[key]); delete __ipeInputPending[key];"),
+        "`__ipeSendOnePendingInput` must retire the debounce it sends, so it is never sent twice"
+    );
+}
+
+/// Pending edits reach the server in the order of their latest edits (CI job
+/// `test`). A pending input's own send that flushed every other pending input
+/// first would post an edit the user made later ahead of it, and a flush loop
+/// whose send flushed again would post the pending inputs in reverse.
+#[test]
+fn pending_edits_are_posted_in_the_order_they_were_made() {
+    let source = code();
+    let one = body_of(&source, "__ipeSendOnePendingInput");
+    assert!(
+        one.contains("__ipeSendEvent(p.msgName,") && !one.contains("__ipeSend("),
+        "a pending input's own event must go through `__ipeSendEvent`, which flushes nothing"
+    );
+    let keyed = body_of(&source, "__ipeSendPendingInput");
+    assert!(
+        keyed.contains(
+            "if (!__ipeInputPending[key]) return; var keys = Object.keys(__ipeInputPending); for (var i = 0; i < keys.length; i++) { __ipeSendOnePendingInput(keys[i]); if (keys[i] === key) return; }"
+        ),
+        "`__ipeSendPendingInput` must send every input edited before `key`, then `key`, and none edited after it"
+    );
+    let debounce = body_of(&source, "__ipeDebouncedSend");
+    assert!(
+        debounce.contains("delete __ipeInputPending[key]; __ipeInputPending[key] = {"),
+        "a new edit must move its key to the end of the pending order"
     );
 }
 
 #[test]
 fn a_refused_event_is_never_sent_again() {
     let source = code();
-    let poster = body_of(&source, THE_POSTER);
+    let answer = body_of(&source, THE_ANSWER);
     for key in ["TOO_LARGE", "REFUSED"] {
         let arm = format!(
-            "case __IPE_EVENT_ANSWER.{key}: __ipeOnPostRefused(body, __IPE_EVENT_ANSWER.{key}); return;"
+            "case __IPE_EVENT_ANSWER.{key}: __ipeOnPostRefused(attempt, __IPE_EVENT_ANSWER.{key}); return;"
         );
         assert!(
-            poster.contains(&arm),
-            "`{THE_POSTER}`'s `{key}` arm must end in `__ipeOnPostRefused` and return"
+            answer.contains(&arm),
+            "`{THE_ANSWER}`'s `{key}` arm must end in `__ipeOnPostRefused` and return"
         );
     }
     let refused = body_of(&source, "__ipeOnPostRefused");
+    assert!(
+        refused.contains(&format!("{{ if (!{ANSWERED}) return;")),
+        "`__ipeOnPostRefused` must settle its event as answered before anything else"
+    );
     for retry in [
         "__ipeEnqueue(",
-        "__ipeOnPostFailure(",
+        "__IPE_POST_SETTLED.RETRY",
         "__ipeScheduleRetry(",
         "__ipePostEvent(",
     ] {
@@ -405,28 +487,172 @@ fn no_answer_field_is_read_by_name() {
     );
 }
 
+/// One post holds the event slot at a time, and only `__ipeSettle` frees it,
+/// once per attempt (CI job `test`). A second release site is one a branch can
+/// forget, and an answer acted on twice re-queues an event the server already
+/// answered, behind an event already sent after it.
 #[test]
-fn the_queue_slot_is_released_only_by_the_post_holding_it() {
+fn the_event_slot_is_released_only_by_the_settle_of_the_post_holding_it() {
     let source = code();
     let poster = body_of(&source, THE_POSTER);
     assert!(
-        source.contains("var __ipeQueueInFlight = null;"),
-        "`__ipeQueueInFlight` must hold the posted body or null"
+        source.contains("var __ipeEventInFlight = null;"),
+        "`__ipeEventInFlight` must hold the posted attempt or null"
     );
     assert!(
-        poster.contains("if (fromQueue) __ipeQueueInFlight = body;"),
-        "`{THE_POSTER}` must hold the queue slot with the body it posts"
+        poster.contains("var attempt = { body: body, bound: null }; __ipeEventInFlight = attempt;"),
+        "`{THE_POSTER}` must hold the event slot with a fresh attempt for every post, live or queued"
     );
-    let release = "if (__ipeQueueInFlight === body) __ipeQueueInFlight = null;";
-    let releases = poster.matches(release).count();
+    let settle = body_of(&source, THE_SETTLE);
     assert!(
-        releases == 2,
-        "`{THE_POSTER}` releases the queue slot from {releases} sites; the answer and the network failure are the two"
+        settle.contains(
+            "{ if (__ipeEventInFlight !== attempt) return false; __ipeEventInFlight = null; clearTimeout(attempt.bound);"
+        ),
+        "`{THE_SETTLE}` must act only for the attempt holding the slot, and free it and its bound first"
     );
-    let writes = source.matches("__ipeQueueInFlight = ").count();
+    let writes = source.matches("__ipeEventInFlight = ").count();
     assert!(
-        writes == releases + 2,
-        "client.js writes `__ipeQueueInFlight` {writes} times; only its declaration, the post holding it and that post's two releases do"
+        writes == 3,
+        "client.js writes `__ipeEventInFlight` {writes} times; only its declaration, the post taking it and `{THE_SETTLE}` do"
+    );
+    assert!(
+        settle.contains(
+            "if (outcome === __IPE_POST_SETTLED.ANSWERED) { __ipeDrainQueue(); return true; } __ipeEnqueue(attempt.body, true); __ipeShowReconnecting(); __ipeScheduleRetry(); return true;"
+        ),
+        "`{THE_SETTLE}` sends the next event on an answer and queues this one again on anything else"
+    );
+}
+
+/// Every answer arm settles its attempt before it acts on the answer, so an
+/// arm that throws afterwards, or a late answer to an attempt already past its
+/// bound, can neither re-queue the event nor act on it twice; and a post that
+/// no arm settles ends in a retry (CI job `test`).
+#[test]
+fn every_answer_settles_its_post_once_before_acting_on_it() {
+    let source = code();
+    let poster = body_of(&source, THE_POSTER);
+    assert!(
+        poster.contains(&format!(
+            ".then(function(r) {{ return {THE_ANSWER}(attempt, r); }}) .then(function() {{ {RETRY} }}, function() {{ {RETRY} }});"
+        )),
+        "`{THE_POSTER}` must end every post the answer leaves unsettled, or a network failure, in a retry"
+    );
+    let answer = body_of(&source, THE_ANSWER);
+    let successes = answer.matches("__ipeOnPostSuccess(").count();
+    let settled_first = answer
+        .matches(&format!("if (!{ANSWERED}) return; __ipeOnPostSuccess();"))
+        .count();
+    assert!(
+        successes == 2 && settled_first == successes,
+        "`{THE_ANSWER}` must settle an accepted or stale answer before it acts on it"
+    );
+    let success = body_of(&source, "__ipeOnPostSuccess");
+    assert!(
+        !success.contains("__ipeDrainQueue(") && !success.contains("__ipeSettle("),
+        "`__ipeOnPostSuccess` keeps the connection's state only; the settle before it sent the next event"
+    );
+    assert!(
+        answer.contains(&format!("}}, function() {{ {ANSWERED}; }});")),
+        "an unreadable stale answer still answers its event"
+    );
+    assert!(
+        answer.contains(
+            "case __IPE_EVENT_ANSWER.SESSION_LOST: if (!__ipeSettle(attempt, __IPE_POST_SETTLED.RETRY)) return; __ipeProbeSessionLost(); return;"
+        ),
+        "a lost-session answer settles before it probes, so a late answer to a settled post acts on nothing"
+    );
+}
+
+/// A post that gets no answer within `__ipeEventAnswerBoundMs` is aborted and
+/// retried in order, so a hung request never holds back the tab's later
+/// events (CI job `test`).
+#[test]
+fn an_unanswered_post_is_retried_past_its_bound() {
+    let source = code();
+    let poster = body_of(&source, THE_POSTER);
+    assert!(
+        poster.contains(&format!(
+            "attempt.bound = setTimeout(function() {{ {RETRY} if (controller) controller.abort(); }}, __ipeEventAnswerBoundMs);"
+        )),
+        "`{THE_POSTER}` must bound every post and retry it past the bound"
+    );
+    assert!(
+        poster.contains("if (controller) init.signal = controller.signal;"),
+        "`{THE_POSTER}` must abort the request it gave up on"
+    );
+    assert!(
+        source.matches("var __ipeEventAnswerBoundMs = ").count() == 1
+            && source.matches("__ipeEventAnswerBoundMs").count() == 2,
+        "the bound is declared once and read only by `{THE_POSTER}`"
+    );
+}
+
+/// An input event queued right behind one of the same debounce key replaces
+/// it, so typing while an event is in flight queues one event per field
+/// instead of filling the queue (CI job `test`).
+#[test]
+fn queued_input_coalesces_by_its_debounce_key() {
+    let source = code();
+    let one = body_of(&source, "__ipeSendOnePendingInput");
+    assert!(
+        one.contains("coalesce: key"),
+        "`__ipeSendOnePendingInput` must name the debounce key its event coalesces under"
+    );
+    let enqueue = body_of(&source, "__ipeEnqueue");
+    assert!(
+        enqueue.contains(
+            "if (!atHead && key !== undefined && tail !== null && __ipeCoalesceKey.get(tail) === key) { __ipeEventQueue.pop(); __ipeFocusTakeSent(tail.seq); }"
+        ),
+        "`__ipeEnqueue` must replace only the tail, only for an appended event of the same key"
+    );
+    let coalesce = enqueue.find("__ipeEventQueue.pop();");
+    let cap = enqueue.find("__ipeEventQueueMax");
+    assert!(
+        coalesce.zip(cap).is_some_and(|(pop, max)| pop < max),
+        "`__ipeEnqueue` must coalesce before it applies the queue's cap"
+    );
+}
+
+/// An edit still waiting on its debounce when the page is left is sent through
+/// the one ordered channel, never a side channel that skips the queue or the
+/// server's epoch check (CI job `test`).
+#[test]
+fn leaving_the_page_sends_pending_edits_in_order() {
+    let source = code();
+    let leave = body_of(&source, "__ipeFlushOnLeave");
+    assert!(
+        leave.contains(
+            "__ipeLeaving = true; try { __ipeSendAllPendingInput(); } finally { __ipeLeaving = false; }"
+        ),
+        "`__ipeFlushOnLeave` must send the pending edits through `__ipeSend`"
+    );
+    for listener in [
+        "window.addEventListener(\"beforeunload\", __ipeFlushOnLeave);",
+        "window.addEventListener(\"pagehide\", __ipeFlushOnLeave);",
+    ] {
+        assert!(
+            source.contains(listener),
+            "client.js must register `{listener}`"
+        );
+    }
+    for side in ["sendBeacon(", "batch:", "keepalive: true"] {
+        assert!(
+            !source.contains(side),
+            "client.js posts `{side}` outside the ordered event channel"
+        );
+    }
+    let starts = function_starts(&source);
+    let posters: BTreeSet<String> = source
+        .match_indices("\"/_ipe/event\"")
+        .map(|(at, _)| enclosing(&starts, at))
+        .collect();
+    let expected: BTreeSet<String> = [THE_POSTER, "__ipeProbeSessionLost"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    assert!(
+        posters == expected,
+        "`/_ipe/event` is posted from {posters:?}; events go through `{THE_POSTER}` alone, beside the session probe"
     );
 }
 
@@ -488,10 +714,10 @@ fn a_pending_field_value_ends_on_a_message_the_server_sends() {
         stamp.contains("if (!e.edited) continue; e.pendingSeq = seq; e.edited = false;"),
         "an event stamps the fields edited since the last event, never by their value"
     );
-    let send = body_of(&source, "__ipeSend");
+    let send = body_of(&source, "__ipeSendEvent");
     assert!(
         send.contains("__ipeStampEdited(mySeq); var snapshot = __ipeInputsSnapshot();"),
-        "`__ipeSend` stamps the edited fields before it reads the snapshot"
+        "`__ipeSendEvent` stamps the edited fields before it reads the snapshot"
     );
     let snapshot = body_of(&source, "__ipeInputsSnapshot");
     assert!(
@@ -504,13 +730,13 @@ fn a_pending_field_value_ends_on_a_message_the_server_sends() {
         retire.contains("if (e.pendingSeq > 0 && e.pendingSeq <= seq) e.pendingSeq = 0;"),
         "an answer to an event ends every value pending at or before it"
     );
-    let poster = body_of(&source, THE_POSTER);
+    let answer = body_of(&source, THE_ANSWER);
     assert!(
-        poster.contains("__ipeOnPostSuccess(); __ipeRetirePending(body.seq);"),
+        answer.contains("__ipeOnPostSuccess(); __ipeRetirePending(body.seq);"),
         "a stale answer ends the values its event carried"
     );
     assert!(
-        poster.contains(
+        answer.contains(
             "if (ipeMark === \"1\" && typeof data.seq === \"number\") __ipeRetirePending(body.seq);"
         ),
         "a marked accept ends the values its event carried, by this tab's seq for it"
@@ -551,11 +777,11 @@ fn an_answers_session_seq_neither_retires_nor_gates() {
             "client.js reads an answer's session seq through `{read}`"
         );
     }
-    let poster = body_of(&source, THE_POSTER);
+    let answer = body_of(&source, THE_ANSWER);
     assert_eq!(
-        poster.matches("__ipeRetirePending(").count(),
-        poster.matches("__ipeRetirePending(body.seq)").count(),
-        "the poster retires by the seq of the event it posted, nothing else"
+        answer.matches("__ipeRetirePending(").count(),
+        answer.matches("__ipeRetirePending(body.seq)").count(),
+        "the answer retires by the seq of the event it posted, nothing else"
     );
 }
 

@@ -919,25 +919,27 @@ test("focus-across-patch: a pointer crossing a layout shift brings never moves f
 });
 
 /**
- * Holds every event POST the page makes and records its body, so no frame
- * answers a send and takes its focus record. `release` lets the held POSTs go.
+ * Answers every event POST the page makes itself and records its body: the
+ * server never sees the event, so no frame answers a send and takes its focus
+ * record. The answer is an accept, so the client posts its next event.
  */
 async function holdEvents(page) {
   const posts = [];
-  let release;
-  const held = new Promise((resolve) => {
-    release = resolve;
-  });
   await page.route("**/_ipe/event", async (route) => {
     posts.push(JSON.parse(route.request().postData() ?? "{}"));
-    await held;
-    await route.continue().catch(() => {});
+    await route
+      .fulfill({
+        status: 200,
+        headers: { "X-Ipe-Web": "1", "Content-Type": "application/json" },
+        body: '{"seq":0,"patches":[]}',
+      })
+      .catch(() => {});
   });
   await untilRoutesLive(page);
-  return { posts, release };
+  return { posts };
 }
 
-/** The seq of the first held POST whose first argument is `arg`. */
+/** The seq of the first recorded POST whose first argument is `arg`. */
 async function sentWith(events, arg) {
   await expect.poll(() => events.posts.some((b) => b.args?.[0] === arg)).toBe(true);
   return events.posts.find((b) => b.args?.[0] === arg).seq;
@@ -962,7 +964,6 @@ test("focus-across-patch: an edit an input method is still composing is no act o
   const typed = await sentWith(events, "ab");
   expect(await recorded(page, typed)).toBe(true);
   await expect(field).toBeFocused();
-  events.release();
 });
 
 test("focus-across-patch: a key an input method takes is no act of the user's", async ({ page }) => {
@@ -981,7 +982,6 @@ test("focus-across-patch: a key an input method takes is no act of the user's", 
   const pressed = await sentWith(events, "j");
   expect(await recorded(page, pressed)).toBe(true);
   expect(await focusedId(page)).toBe("root");
-  events.release();
 });
 
 /** Whether `frame` writes `attr` in place and replaces no node's children. */
