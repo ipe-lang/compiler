@@ -2753,23 +2753,113 @@ async fn build_pool<E: Send + crate::FromIpeError + 'static>(
         Ok(vetted) => vetted.into_pool(),
         Err(refused) => return IpeResult::Err(connect_refusal("", KERNEL_ENGINE, &refused)),
     };
-    let wal = match journal {
-        Journal::Unchanged => false,
-        Journal::Wal => true,
-        Journal::WalIfShared => db_url.is_shared_sqlite_file(),
-    };
-    if wal {
-        let switched = switch_to_wal(&pool).await;
-        if let (Journal::Wal, Err(e)) = (journal, switched) {
-            pool.close().await;
-            return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e));
+    match journal {
+        Journal::Unchanged => {}
+        Journal::Wal => {
+            if let Err(refused) = switch_to_wal(&pool).await {
+                pool.close().await;
+                return IpeResult::Err(wal_refusal(refused));
+            }
+        }
+        Journal::WalIfShared => {
+            if db_url.is_shared_sqlite_file() {
+                // Best effort by contract: a file the URL opens read-only, or
+                // one without shared memory, keeps its journal and still opens.
+                let _: Result<(), WalSwitchRefused> = switch_to_wal(&pool).await;
+            }
         }
     }
     ok_res(pool)
 }
 
+/// The Ipê `Error` for a WAL switch [`Journal::Wal`] requires and SQLite
+/// refused: the driver's failure keeps its classification, a kept journal mode
+/// is `OtherFailure` naming the mode.
+fn wal_refusal<E: crate::FromIpeError>(refused: WalSwitchRefused) -> E {
+    match refused {
+        WalSwitchRefused::Driver(e) => ipe_err(KERNEL_ENGINE, &e),
+        WalSwitchRefused::Kept(_) | WalSwitchRefused::UnknownMode => E::from_ipe_error(
+            IpeError::database(IpeDbFailure::OtherFailure, refused.to_string()),
+        ),
+    }
+}
+
 /// The pause between two attempts of [`switch_to_wal`] on a held write lock.
 const WAL_SWITCH_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// A journal mode SQLite reports in place of WAL after a WAL switch it did not
+/// apply: the file has no shared memory for a WAL index, or is in memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeptJournal {
+    /// `delete`, the rollback-journal default.
+    Delete,
+    /// `truncate`.
+    Truncate,
+    /// `persist`.
+    Persist,
+    /// `memory`.
+    Memory,
+    /// `off`.
+    Off,
+}
+
+impl KeptJournal {
+    /// The mode's name as SQLite spells it.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Delete => "delete",
+            Self::Truncate => "truncate",
+            Self::Persist => "persist",
+            Self::Memory => "memory",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// Why [`switch_to_wal`] left the file outside WAL.
+#[derive(Debug)]
+pub(crate) enum WalSwitchRefused {
+    /// The switch failed: a non-busy failure, or a busy one past the timeout.
+    Driver(sqlx::Error),
+    /// The switch ran, and SQLite kept this journal mode.
+    Kept(KeptJournal),
+    /// The switch ran, and SQLite reported a mode it never names.
+    UnknownMode,
+}
+
+impl std::fmt::Display for WalSwitchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Driver(e) => write!(
+                f,
+                "db: the switch to WAL failed: {}",
+                DriverFailure::of(DbEngine::Sqlite, e)
+            ),
+            Self::Kept(mode) => write!(
+                f,
+                "db: the file stayed in the `{}` journal mode, not WAL",
+                mode.name()
+            ),
+            Self::UnknownMode => {
+                f.write_str("db: the switch to WAL reported an unknown journal mode")
+            }
+        }
+    }
+}
+
+/// The outcome of a WAL switch, from the journal mode SQLite reports after it.
+fn wal_outcome(mode: &str) -> Result<(), WalSwitchRefused> {
+    let kept = match mode.to_ascii_lowercase().as_str() {
+        "wal" => return Ok(()),
+        "delete" => KeptJournal::Delete,
+        "truncate" => KeptJournal::Truncate,
+        "persist" => KeptJournal::Persist,
+        "memory" => KeptJournal::Memory,
+        "off" => KeptJournal::Off,
+        _ => return Err(WalSwitchRefused::UnknownMode),
+    };
+    Err(WalSwitchRefused::Kept(kept))
+}
 
 /// Switch `pool`'s SQLite file to WAL, waiting out a held write lock for
 /// [`SQLITE_BUSY_TIMEOUT`], as every other statement does.
@@ -2778,32 +2868,44 @@ const WAL_SWITCH_RETRY: std::time::Duration = std::time::Duration::from_millis(1
 /// upgrade never runs the busy handler: another connection holding the write
 /// lock fails the switch at once with `SQLITE_BUSY`, whatever the busy timeout.
 /// A busy switch is retried until the timeout has elapsed, so a writer in
-/// flight delays the open instead of failing it.
+/// flight delays the open instead of failing it. No attempt starts past the
+/// deadline; the one in flight at it is bounded by the connection's own busy
+/// timeout.
+///
+/// SQLite answers a switch it cannot apply with the mode it kept, not with an
+/// error, so the reported mode is read and anything but `wal` is a refusal.
 ///
 /// The one issuer of the switch: the `Ipe.Db` pool and the telemetry spill
 /// both open through it.
 ///
 /// # Errors
 ///
-/// The switch's driver error: a non-busy failure at once, a busy one once the
-/// timeout has elapsed.
-pub(crate) async fn switch_to_wal<DB>(pool: &sqlx::Pool<DB>) -> Result<(), sqlx::Error>
+/// [`WalSwitchRefused::Driver`] for the switch's driver error (a non-busy
+/// failure at once, a busy one once the timeout has elapsed);
+/// [`WalSwitchRefused::Kept`] or [`WalSwitchRefused::UnknownMode`] when the
+/// switch ran and the file is not in WAL.
+pub(crate) async fn switch_to_wal<DB>(pool: &sqlx::Pool<DB>) -> Result<(), WalSwitchRefused>
 where
     DB: sqlx::Database,
     for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
     <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
+    (String,): for<'r> sqlx::FromRow<'r, DB::Row>,
 {
-    let deadline = tokio::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
+    let started = tokio::time::Instant::now();
+    let deadline = started.checked_add(SQLITE_BUSY_TIMEOUT).unwrap_or(started);
     loop {
-        match sqlx::query("PRAGMA journal_mode=WAL;").execute(pool).await {
-            Ok(_) => return Ok(()),
+        match sqlx::query_scalar::<DB, String>("PRAGMA journal_mode=WAL;")
+            .fetch_one(pool)
+            .await
+        {
+            Ok(mode) => return wal_outcome(&mode),
             Err(e)
                 if classify_failure(DbEngine::Sqlite, &e) == IpeDbFailure::Busy
                     && tokio::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(WAL_SWITCH_RETRY).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => return Err(WalSwitchRefused::Driver(e)),
         }
     }
 }
@@ -17186,6 +17288,60 @@ mod tests {
             pool.close().await;
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        /// An open that requires WAL fails when SQLite keeps another journal
+        /// mode, which it reports as the switch's answer instead of an error.
+        #[tokio::test]
+        async fn a_required_wal_switch_sqlite_keeps_out_fails_the_open() {
+            let db_url = DbUrl::sqlite_memory().expect("the in-memory URL parses");
+            let opened = build_pool::<IpeError>(&db_url, Journal::Wal).await;
+            let refused = match opened {
+                IpeResult::Err(IpeError::Error(kind, info)) => Some((kind, info.message)),
+                IpeResult::Ok(_) => None,
+            };
+            assert_eq!(
+                refused,
+                Some((
+                    IpeDbFailure::OtherFailure.kind(),
+                    "db: the file stayed in the `memory` journal mode, not WAL".to_owned()
+                ))
+            );
+        }
+
+        /// A best-effort WAL open still opens a file SQLite keeps outside WAL.
+        #[tokio::test]
+        async fn a_best_effort_wal_switch_sqlite_keeps_out_still_opens() {
+            let db_url = DbUrl::sqlite_memory().expect("the in-memory URL parses");
+            let opened = build_pool::<String>(&db_url, Journal::WalIfShared).await;
+            assert!(matches!(opened, IpeResult::Ok(_)));
+        }
+
+        /// Only `wal` is a switch that took; every mode SQLite keeps instead
+        /// is named, and a mode it never reports is refused, not admitted.
+        #[test]
+        fn the_reported_journal_mode_decides_the_switch() {
+            assert!(wal_outcome("wal").is_ok());
+            assert!(wal_outcome("WAL").is_ok());
+            for (mode, kept) in [
+                ("delete", KeptJournal::Delete),
+                ("truncate", KeptJournal::Truncate),
+                ("persist", KeptJournal::Persist),
+                ("memory", KeptJournal::Memory),
+                ("off", KeptJournal::Off),
+            ] {
+                assert!(
+                    matches!(wal_outcome(mode), Err(WalSwitchRefused::Kept(k)) if k == kept),
+                    "{mode}"
+                );
+                assert_eq!(kept.name(), mode);
+            }
+            for mode in ["", "wal2", " wal", "walx"] {
+                assert!(
+                    matches!(wal_outcome(mode), Err(WalSwitchRefused::UnknownMode)),
+                    "{mode:?}"
+                );
             }
         }
 
