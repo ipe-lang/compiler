@@ -726,6 +726,10 @@ class IpeScansAtQuick(unittest.TestCase):
         tests_dir = os.path.join(lg.REPO_ROOT, "src", "ipe-cli", "tests")
         on_disk = {
             f[: -len(".rs")] for f in os.listdir(tests_dir) if f.endswith(("_scan.rs", "_ratchet.rs"))
+        } | {
+            d
+            for d in os.listdir(tests_dir)
+            if d.endswith("_scans") and os.path.isfile(os.path.join(tests_dir, d, "main.rs"))
         }
         self.assertEqual(named, on_disk)
 

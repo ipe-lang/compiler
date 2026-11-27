@@ -388,18 +388,154 @@ pub fn trust_summary(
 
 // ── project-local cache ─────────────────────────────────────────────────────
 
-/// The filesystem slug for a crate's cache artifacts.
-#[must_use]
-pub fn slugify(name: &str) -> String {
-    name.chars()
+/// The module slug one installed crate is cached and emitted under.
+///
+/// Every value is a legal Rust module identifier that is no keyword, not the
+/// lone `_`, and outside the reserved asserted-shim namespace
+/// ([`crate::asserted::ASSERTED_SHIM_MODULE`]); it is also a fixed point of
+/// the package-name folding. [`FfiSlug::of`] and [`FfiSlug::parse_canonical`]
+/// are the only ways in.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FfiSlug(String);
+
+/// Why a spelling is refused as an [`FfiSlug`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlugDefect {
+    /// Empty, a byte outside `[a-z0-9_]`, or a leading digit.
+    Charset,
+    /// A Rust keyword, which no bare module identifier may be.
+    Keyword,
+    /// The lone `_`, which names no module.
+    Underscore,
+    /// Inside the reserved asserted-shim namespace `ipe_asserted`.
+    Reserved,
+    /// Not what any package name folds to.
+    ///
+    /// A trailing `_` follows only a stem that is a keyword or itself ends in `_`.
+    NotCanonical,
+}
+
+impl std::fmt::Display for SlugDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Charset => {
+                "a module slug must be non-empty, use only `a-z`, `0-9` and `_`, \
+                 and not start with a digit"
+            }
+            Self::Keyword => "a module slug cannot be a Rust keyword",
+            Self::Underscore => "a module slug cannot be the lone `_`",
+            Self::Reserved => {
+                "a module slug cannot begin with `ipe_asserted`, the namespace of the \
+                 asserted-call shims"
+            }
+            Self::NotCanonical => "the module slug is not what any package name folds to",
+        })
+    }
+}
+
+impl FfiSlug {
+    /// The slug a package name folds to.
+    ///
+    /// The name is lowercased and every byte outside `[a-z0-9]` becomes `_`;
+    /// a leading digit gains a `_` prefix; a stem that is a Rust keyword
+    /// ([`ipe_intern::is_rust_keyword`]) or already ends in `_` gains a `_`
+    /// suffix. The reserved namespace is judged on both the lowercased and
+    /// the folded spelling, so no folding step carries a name into it.
+    ///
+    /// # Errors
+    ///
+    /// [`SlugDefect::Reserved`] for a name in the asserted-shim namespace;
+    /// [`SlugDefect::Underscore`] when the fold leaves the lone `_`.
+    pub fn of(name: &PackageName) -> Result<Self, SlugDefect> {
+        let lowered = name.as_str().to_ascii_lowercase();
+        if is_reserved_slug(&lowered) {
+            return Err(SlugDefect::Reserved);
+        }
+        let folded = fold_slug(&lowered);
+        if folded == "_" {
+            return Err(SlugDefect::Underscore);
+        }
+        if is_reserved_slug(&folded) {
+            return Err(SlugDefect::Reserved);
+        }
+        Ok(Self(folded))
+    }
+
+    /// Parse a slug read back from a cache file name.
+    ///
+    /// Accepts exactly the spellings [`FfiSlug::of`] can produce:
+    /// `^[a-z_][a-z0-9_]*$`, no keyword, not `_`, outside the reserved
+    /// namespace, and a fixed point of the folding.
+    ///
+    /// # Errors
+    ///
+    /// The [`SlugDefect`] naming the first rule `raw` breaks.
+    pub fn parse_canonical(raw: &str) -> Result<Self, SlugDefect> {
+        let charset_ok = raw
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+        let leading_ok = raw
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_lowercase() || b == b'_');
+        if !(charset_ok && leading_ok) {
+            return Err(SlugDefect::Charset);
+        }
+        if raw == "_" {
+            return Err(SlugDefect::Underscore);
+        }
+        if ipe_intern::is_rust_keyword(raw) {
+            return Err(SlugDefect::Keyword);
+        }
+        if is_reserved_slug(raw) {
+            return Err(SlugDefect::Reserved);
+        }
+        let canonical = raw
+            .strip_suffix('_')
+            .is_none_or(|stem| ipe_intern::is_rust_keyword(stem) || stem.ends_with('_'));
+        if !canonical {
+            return Err(SlugDefect::NotCanonical);
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The slug text, a legal Rust module identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for FfiSlug {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Fold an already-lowercased name to slug form (see [`FfiSlug::of`]).
+fn fold_slug(lowered: &str) -> String {
+    let mut out: String = lowered
+        .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
             } else {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    if ipe_intern::is_rust_keyword(&out) || out.ends_with('_') {
+        out.push('_');
+    }
+    out
+}
+
+/// Whether `spelling` lies in the reserved asserted-shim namespace.
+fn is_reserved_slug(spelling: &str) -> bool {
+    spelling.starts_with(crate::asserted::ASSERTED_SHIM_MODULE)
 }
 
 /// The suffix that marks a cache entry as one installed crate's consumer manifest.
@@ -427,7 +563,7 @@ pub struct ArtifactNames {
 impl ArtifactNames {
     /// The artifact file names for `slug`.
     #[must_use]
-    pub fn for_slug(slug: &str) -> Self {
+    pub fn for_slug(slug: &FfiSlug) -> Self {
         Self {
             ipei: format!("{slug}.ipei"),
             kernel_json: format!("{slug}.kernel.json"),
@@ -507,6 +643,65 @@ struct CacheDir {
 struct LevelError {
     path: PathBuf,
     source: std::io::Error,
+}
+
+/// The cache's exclusive install lock, released when dropped.
+///
+/// Every write and removal holds it from the occupant probe through its last
+/// rename, so two installs racing on one slug run one after the other: the
+/// second probe sees the first's record and refuses, never interleaving two
+/// packages' artifacts under one slug.
+struct InstallLock {
+    /// The handle the advisory lock is held on.
+    _held: std::fs::File,
+}
+
+/// The entry the non-Unix install lock is held on; no slug starts with `.`,
+/// so it names no artifact.
+#[cfg(not(unix))]
+const INSTALL_LOCK_NAME: &str = ".install.lock";
+
+/// `FILE_FLAG_OPEN_REPARSE_POINT`: open a link or junction itself, never its target.
+#[cfg(windows)]
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+/// `FILE_FLAG_BACKUP_SEMANTICS`: let an open name a directory, so it is judged, not failed.
+#[cfg(windows)]
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+
+/// The longest an install waits for another holder of the cache's install lock.
+///
+/// A holder keeps the lock only across local artifact writes, so a wait this
+/// long means a stopped or wedged holder; the install is refused, never hung.
+const INSTALL_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often a waiting install retries the install lock.
+const INSTALL_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Take `held`'s exclusive lock, retrying until `wait` has passed.
+///
+/// A lock still held elsewhere after `wait` is a `TimedOut` error.
+fn lock_within(held: &std::fs::File, wait: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now().checked_add(wait);
+    loop {
+        match held.try_lock() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if deadline.is_none_or(|deadline| std::time::Instant::now() >= deadline) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "another install held the cache's install lock for {} seconds; \
+                             retry once it finishes",
+                            wait.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(INSTALL_LOCK_POLL);
+            }
+        }
+    }
 }
 
 /// The name of a fresh temporary sibling of the entry `name`, unique to this call within this process.
@@ -590,6 +785,19 @@ impl CacheDir {
         Ok(Some(Self { dir: level }))
     }
 
+    /// Take the cache's exclusive install lock, waiting at most `wait` while another holder has it.
+    ///
+    /// The lock is held on the cache directory's own handle, so no lock file
+    /// is created in the cache.
+    fn lock(&self, wait: std::time::Duration) -> std::io::Result<InstallLock> {
+        // A fresh open of the directory, never a duplicate of the held handle:
+        // the lock belongs to this guard alone and is released when it drops.
+        let held = rustix::fs::openat(&self.dir, ".", Self::dir_flags(), rustix::fs::Mode::empty())
+            .map(std::fs::File::from)?;
+        lock_within(&held, wait)?;
+        Ok(InstallLock { _held: held })
+    }
+
     /// Replace the entry `name` with a new owner-only file holding `contents`.
     ///
     /// The bytes go to a temporary sibling ([`temp_name`]) created exclusively
@@ -623,6 +831,44 @@ impl CacheDir {
             let _ = rustix::fs::unlinkat(&self.dir, temp.as_str(), AtFlags::empty());
         }
         written
+    }
+
+    /// The text of the regular file `name`, read never through a link; `None` when no regular file is there.
+    ///
+    /// A link or other non-regular entry holds no record and reads as `None`,
+    /// never followed, so the rename that replaces it is the next step; a
+    /// directory, which no rename can replace, is an `IsADirectory` error, so
+    /// the write is refused before any artifact changes. A text past
+    /// [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
+    fn read(&self, name: &str) -> std::io::Result<Option<String>> {
+        use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+        use rustix::io::Errno;
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        let file = match rustix::fs::openat(&self.dir, name, flags, Mode::empty()) {
+            Ok(fd) => std::fs::File::from(fd),
+            Err(e) if e == Errno::NOENT => return Ok(None),
+            Err(e) => {
+                let entry = rustix::fs::statat(&self.dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+                return match FileType::from_raw_mode(entry.st_mode) {
+                    FileType::RegularFile => Err(e.into()),
+                    FileType::Directory => Err(std::io::ErrorKind::IsADirectory.into()),
+                    FileType::Symlink
+                    | FileType::Fifo
+                    | FileType::Socket
+                    | FileType::CharacterDevice
+                    | FileType::BlockDevice
+                    | FileType::Unknown => Ok(None),
+                };
+            }
+        };
+        let kind = file.metadata()?.file_type();
+        if kind.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        if !kind.is_file() {
+            return Ok(None);
+        }
+        read_capped(file).map(Some)
     }
 
     /// Remove the entry `name`, never through a link; an absent entry is fine.
@@ -675,6 +921,23 @@ impl CacheDir {
         Ok(Some(Self { dir: level }))
     }
 
+    /// Take the cache's exclusive install lock, waiting at most `wait` while another holder has it.
+    ///
+    /// The lock is held on [`INSTALL_LOCK_NAME`], opened as the entry itself,
+    /// never through a link.
+    fn lock(&self, wait: std::time::Duration) -> std::io::Result<InstallLock> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+        );
+        let held = options.open(self.dir.join(INSTALL_LOCK_NAME))?;
+        lock_within(&held, wait)?;
+        Ok(InstallLock { _held: held })
+    }
+
     /// Replace the entry `name` with a new file holding `contents`, through a temporary sibling and a rename.
     fn replace(&self, name: &str, contents: &str) -> std::io::Result<()> {
         use std::io::Write as _;
@@ -692,6 +955,40 @@ impl CacheDir {
         written
     }
 
+    /// The text of the regular file `name`, never through a link; `None` when no regular file is there.
+    ///
+    /// A link or other non-regular entry holds no record and reads as `None`;
+    /// a directory, which no rename can replace, is an `IsADirectory` error;
+    /// a text past [`OCCUPANT_PROBE_CAP`] bytes is an `InvalidData` error.
+    ///
+    /// The entry is opened first and its handle judged, so what is judged is
+    /// what is read; on Windows the open names a link or junction itself.
+    fn read(&self, name: &str) -> std::io::Result<Option<String>> {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        std::os::windows::fs::OpenOptionsExt::custom_flags(
+            &mut options,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+        );
+        let file = match options.open(self.dir.join(name)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let kind = file.metadata()?.file_type();
+        if kind.is_symlink() {
+            return Ok(None);
+        }
+        if kind.is_dir() {
+            return Err(std::io::ErrorKind::IsADirectory.into());
+        }
+        if !kind.is_file() {
+            return Ok(None);
+        }
+        read_capped(file).map(Some)
+    }
+
     /// Remove the entry `name`; an absent entry is fine.
     fn remove(&self, name: &str) -> std::io::Result<()> {
         match std::fs::remove_file(self.dir.join(name)) {
@@ -700,6 +997,21 @@ impl CacheDir {
             Err(e) => Err(e),
         }
     }
+}
+
+/// The most bytes the write-time occupant probe reads of a held `<slug>.pkg.json`.
+const OCCUPANT_PROBE_CAP: u64 = 4 * 1024 * 1024;
+
+/// The text of `file`, refused as `InvalidData` past [`OCCUPANT_PROBE_CAP`] bytes.
+fn read_capped(file: std::fs::File) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    file.take(OCCUPANT_PROBE_CAP.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > OCCUPANT_PROBE_CAP) {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// The FFI cache path relative to its project root, built one component at a time.
@@ -791,7 +1103,7 @@ impl FfiCache {
 
     /// The artifact paths for a slug.
     #[must_use]
-    pub fn artifact_paths(&self, slug: &str) -> ArtifactPaths {
+    pub fn artifact_paths(&self, slug: &FfiSlug) -> ArtifactPaths {
         let names = ArtifactNames::for_slug(slug);
         ArtifactPaths {
             ipei: self.root.join(names.ipei),
@@ -816,9 +1128,13 @@ impl FfiCache {
     ///
     /// # Errors
     ///
-    /// `IPE-F4412` naming a cache level that is a link or not a directory, or
-    /// the first path that could not be written; a wire-defect diagnostic when
-    /// the cache is not anchored at a project root.
+    /// `IPE-F4412` naming a cache level that is a link or not a directory, the
+    /// first path that could not be written, or the cache root when another
+    /// install holds the install lock past [`INSTALL_LOCK_WAIT`]; a wire-defect
+    /// diagnostic when the cache is not anchored at a project root; `IPE-F4416` when the
+    /// package name folds to no legal slug; `IPE-F4416` when another package
+    /// already holds the slug, or its occupant's inspection document does not
+    /// decode.
     pub fn write_package(
         &self,
         pkg: &PkgInfo,
@@ -829,12 +1145,37 @@ impl FfiCache {
             detail: e.to_string(),
         };
         let level_err = |e: LevelError| io_err(&e.path, &e.source);
+        let slug = FfiSlug::of(pkg.name_pkg()).map_err(|defect| Diagnostic::SlugRefused {
+            name: pkg.name().to_owned(),
+            defect,
+        })?;
         let dir = CacheDir::open(self.project_root()?, true)
             .map_err(level_err)?
             .ok_or_else(|| io_err(&self.root, &std::io::ErrorKind::NotFound.into()))?;
-        let slug = slugify(pkg.name());
+        let _install = dir
+            .lock(INSTALL_LOCK_WAIT)
+            .map_err(|e| io_err(&self.root, &e))?;
         let names = ArtifactNames::for_slug(&slug);
         let paths = self.artifact_paths(&slug);
+        // The occupant probe reads the exact `<slug>.pkg.json` the write below
+        // replaces: a slug another package holds is refused, never overwritten.
+        // A link there is no package's record: the rename below replaces the
+        // link itself, never writing through it.
+        let occupant = dir
+            .read(&names.pkg_json)
+            .map_err(|e| io_err(&paths.pkg_json, &e))?;
+        if let Some(occupant) = occupant {
+            let installed = PkgInfo::decode_json(&occupant)
+                .ok()
+                .map(|held| held.name().to_owned());
+            if installed.as_deref() != Some(pkg.name()) {
+                return Err(Diagnostic::SlugCollision {
+                    slug: slug.as_str().to_owned(),
+                    installed,
+                    incoming: pkg.name().to_owned(),
+                });
+            }
+        }
         let iface = crate::interface::crate_interface(pkg);
         let consumer_json = emit_consumer_json(pkg, &iface, self)?;
         let writes: [(&str, &Path, String); 7] = [
@@ -875,9 +1216,10 @@ impl FfiCache {
     /// # Errors
     ///
     /// `IPE-F4412` naming a cache level that is a link or not a directory, or
-    /// the first artifact that exists but cannot be deleted; a wire-defect
-    /// diagnostic when the cache is not anchored at a project root.
-    pub fn remove_package(&self, slug: &str) -> Result<(), Diagnostic> {
+    /// the first artifact that exists but cannot be deleted, or the cache root
+    /// when another install holds the install lock past [`INSTALL_LOCK_WAIT`];
+    /// a wire-defect diagnostic when the cache is not anchored at a project root.
+    pub fn remove_package(&self, slug: &FfiSlug) -> Result<(), Diagnostic> {
         let io_err = |path: &Path, e: &std::io::Error| Diagnostic::ArtifactIo {
             path: path.to_string_lossy().into_owned(),
             detail: e.to_string(),
@@ -887,6 +1229,9 @@ impl FfiCache {
         else {
             return Ok(());
         };
+        let _install = dir
+            .lock(INSTALL_LOCK_WAIT)
+            .map_err(|e| io_err(&self.root, &e))?;
         let names = ArtifactNames::for_slug(slug);
         let paths = self.artifact_paths(slug);
         for (name, path) in [
@@ -1309,8 +1654,8 @@ pub fn emit_consumer_json(
 /// One installed crate's consumer-side view, loaded from the artifact cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledCrate {
-    /// The cache slug (`semver`).
-    pub slug: String,
+    /// The module slug the crate is cached and emitted under (`semver`).
+    pub slug: FfiSlug,
     /// Ipê module qualifier (`Rust.Semver`).
     pub module_name: String,
     /// Kernel-name prefix (`Rust_Semver`).
@@ -1333,23 +1678,19 @@ pub struct InstalledCrate {
     pub define_types: BTreeSet<String>,
     /// The transparent foreign types the interface surfaces (see
     /// [`crate::interface::CrateInterface::transparent_types`]) — the shapes
-    /// the backend's conversion glue is assembled from. Empty for a legacy
-    /// cache, whose interface text predates transparency.
+    /// the backend's conversion glue is assembled from.
     pub transparent_types: std::collections::BTreeMap<String, crate::transparency::TransparentType>,
     /// The typed `[dependencies]` entries the emitted app crate needs.
     pub cargo_deps: Vec<CargoDep>,
     /// The crate's own Cargo package name, the `[dependencies]` key its direct
-    /// pin renders under.
-    ///
-    /// `None` for a legacy cache, which predates the inspection document and
-    /// so cannot prove which of its dependency lines is the direct crate.
-    pub package_name: Option<PackageName>,
+    /// pin renders under, proven by the crate's inspection document.
+    pub package_name: PackageName,
     /// Cargo package name → Rust lib identifier, for every dependency the
     /// crate's inspection resolved.
     ///
     /// The bridge between the two tables `assemble_emit` must keep in
     /// agreement: the `[dependencies]` key a pin renders under and the
-    /// `::<ident>::` path root emitted code names. Empty for a legacy cache.
+    /// `::<ident>::` path root emitted code names.
     pub dep_idents: std::collections::BTreeMap<String, crate::naming::RustIdent>,
     /// The structured interface bindings (name, wrapper, arity, signature) —
     /// the data the catalog unification re-renders a demoted module from.
@@ -1359,18 +1700,35 @@ pub struct InstalledCrate {
     /// Rust lib ident → exact resolved version, from the crate's own
     /// inspection (its jail's lockfile). The unification's version guard
     /// refuses to collapse two nominals whose defining crate resolved to
-    /// different versions across members. Empty for a legacy cache.
+    /// different versions across members.
     pub dep_versions: std::collections::BTreeMap<String, String>,
     /// Inspected crate-top-level free-function facts, keyed by fn name — the
     /// asserted-call compile-time cross-check (`Rust.Ffi.call`, design §5.2
-    /// rule 1). Empty for a legacy cache, which then cross-checks nothing;
-    /// the emitted shim's `rustc` check still holds.
+    /// rule 1). A function absent here is checked by the emitted shim's
+    /// `rustc` build alone.
     pub inspected_free_fns: std::collections::BTreeMap<String, InspectedFnFact>,
     /// Inspected public-constant facts, keyed by the constant's crate-relative
     /// path (`f64::consts::PI`) — the `Rust.const` type cross-check. A native
     /// constant must appear here or its assertion is refused (fail-closed, no
-    /// blind trust). Empty for a legacy cache, which then admits no `.const`.
+    /// blind trust).
     pub inspected_consts: std::collections::BTreeMap<String, InspectedConstFact>,
+}
+
+impl InstalledCrate {
+    /// The Rust lib identifier emitted code names the crate by.
+    ///
+    /// The identifier the crate's own inspection resolved for its package
+    /// name, else the package name with `-` turned into `_`. `None` when that
+    /// spelling is no Rust identifier, so a lookup by lib identifier finds
+    /// nothing.
+    #[must_use]
+    pub fn lib_ident(&self) -> Option<crate::naming::RustIdent> {
+        let name = &self.package_name;
+        self.dep_idents
+            .get(name.as_str())
+            .cloned()
+            .or_else(|| crate::naming::RustIdent::parse(&name.as_str().replace('-', "_")).ok())
+    }
 }
 
 /// One inspected free function's declared Rust surface, for the asserted-call
@@ -1515,31 +1873,47 @@ impl CacheSource for PathCacheSource<'_> {
 
 /// Load every installed crate from a project's FFI artifact cache, read through `source`.
 ///
-/// `<slug>.pkg.json` is the SOLE source of record: when it exists, EVERY
-/// consumer-side view — interface source, bindings source, module/kernel
-/// names, opaque maps, dep lines — is RE-DERIVED by decoding it through the
-/// validated [`PkgInfo`] gate and re-running the emitters. The sibling
-/// projection files (`.ipei`, `consumer.json`, `<slug>.ipe`, `_bindings.rs`)
-/// are debug/watch artifacts the loader never trusts, so a projection that
-/// diverges from the catalog (torn write, mixed-run cache, hand edit) is
-/// inert by construction: a member either exists in `pkg.json` or it does
-/// not exist anywhere. A planted `_bindings.rs` cannot inject a wrapper
-/// body, because the emit derives only from decode-validated newtypes (no
-/// raw type/path/selector string reaches the rendered code); a tampered
-/// `pkg.json` re-runs the full decode gate, so it can only ever produce
-/// injection-free wrappers or fail closed.
+/// `<slug>.pkg.json` is the SOLE source of record: EVERY consumer-side view —
+/// interface source, bindings source, module/kernel names, opaque maps, dep
+/// lines — is RE-DERIVED by decoding it through the validated [`PkgInfo`]
+/// gate and re-running the emitters. The sibling projection files (`.ipei`,
+/// `consumer.json`, `<slug>.ipe`, `_bindings.rs`) are debug/watch artifacts
+/// the loader never trusts, so a projection that diverges from the catalog
+/// (torn write, mixed-run cache, hand edit) is inert by construction: a
+/// member either exists in `pkg.json` or it does not exist anywhere. A
+/// planted `_bindings.rs` cannot inject a wrapper body, because the emit
+/// derives only from decode-validated newtypes (no raw type/path/selector
+/// string reaches the rendered code); a tampered `pkg.json` re-runs the full
+/// decode gate, so it can only ever produce injection-free wrappers or fail
+/// closed.
+///
+/// Every `<slug>.consumer.json` names its slug, parsed through
+/// [`FfiSlug::parse_canonical`]; one spelling outside that grammar refuses the
+/// whole catalog, naming the file. The slug must be the one the document's
+/// package name folds to, and a crate cached without its document is refused
+/// with a reinstall hint.
 ///
 /// # Errors
 ///
 /// `IPE-F4412` for an unreadable artifact; a wire-defect diagnostic for a
-/// malformed consumer manifest, a malformed inspection document, or a missing
-/// wrapper; any error `source` raises while listing or reading.
+/// cache file name that is no slug, a slug its package name does not fold to,
+/// a crate cached without its inspection document, or a malformed inspection
+/// document; any error `source` raises while listing or reading.
 pub fn load_catalog_from<S: CacheSource>(source: &S) -> Result<Vec<InstalledCrate>, S::Error> {
-    let mut slugs: Vec<String> = source
-        .entry_names()?
-        .into_iter()
-        .filter_map(|name| name.strip_suffix(CONSUMER_SUFFIX).map(str::to_owned))
-        .collect();
+    let mut slugs: Vec<FfiSlug> = Vec::new();
+    for name in source.entry_names()? {
+        let Some(raw) = name.strip_suffix(CONSUMER_SUFFIX) else {
+            continue;
+        };
+        let slug = FfiSlug::parse_canonical(raw).map_err(|defect| Diagnostic::WireMalformed {
+            context: format!("FFI cache file `{}`", source.root().join(&name).display()),
+            defect: crate::diag::WireDefect::SlugFileName {
+                got: raw.to_owned(),
+                defect,
+            },
+        })?;
+        slugs.push(slug);
+    }
     slugs.sort();
     let mut out = Vec::with_capacity(slugs.len());
     for slug in slugs {
@@ -1553,279 +1927,42 @@ pub fn load_catalog_from<S: CacheSource>(source: &S) -> Result<Vec<InstalledCrat
 /// # Errors
 ///
 /// As [`load_catalog_from`], scoped to this slug's artifacts.
-#[allow(clippy::too_many_lines)] // one linear artifact decode-and-cross-check cascade
 fn load_installed_crate<S: CacheSource>(
     source: &S,
-    slug: String,
+    slug: FfiSlug,
 ) -> Result<InstalledCrate, S::Error> {
-    {
-        let cache = FfiCache {
-            root: source.root().to_path_buf(),
-        };
-        let paths = cache.artifact_paths(&slug);
-        let names = ArtifactNames::for_slug(&slug);
-        let read = |name: &str, path: &Path| -> Result<String, S::Error> {
-            source.read_artifact(name)?.ok_or_else(|| {
-                Diagnostic::ArtifactIo {
-                    path: path.to_string_lossy().into_owned(),
-                    detail: "artifact is missing".to_owned(),
-                }
-                .into()
-            })
-        };
-        // RE-DERIVE the whole consumer-side view from the validated
-        // inspection document — no on-disk projection is trusted as text
-        // (see [`load_catalog_from`]). A legacy cache written before the
-        // `pkg.json` artifact existed has no document to re-derive from; it
-        // falls back to the stored projections, whose trust then rests on
-        // the discovery-time ownership/write-boundary gate the source
-        // enforces plus the injection-free-by-construction emitter.
-        if let Some(pkg_text) = source.read_artifact(&names.pkg_json)? {
-            let pkg = PkgInfo::decode_json(&pkg_text)?;
-            return installed_crate_from_pkg(slug, &pkg, &cache).map_err(Into::into);
+    let cache = FfiCache {
+        root: source.root().to_path_buf(),
+    };
+    let names = ArtifactNames::for_slug(&slug);
+    let context = || {
+        format!(
+            "FFI cache file `{}`",
+            cache.artifact_paths(&slug).pkg_json.display()
+        )
+    };
+    let Some(pkg_text) = source.read_artifact(&names.pkg_json)? else {
+        return Err(Diagnostic::WireMalformed {
+            context: context(),
+            defect: crate::diag::WireDefect::InspectionMissing {
+                slug: slug.as_str().to_owned(),
+            },
         }
-        let consumer_text = read(&names.consumer, &paths.consumer)?;
-        let interface_source = read(&names.interface, &paths.interface)?;
-        let dep_versions: std::collections::BTreeMap<String, String> =
-            std::collections::BTreeMap::new();
-        let bindings_source = read(&names.bindings, &paths.bindings)?;
-        let malformed = |detail: String| Diagnostic::WireMalformed {
-            context: format!("consumer manifest `{}`", paths.consumer.display()),
-            defect: crate::diag::WireDefect::Json { detail },
-        };
-        let doc: serde_json::Value = serde_json::from_str(&consumer_text)
-            .map_err(|e| malformed(format!("invalid JSON: {e}")))?;
-        let str_field = |key: &str| -> Result<String, Diagnostic> {
-            doc.get(key)
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
-                .ok_or_else(|| malformed(format!("missing string field `{key}`")))
-        };
-        let module_name = str_field("moduleName")?;
-        let kernel_name = str_field("kernelName")?;
-        // Opaque-type paths reach the wrapper emitter verbatim; parse each
-        // through the validated newtype at the cache boundary so an un-renderable
-        // path is unrepresentable past decode.
-        let opaque_types: std::collections::BTreeMap<String, String> = {
-            let raw = doc
-                .get("opaqueTypes")
-                .and_then(serde_json::Value::as_object);
-            let mut out = std::collections::BTreeMap::new();
-            for (k, v) in raw.into_iter().flatten() {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| malformed(format!("opaqueTypes[{k:?}]: not a string")))?;
-                crate::naming::RustPathSegment::parse(s).map_err(|e| {
-                    malformed(format!("opaqueTypes[{k:?}]: invalid Rust path: {e:?}"))
-                })?;
-                out.insert(k.clone(), s.to_owned());
-            }
-            out
-        };
-        // Mirror the fail-closed decode of `opaqueTypes`: a non-string value is a
-        // malformed manifest (silent coercion could hide a tampered cache entry).
-        // An absent `opaqueTypeIds` field is allowed (older caches omit it).
-        let opaque_type_ids: std::collections::BTreeMap<String, String> = {
-            let raw = doc
-                .get("opaqueTypeIds")
-                .and_then(serde_json::Value::as_object);
-            let mut out = std::collections::BTreeMap::new();
-            for (k, v) in raw.into_iter().flatten() {
-                let s = v
-                    .as_str()
-                    .ok_or_else(|| malformed(format!("opaqueTypeIds[{k:?}]: not a string")))?;
-                out.insert(k.clone(), s.to_owned());
-            }
-            out
-        };
-        let define_types: BTreeSet<String> = doc
-            .get("defineTypes")
-            .and_then(serde_json::Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // Each stored line is parsed back into a typed registry pin under the
-        // exact grammar the manifest emitter renders. A legacy manifest has no
-        // inspection document to re-derive a wrapper crate's source from, so a
-        // `path` line (and every other shape) is refused rather than forwarded
-        // into the emitted `Cargo.toml` unproven.
-        let cargo_deps: Vec<CargoDep> = match doc.get("cargoDeps") {
-            None => Vec::new(),
-            Some(v) => v
-                .as_array()
-                .ok_or_else(|| malformed("`cargoDeps` is not an array".to_owned()))?
-                .iter()
-                .map(|line| {
-                    let line = line.as_str().ok_or_else(|| {
-                        malformed("`cargoDeps` carries a non-string entry".to_owned())
-                    })?;
-                    CargoDep::parse_registry_line(line).map_err(|defect| {
-                        Diagnostic::WireMalformed {
-                            context: format!("consumer manifest `{}`", paths.consumer.display()),
-                            defect,
-                        }
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-        };
-        let transparent_types: std::collections::BTreeMap<
-            String,
-            crate::transparency::TransparentType,
-        > = match doc.get("transparentTypes") {
-            None => std::collections::BTreeMap::new(),
-            Some(v) => {
-                let entries = v
-                    .as_array()
-                    .ok_or_else(|| malformed("`transparentTypes` is not an array".to_owned()))?;
-                let mut out = std::collections::BTreeMap::new();
-                for entry in entries {
-                    let t = crate::transparency::TransparentType::from_projection_json(entry)
-                        .map_err(malformed)?;
-                    out.insert(t.name().as_str().to_owned(), t);
-                }
-                out
-            }
-        };
-        // Fail-closed cross-check: an interface text that surfaces a
-        // transparent shape — a record alias (`type alias …`) or a closed
-        // union (exported WITH `(..)`, a marker the opaque `type N = N`
-        // placeholder and every `define` nominal never carry) — must come
-        // with the structured shapes, or the glue the backend assembles from
-        // them would be missing while the module still declares the
-        // record/union as a native app type. The lowerer keys transparency on
-        // this module TEXT, so it would emit an app enum the wrapper's foreign
-        // result never converts to (an E0308 the SEAL forbids). A torn or
-        // hand-edited projection pair, refused rather than mis-wired.
-        let surfaces_transparent =
-            interface_source.contains("\ntype alias ") || interface_source.contains("(..)");
-        if transparent_types.is_empty() && surfaces_transparent {
-            return Err(malformed(
-                "interface module surfaces a transparent record/union but the manifest \
-                 carries no `transparentTypes` — re-run `ipe add` to regenerate the cache"
-                    .to_owned(),
-            )
-            .into());
+        .into());
+    };
+    let pkg = PkgInfo::decode_json(&pkg_text)?;
+    let folded = FfiSlug::of(pkg.name_pkg()).ok();
+    if folded.as_ref() != Some(&slug) {
+        return Err(Diagnostic::WireMalformed {
+            context: context(),
+            defect: crate::diag::WireDefect::SlugMismatch {
+                slug: slug.as_str().to_owned(),
+                name: pkg.name().to_owned(),
+            },
         }
-        let bindings: Vec<crate::interface::InterfaceBinding> = doc
-            .get("bindings")
-            .and_then(serde_json::Value::as_array)
-            .map_or_else(
-                || Ok(Vec::new()),
-                |a| {
-                    a.iter()
-                        .filter_map(|b| {
-                            let get = |k: &str| b.get(k).and_then(serde_json::Value::as_str);
-                            let ref_name = get("refName")?.to_owned();
-                            let wrapper_ident = get("wrapperIdent")?.to_owned();
-                            let arity = usize::try_from(
-                                b.get("arity").and_then(serde_json::Value::as_u64)?,
-                            )
-                            .ok()?;
-                            let sig = get("sig")?.to_owned();
-                            // Absent slots mean no parameter converts; present
-                            // slots must align with the binding's arity, or the
-                            // backend would skip (or misapply) a conversion.
-                            // A slot is a transparent type name or `null`; any
-                            // other JSON value is malformed, never read as "no
-                            // conversion".
-                            let transparent_params = b
-                                .get("transparentParams")
-                                .and_then(serde_json::Value::as_array)
-                                .map_or_else(
-                                    || Ok(crate::interface::TransparentParams::None),
-                                    |ps| {
-                                        ps.iter()
-                                            .enumerate()
-                                            .map(|(i, p)| match p {
-                                                serde_json::Value::Null => Ok(None),
-                                                serde_json::Value::String(s) => Ok(Some(s.clone())),
-                                                serde_json::Value::Bool(_)
-                                                | serde_json::Value::Number(_)
-                                                | serde_json::Value::Array(_)
-                                                | serde_json::Value::Object(_) => {
-                                                    Err(malformed(format!(
-                                                        "binding `{ref_name}`: \
-                                                         transparentParams[{i}] is neither a \
-                                                         type name nor null"
-                                                    )))
-                                                }
-                                            })
-                                            .collect::<Result<Vec<_>, Diagnostic>>()
-                                            .and_then(|slots| {
-                                                crate::interface::TransparentParams::aligned(
-                                                    slots, arity,
-                                                )
-                                                .map_err(|drift| {
-                                                    malformed(format!(
-                                                        "binding `{ref_name}`: {drift}"
-                                                    ))
-                                                })
-                                            })
-                                    },
-                                );
-                            let transparent_result = b.get("transparentResult").and_then(|r| {
-                                Some(crate::interface::TransparentResult {
-                                    type_name: r
-                                        .get("typeName")
-                                        .and_then(serde_json::Value::as_str)?
-                                        .to_owned(),
-                                    in_result: r
-                                        .get("inResult")
-                                        .and_then(serde_json::Value::as_bool)?,
-                                })
-                            });
-                            Some(transparent_params.map(|transparent_params| {
-                                crate::interface::InterfaceBinding {
-                                    ref_name,
-                                    wrapper_ident,
-                                    arity,
-                                    sig,
-                                    transparent_params,
-                                    transparent_result,
-                                }
-                            }))
-                        })
-                        .collect::<Result<Vec<_>, Diagnostic>>()
-                },
-            )?;
-        let wrapper_idents: BTreeSet<String> =
-            bindings.iter().map(|b| b.wrapper_ident.clone()).collect();
-        // Fail-closed cross-check: every forwarded wrapper must exist in the
-        // stored bindings source.
-        for ident in &wrapper_idents {
-            let decl = format!("pub fn {ident}(");
-            if !bindings_source.contains(&decl) {
-                return Err(malformed(format!(
-                    "interface forwards to wrapper `{ident}` but `{}` declares no such \
-                     `pub fn` — re-run `ipe add` to regenerate the cache",
-                    paths.bindings.display()
-                ))
-                .into());
-            }
-        }
-        Ok(InstalledCrate {
-            slug,
-            module_name,
-            kernel_name,
-            interface_source,
-            bindings_source,
-            opaque_types,
-            opaque_type_ids,
-            define_types,
-            transparent_types,
-            cargo_deps,
-            package_name: None,
-            dep_idents: std::collections::BTreeMap::new(),
-            bindings,
-            wrapper_idents,
-            dep_versions,
-            inspected_free_fns: std::collections::BTreeMap::new(),
-            inspected_consts: std::collections::BTreeMap::new(),
-        })
+        .into());
     }
+    installed_crate_from_pkg(slug, &pkg, &cache).map_err(Into::into)
 }
 
 /// Re-derive one installed crate's whole consumer-side view from its
@@ -1835,7 +1972,7 @@ fn load_installed_crate<S: CacheSource>(
 /// # Errors
 /// A wire-defect diagnostic when a dependency line cannot be rendered.
 pub fn installed_crate_from_pkg(
-    slug: String,
+    slug: FfiSlug,
     pkg: &PkgInfo,
     cache: &FfiCache,
 ) -> Result<InstalledCrate, Diagnostic> {
@@ -1903,7 +2040,7 @@ pub fn installed_crate_from_pkg(
         define_types: iface.define_types,
         transparent_types: iface.transparent_types,
         cargo_deps: cargo_deps(pkg, cache)?,
-        package_name: Some(pkg.name_pkg().clone()),
+        package_name: pkg.name_pkg().clone(),
         dep_idents,
         bindings: iface.bindings,
         wrapper_idents,
@@ -2067,13 +2204,13 @@ impl CargoDep {
         }
     }
 
-    /// Parse a legacy consumer manifest's stored dependency line.
+    /// Parse a stored dependency line as a registry pin.
     ///
     /// Only the exact registry-pin grammar [`CargoDep::render`] emits is
     /// accepted: the parsed value must re-render to the input byte for byte.
-    /// A legacy manifest has no inspection document to re-derive a wrapper
-    /// crate's source from, so a `path` line has no proof it sits inside the
-    /// project and is refused with every other shape.
+    /// A line carries no inspection document to prove a wrapper crate's
+    /// source, so a `path` line has no proof it sits inside the project and
+    /// is refused with every other shape.
     ///
     /// # Errors
     ///
@@ -2611,7 +2748,6 @@ mod tests {
     }
 
     /// A fresh scratch directory named for `tag` and this process.
-    #[cfg(unix)]
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = ipe_test_temp::temp_root().join(format!("ipe-ffi-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2644,7 +2780,7 @@ mod tests {
     fn a_linked_cache_level_never_redirects_a_write_or_a_removal() {
         use std::os::unix::fs::symlink;
         let pkg = semver_pkg();
-        let names = ArtifactNames::for_slug(&slugify(pkg.name()));
+        let names = ArtifactNames::for_slug(&slug_of(&pkg));
         for (index, linked) in FFI_CACHE_COMPONENTS.iter().enumerate() {
             let root = scratch_dir(&format!("linked-level-root-{index}"));
             let outside = scratch_dir(&format!("linked-level-outside-{index}"));
@@ -2672,7 +2808,7 @@ mod tests {
             );
 
             std::fs::write(target.join(&names.pkg_json), "kept").expect("an outside file");
-            let refused = cache.remove_package(&slugify(pkg.name()));
+            let refused = cache.remove_package(&slug_of(&pkg));
             assert!(
                 matches!(refused, Err(Diagnostic::ArtifactIo { .. })),
                 "level {linked}: {refused:?}"
@@ -2720,7 +2856,7 @@ mod tests {
             .nth(1)
             .and_then(|n| n.parse().ok())
             .expect("the temporary name carries its counter");
-        let names = ArtifactNames::for_slug(&slugify(pkg.name()));
+        let names = ArtifactNames::for_slug(&slug_of(&pkg));
         let every = [
             &names.ipei,
             &names.kernel_json,
@@ -2780,10 +2916,14 @@ mod tests {
         assert!(coverage.contains("Dropped bindings: 1"), "{coverage}");
         assert!(coverage.contains("contradictory shape flags"), "{coverage}");
         assert!(coverage.contains("facade guidance"), "{coverage}");
-        cache.remove_package("semver").expect("removes");
+        cache
+            .remove_package(&FfiSlug::parse_canonical("semver").expect("a slug"))
+            .expect("removes");
         assert!(!paths.ipei.exists());
         // Idempotent: removing again is fine.
-        cache.remove_package("semver").expect("idempotent");
+        cache
+            .remove_package(&FfiSlug::parse_canonical("semver").expect("a slug"))
+            .expect("idempotent");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2828,172 +2968,364 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[test]
-    fn legacy_cache_without_pkg_json_falls_back_to_stored_bindings() {
-        // A cache written before the pkg.json artifact existed still loads: the
-        // re-derivation gracefully falls back to the stored _bindings.rs text
-        // (trust then rests on the discovery ownership gate + the injection-free
-        // emitter). Removing pkg.json models the legacy layout.
-        let tmp =
-            ipe_test_temp::temp_root().join(format!("ipe-ffi-legacy-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let cache = FfiCache::at_project_root(&tmp);
-        let (_pkg, paths) = install_from_inspection(&cache, &semver_json()).expect("installs");
-        let stored = std::fs::read_to_string(&paths.bindings).expect("readable");
-        std::fs::remove_file(&paths.pkg_json).expect("drop pkg.json");
-        let catalog = load_catalog(cache.root()).expect("loads legacy layout");
-        let c = catalog.first().expect("one crate");
-        assert_eq!(
-            c.bindings_source, stored,
-            "legacy path serves the stored text"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
+    /// The slug `pkg` folds to.
+    #[cfg(unix)]
+    fn slug_of(pkg: &PkgInfo) -> FfiSlug {
+        FfiSlug::of(pkg.name_pkg()).expect("a fixture package name folds")
     }
 
-    fn transparent_enum_json() -> String {
+    /// The slug `name` folds to, or why it folds to none.
+    fn fold(name: &str) -> Result<String, SlugDefect> {
+        let name = PackageName::parse(name).expect("a fixture package name");
+        FfiSlug::of(&name).map(|slug| slug.as_str().to_owned())
+    }
+
+    /// A minimal inspection document for the package `name`.
+    fn named_json(name: &str) -> String {
         json!({
-            "pkg": "tm", "name": "tm", "version": "0.1.0",
-            "functions": [
-                {"name": "mk",
-                 "params": [{"name": "n", "type": "Int", "ipeType": "Int", "rustType": "i64"}],
-                 "results": [{"name": "", "type": "Shade", "rustType": "tm::Shade"}],
-                 "effect": "pure"}
-            ],
-            "errors": [],
-            "types": [
-                {"name": "Shade", "rustPath": "tm::Shade", "kind": "enum",
-                 "variants": [
-                    {"name": "On", "kind": "unit"},
-                    {"name": "Level", "kind": "tuple",
-                     "members": [{"name": "0", "type": "Int", "rustType": "i64"}]}
-                 ]}
-            ]
+            "pkg": name, "name": name, "version": "0.1.0",
+            "functions": [], "errors": []
         })
         .to_string()
     }
 
-    /// A torn legacy projection pair (no `pkg.json`) whose interface text still
-    /// surfaces a transparent CLOSED UNION (`type X = … (..)` export) while the
-    /// consumer manifest has had `transparentTypes` + the binding markers
-    /// stripped must be REFUSED. The lowerer keys transparency on the module
-    /// text, so admitting it would emit a native app enum the wrapper's foreign
-    /// result never converts to — an E0308 after `ipe` exit 0.
     #[test]
-    fn legacy_torn_transparent_union_is_refused() {
-        let tmp =
-            ipe_test_temp::temp_root().join(format!("ipe-ffi-torn-enum-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let cache = FfiCache::at_project_root(&tmp);
-        let (_pkg, paths) =
-            install_from_inspection(&cache, &transparent_enum_json()).expect("installs");
-        std::fs::remove_file(&paths.pkg_json).expect("drop pkg.json");
-        let consumer = std::fs::read_to_string(&paths.consumer).expect("readable");
-        let mut doc: serde_json::Value = serde_json::from_str(&consumer).expect("json");
-        if let Some(o) = doc.as_object_mut() {
-            o.remove("transparentTypes");
-            if let Some(bs) = o.get_mut("bindings").and_then(|b| b.as_array_mut()) {
-                for b in bs {
-                    if let Some(bo) = b.as_object_mut() {
-                        bo.remove("transparentParams");
-                        bo.remove("transparentResult");
-                    }
-                }
-            }
+    fn a_package_name_folds_to_a_legal_module_slug() {
+        assert_eq!(fold("semver").as_deref(), Ok("semver"));
+        assert_eq!(fold("Serde-Json").as_deref(), Ok("serde_json"));
+        assert_eq!(fold("Match").as_deref(), Ok("match_"));
+        assert_eq!(fold("self").as_deref(), Ok("self_"));
+        assert_eq!(fold("gen").as_deref(), Ok("gen_"));
+        assert_eq!(fold("foo_").as_deref(), Ok("foo__"));
+        assert_eq!(fold("foo-").as_deref(), Ok("foo__"));
+        assert_eq!(fold("match_").as_deref(), Ok("match__"));
+    }
+
+    #[test]
+    fn a_package_name_in_the_asserted_shim_namespace_is_refused() {
+        for name in [
+            "ipe_asserted",
+            "ipe-asserted",
+            "IPE_Asserted-x",
+            "ipe_asserted_const",
+            "ipe-asserted-const-pi",
+        ] {
+            assert_eq!(fold(name), Err(SlugDefect::Reserved), "{name}");
         }
-        std::fs::write(&paths.consumer, serde_json::to_string_pretty(&doc).unwrap()).expect("w");
-        let result = load_catalog(cache.root());
-        assert!(
-            result.is_err(),
-            "torn transparent-union legacy cache must be refused, got: {:?}",
-            result.map(|c| c.first().map(|x| x
-                .transparent_types
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()))
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(fold("ipe-assert").as_deref(), Ok("ipe_assert"));
     }
 
-    fn transparent_define_json() -> String {
-        json!({
-            "pkg": "demo", "name": "demo", "version": "0.1.0",
-            "functions": [{
-                "name": "counter_new", "effect": "pure", "isStructCtor": true,
-                "structName": "Counter",
-                "structFields": [{ "name": "value", "type": "i64" }],
-                "structDerives": ["Clone"]
-            }],
-            "errors": []
-        })
-        .to_string()
-    }
-
-    /// A transparent DEFINE type survives the legacy (no `pkg.json`) load: the
-    /// consumer manifest's `transparentTypes` carries the shape (bare-nominal
-    /// `rustPath`, the define convention) and the constructor binding keeps its
-    /// result-conversion marker.
     #[test]
-    fn legacy_transparent_define_round_trips_through_the_consumer_manifest() {
-        let tmp = ipe_test_temp::temp_root()
-            .join(format!("ipe-ffi-define-legacy-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let cache = FfiCache::at_project_root(&tmp);
-        let (_pkg, paths) =
-            install_from_inspection(&cache, &transparent_define_json()).expect("installs");
-        std::fs::remove_file(&paths.pkg_json).expect("drop pkg.json");
-        let catalog = load_catalog(cache.root()).expect("loads legacy layout");
-        let c = catalog.first().expect("one crate");
-        let t = c
-            .transparent_types
-            .get("Counter")
-            .expect("transparent define shape survives");
-        assert_eq!(t.rust_path().as_str(), "Counter", "bare define nominal");
-        assert!(c.define_types.is_empty(), "{:?}", c.define_types);
-        let b = c
-            .bindings
-            .iter()
-            .find(|b| b.ref_name == "counter_new")
-            .expect("constructor binding");
+    fn every_folded_slug_parses_back_to_itself() {
+        for name in [
+            "semver",
+            "Serde-Json",
+            "Match",
+            "self",
+            "gen",
+            "foo_",
+            "foo__",
+            "match_",
+            "a1-b2",
+        ] {
+            let folded = fold(name).expect("folds");
+            assert_eq!(
+                FfiSlug::parse_canonical(&folded).map(|slug| slug.as_str().to_owned()),
+                Ok(folded.clone()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_spelling_no_package_name_folds_to_is_refused_as_a_slug() {
+        for (raw, defect) in [
+            ("", SlugDefect::Charset),
+            ("Semver", SlugDefect::Charset),
+            ("serde-json", SlugDefect::Charset),
+            ("9lives", SlugDefect::Charset),
+            ("a.b", SlugDefect::Charset),
+            ("_", SlugDefect::Underscore),
+            ("match", SlugDefect::Keyword),
+            ("self", SlugDefect::Keyword),
+            ("ipe_asserted", SlugDefect::Reserved),
+            ("ipe_asserted_const_x", SlugDefect::Reserved),
+            ("semver_", SlugDefect::NotCanonical),
+        ] {
+            assert_eq!(FfiSlug::parse_canonical(raw), Err(defect), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_second_package_on_a_held_slug_is_refused_and_the_occupant_kept() {
+        let root = scratch_dir("slug-collision");
+        let cache = FfiCache::at_project_root(&root);
+        let (_, paths) = install_from_inspection(&cache, &named_json("a-b")).expect("installs");
+        let held = std::fs::read_to_string(&paths.pkg_json).expect("occupant");
+        let refused = install_from_inspection(&cache, &named_json("a_b"));
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::SlugCollision { slug, installed: Some(installed), incoming })
+                    if slug == "a_b" && installed == "a-b" && incoming == "a_b"
+            ),
+            "{refused:?}"
+        );
         assert_eq!(
-            b.transparent_result.as_ref().map(|r| r.type_name.as_str()),
-            Some("Counter")
+            std::fs::read_to_string(&paths.pkg_json).expect("occupant"),
+            held,
+            "the occupant is never overwritten"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            install_from_inspection(&cache, &named_json("a-b")).is_ok(),
+            "the occupant's own reinstall is no collision"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A torn legacy projection whose interface text surfaces a define RECORD
-    /// (`type alias …`) while the consumer manifest lost `transparentTypes` is
-    /// refused, exactly like the torn transparent-union import — the glue the
-    /// backend assembles would be missing while the module still declares the
-    /// record as a native app type.
     #[test]
-    fn legacy_torn_transparent_define_is_refused() {
-        let tmp =
-            ipe_test_temp::temp_root().join(format!("ipe-ffi-torn-define-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let cache = FfiCache::at_project_root(&tmp);
-        let (_pkg, paths) =
-            install_from_inspection(&cache, &transparent_define_json()).expect("installs");
-        std::fs::remove_file(&paths.pkg_json).expect("drop pkg.json");
-        let consumer = std::fs::read_to_string(&paths.consumer).expect("readable");
-        let mut doc: serde_json::Value = serde_json::from_str(&consumer).expect("json");
-        if let Some(o) = doc.as_object_mut() {
-            o.remove("transparentTypes");
-            if let Some(bs) = o.get_mut("bindings").and_then(|b| b.as_array_mut()) {
-                for b in bs {
-                    if let Some(bo) = b.as_object_mut() {
-                        bo.remove("transparentResult");
-                    }
-                }
+    fn an_undecodable_occupant_is_a_collision_never_overwritten() {
+        let root = scratch_dir("slug-undecodable");
+        let cache = FfiCache::at_project_root(&root);
+        let (_, paths) = install_from_inspection(&cache, &named_json("a-b")).expect("installs");
+        std::fs::write(&paths.pkg_json, "{ not json").expect("corrupt the occupant");
+        let refused = install_from_inspection(&cache, &named_json("a-b"));
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::SlugCollision {
+                    installed: None,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        let shown = refused
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(
+            shown.contains("ipe rust remove a-b") && !shown.contains("remove `a crate"),
+            "the remedy names the crate being added, never a placeholder: {shown}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&paths.pkg_json).expect("occupant"),
+            "{ not json"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_held_install_lock_holds_the_occupant_probe_until_release() {
+        let root = scratch_dir("slug-lock");
+        let cache = FfiCache::at_project_root(&root);
+        let dir = CacheDir::open(&root, true)
+            .ok()
+            .flatten()
+            .expect("cache opens");
+        let held = dir.lock(INSTALL_LOCK_WAIT).expect("lock");
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let _ = sent.send(install_from_inspection(&cache, &named_json("a_b")).map(|_| ()));
+            })
+            .expect("spawn the waiting install");
+        assert!(
+            received
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_err(),
+            "an install never probes while another holder has the lock"
+        );
+        let names = ArtifactNames::for_slug(&FfiSlug::parse_canonical("a_b").expect("a slug"));
+        dir.replace(&names.pkg_json, &named_json("a-b"))
+            .expect("the holder commits its record");
+        drop(held);
+        let outcome = received
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the released lock lets the waiting install report");
+        worker.join().expect("the waiting install's thread");
+        assert!(
+            matches!(
+                &outcome,
+                Err(Diagnostic::SlugCollision { installed: Some(installed), .. })
+                    if installed == "a-b"
+            ),
+            "the waiting install sees the committed record and refuses: {outcome:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lock_held_past_its_wait_is_refused_never_waited_on_forever() {
+        let root = scratch_dir("slug-lock-wait");
+        let dir = CacheDir::open(&root, true)
+            .ok()
+            .flatten()
+            .expect("cache opens");
+        let held = dir.lock(INSTALL_LOCK_WAIT).expect("lock");
+        let waiter = CacheDir::open(&root, false)
+            .ok()
+            .flatten()
+            .expect("cache reopens");
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .spawn(move || {
+                let outcome = waiter
+                    .lock(std::time::Duration::from_millis(200))
+                    .map(drop)
+                    .map_err(|e| e.kind());
+                let _ = sent.send(outcome);
+            })
+            .expect("spawn the waiting lock");
+        let outcome = received
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("a held lock refuses within its wait, never blocks forever");
+        assert_eq!(
+            outcome,
+            Err(std::io::ErrorKind::TimedOut),
+            "a lock another holder keeps past the wait is a typed refusal"
+        );
+        worker.join().expect("the waiting lock's thread");
+        drop(held);
+        assert!(
+            dir.lock(std::time::Duration::from_millis(200)).is_ok(),
+            "a released lock is taken again"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_at_the_slug_record_refuses_the_write_before_any_artifact() {
+        let root = scratch_dir("slug-record-dir");
+        let cache = FfiCache::at_project_root(&root);
+        let paths = cache.artifact_paths(&FfiSlug::parse_canonical("a_b").expect("a slug"));
+        std::fs::create_dir_all(&paths.pkg_json).expect("a directory at the record");
+        let refused = install_from_inspection(&cache, &named_json("a-b"));
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::ArtifactIo { path, .. }) if path.ends_with("a_b.pkg.json")
+            ),
+            "{refused:?}"
+        );
+        for artifact in every_artifact(&paths) {
+            if artifact != paths.pkg_json {
+                assert!(
+                    std::fs::symlink_metadata(artifact).is_err(),
+                    "{} is never written",
+                    artifact.display()
+                );
             }
         }
-        std::fs::write(&paths.consumer, serde_json::to_string_pretty(&doc).unwrap()).expect("w");
-        let result = load_catalog(cache.root());
+        assert!(paths.pkg_json.is_dir(), "the directory is left in place");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_reserved_package_name_is_refused_before_anything_is_written() {
+        let root = scratch_dir("slug-reserved");
+        let cache = FfiCache::at_project_root(&root);
+        let refused = install_from_inspection(&cache, &named_json("ipe-asserted-x"));
         assert!(
-            result.is_err(),
-            "torn transparent-define legacy cache must be refused"
+            matches!(
+                &refused,
+                Err(Diagnostic::SlugRefused {
+                    defect: SlugDefect::Reserved,
+                    ..
+                })
+            ),
+            "{refused:?}"
         );
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(
+            refused.as_ref().err().map(Diagnostic::code),
+            Some(ipe_diagnostics::IPE_F4416),
+            "a slug refusal is the slug family's code, never the git-source gate's"
+        );
+        assert!(
+            !cache.root().exists(),
+            "a refused slug creates no cache directory"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cache_file_name_outside_the_slug_grammar_refuses_the_whole_catalog() {
+        let root = scratch_dir("slug-filename");
+        let cache = FfiCache::at_project_root(&root);
+        install_from_inspection(&cache, &semver_json()).expect("installs");
+        std::fs::write(cache.root().join("Bad-Name.consumer.json"), "{}").expect("plant");
+        let refused = load_catalog(cache.root());
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::WireMalformed {
+                    context,
+                    defect: crate::diag::WireDefect::SlugFileName { got, defect: SlugDefect::Charset },
+                }) if got == "Bad-Name" && context.contains("Bad-Name.consumer.json")
+            ),
+            "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cached_crate_under_a_slug_its_name_does_not_fold_to_is_refused() {
+        let root = scratch_dir("slug-mismatch");
+        let cache = FfiCache::at_project_root(&root);
+        let (_, paths) = install_from_inspection(&cache, &semver_json()).expect("installs");
+        let other = FfiSlug::parse_canonical("other").expect("a slug");
+        let moved = cache.artifact_paths(&other);
+        std::fs::rename(&paths.pkg_json, &moved.pkg_json).expect("move pkg.json");
+        std::fs::rename(&paths.consumer, &moved.consumer).expect("move consumer.json");
+        let refused = load_catalog(cache.root());
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::WireMalformed {
+                    defect: crate::diag::WireDefect::SlugMismatch { slug, name },
+                    ..
+                }) if slug == "other" && name == "semver"
+            ),
+            "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_cached_crate_without_its_inspection_document_is_refused() {
+        let root = scratch_dir("slug-no-pkg-json");
+        let cache = FfiCache::at_project_root(&root);
+        let (_, paths) = install_from_inspection(&cache, &semver_json()).expect("installs");
+        std::fs::remove_file(&paths.pkg_json).expect("drop pkg.json");
+        let refused = load_catalog(cache.root());
+        assert!(
+            matches!(
+                &refused,
+                Err(Diagnostic::WireMalformed {
+                    defect: crate::diag::WireDefect::InspectionMissing { slug },
+                    ..
+                }) if slug == "semver"
+            ),
+            "{refused:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_lib_ident_is_the_underscored_package_name() {
+        let root = scratch_dir("lib-ident");
+        let cache = FfiCache::at_project_root(&root);
+        install_from_inspection(&cache, &named_json("Match")).expect("installs");
+        let catalog = load_catalog(cache.root()).expect("loads");
+        let c = catalog.first().expect("one crate");
+        assert_eq!(c.slug.as_str(), "match_");
+        assert_eq!(
+            c.lib_ident().map(|ident| ident.as_str().to_owned()),
+            Some("Match".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -3108,12 +3440,6 @@ mod tests {
             "an injection-bearing pkg.json must never emit the injection: {loaded:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn slug_is_lowercase_alnum_underscore() {
-        assert_eq!(slugify("semver"), "semver");
-        assert_eq!(slugify("Serde-Json"), "serde_json");
     }
 
     // ── manifest lines ──────────────────────────────────────────────────
@@ -3658,81 +3984,6 @@ mod tests {
         }
     }
 
-    // ── opaqueTypeIds cache boundary (fail-closed) ───────────────────────
-
-    /// Write a legacy consumer-JSON cache (no `.pkg.json`) into a temp dir
-    /// and return the cache root path, so `load_catalog` exercises the
-    /// consumer-JSON decode path (the one that was fail-open on `opaqueTypeIds`).
-    fn write_legacy_cache(test_name: &str, consumer_json: &str) -> std::path::PathBuf {
-        let root = ipe_test_temp::temp_root()
-            .join(format!("ipe-ffi-legacy-{test_name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create cache dir");
-        // Write the minimum artifacts the legacy path reads (no `.pkg.json`).
-        std::fs::write(root.join("semver.consumer.json"), consumer_json)
-            .expect("write consumer.json");
-        // Use the opaque-placeholder form — `type N = N` — so the interface
-        // does not surface a transparent record (no `type alias`, no `(..)`),
-        // and the transparentTypes cross-check passes even when the field is absent.
-        std::fs::write(
-            root.join("semver.ipe"),
-            "module Rust.Semver exposing (Version)\ntype Version = Version\n",
-        )
-        .expect("write interface");
-        std::fs::write(root.join("semver_bindings.rs"), "// autogenerated\n")
-            .expect("write bindings");
-        root
-    }
-
-    /// A non-string value in `opaqueTypeIds` must be a typed `WireMalformed`
-    /// refusal — the old `decode_str_map` helper silently dropped non-string
-    /// values, leaving the map entry absent instead of refusing the manifest.
-    #[test]
-    fn opaque_type_ids_non_string_value_is_rejected() {
-        let consumer = json!({
-            "moduleName": "Rust.Semver",
-            "kernelName": "Rust_Semver",
-            "opaqueTypes": { "Version": "::semver::Version" },
-            "opaqueTypeIds": { "Version": 42 },
-            "defineTypes": [],
-            "cargoDeps": [],
-            "bindings": []
-        })
-        .to_string();
-        let cache_root = write_legacy_cache("ids_reject", &consumer);
-        let err = load_catalog(&cache_root)
-            .expect_err("a non-string opaqueTypeIds value must be a typed WireMalformed refusal");
-        assert!(
-            matches!(err, Diagnostic::WireMalformed { .. }),
-            "expected WireMalformed, got: {err:?}"
-        );
-        let _ = std::fs::remove_dir_all(&cache_root);
-    }
-
-    /// An absent `opaqueTypeIds` field is accepted — older caches omit it.
-    #[test]
-    fn opaque_type_ids_absent_field_accepted_for_legacy_caches() {
-        let consumer = json!({
-            "moduleName": "Rust.Semver",
-            "kernelName": "Rust_Semver",
-            "opaqueTypes": { "Version": "::semver::Version" },
-            "defineTypes": [],
-            "cargoDeps": [],
-            "bindings": []
-        })
-        .to_string();
-        let cache_root = write_legacy_cache("ids_absent", &consumer);
-        let catalog = load_catalog(&cache_root)
-            .expect("absent opaqueTypeIds must be accepted for legacy-cache compat");
-        assert_eq!(catalog.len(), 1);
-        let entry = catalog.first().expect("catalog must have one entry");
-        assert!(
-            entry.opaque_type_ids.is_empty(),
-            "an absent opaqueTypeIds field yields an empty map"
-        );
-        let _ = std::fs::remove_dir_all(&cache_root);
-    }
-
     /// A minimal wrapper-crate inspection bound at `wrapper_path`.
     fn wrapper_pkg(wrapper_path: &str) -> Result<PkgInfo, Diagnostic> {
         PkgInfo::decode_json(
@@ -3960,25 +4211,11 @@ mod tests {
         assert_eq!(here.project_root().ok(), Some(Path::new(".")));
     }
 
-    /// A legacy consumer manifest carrying `cargo_deps` as its dependency list.
-    fn legacy_consumer_with_deps(cargo_deps: &serde_json::Value) -> String {
-        json!({
-            "moduleName": "Rust.Semver",
-            "kernelName": "Rust_Semver",
-            "opaqueTypes": { "Version": "::semver::Version" },
-            "defineTypes": [],
-            "cargoDeps": cargo_deps,
-            "bindings": []
-        })
-        .to_string()
-    }
-
-    /// A legacy manifest cannot re-derive a wrapper crate's source, so any
-    /// stored line outside the exact registry-pin grammar — a `path` line in
-    /// any spelling, a split key, an injected newline — is refused rather than
-    /// forwarded into the emitted manifest.
+    /// Any line outside the exact registry-pin grammar — a `path` line in any
+    /// spelling, a split key, an injected newline — is refused as a typed
+    /// legacy line rather than read as a pin.
     #[test]
-    fn legacy_manifest_with_off_grammar_dep_line_is_refused() {
+    fn off_grammar_dep_line_is_refused() {
         for (i, line) in [
             "engine_wrap = { path = \"/etc\" }",
             "engine_wrap = {path=\"/etc\"}",
@@ -3995,49 +4232,13 @@ mod tests {
         .into_iter()
         .enumerate()
         {
-            let consumer = legacy_consumer_with_deps(&json!([line]));
-            let cache_root = write_legacy_cache(&format!("off_grammar_{i}"), &consumer);
-            let r = load_catalog(&cache_root);
-            let _ = std::fs::remove_dir_all(&cache_root);
+            let r = CargoDep::parse_registry_line(line);
             assert!(
                 matches!(
                     &r,
-                    Err(Diagnostic::WireMalformed {
-                        defect: crate::diag::WireDefect::LegacyDependencyLine { got },
-                        ..
-                    }) if got == line
+                    Err(crate::diag::WireDefect::LegacyDependencyLine { got }) if got == line
                 ),
-                "{line:?} must be refused as a typed legacy line: {r:?}"
-            );
-        }
-    }
-
-    /// A non-string `cargoDeps` entry or a non-array `cargoDeps` is refused,
-    /// never skipped.
-    #[test]
-    fn legacy_manifest_with_non_string_dep_entry_is_refused() {
-        let non_string = "`cargoDeps` carries a non-string entry";
-        for (i, (deps, expected)) in [
-            (json!([42]), non_string),
-            (json!(["semver = \"=1.0.0\"", null]), non_string),
-            (json!("x"), "`cargoDeps` is not an array"),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let consumer = legacy_consumer_with_deps(deps);
-            let cache_root = write_legacy_cache(&format!("non_string_dep_{i}"), &consumer);
-            let r = load_catalog(&cache_root);
-            let _ = std::fs::remove_dir_all(&cache_root);
-            assert!(
-                matches!(
-                    &r,
-                    Err(Diagnostic::WireMalformed {
-                        defect: crate::diag::WireDefect::Json { detail },
-                        ..
-                    }) if detail == expected
-                ),
-                "{deps} must be refused: {r:?}"
+                "line {i}: {line:?} must be refused as a typed legacy line: {r:?}"
             );
         }
     }
@@ -4055,27 +4256,20 @@ mod tests {
         );
     }
 
-    /// A legacy line in the exact rendered grammar loads as a typed registry pin.
+    /// A line in the exact rendered grammar parses as a typed registry pin.
     #[test]
-    fn legacy_manifest_registry_lines_load_typed() {
+    fn registry_lines_parse_typed() {
         let lines = [
             "semver = \"=1.0.0\"",
             "serde = { version = \"=1.0.200\", features = [\"derive\", \"std\"] }",
         ];
-        let consumer = legacy_consumer_with_deps(&json!(lines));
-        let cache_root = write_legacy_cache("registry_lines", &consumer);
-        let r = load_catalog(&cache_root);
-        let _ = std::fs::remove_dir_all(&cache_root);
-        let catalog = r.expect("exact registry lines load");
-        let entry = catalog.first().expect("one entry");
-        let rendered: Vec<String> = entry.cargo_deps.iter().map(CargoDep::render).collect();
+        let deps: Vec<CargoDep> = lines
+            .iter()
+            .map(|line| CargoDep::parse_registry_line(line).expect("exact registry line"))
+            .collect();
+        let rendered: Vec<String> = deps.iter().map(CargoDep::render).collect();
         assert_eq!(rendered, lines);
-        assert!(
-            entry
-                .cargo_deps
-                .iter()
-                .all(|d| matches!(d, CargoDep::Registry { .. }))
-        );
+        assert!(deps.iter().all(|d| matches!(d, CargoDep::Registry { .. })));
     }
 
     /// Every line the renderer emits for a registry pin parses back to the
@@ -4091,40 +4285,6 @@ mod tests {
                 "{dep:?}"
             );
         }
-    }
-
-    /// A stored transparent-parameter slot that is neither a type name nor
-    /// `null` is refused, never read as "no conversion".
-    #[test]
-    fn legacy_manifest_with_non_string_transparent_param_is_refused() {
-        let consumer = json!({
-            "moduleName": "Rust.Semver",
-            "kernelName": "Rust_Semver",
-            "opaqueTypes": { "Version": "::semver::Version" },
-            "defineTypes": [],
-            "cargoDeps": [],
-            "bindings": [{
-                "refName": "parse",
-                "wrapperIdent": "semver_parse",
-                "arity": 1,
-                "sig": "String -> Result Error Version",
-                "transparentParams": [7]
-            }]
-        })
-        .to_string();
-        let cache_root = write_legacy_cache("non_string_param", &consumer);
-        let r = load_catalog(&cache_root);
-        let _ = std::fs::remove_dir_all(&cache_root);
-        assert!(
-            matches!(
-                &r,
-                Err(Diagnostic::WireMalformed {
-                    defect: crate::diag::WireDefect::Json { detail },
-                    ..
-                }) if detail.contains("transparentParams[0]")
-            ),
-            "{r:?}"
-        );
     }
 
     /// Every string, whatever it holds, round-trips through the TOML basic
@@ -4384,40 +4544,5 @@ mod tests {
         assert_eq!(dir.package().as_str(), "engine_wrap");
         assert_eq!(Some(dir.as_str()), canonical.to_str());
         assert!(features.is_empty());
-    }
-
-    /// Stored transparent-parameter slots that disagree with the binding's
-    /// arity are refused at load, never handed to the backend's per-position
-    /// glue lookup.
-    #[test]
-    fn legacy_manifest_with_misaligned_transparent_params_is_refused() {
-        let consumer = json!({
-            "moduleName": "Rust.Semver",
-            "kernelName": "Rust_Semver",
-            "opaqueTypes": { "Version": "::semver::Version" },
-            "defineTypes": [],
-            "cargoDeps": [],
-            "bindings": [{
-                "refName": "parse",
-                "wrapperIdent": "semver_parse",
-                "arity": 1,
-                "sig": "String -> Result Error Version",
-                "transparentParams": [null, "Version"]
-            }]
-        })
-        .to_string();
-        let cache_root = write_legacy_cache("misaligned", &consumer);
-        let r = load_catalog(&cache_root);
-        let _ = std::fs::remove_dir_all(&cache_root);
-        assert!(
-            matches!(
-                &r,
-                Err(Diagnostic::WireMalformed {
-                    defect: crate::diag::WireDefect::Json { detail },
-                    ..
-                }) if detail.contains("transparent-parameter slots")
-            ),
-            "{r:?}"
-        );
     }
 }

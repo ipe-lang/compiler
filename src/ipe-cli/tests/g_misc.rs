@@ -72,6 +72,8 @@ mod golden_eq_opaque_handle_gate;
 mod golden_ffi_kernel_alias_seal;
 #[path = "g_misc/golden_ffi_nonclone_handle_reuse_seal.rs"]
 mod golden_ffi_nonclone_handle_reuse_seal;
+#[path = "g_misc/golden_ffi_slug_seal.rs"]
+mod golden_ffi_slug_seal;
 #[path = "g_misc/golden_harness_coverage.rs"]
 mod golden_harness_coverage;
 #[path = "g_misc/golden_http_statuscode_imagesrc_seal.rs"]

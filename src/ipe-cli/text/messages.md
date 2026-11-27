@@ -2123,6 +2123,10 @@ module `{module}` clashes with the installed FFI crate `{krate}` — the `Rust.*
 
 installed FFI crate `{krate}` defines a `[rust.define.*]` type `{name}` whose name also names an inspected opaque type of the crate — the two are different Rust types that would collide on one nominal; rename the define type
 
+## ffi-slug-collision
+
+installed FFI crates `{first}` and `{second}` both map to the module slug `{slug}` — remove one with `ipe rust remove`, then reinstall the other
+
 ## ffi-dependency-source-conflict
 
 installed FFI crates bind dependency `{name}` to two different sources:
@@ -2140,6 +2144,10 @@ re-add one of the crates so the version pins agree
 
 installed FFI crates need different versions of dependency `{name}`, so the app does not declare it, but `{site}` names its crate `{ident}` directly
 re-add the crates so their `{name}` versions agree
+
+## ffi-shared-lib-ident
+
+installed FFI crates `{first}` and `{second}` both build the Rust library `{ident}`, so `{site}` naming `{ident}` cannot tell them apart — remove one with `ipe rust remove`
 
 ## ffi-emit-unlexable
 

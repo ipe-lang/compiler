@@ -47,7 +47,7 @@ use crate::pkginfo::PkgInfo;
 ///
 /// Returned sorted and deduplicated for a deterministic probe.
 #[must_use]
-pub fn surviving_wrapper_paths(pkg: &PkgInfo, slug: &str) -> Vec<String> {
+pub fn surviving_wrapper_paths(pkg: &PkgInfo, slug: &crate::driver::FfiSlug) -> Vec<String> {
     let kernel = crate::naming::rust_kernel_name(pkg.pkg_path());
     let mut paths: Vec<String> = crate::bindings::surviving_ref_names(pkg)
         .iter()
@@ -142,6 +142,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// The slug spelled `raw`.
+    fn slug(raw: &str) -> crate::driver::FfiSlug {
+        crate::driver::FfiSlug::parse_canonical(raw).expect("a fixture slug")
+    }
+
     // The fixture builders move a `serde_json::Value` into the `json!` macro; the
     // by-value take is the natural shape for a test factory.
     #[allow(clippy::needless_pass_by_value)]
@@ -172,7 +177,7 @@ mod tests {
                 "effect": "fallible"
             }]),
         );
-        let paths = surviving_wrapper_paths(&pkg, "semver");
+        let paths = surviving_wrapper_paths(&pkg, &slug("semver"));
         assert!(!paths.is_empty(), "the fn survives DCE");
         assert!(
             paths.iter().all(|p| p.starts_with("crate::ffi::semver::")),
@@ -256,7 +261,10 @@ mod tests {
             .collect();
         let mut expected_sorted = expected;
         expected_sorted.sort();
-        assert_eq!(surviving_wrapper_paths(&pkg, "semver"), expected_sorted);
+        assert_eq!(
+            surviving_wrapper_paths(&pkg, &slug("semver")),
+            expected_sorted
+        );
     }
 
     #[test]
@@ -264,7 +272,7 @@ mod tests {
         // A package whose every fn drops out of DCE has no probeable surface; the
         // path set is empty and the caller rejects (never emits a vacuous probe).
         let pkg = pkg_with("empty", json!([]));
-        assert!(surviving_wrapper_paths(&pkg, "empty").is_empty());
+        assert!(surviving_wrapper_paths(&pkg, &slug("empty")).is_empty());
     }
 
     #[test]
@@ -286,8 +294,8 @@ mod tests {
             ]),
         );
         assert_eq!(
-            surviving_wrapper_paths(&a, "multi"),
-            surviving_wrapper_paths(&b, "multi")
+            surviving_wrapper_paths(&a, &slug("multi")),
+            surviving_wrapper_paths(&b, &slug("multi"))
         );
     }
 }

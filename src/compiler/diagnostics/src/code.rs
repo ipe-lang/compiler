@@ -756,6 +756,8 @@ code! {
     IPE_F4414 = "IPE-F4414", "an author-asserted foreign call (Rust.Ffi.call) was refused", "IPE-F4414";
     /// a crate being added needs a system library that is not installed
     IPE_F4415 = "IPE-F4415", "a crate being added needs a system library that is not installed", "IPE-F4415";
+    /// a foreign crate cannot take its module slug
+    IPE_F4416 = "IPE-F4416", "a foreign crate cannot take its module slug", "IPE-F4416";
 
     // -----------------------------------------------------------------------
     // Security consent (IPE-S####)

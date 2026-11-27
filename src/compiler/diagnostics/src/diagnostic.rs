@@ -11,30 +11,30 @@
 
 use crate::code::{
     Code, Family, IPE_E0001, IPE_E0002, IPE_E0003, IPE_E0013, IPE_E0014, IPE_F4400, IPE_F4401,
-    IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414, IPE_F4415, IPE_I0001,
-    IPE_I0010, IPE_I0011, IPE_I0100, IPE_I0101, IPE_I0102, IPE_I0103, IPE_I0200, IPE_I0201,
-    IPE_I0202, IPE_I0203, IPE_L0100, IPE_L0101, IPE_L0102, IPE_L0103, IPE_L0104, IPE_L0105,
-    IPE_L0106, IPE_L0107, IPE_L0108, IPE_L0110, IPE_L0111, IPE_L0112, IPE_L0113, IPE_L0114,
-    IPE_L0115, IPE_L0116, IPE_L0117, IPE_L0118, IPE_L0119, IPE_L0120, IPE_L0121, IPE_L0122,
-    IPE_L0123, IPE_L0124, IPE_L0125, IPE_L0126, IPE_L0127, IPE_L0128, IPE_L0129, IPE_L0130,
-    IPE_L0131, IPE_L0132, IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141, IPE_L0142,
-    IPE_L0143, IPE_L0144, IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149, IPE_L0150,
-    IPE_L0151, IPE_L0152, IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157, IPE_L0158,
-    IPE_L0159, IPE_L0160, IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0165, IPE_L0166,
-    IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005, IPE_N0010,
-    IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023, IPE_N0024,
-    IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031, IPE_N0032,
-    IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040, IPE_N0041,
-    IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048, IPE_N0049,
-    IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003, IPE_P0010,
-    IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017, IPE_P0018,
-    IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050, IPE_P0060,
-    IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067, IPE_P0068,
-    IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074, IPE_P0075, IPE_P0076,
-    IPE_P0077, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002, IPE_T0003,
-    IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015, IPE_T0016,
-    IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023, IPE_T0024,
-    Severity,
+    IPE_F4402, IPE_F4410, IPE_F4411, IPE_F4412, IPE_F4413, IPE_F4414, IPE_F4415, IPE_F4416,
+    IPE_I0001, IPE_I0010, IPE_I0011, IPE_I0100, IPE_I0101, IPE_I0102, IPE_I0103, IPE_I0200,
+    IPE_I0201, IPE_I0202, IPE_I0203, IPE_L0100, IPE_L0101, IPE_L0102, IPE_L0103, IPE_L0104,
+    IPE_L0105, IPE_L0106, IPE_L0107, IPE_L0108, IPE_L0110, IPE_L0111, IPE_L0112, IPE_L0113,
+    IPE_L0114, IPE_L0115, IPE_L0116, IPE_L0117, IPE_L0118, IPE_L0119, IPE_L0120, IPE_L0121,
+    IPE_L0122, IPE_L0123, IPE_L0124, IPE_L0125, IPE_L0126, IPE_L0127, IPE_L0128, IPE_L0129,
+    IPE_L0130, IPE_L0131, IPE_L0132, IPE_L0134, IPE_L0135, IPE_L0136, IPE_L0140, IPE_L0141,
+    IPE_L0142, IPE_L0143, IPE_L0144, IPE_L0145, IPE_L0146, IPE_L0147, IPE_L0148, IPE_L0149,
+    IPE_L0150, IPE_L0151, IPE_L0152, IPE_L0153, IPE_L0154, IPE_L0155, IPE_L0156, IPE_L0157,
+    IPE_L0158, IPE_L0159, IPE_L0160, IPE_L0161, IPE_L0162, IPE_L0163, IPE_L0164, IPE_L0165,
+    IPE_L0166, IPE_L0200, IPE_L0201, IPE_N0001, IPE_N0002, IPE_N0003, IPE_N0004, IPE_N0005,
+    IPE_N0010, IPE_N0011, IPE_N0012, IPE_N0013, IPE_N0020, IPE_N0021, IPE_N0022, IPE_N0023,
+    IPE_N0024, IPE_N0025, IPE_N0026, IPE_N0027, IPE_N0028, IPE_N0029, IPE_N0030, IPE_N0031,
+    IPE_N0032, IPE_N0033, IPE_N0034, IPE_N0035, IPE_N0036, IPE_N0038, IPE_N0039, IPE_N0040,
+    IPE_N0041, IPE_N0042, IPE_N0043, IPE_N0044, IPE_N0045, IPE_N0046, IPE_N0047, IPE_N0048,
+    IPE_N0049, IPE_N0050, IPE_N0051, IPE_N0052, IPE_N0053, IPE_P0001, IPE_P0002, IPE_P0003,
+    IPE_P0010, IPE_P0011, IPE_P0012, IPE_P0013, IPE_P0014, IPE_P0015, IPE_P0016, IPE_P0017,
+    IPE_P0018, IPE_P0020, IPE_P0021, IPE_P0030, IPE_P0031, IPE_P0040, IPE_P0041, IPE_P0050,
+    IPE_P0060, IPE_P0061, IPE_P0062, IPE_P0063, IPE_P0064, IPE_P0065, IPE_P0066, IPE_P0067,
+    IPE_P0068, IPE_P0069, IPE_P0070, IPE_P0071, IPE_P0072, IPE_P0073, IPE_P0074, IPE_P0075,
+    IPE_P0076, IPE_P0077, IPE_S0001, IPE_S0002, IPE_S0003, IPE_S0004, IPE_T0001, IPE_T0002,
+    IPE_T0003, IPE_T0004, IPE_T0010, IPE_T0011, IPE_T0012, IPE_T0013, IPE_T0014, IPE_T0015,
+    IPE_T0016, IPE_T0017, IPE_T0018, IPE_T0019, IPE_T0020, IPE_T0021, IPE_T0022, IPE_T0023,
+    IPE_T0024, Severity,
 };
 use crate::span::Span;
 use crate::suggest::{Confidence, Hit};
@@ -2665,6 +2665,25 @@ pub enum FfiError {
         /// A short OS-aware install hint.
         install_hint: TerminalSafe,
     },
+    /// `IPE-F4416` — a crate being installed maps to the module slug another
+    /// installed crate already holds.
+    SlugCollision {
+        /// The module slug both crates map to.
+        slug: TerminalSafe,
+        /// The package name of the crate already installed under the slug,
+        /// or `None` when its inspection document does not decode.
+        installed: Option<TerminalSafe>,
+        /// The package name of the crate being installed.
+        incoming: TerminalSafe,
+    },
+    /// `IPE-F4416` — a crate being installed has a package name that folds to
+    /// no legal module slug.
+    SlugRefused {
+        /// The package name being installed.
+        name: TerminalSafe,
+        /// Which slug rule the folded name breaks.
+        detail: TerminalSafe,
+    },
 }
 
 /// The closed defect payload for sandbox diagnostics (`IPE-F441x`).
@@ -4486,6 +4505,7 @@ const fn ffi_code(msg: &FfiError) -> Code {
         FfiError::ArtifactIo { .. } => IPE_F4412,
         FfiError::AssertedRefused { .. } => IPE_F4414,
         FfiError::SystemLibraryNotFound { .. } => IPE_F4415,
+        FfiError::SlugCollision { .. } | FfiError::SlugRefused { .. } => IPE_F4416,
     })
 }
 
@@ -4513,7 +4533,9 @@ const fn ffi_span(msg: &FfiError) -> Span {
         | FfiError::ShapeContradiction { .. }
         | FfiError::SourceRejected { .. }
         | FfiError::ArtifactIo { .. }
-        | FfiError::SystemLibraryNotFound { .. } => Span::DUMMY,
+        | FfiError::SystemLibraryNotFound { .. }
+        | FfiError::SlugCollision { .. }
+        | FfiError::SlugRefused { .. } => Span::DUMMY,
     }
 }
 
@@ -4538,6 +4560,41 @@ fn ffi_help(msg: &FfiError) -> Vec<HelpLine> {
                     .into(),
             ),
             HelpLine::SeeExplain("IPE-F4415"),
+        ],
+        FfiError::SlugCollision {
+            installed: Some(installed),
+            ..
+        } => vec![
+            HelpLine::Note(
+                format!(
+                    "remove `{installed}` with `ipe rust remove {installed}` before adding \
+                     the other crate, or keep only one of the two"
+                )
+                .into_boxed_str(),
+            ),
+            HelpLine::SeeExplain("IPE-F4416"),
+        ],
+        FfiError::SlugCollision {
+            installed: None,
+            incoming,
+            ..
+        } => vec![
+            HelpLine::Note(
+                format!(
+                    "remove the undecodable record with `ipe rust remove {incoming}`, \
+                     then add the crate again"
+                )
+                .into_boxed_str(),
+            ),
+            HelpLine::SeeExplain("IPE-F4416"),
+        ],
+        FfiError::SlugRefused { .. } => vec![
+            HelpLine::Note(
+                "no crate with this package name can be installed; pick another crate \
+                 or wrap it in a local wrapper crate under a different name"
+                    .into(),
+            ),
+            HelpLine::SeeExplain("IPE-F4416"),
         ],
         FfiError::CallUnrenderable { .. }
         | FfiError::GenericNotBindable { .. }

@@ -358,6 +358,7 @@ const TEST_BINARIES: &[(&str, &str, Reason)] = &[
     ("ipe", "served_install_icon", Reason::Unconsolidated),
     ("ipe", "server_e2e", Reason::Unconsolidated),
     ("ipe", "server_shutdown_e2e", Reason::Unconsolidated),
+    ("ipe", "source_scans", Reason::AreaHarness),
     ("ipe", "spike_std_source", Reason::Unconsolidated),
     ("ipe", "static_emit", Reason::DedicatedJob),
     ("ipe", "stdlib_alias_gate", Reason::Unconsolidated),

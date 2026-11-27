@@ -10,8 +10,8 @@ use std::collections::BTreeMap;
 
 use ipe_canon::ast as canon;
 use ipe_diagnostics::{
-    Code, DResult, Diagnostic, Feature, IPE_L0101, IPE_L0102, IPE_L0107, IPE_L0108, IPE_L0119,
-    IPE_L0154, Located, LowerError, ModelLeaf, Span,
+    Code, DResult, Diagnostic, Feature, IPE_L0101, IPE_L0102, IPE_L0107, IPE_L0108, IPE_L0117,
+    IPE_L0119, IPE_L0136, IPE_L0154, Located, LowerError, ModelLeaf, Span,
 };
 use ipe_intern::{Interner, Symbol};
 use ipe_ir::{BoundSet, Callee, Expr, FuncId, IrType, KernelFn};
@@ -2637,5 +2637,136 @@ fn web_model_without_clone_is_refused_as_a_model() -> DResult<()> {
         ),
         "expected IPE-L0120 blaming the Task at the entry, got {res:?}"
     );
+    Ok(())
+}
+
+/// A constructor field of `Set Float` is refused at the constructor's own span.
+#[test]
+fn enum_ctor_with_float_keyed_set_reports_ctor_span() -> DResult<()> {
+    let mut i = Interner::new();
+    let t = i.intern("T")?;
+    let c = i.intern("C")?;
+    let set = i.intern("Set")?;
+    let float = i.intern("Float")?;
+    let ctor_span = Span::new(9, 20);
+    let union = canon::Union {
+        home: Vec::new(),
+        name: t,
+        name_span: Span::new(5, 6),
+        vars: Vec::new(),
+        ctors: vec![canon::Ctor {
+            name: c,
+            index: 0,
+            arity: 1,
+            args: vec![canon::Type::Con {
+                home: Vec::new(),
+                name: set,
+                args: vec![canon::Type::Con {
+                    home: Vec::new(),
+                    name: float,
+                    args: Vec::new(),
+                }],
+            }],
+            span: ctor_span,
+        }],
+    };
+    let res = run(vec![union], Vec::new(), BTreeMap::new(), &mut i);
+    assert_unsupported(res, Feature::FloatKeyedCollection, IPE_L0117, ctor_span);
+    Ok(())
+}
+
+/// A union's constructor refusal is homed to the union's own module, never
+/// the entry module its span would otherwise be read against.
+#[test]
+fn enum_ctor_refusal_is_homed_to_the_union_module() -> DResult<()> {
+    let mut i = Interner::new();
+    let lib = i.intern("Lib")?;
+    let t = i.intern("T")?;
+    let c = i.intern("C")?;
+    let set = i.intern("Set")?;
+    let float = i.intern("Float")?;
+    let ctor_span = Span::new(9, 20);
+    let union = canon::Union {
+        home: vec![lib],
+        name: t,
+        name_span: Span::new(5, 6),
+        vars: Vec::new(),
+        ctors: vec![canon::Ctor {
+            name: c,
+            index: 0,
+            arity: 1,
+            args: vec![canon::Type::Con {
+                home: Vec::new(),
+                name: set,
+                args: vec![canon::Type::Con {
+                    home: Vec::new(),
+                    name: float,
+                    args: Vec::new(),
+                }],
+            }],
+            span: ctor_span,
+        }],
+    };
+    let m = canon::Module {
+        imports_unsafe_submodule: false,
+        imported_web_capabilities: std::collections::BTreeSet::new(),
+        name: Vec::new(),
+        unions: vec![union],
+        defs: Vec::new(),
+    };
+    let types = SolvedTypes {
+        env: BTreeMap::new(),
+        regions: BTreeMap::new(),
+        expected: BTreeMap::new(),
+        bounds: BTreeMap::new(),
+        warnings: Vec::new(),
+        poly_var_map: BTreeMap::new(),
+        untyped_type_params: BTreeMap::new(),
+        msg_defaulted_vars: BTreeMap::new(),
+        signature_wildcards: BTreeMap::new(),
+    };
+    let res = lower(&m, &types, &mut i, "", "", ipe_lower::Roots::Entry);
+    assert!(
+        matches!(
+            &res,
+            Err((Diagnostic::Lower {
+                span,
+                msg: LowerError::Unsupported(Feature::FloatKeyedCollection),
+            }, home)) if *span == ctor_span && *home == [lib]
+        ),
+        "a ctor refusal reports at the ctor in the union's module, got {:?}",
+        res.as_ref().err()
+    );
+    Ok(())
+}
+
+/// A `main` whose type is not a runnable entry is refused at `main`'s name.
+#[test]
+fn non_entry_main_reports_main_span() -> DResult<()> {
+    let mut i = Interner::new();
+    let main = i.intern("main")?;
+    let name_span = Span::new(0, 4);
+    let def = canon::Def::Typed {
+        home: vec![],
+        name: Located::new(name_span, main),
+        free_vars: Vec::new(),
+        patterns: Vec::new(),
+        body: int(Span::new(12, 13), 1),
+        ty: con_int(&mut i)?,
+    };
+    let res = run(Vec::new(), vec![def], BTreeMap::new(), &mut i);
+    assert!(
+        matches!(
+            &res,
+            Err(Diagnostic::Lower {
+                span,
+                msg: LowerError::NonEntryMain { .. },
+            }) if *span == name_span
+        ),
+        "a non-runnable `main` must refuse at its name, got {:?}",
+        res.as_ref().err()
+    );
+    let code = res.as_ref().err().map(Diagnostic::code);
+    assert_eq!(code, Some(IPE_L0136), "the refusal is IPE-L0136");
     Ok(())
 }

@@ -22,7 +22,7 @@
 use std::path::Path;
 
 use ipe_ffi::bindings::{emit_bindings, surviving_ref_names};
-use ipe_ffi::driver::{FfiCache, cargo_dep_lines};
+use ipe_ffi::driver::{FfiCache, FfiSlug, cargo_dep_lines};
 use ipe_ffi::interface::crate_interface;
 use ipe_ffi::pkginfo::PkgInfo;
 use ipe_ffi::probe::{emit_probe_main, surviving_wrapper_paths};
@@ -260,6 +260,11 @@ fn main() {
 /// The package slug, wrapper crate name and app crate prefix of the async seals.
 const ASYNC_WRAP: &str = "async_wrap";
 
+/// The module slug the async wrapper crate is cached under.
+fn async_wrap_slug() -> FfiSlug {
+    FfiSlug::parse_canonical(ASYNC_WRAP).expect("the async wrapper's name is a slug")
+}
+
 /// The inspection document for an async wrapper crate at `wrapper_path`.
 ///
 /// `greet` is an `async fn` the inspector reports as effectful. `drive` takes a
@@ -359,7 +364,7 @@ fn a_future_param_over_drops_and_the_effectful_fn_binds_a_task() {
         "a future parameter must over-drop, never emit-and-cargo-fail:\n{bindings}"
     );
     assert_eq!(
-        surviving_wrapper_paths(&pkg, ASYNC_WRAP).len(),
+        surviving_wrapper_paths(&pkg, &async_wrap_slug()).len(),
         1,
         "the probe surface is the effectful wrapper alone"
     );
@@ -420,7 +425,7 @@ fn the_tier2_probe_builds_an_effectful_surface() {
         ipe_test_temp::temp_root().join(format!("ipe_ffi_async_wrap_probe_{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let pkg = write_async_app(&root, "async_wrap_probe", "fn main() {}\n");
-    let paths = surviving_wrapper_paths(&pkg, ASYNC_WRAP);
+    let paths = surviving_wrapper_paths(&pkg, &async_wrap_slug());
     assert!(!paths.is_empty(), "the effectful wrapper survives");
     let probe = emit_probe_main(&paths, &ipe_intern::ffi_crate_root());
     std::fs::write(root.join("src").join("main.rs"), probe).expect("the probe root is written");
