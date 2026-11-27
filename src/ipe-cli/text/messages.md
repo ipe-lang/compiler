@@ -3106,7 +3106,8 @@ released (bundle) → {path} (run `./ipe-wrapper -- <args>`; WARNING: ipe-app ca
 
 ## android-build-steps
 
-1. `gradle wrapper` once with Gradle {gradle} or newer — the project ships no wrapper.
+1. `gradle wrapper --gradle-version {gradle} --gradle-distribution-sha256-sum {sha}` once, with any Gradle 8.x — the project ships no wrapper; the wrapper then downloads Gradle {gradle} and checks that SHA-256 on every run.
+   To switch Gradle, rerun this step with another version and the SHA-256 of its `-bin.zip` distribution; only Gradle {gradle} is tested.
 2. `./gradlew assembleDebug` (Android SDK, API {api}) builds an APK signed with the SDK's debug key, for local install only.
 3. `./gradlew installDebug` installs it onto a running emulator or device.
 4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
@@ -3117,7 +3118,15 @@ note: an unsigned Android Gradle project is written here. To build it:
 
 ## mobile-ios-note
 
-note: the iOS shell project layout is written here, but a signed, runnable .ipa must be produced on a macOS runner with Xcode + a signing identity (out of scope).
+note: the iOS shell sources (Swift files, Info.plist, assets) are written here, not an Xcode project: on macOS, build them in Xcode with the steps in its README.txt; a signed, runnable .ipa also needs a signing identity (out of scope).
+
+## ios-build-steps
+
+1. On macOS, create a new Xcode iOS App project (Interface: Storyboard, Language: Swift) and name its product exactly as the `CFBundleExecutable` value in `App/Info.plist`.
+2. Delete the template's `AppDelegate.swift`, `SceneDelegate.swift`, `ViewController.swift`, `Main.storyboard`, `Info.plist` and `Assets.xcassets`: the shell's `App/AppDelegate.swift` is the app's one `@main` entry point, and two entry points do not compile.
+3. Add the files under `App/` to the target, with `App/www/` as a folder reference so the client keeps its layout.
+4. In the target's Build Settings, set Generate Info.plist File to No and Info.plist File to `App/Info.plist`.
+5. Pick an iOS Simulator and press ⌘R. A signed, distributable `.ipa` also needs a signing identity.
 
 # Consent refusals
 

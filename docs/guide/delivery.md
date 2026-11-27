@@ -189,10 +189,11 @@ The Android shell is a ready-to-build Gradle project; the client rides under
 there is no remote host and no `file://` access. See
 [Android (emulator)](#android-emulator) below for the build steps.
 
-`ipe release build web client ios` writes the equivalent Xcode project (`WKWebView` +
-`WKURLSchemeHandler`). Its layout and derived-permission manifest are written for
-inspection, but a signed `.ipa` must be produced on a macOS runner with Xcode and
-a signing identity. As with desktop, `build web client <os>` lays out the same shell
+`ipe release build web client ios` writes the iOS shell as sources, not an Xcode
+project: the Swift files of a `WKWebView` + `WKURLSchemeHandler` shell, the
+derived-permission `Info.plist`, and the client's assets. You build them in a new
+Xcode project on macOS (see [iOS (simulator)](#ios-simulator) below); a signed
+`.ipa` also needs a signing identity. As with desktop, `build web client <os>` lays out the same shell
 around a fast dev client; `release web client <os>` hosts the production client.
 
 ## Running and simulating each host
@@ -242,7 +243,8 @@ With the Android SDK on `PATH`, `cd` into `out/release/web-client-android/dist/a
 and:
 
 <!-- android-build-steps -->
-1. `gradle wrapper` once with Gradle 8.7 or newer — the project ships no wrapper.
+1. `gradle wrapper --gradle-version 8.7 --gradle-distribution-sha256-sum 544c35d6bd849ae8a5ed0bcea39ba677dc40f49df7d1835561582da2009b961d` once, with any Gradle 8.x — the project ships no wrapper; the wrapper then downloads Gradle 8.7 and checks that SHA-256 on every run.
+   To switch Gradle, rerun this step with another version and the SHA-256 of its `-bin.zip` distribution; only Gradle 8.7 is tested.
 2. `./gradlew assembleDebug` (Android SDK, API 34) builds an APK signed with the SDK's debug key, for local install only.
 3. `./gradlew installDebug` installs it onto a running emulator or device.
 4. Store build: add a `signingConfig` for your keystore to `app/build.gradle`, then run `./gradlew assembleRelease`.
@@ -253,19 +255,20 @@ Android SDK.
 
 ### iOS (simulator)
 
-`release web client ios` writes an Xcode project to `out/release/web-client-ios/dist/ios/<name>-ios/` (a
-`WKWebView` plus a scheme handler serving the wasm client). Simulating needs
-**macOS + Xcode**:
+`release web client ios` writes the shell's sources to `out/release/web-client-ios/dist/ios/<name>-ios/`
+(a `WKWebView` plus a scheme handler serving the wasm client, under `App/`). It is
+not an Xcode project, so there is no scheme to build from the command line.
+Simulating needs **macOS + Xcode**:
 
-```sh
-open out/release/web-client-ios/dist/ios/<name>-ios/          # open the Xcode project, pick an iOS Simulator, press ⌘R
-# headless macOS:
-xcrun simctl boot "iPhone 15"
-xcodebuild -scheme App -destination 'platform=iOS Simulator,name=iPhone 15'
-```
+<!-- ios-build-steps -->
+1. On macOS, create a new Xcode iOS App project (Interface: Storyboard, Language: Swift) and name its product exactly as the `CFBundleExecutable` value in `App/Info.plist`.
+2. Delete the template's `AppDelegate.swift`, `SceneDelegate.swift`, `ViewController.swift`, `Main.storyboard`, `Info.plist` and `Assets.xcassets`: the shell's `App/AppDelegate.swift` is the app's one `@main` entry point, and two entry points do not compile.
+3. Add the files under `App/` to the target, with `App/www/` as a folder reference so the client keeps its layout.
+4. In the target's Build Settings, set Generate Info.plist File to No and Info.plist File to `App/Info.plist`.
+5. Pick an iOS Simulator and press ⌘R. A signed, distributable `.ipa` also needs a signing identity.
+<!-- /ios-build-steps -->
 
-A distributable `.ipa` additionally needs a signing identity. iOS cannot be
-built or simulated on Linux or Windows.
+iOS cannot be built or simulated on Linux or Windows.
 
 ## OS permissions come from your capabilities
 

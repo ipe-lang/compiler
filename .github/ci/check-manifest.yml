@@ -620,9 +620,9 @@ checks:
           differs: CI runs the same suite from one archive split into cost-balanced shard groups
     guards: >-
       SEAL, and Security — the vendored-emit SEAL, the real Linux x64 build
-      jail, and the browser port-glue proofs report through this verdict, so a
-      red in any of them blocks a landing.
-    aggregates: [test-prep, e2e, seal-modset-vendored, linux-x64-tier2, browser-e2e]
+      jail, the browser port-glue proofs and the generated Android shell build
+      report through this verdict, so a red in any of them blocks a landing.
+    aggregates: [test-prep, e2e, seal-modset-vendored, linux-x64-tier2, browser-e2e, android-shell-build]
   - context: seal-slice
     disposition: gate
     producer: ci.yml

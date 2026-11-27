@@ -4466,6 +4466,69 @@ class TestPhaseRouting(unittest.TestCase):
             "aggregates 'fmt', whose `if:` must be exactly",
         )
 
+    # (e2) an aggregated job keyed on another declared scope is named in `scopes`.
+    _NARROW_OLD = (
+        "      code: ${{ steps.classify.outputs.code != 'false' }}\n",
+        "  test:\n    runs-on: ubuntu-latest\n    needs: [changes, test-run]\n",
+        "            test-run=${{ needs.test-run.result }}\n",
+        "          scope: ${{ needs.changes.outputs.code }}\n  asan:\n",
+    )
+
+    def narrowed(self, scopes: str | None, *, job_scope: str = "mobile", declare: bool = True) -> str:
+        """`_PH_OK` with a `mob-run` job keyed on `job_scope` under the `test` verdict."""
+        content = _PH_OK
+        for old in self._NARROW_OLD:
+            self.assertEqual(content.count(old), 1, old)
+        if declare:
+            content = content.replace(
+                self._NARROW_OLD[0],
+                self._NARROW_OLD[0] + "      mobile: ${{ steps.classify.outputs.mobile != 'false' }}\n",
+            )
+        content = content.replace(
+            self._NARROW_OLD[1],
+            "  mob-run:\n    runs-on: ubuntu-latest\n    needs: [changes, fmt, guard]\n"
+            f"    if: needs.changes.outputs.tests == 'true' && needs.changes.outputs.{job_scope} == 'true'\n"
+            "    steps:\n      - run: echo mob\n"
+            "  test:\n    runs-on: ubuntu-latest\n    needs: [changes, test-run, mob-run]\n",
+        )
+        content = content.replace(
+            self._NARROW_OLD[2],
+            self._NARROW_OLD[2] + "            mob-run=${{ needs.mob-run.result }}\n",
+        )
+        if scopes is not None:
+            content = content.replace(
+                self._NARROW_OLD[3],
+                f"          scope: ${{{{ needs.changes.outputs.code }}}}\n          scopes: {scopes}\n  asan:\n",
+            )
+        return content
+
+    def test_narrowed_job_named_in_scopes_passes(self) -> None:
+        self.assertEqual(self.errors(self.narrowed("mob-run=${{ needs.changes.outputs.mobile }}")), [])
+
+    def test_narrowed_job_missing_from_scopes_refused(self) -> None:
+        errors = self.errors(self.narrowed(None))
+        self.assertTrue(any("`scopes` must be" in e for e in errors), errors)
+
+    def test_scopes_pair_reading_another_output_refused(self) -> None:
+        errors = self.errors(self.narrowed("mob-run=${{ needs.changes.outputs.code }}"))
+        self.assertTrue(any("`scopes` must be" in e for e in errors), errors)
+
+    def test_narrowed_job_on_an_undeclared_output_refused(self) -> None:
+        errors = self.errors(self.narrowed("mob-run=${{ needs.changes.outputs.mobile }}", declare=False))
+        self.assertTrue(any("aggregates 'mob-run', whose `if:` must be exactly" in e for e in errors), errors)
+
+    def test_narrowed_job_on_release_only_refused(self) -> None:
+        errors = self.errors(self.narrowed("mob-run=${{ needs.changes.outputs.release_only }}", job_scope="release_only"))
+        self.assertTrue(any("aggregates 'mob-run', whose `if:` must be exactly" in e for e in errors), errors)
+
+    def test_scopes_without_a_narrowed_job_refused(self) -> None:
+        self.assertRefused(
+            "          scope: ${{ needs.changes.outputs.code }}\n  asan:\n",
+            "          scope: ${{ needs.changes.outputs.code }}\n"
+            "          scopes: test-run=${{ needs.changes.outputs.code }}\n  asan:\n",
+            "sets `scopes` but every aggregated job keys on `scope`",
+        )
+
     # (f) a job needs only jobs that run on every event it runs on.
     def test_cheap_job_needing_a_tests_job_refused(self) -> None:
         self.assertRefused(
@@ -10696,6 +10759,64 @@ class TestReleaseFeatureLive(unittest.TestCase):
         self.assertRefused("is a glob", ws='[workspace]\nmembers = ["cli/*"]\n')
         self.assertRefused("no list of", ws="[workspace]\n")
         self.assertRefused("is no workspace member", ws='[workspace]\nmembers = ["inspector"]\n')
+
+
+
+class TestPhaseVerdictAction(unittest.TestCase):
+    """The phase-verdict action's own script: a needed job may skip only where
+    the phase or that job's own scope flag is off, and a malformed `scopes`
+    list fails it."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        path = os.path.join(os.path.dirname(HERE), "actions", "phase-verdict", "action.yml")
+        with open(path, encoding="utf-8") as fh:
+            doc = verify_manifest.strict_yaml.safe_load(fh)
+        steps = doc["runs"]["steps"]
+        assert len(steps) == 1, steps
+        cls.script = steps[0]["run"]
+
+    def verdict(self, results: str, *, tier: str = "true", scope: str = "true", scopes: str = "", event: str = "merge_group") -> int:
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "GITHUB_EVENT_NAME": event,
+            "RESULTS": results,
+            "PHASE": "tests",
+            "TIER": tier,
+            "SCOPE": scope,
+            "SCOPES": scopes,
+        }
+        done = subprocess.run(["bash", "-c", self.script], env=env, capture_output=True, timeout=30, check=False)
+        return done.returncode
+
+    def test_every_job_succeeding_passes(self) -> None:
+        self.assertEqual(self.verdict("changes=success a=success b=success"), 0)
+
+    def test_skip_under_an_on_scope_fails(self) -> None:
+        self.assertNotEqual(self.verdict("changes=success a=success b=skipped"), 0)
+
+    def test_skip_under_an_off_scope_passes(self) -> None:
+        self.assertEqual(self.verdict("changes=success a=skipped", scope="false"), 0)
+
+    def test_failure_fails_even_off_scope(self) -> None:
+        self.assertNotEqual(self.verdict("changes=success a=failure", scope="false"), 0)
+
+    def test_narrowed_job_skipping_on_its_off_scope_passes(self) -> None:
+        self.assertEqual(self.verdict("changes=success a=success m=skipped", scopes="m=false"), 0)
+
+    def test_narrowed_job_skipping_on_its_on_scope_fails(self) -> None:
+        self.assertNotEqual(self.verdict("changes=success a=success m=skipped", scopes="m=true"), 0)
+
+    def test_narrowed_job_on_scope_beats_an_off_aggregate_scope(self) -> None:
+        self.assertNotEqual(self.verdict("changes=success a=skipped m=skipped", scope="false", scopes="m=true"), 0)
+
+    def test_off_phase_skip_passes(self) -> None:
+        self.assertEqual(self.verdict("changes=success m=skipped", tier="false", scopes="m=true", event="pull_request"), 0)
+
+    def test_malformed_scopes_fail(self) -> None:
+        for scopes in ("m", "=true", "m=maybe", "m=", "changes=true", "m=true m=false", "x=true"):
+            with self.subTest(scopes=scopes):
+                self.assertNotEqual(self.verdict("changes=success a=success m=success", scopes=scopes), 0)
 
 
 if __name__ == "__main__":
