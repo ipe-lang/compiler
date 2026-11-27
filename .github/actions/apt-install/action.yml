@@ -1,25 +1,30 @@
 name: Install apt packages
 description: >-
   The one apt package install every CI job runs (ci/verify-manifest.py check
-  27 refuses any other). Each of three attempts first completes an install an
-  earlier cap interrupted mid-unpack, then updates and installs with apt's own
-  download retries; every command is capped at six minutes and at what is left
-  of one fifteen-minute budget for the whole install, and is killed thirty
-  seconds after its cap if it ignores the stop. The first attempt uses the
-  runner's own Ubuntu mirror; each failed attempt repoints every Ubuntu archive
-  and security source to the next independent mirror (archive.ubuntu.com, then
-  mirrors.edge.kernel.org) before the next, names each source file it
-  repointed, and warns, naming the source hosts it found, when it found none
-  to repoint. Archives an attempt finished downloading stay in the archive
-  directory, so a later attempt fetches only what is still missing. When the
-  archive directory is a job's cache, each attempt first asks apt, from the
-  index `update` has just verified against its signature, for the name, size
-  and SHA-256 of every archive the install needs, and removes every cached
-  entry in it (apart from apt's own `partial` directory and `lock` file)
-  that is not a listed archive or whose size or hash differs (a hash type other
-  than SHA-256 or SHA-512 counts as differing), and makes `partial` a
-  directory again, so apt installs only archives the signed index vouches
-  for. When every attempt fails the step fails, and so does a spent budget.
+  27 refuses any other). apt reads only the Ubuntu archive's own source files,
+  `/etc/apt/sources.list` and `/etc/apt/sources.list.d/ubuntu.sources` (an
+  install refuses when neither exists), so no other source the runner image
+  configures can fail or feed the install; every index and archive is still
+  checked against its signature. Each of three attempts first completes an
+  install an earlier cap interrupted mid-unpack, then updates and installs
+  with apt's own download retries; every command is capped at six minutes and
+  at what is left of one fifteen-minute budget for the whole install, and is
+  killed thirty seconds after its cap if it ignores the stop. The first
+  attempt uses the runner's own Ubuntu mirror; each failed attempt repoints
+  every Ubuntu archive and security source to the next independent mirror
+  (archive.ubuntu.com, then mirrors.edge.kernel.org) before the next, names
+  each source file it repointed, and warns, naming the source hosts it found,
+  when it found none to repoint. Archives an attempt finished downloading stay
+  in the archive directory, so a later attempt fetches only what is still
+  missing. When the archive directory is a job's cache, each attempt first
+  asks apt, from the index `update` has just verified against its signature,
+  for the name, size and SHA-256 of every archive the install needs, and
+  removes every cached entry in it (apart from apt's own `partial` directory
+  and `lock` file) that is not a listed archive or whose size or hash differs
+  (a hash type other than SHA-256 or SHA-512 counts as differing), and makes
+  `partial` a directory again, so apt installs only archives the signed index
+  vouches for. When every attempt fails the step fails, and so does a spent
+  budget.
 inputs:
   packages:
     description: Space-separated Debian package names on one line (lower-case ASCII letters, digits and `.+:-`, never a leading `-`).
@@ -76,13 +81,19 @@ runs:
             exit 1
             ;;
         esac
+        if [[ ! "${RUNNER_TEMP:-}" =~ ^(/[A-Za-z0-9._-]+)+$ || ! -d "$RUNNER_TEMP" ]]; then
+          echo "::error::apt-install: RUNNER_TEMP must be an existing absolute directory to hold the Ubuntu source list and the signed archive listing" >&2
+          exit 1
+        fi
+        main_list=/etc/apt/sources.list
+        part_list=/etc/apt/sources.list.d/ubuntu.sources
+        if [[ ! -f "$main_list" && ! -f "$part_list" ]]; then
+          echo "::error::apt-install: neither ${main_list} nor ${part_list} exists, so there is no Ubuntu source to install from" >&2
+          exit 1
+        fi
         if [[ -n "$APT_ARCHIVES" ]]; then
           if [[ ! "$APT_ARCHIVES" =~ ^(/[A-Za-z0-9._-]+)+$ || "$APT_ARCHIVES/" == */../* || "$APT_ARCHIVES/" == */./* ]]; then
             echo "::error::apt-install: archives must be an absolute directory with no . or .. segment" >&2
-            exit 1
-          fi
-          if [[ ! "${RUNNER_TEMP:-}" =~ ^(/[A-Za-z0-9._-]+)+$ || ! -d "$RUNNER_TEMP" ]]; then
-            echo "::error::apt-install: RUNNER_TEMP must be an existing absolute directory to list the signed archives in" >&2
             exit 1
           fi
           mkdir -p "$APT_ARCHIVES"
@@ -91,7 +102,15 @@ runs:
           mkdir "$listing_dir/partial"
           listing="$listing_dir/uris"
         fi
-        apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        sources_dir="$(mktemp -d -p "$RUNNER_TEMP" apt-sources.XXXXXX)"
+        mkdir "$sources_dir/parts"
+        if [[ -f "$main_list" ]]; then
+          ln -s -- "$main_list" "$sources_dir/sources.list"
+        fi
+        if [[ -f "$part_list" ]]; then
+          ln -s -- "$part_list" "$sources_dir/parts/ubuntu.sources"
+        fi
+        apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o "Dir::Etc::sourcelist=$sources_dir/sources.list" -o "Dir::Etc::sourceparts=$sources_dir/parts" -o APT::Get::List-Cleanup=false)
         mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)
         source_host='://([A-Za-z0-9.-]*\.)?(archive|security)\.ubuntu\.com/'
         deadline=$((SECONDS + 900))
@@ -99,7 +118,7 @@ runs:
           mirror="${mirrors[attempt - 1]}"
           if [[ -n "$mirror" ]]; then
             repointed=0
-            for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            for list in /etc/apt/apt-mirrors.txt "$main_list" "$part_list"; do
               if [[ -f "$list" ]] && grep -qE "$source_host" "$list"; then
                 sudo sed -i -E "s#${source_host}#://${mirror}/#g" "$list"
                 echo "apt attempt $attempt repoints $list to $mirror"
@@ -108,7 +127,7 @@ runs:
             done
             if ((repointed == 0)); then
               found=()
-              for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+              for list in /etc/apt/apt-mirrors.txt "$main_list" "$part_list"; do
                 if [[ -f "$list" ]]; then
                   found+=("$list")
                 fi
