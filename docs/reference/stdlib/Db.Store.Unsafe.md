@@ -202,9 +202,13 @@ compositePrimaryKey : List String -> Draft row -> Draft row
 ```
 
 `compositePrimaryKey cols draft` — make the string-named `cols`, in order,
-one table-level primary key. Needs two or more distinct columns of the draft;
-an empty or one-column list, a repeated or unknown column, or a draft that
-already has a primary key is refused, fail-closed, when the schema is built.
+one table-level primary key. Needs two or more distinct, non-nullable columns
+of the draft; an empty or one-column list, a repeated, unknown, or nullable
+(`CNull`) column, or a draft that already has a primary key is refused,
+fail-closed, when the schema is built. The schema DDL renders each key column
+`NOT NULL` plus one table-level `PRIMARY KEY (…)` term in the listed order; a
+draft that also marks a column `serial` has its DDL refused (`AUTOINCREMENT`
+needs a one-column `INTEGER` key).
 
 Example:
 
