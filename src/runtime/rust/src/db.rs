@@ -17224,20 +17224,20 @@ mod tests {
                 .execute(&mut *held)
                 .await
                 .expect("write under the lock");
-            let release = tokio::spawn(async move {
+            let release = async move {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
                 sqlx::query("COMMIT")
                     .execute(&mut *held)
                     .await
                     .expect("release the write lock");
                 drop(held);
-            });
-            let switched = match build_pool::<String>(&db_url, Journal::Wal).await {
+            };
+            let (switched, ()) = tokio::join!(build_pool::<String>(&db_url, Journal::Wal), release);
+            let pool = match switched {
                 IpeResult::Ok(pool) => Ok(pool),
                 IpeResult::Err(e) => Err(e),
-            };
-            release.await.expect("the writer ends");
-            let pool = switched.expect("the WAL switch waits out the held write lock");
+            }
+            .expect("the WAL switch waits out the held write lock");
             let mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
                 .fetch_one(&pool)
                 .await
