@@ -215,8 +215,9 @@ closed. The columns are derived from the codec's `Shape`: an `SRecord`
 becomes the typed column list, a non-`SRecord` codec (a bare scalar, a blob)
 names no columns and is an `Err`. The table name and every derived column
 name are run through `validSqlIdent`; the first non-conforming identifier is
-an `Err`, and no draft is produced. A returned `Draft` therefore holds only
-accepted identifiers, and its columns cannot drift from the codec that reads
+an `Err`, as are two column names differing only in case (SQL compares
+identifiers case-insensitively), and no draft is produced. A returned `Draft`
+therefore holds only accepted, distinct identifiers, and its columns cannot drift from the codec that reads
 and writes its rows (parse-don't-validate + one source of truth).
 
 A `Draft` is NOT queryable: classify it with `public` (world-open) or
@@ -236,7 +237,8 @@ derived from `columns` (`rowCodec`), so the same codec-driven CRUD applies once
 the draft is classified: writes bind each declared column, reads decode back
 into a `Row`, and the typed `read*` helpers parse a column into its Ipê type.
 Like `fromCodec`, the table name and every column name run through
-`validSqlIdent`, so an invalid identifier fails closed before any SQL is built.
+`validSqlIdent`, so an invalid identifier fails closed before any SQL is built,
+and two column names differing only in case (one SQL identifier) are refused.
 Classify the result with `public` / `secured` before querying (deny-by-default).
 
 ## `rowCodec`
@@ -321,6 +323,9 @@ serial : (row -> t) -> Draft row -> Draft row
 
 Mark the accessor-named column DB-assigned (serial). `insert` omits it so
 the database generates it — a client value can never overwrite a serial column.
+The column must be the store's one-column primary key with an `INTEGER` SQL
+type (an `Int` field); `createSql` / `migrations` return a typed `Err`
+otherwise.
 
 ## `unique`
 
@@ -674,7 +679,10 @@ The primary key renders from the store's key declaration:
 Before rendering, the key is re-proved: the declaration and the store's
 primary-key specs agree, a composite key's columns are valid identifiers
 naming distinct, non-nullable columns of the table, and a composite key has
-no `serial` column. The first fault is a typed `Err` and no DDL is produced.
+no `serial` column. Every column name is also re-proved distinct under SQL's
+case-insensitive identifier comparison, and a `serial` column must be the
+one-column `INTEGER` key. The first fault is a typed `Err` and no DDL is
+produced.
 
 The DDL is `CREATE TABLE IF NOT EXISTS`: when a table of that name already
 exists, `Db.migrate` records the entry as applied without comparing the
@@ -1067,7 +1075,8 @@ This function is a total constructor: `from` and `to` are admitted into the
 op log unconditionally. Identifier validation happens once, in `migrations`,
 which is the only point SQL text is built — an invalid name therefore
 surfaces as `Err` there, not here. A rename whose `from` is not a current
-column, or whose `to` already names one, leaves the current schema unchanged
+column, or whose `to` already names one (compared case-insensitively, as SQL
+compares identifiers), leaves the current schema unchanged
 and is refused by `migrations`, so a store carrying it cannot be migrated.
 
 Example:
