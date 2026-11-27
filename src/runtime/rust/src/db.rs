@@ -2759,13 +2759,53 @@ async fn build_pool<E: Send + crate::FromIpeError + 'static>(
         Journal::WalIfShared => db_url.is_shared_sqlite_file(),
     };
     if wal {
-        let switched = sqlx::query("PRAGMA journal_mode=WAL;").execute(&pool).await;
+        let switched = switch_to_wal(&pool).await;
         if let (Journal::Wal, Err(e)) = (journal, switched) {
             pool.close().await;
             return IpeResult::Err(ipe_err(KERNEL_ENGINE, &e));
         }
     }
     ok_res(pool)
+}
+
+/// The pause between two attempts of [`switch_to_wal`] on a held write lock.
+const WAL_SWITCH_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Switch `pool`'s SQLite file to WAL, waiting out a held write lock for
+/// [`SQLITE_BUSY_TIMEOUT`], as every other statement does.
+///
+/// SQLite takes the switch's write lock by upgrading its own read lock, and an
+/// upgrade never runs the busy handler: another connection holding the write
+/// lock fails the switch at once with `SQLITE_BUSY`, whatever the busy timeout.
+/// A busy switch is retried until the timeout has elapsed, so a writer in
+/// flight delays the open instead of failing it.
+///
+/// The one issuer of the switch: the `Ipe.Db` pool and the telemetry spill
+/// both open through it.
+///
+/// # Errors
+///
+/// The switch's driver error: a non-busy failure at once, a busy one once the
+/// timeout has elapsed.
+pub(crate) async fn switch_to_wal<DB>(pool: &sqlx::Pool<DB>) -> Result<(), sqlx::Error>
+where
+    DB: sqlx::Database,
+    for<'c> &'c mut DB::Connection: sqlx::Executor<'c, Database = DB>,
+    <DB as sqlx::Database>::Arguments: sqlx::IntoArguments<DB>,
+{
+    let deadline = tokio::time::Instant::now() + SQLITE_BUSY_TIMEOUT;
+    loop {
+        match sqlx::query("PRAGMA journal_mode=WAL;").execute(pool).await {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if classify_failure(DbEngine::Sqlite, &e) == IpeDbFailure::Busy
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(WAL_SWITCH_RETRY).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The identity a shared pool is cached under.
@@ -17144,6 +17184,67 @@ mod tests {
             }
             drop(held);
             pool.close().await;
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        /// A WAL switch that meets another connection's held write lock waits
+        /// for it to end and then switches, never failing the open with
+        /// `SQLITE_BUSY` while the busy timeout has not elapsed.
+        #[tokio::test]
+        async fn a_wal_switch_waits_out_a_held_write_lock() {
+            let path = crate::scratch_core::test_private_root().join(format!(
+                "ipe_wal_switch_{}_{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos())
+            ));
+            let name =
+                SqliteFileName::parse_under(&path.display().to_string(), crate::path_core::HOST)
+                    .expect("a scratch path seals");
+            let db_url =
+                DbUrl::sqlite_file(&name, FileMode::CreateIfMissing).expect("a sealed name opens");
+            let writer = match build_pool::<String>(&db_url, Journal::Unchanged).await {
+                IpeResult::Ok(pool) => Some(pool),
+                IpeResult::Err(_) => None,
+            }
+            .expect("build the writer's pool");
+            sqlx::query("CREATE TABLE t (v INTEGER NOT NULL)")
+                .execute(&writer)
+                .await
+                .expect("create table");
+            let mut held = writer.acquire().await.expect("acquire the writer");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *held)
+                .await
+                .expect("take the write lock");
+            sqlx::query("INSERT INTO t (v) VALUES (1)")
+                .execute(&mut *held)
+                .await
+                .expect("write under the lock");
+            let release = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                sqlx::query("COMMIT")
+                    .execute(&mut *held)
+                    .await
+                    .expect("release the write lock");
+                drop(held);
+            });
+            let switched = match build_pool::<String>(&db_url, Journal::Wal).await {
+                IpeResult::Ok(pool) => Ok(pool),
+                IpeResult::Err(e) => Err(e),
+            };
+            release.await.expect("the writer ends");
+            let pool = switched.expect("the WAL switch waits out the held write lock");
+            let mode = sqlx::query_scalar::<_, String>("PRAGMA journal_mode")
+                .fetch_one(&pool)
+                .await
+                .expect("read the journal mode");
+            assert_eq!(mode, "wal");
+            pool.close().await;
+            writer.close().await;
             for suffix in ["", "-wal", "-shm"] {
                 let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
             }

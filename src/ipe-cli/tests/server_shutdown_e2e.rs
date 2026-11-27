@@ -278,15 +278,24 @@ main =
         }
 ";
 
+/// The line [`WEB_SESSION_DB`] and [`WEB_SESSION_TICKS`] log once their store
+/// file runs in WAL and its `-wal` exists.
+const STORE_IN_WAL_LINE: &str = "store file in WAL";
+
 /// A `Web.tea` app whose `init` opens the session-store file through
 /// `Ipe.Db`: the `Db` use builds the store's `db` feature in, and the open
 /// switches the file to WAL, so the session store's own connections run in WAL
-/// and leave a `-wal` behind unless their pool closes.
+/// and leave a `-wal` behind unless their pool closes. A read through the
+/// opened pool creates the `-wal`, which that pool's idle connection keeps,
+/// before the app logs `store file in WAL`; a failed open or read logs
+/// `store file open failed` instead.
 const WEB_SESSION_DB: &str = r#"module Main exposing (main)
 
 import Ipe.Db as Db
 import Ipe.Db.Location as Location exposing (Mode(..))
-import Ipe.Error exposing (Error)
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Error as Error exposing (Error)
+import Ipe.Log as Log
 import Ipe.Path as Path
 import Ipe.Result as Result
 import Ipe.String
@@ -307,7 +316,9 @@ openStoreFile =
         |> Result.andThen (Location.file CreateIfMissing)
         |> Task.fromResult
         |> Task.andThen (\location -> Db.open location)
-        |> Task.map (\_ -> ())
+        |> Task.andThen (\db -> Unsafe.unsafeQuery db "SELECT name FROM sqlite_master" [])
+        |> Task.andThen (\_ -> Log.info "store file in WAL")
+        |> Task.onError (\e -> Log.warnWith "store file open failed" [ Error.toString e ])
 
 init : WebReq -> ( Model, Cmd Msg )
 init _req =
@@ -344,12 +355,15 @@ main =
 /// A `Web.tea` app whose session ticks every 50 ms, so a driver turn and its
 /// checkpoint write are running whenever the shutdown closes. Its `init` opens
 /// the session-store file through `Ipe.Db`: the `Db` use builds the store's `db`
-/// feature in, and the open switches the file to WAL.
+/// feature in, and the open switches the file to WAL. As in [`WEB_SESSION_DB`],
+/// the app logs `store file in WAL` once the `-wal` exists.
 const WEB_SESSION_TICKS: &str = r#"module Main exposing (main)
 
 import Ipe.Db as Db
 import Ipe.Db.Location as Location exposing (Mode(..))
-import Ipe.Error exposing (Error)
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Error as Error exposing (Error)
+import Ipe.Log as Log
 import Ipe.Path as Path
 import Ipe.Result as Result
 import Ipe.String
@@ -370,7 +384,9 @@ openStoreFile =
         |> Result.andThen (Location.file CreateIfMissing)
         |> Task.fromResult
         |> Task.andThen (\location -> Db.open location)
-        |> Task.map (\_ -> ())
+        |> Task.andThen (\db -> Unsafe.unsafeQuery db "SELECT name FROM sqlite_master" [])
+        |> Task.andThen (\_ -> Log.info "store file in WAL")
+        |> Task.onError (\e -> Log.warnWith "store file open failed" [ Error.toString e ])
 
 init : WebReq -> ( Model, Cmd Msg )
 init _req =
@@ -1286,15 +1302,12 @@ fn a_sqlite_session_store_closes_on_sigterm() -> Result<(), BoxError> {
     let page = get(port, "/")?;
     let sid = session_cookie(&page)
         .ok_or_else(|| -> BoxError { format!("{test_name}: no ipe_sid cookie: {page}").into() })?;
-    let switched = Instant::now() + LINE_BUDGET;
-    while !sidecar(&db, "-wal").exists() {
-        assert!(
-            Instant::now() < switched,
-            "{test_name}: the session file never ran in WAL; seen {:?}",
-            served.seen
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    served.wait_for(STORE_IN_WAL_LINE, LINE_BUDGET)?;
+    assert!(
+        sidecar(&db, "-wal").exists(),
+        "{test_name}: the session file runs in WAL; seen {:?}",
+        served.seen
+    );
     let again = get_with_session(port, "/", &sid)?;
     assert!(
         again.starts_with("HTTP/1.1 200"),
@@ -1492,15 +1505,12 @@ fn a_ticking_session_stops_its_turns_before_the_store_closes() -> Result<(), Box
         page.starts_with("HTTP/1.1 200"),
         "{test_name}: the page renders: {page}"
     );
-    let switched = Instant::now() + LINE_BUDGET;
-    while !sidecar(&db, "-wal").exists() {
-        assert!(
-            Instant::now() < switched,
-            "{test_name}: the session file never ran in WAL; seen {:?}",
-            served.seen
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    served.wait_for(STORE_IN_WAL_LINE, LINE_BUDGET)?;
+    assert!(
+        sidecar(&db, "-wal").exists(),
+        "{test_name}: the session file runs in WAL; seen {:?}",
+        served.seen
+    );
     // Several ticks, each a turn and a checkpoint write, run before the signal.
     std::thread::sleep(Duration::from_millis(400));
     served.signal("-TERM")?;

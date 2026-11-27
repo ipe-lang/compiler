@@ -154,13 +154,15 @@ const SPILL_MAX_CONNECTIONS: u32 = 4;
 /// [`crate::system::SQLITE_BUSY_TIMEOUT`] from its connect options. WAL is the
 /// only journal mode that lets the console child read while this process writes
 /// without each blocking the other; the console reader opens read-write to
-/// attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`).
+/// attach the `-wal`/`-shm` files (`web/hub.rs::open_spill`). The switch waits
+/// out a held write lock ([`crate::db::switch_to_wal`]); a switch still refused
+/// leaves the file in its journal mode, which the spill writes through all the same.
 async fn open_spill_pool(path: &str) -> Result<SqlitePool, crate::db::DbConnectError> {
     let url = crate::db::DbUrl::sqlite_path(path, crate::db::FileMode::CreateIfMissing)?;
     let pool = crate::db::VettedPool::<sqlx::Sqlite>::connect(&url, SPILL_MAX_CONNECTIONS)
         .await?
         .into_pool();
-    let _ = sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await;
+    let _ = crate::db::switch_to_wal(&pool).await;
     crate::db::own_pool(crate::db::PoolRole::TelemetrySpill, &pool);
     Ok(pool)
 }
