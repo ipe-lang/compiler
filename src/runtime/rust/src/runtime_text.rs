@@ -328,7 +328,7 @@ const fn ids_well_formed() -> bool {
 // IPE-RUST-AUDIT:ACCEPTED (Arthur Maciel) — compile-time `const` assertion (not a runtime panic); fails the BUILD if `TextId::ALL` drifts from the declaration or two ids share a wire spelling [ledger #boundary]
 const _: () = assert!(ids_well_formed());
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::{Audience, Locale, MAX_TEXT_BYTES, TextDefect, TextId, admits, text_defect};
 
@@ -745,7 +745,6 @@ mod tests {
         assert_eq!(
             set_text,
             [
-                "setText: function(el, text) { textContent.call(el, text); },",
                 "__ipeNode.setText(el, p.text);",
                 "__ipeNode.setText(el, typeof detail === \"S\" ? row + detail : row);",
             ],

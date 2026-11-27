@@ -363,7 +363,7 @@ var __ipeNode = (function() {
 })();
 // The runtime texts the client draws, by the name the client calls each one:
 // the value is the text's id, the key of its row in the boot catalog
-// (`cfg.text`) and in the built-in catalog (`__IPE_TEXT_DEFAULT`). A notice
+// (`cfg.text`) and in the built-in catalog (`__ipeTextDefault`). A notice
 // reaches the page only through `__ipeSay`, by one of these ids.
 var __IPE_TEXT = Object.freeze({
   BOOT_FAILED: "boot-failed",
@@ -2803,7 +2803,7 @@ function __ipeSetStatus(state, id, detail) {
 // when given, always as text. `""` clears `el`; an id outside `__IPE_TEXT`
 // draws nothing. Before boot accepts its catalog the built-in one answers.
 function __ipeSay(el, id, detail) {
-  var catalog = __ipeText || __IPE_TEXT_DEFAULT;
+  var catalog = __ipeText || __ipeTextDefault;
   var row = id === "" ? "" : Object.prototype.hasOwnProperty.call(catalog, id) ? catalog[id] : "";
   __ipeNode.setText(el, typeof detail === "string" ? row + detail : row);
 }
@@ -2976,7 +2976,7 @@ function __ipeBuildStatusEl(state) {
   el.setAttribute("role", "status");
   el.setAttribute("aria-live", "polite");
   // The banner's text is in the catalog's language, which may not be the page's.
-  el.setAttribute("lang", __ipeText ? __ipeTextLang : __IPE_TEXT_DEFAULT_LANG);
+  el.setAttribute("lang", __ipeText ? __ipeTextLang : __ipeTextDefaultLang);
   // Inline styles — no global stylesheet leak. Max z-index puts the
   // banner above any user fixed-position element. Fixed position
   // bottom-center; transitions for fade in/out feel less jarring.

@@ -215,7 +215,7 @@ fn client_text_prelude() -> String {
         })
         .collect();
     format!(
-        "var __IPE_TEXT_DEFAULT = Object.freeze({});\nvar __IPE_TEXT_DEFAULT_LANG = {};\n",
+        "var __ipeTextDefault = Object.freeze({});\nvar __ipeTextDefaultLang = {};\n",
         serde_json::Value::Object(rows),
         serde_json::Value::String(Locale::DEFAULT.tag().to_owned()),
     )
@@ -9619,7 +9619,7 @@ mod base_path_tests {
         let mut lines = prelude.lines();
         let catalog = lines
             .next()
-            .and_then(|line| line.strip_prefix("var __IPE_TEXT_DEFAULT = Object.freeze("))
+            .and_then(|line| line.strip_prefix("var __ipeTextDefault = Object.freeze("))
             .and_then(|line| line.strip_suffix(");"))
             .expect("the prelude freezes the built-in catalog");
         let catalog: serde_json::Map<String, serde_json::Value> =
@@ -9631,7 +9631,7 @@ mod base_path_tests {
                 Some(Locale::DEFAULT.text(id))
             );
         }
-        assert_eq!(lines.next(), Some("var __IPE_TEXT_DEFAULT_LANG = \"en\";"));
+        assert_eq!(lines.next(), Some("var __ipeTextDefaultLang = \"en\";"));
         assert_eq!(lines.next(), None, "the prelude is two declarations");
     }
 
