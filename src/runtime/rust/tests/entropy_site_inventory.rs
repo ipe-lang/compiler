@@ -843,29 +843,502 @@ fn emitted_wasm_manifest() -> String {
     text.unwrap_or_default()
 }
 
-#[test]
-fn manifests_carry_no_generator() {
-    let sources = [
-        ("Cargo.toml", read_crate_file("Cargo.toml")),
+/// Where a scanned manifest's uuid dependency comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UuidEntry {
+    /// The manifest declares uuid itself, so its features are read here.
+    Declared,
+    /// The backend appends uuid on demand, through the path
+    /// [`on_demand_uuid_refusals`] proves featureless; the manifest itself must
+    /// not declare it.
+    OnDemand,
+    /// No uuid entry: the manifest names the runtime crate, whose own manifest
+    /// is scanned.
+    Absent,
+}
+
+/// The vendored base manifest, relative to the runtime crate root.
+const VENDORED_TEMPLATE: &str = "../../compiler/backend/rust/templates/Cargo.toml";
+
+/// Every manifest an emitted crate carries, or the runtime crate builds with,
+/// and where its uuid dependency comes from.
+fn scanned_manifests() -> Vec<(&'static str, String, UuidEntry)> {
+    vec![
+        (
+            "Cargo.toml",
+            read_crate_file("Cargo.toml"),
+            UuidEntry::Declared,
+        ),
         (
             "templates/Cargo.toml",
-            read_crate_file("../../compiler/backend/rust/templates/Cargo.toml"),
+            read_crate_file(VENDORED_TEMPLATE),
+            UuidEntry::OnDemand,
         ),
-        ("project.rs WASM_CARGO_TOML", emitted_wasm_manifest()),
-    ];
-    for (name, text) in &sources {
-        let parsed = parse_toml(name, text);
-        assert!(
-            dependency_tables(&parsed)
-                .iter()
-                .any(|(_, table)| table.contains_key("uuid")),
-            "{name}: the uuid dependency was not found, so its features were not read"
-        );
+        (
+            "templates/Cargo.dep.toml",
+            dep_model_manifest("Cargo.dep.toml"),
+            UuidEntry::Absent,
+        ),
+        (
+            "templates/Cargo.wasm-dep.toml",
+            dep_model_manifest("Cargo.wasm-dep.toml"),
+            UuidEntry::Absent,
+        ),
+        (
+            "project.rs WASM_CARGO_TOML",
+            emitted_wasm_manifest(),
+            UuidEntry::Declared,
+        ),
+    ]
+}
+
+/// The dependency-model template `file`, its runtime-feature list emptied: the
+/// list names `ipe_runtime` features only, which the runtime crate's own
+/// `[features]` table (scanned above) maps onto crates.
+fn dep_model_manifest(file: &str) -> String {
+    const SLOT: &str = "__IPE_RUNTIME_FEATURES__";
+    let text = read_crate_file(&format!("../../compiler/backend/rust/templates/{file}"));
+    assert!(text.contains(SLOT), "templates/{file}: `{SLOT}` not found");
+    text.replace(SLOT, "")
+}
+
+/// Every way `text` breaks the generator ban or its uuid-entry shape `entry`.
+fn manifest_refusals(name: &str, text: &str, entry: UuidEntry) -> Vec<String> {
+    let parsed = parse_toml(name, text);
+    let declared = dependency_tables(&parsed)
+        .iter()
+        .any(|(_, table)| table.contains_key("uuid"));
+    let mut refusals = manifest_generators(&parsed);
+    match (entry, declared) {
+        (UuidEntry::Declared, false) => refusals
+            .push("the uuid dependency was not found, so its features were not read".to_owned()),
+        (UuidEntry::OnDemand | UuidEntry::Absent, true) => refusals.push(
+            "declares a uuid dependency the scan does not expect; record where it comes from"
+                .to_owned(),
+        ),
+        (UuidEntry::Declared, true) | (UuidEntry::OnDemand | UuidEntry::Absent, false) => {}
+    }
+    refusals
+}
+
+#[test]
+fn manifests_carry_no_generator() {
+    for (name, text, entry) in scanned_manifests() {
         assert_eq!(
-            manifest_generators(&parsed),
+            manifest_refusals(name, &text, entry),
             Vec::<String>::new(),
             "{name}: ids draw through `entropy::fill_entropy`; no manifest may admit \
              another generator"
+        );
+    }
+}
+
+/// A generator feature planted in the vendored template's `[features]` table,
+/// a uuid entry the template does not expect, and a declared manifest whose
+/// uuid entry moved are each refused.
+#[test]
+fn template_generators_are_refused() {
+    let template = read_crate_file(VENDORED_TEMPLATE);
+    let anchor = "server = [\"dep:futures-util\"]";
+    assert!(
+        template.contains(anchor),
+        "templates/Cargo.toml: `{anchor}` not found"
+    );
+    let implied = template.replacen(anchor, "server = [\"dep:futures-util\", \"uuid/v4\"]", 1);
+    assert_eq!(
+        manifest_refusals("fixture", &implied, UuidEntry::OnDemand).len(),
+        1
+    );
+    let dep = "getrandom = \"0.2\"";
+    assert!(
+        template.contains(dep),
+        "templates/Cargo.toml: `{dep}` not found"
+    );
+    let declared = template.replacen(dep, &format!("{dep}\nuuid = \"1\""), 1);
+    assert_eq!(
+        manifest_refusals("fixture", &declared, UuidEntry::OnDemand).len(),
+        1
+    );
+    assert_eq!(
+        manifest_refusals("fixture", "[dependencies]\n", UuidEntry::Declared).len(),
+        1
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The on-demand uuid entry carries no feature: the backend appends uuid only
+// through `module_deps_cargo_toml`, which renders a `CrateSpec` (a name and a
+// version, no feature slot) with no feature.
+// ---------------------------------------------------------------------------
+
+/// The backend source root, relative to the runtime crate root.
+const BACKEND_SRC: &str = "../../compiler/backend/rust/src";
+
+/// The one function that renders a `MOD_APPENDS` row's crates.
+const ROW_RENDERER: &str = "module_deps_cargo_toml";
+
+/// The backend's non-test sources: a `tests` directory and a `*tests.rs` file
+/// hold test-only modules.
+fn backend_sources() -> Vec<(String, String)> {
+    let sources: Vec<(String, String)> =
+        rust_sources(&e2e_support::manifest_dir!().join(BACKEND_SRC))
+            .into_iter()
+            .filter(|(name, _)| !name.contains("tests/") && !name.ends_with("tests.rs"))
+            .collect();
+    for required in ["crate_specs.rs", "project.rs"] {
+        assert!(
+            sources.iter().any(|(name, _)| name == required),
+            "the backend source walk did not read {required}"
+        );
+    }
+    sources
+}
+
+/// Whether `attrs` hold `#[cfg(test)]`.
+fn is_test_only(attrs: &[Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && matches!(&attr.meta, Meta::List(list) if list.tokens.to_string() == "test")
+    })
+}
+
+/// The string literals in `tokens`, at any group depth.
+fn token_strings(tokens: TokenStream, out: &mut Vec<String>) {
+    for tree in tokens {
+        match tree {
+            TokenTree::Group(group) => token_strings(group.stream(), out),
+            TokenTree::Literal(lit) => {
+                if let Ok(lit) = syn::parse_str::<syn::LitStr>(&lit.to_string()) {
+                    out.push(lit.value());
+                }
+            }
+            TokenTree::Ident(_) | TokenTree::Punct(_) => {}
+        }
+    }
+}
+
+/// Whether `expr` is the empty slice `&[]`.
+fn is_empty_slice(expr: &Expr) -> bool {
+    matches!(expr, Expr::Reference(r) if matches!(&*r.expr, Expr::Array(a) if a.elems.is_empty()))
+}
+
+/// What the backend's non-test sources say about how uuid can enter a
+/// manifest.
+#[derive(Default)]
+struct UuidPaths {
+    within: Vec<String>,
+    /// The enclosing item of every `.deps` read.
+    deps_reads: Vec<String>,
+    /// `(enclosing item, literal)` for every string literal, macro bodies
+    /// included, doc attributes excluded.
+    strings: Vec<(String, String)>,
+    /// Whether each `PinnedCrate { .. }` the row renderer builds has
+    /// `features: &[]`.
+    renderer_features: Vec<bool>,
+    /// Whether each `dependency_line(..)` call in the row renderer passes
+    /// exactly `&[]`.
+    renderer_extras: Vec<bool>,
+}
+
+impl UuidPaths {
+    fn here(&self) -> String {
+        self.within.last().cloned().unwrap_or_default()
+    }
+
+    fn in_renderer(&self) -> bool {
+        self.within.iter().any(|item| item == ROW_RENDERER)
+    }
+
+    /// Visit `node` inside the item `name`, unless `attrs` make it test-only.
+    fn within_item(
+        &mut self,
+        attrs: &[Attribute],
+        name: Option<String>,
+        node: impl FnOnce(&mut Self),
+    ) {
+        if is_test_only(attrs) {
+            return;
+        }
+        let pushed = name.is_some();
+        if let Some(name) = name {
+            self.within.push(name);
+        }
+        node(self);
+        if pushed {
+            self.within.pop();
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for UuidPaths {
+    fn visit_attribute(&mut self, _: &'ast Attribute) {}
+
+    fn visit_item(&mut self, item: &'ast Item) {
+        let (attrs, name): (&[Attribute], Option<String>) = match item {
+            Item::Fn(f) => (&f.attrs, Some(f.sig.ident.to_string())),
+            Item::Const(c) => (&c.attrs, Some(c.ident.to_string())),
+            Item::Static(s) => (&s.attrs, Some(s.ident.to_string())),
+            Item::Mod(m) => (&m.attrs, None),
+            Item::Impl(i) => (&i.attrs, None),
+            Item::Struct(s) => (&s.attrs, None),
+            Item::Enum(e) => (&e.attrs, None),
+            Item::Trait(t) => (&t.attrs, None),
+            Item::Macro(m) => (&m.attrs, None),
+            _ => (&[], None),
+        };
+        self.within_item(attrs, name, |this| visit::visit_item(this, item));
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        let (attrs, name): (&[Attribute], Option<String>) = match item {
+            ImplItem::Fn(f) => (&f.attrs, Some(f.sig.ident.to_string())),
+            ImplItem::Const(c) => (&c.attrs, Some(c.ident.to_string())),
+            _ => (&[], None),
+        };
+        self.within_item(attrs, name, |this| visit::visit_impl_item(this, item));
+    }
+
+    fn visit_expr_field(&mut self, field: &'ast syn::ExprField) {
+        if matches!(&field.member, syn::Member::Named(id) if id == "deps") {
+            self.deps_reads.push(self.here());
+        }
+        visit::visit_expr_field(self, field);
+    }
+
+    fn visit_expr_struct(&mut self, expr: &'ast syn::ExprStruct) {
+        let pinned = expr
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "PinnedCrate");
+        if pinned && self.in_renderer() {
+            let features = expr
+                .fields
+                .iter()
+                .find(|f| matches!(&f.member, syn::Member::Named(id) if id == "features"));
+            self.renderer_features
+                .push(features.is_some_and(|f| is_empty_slice(&f.expr)));
+        }
+        visit::visit_expr_struct(self, expr);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "dependency_line" && self.in_renderer() {
+            let extra = call.args.first();
+            self.renderer_extras
+                .push(call.args.len() == 1 && extra.is_some_and(is_empty_slice));
+        }
+        visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_lit_str(&mut self, lit: &'ast syn::LitStr) {
+        self.strings.push((self.here(), lit.value()));
+    }
+
+    fn visit_macro(&mut self, mac: &'ast Macro) {
+        let mut strings = Vec::new();
+        token_strings(mac.tokens.clone(), &mut strings);
+        let here = self.here();
+        self.strings
+            .extend(strings.into_iter().map(|text| (here.clone(), text)));
+    }
+}
+
+/// Whether `text` spells a uuid dependency entry: a `uuid = ..` key line, a
+/// `[..dependencies.uuid]` table or a rename onto uuid.
+fn spells_a_uuid_entry(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim();
+        line.strip_prefix("uuid")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+            || line.contains("dependencies.uuid")
+            || line.replace(' ', "").contains("package=\"uuid\"")
+    })
+}
+
+/// The field names of `struct CrateSpec`.
+fn crate_spec_fields(file: &syn::File) -> Option<Vec<String>> {
+    file.items.iter().find_map(|item| match item {
+        Item::Struct(s) if s.ident == "CrateSpec" => Some(
+            s.fields
+                .iter()
+                .filter_map(|f| f.ident.as_ref().map(ToString::to_string))
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+/// The `name` of `const UUID: CrateSpec = CrateSpec { .. }`.
+fn uuid_spec_name(file: &syn::File) -> Option<String> {
+    file.items.iter().find_map(|item| match item {
+        Item::Const(c) if c.ident == "UUID" => match &*c.expr {
+            Expr::Struct(s) if s.path.is_ident("CrateSpec") => {
+                s.fields.iter().find_map(|f| match (&f.member, &f.expr) {
+                    (
+                        syn::Member::Named(id),
+                        Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(lit),
+                            ..
+                        }),
+                    ) if id == "name" => Some(lit.value()),
+                    _ => None,
+                })
+            }
+            _ => None,
+        },
+        _ => None,
+    })
+}
+
+/// Every way the backend `sources` could admit a uuid feature in an emitted
+/// manifest past the scanned manifests: a feature slot on `CrateSpec`, a uuid
+/// spec the proof cannot find, a `MOD_APPENDS` row's crates read outside
+/// [`ROW_RENDERER`] or rendered with a feature there, a `uuid/..` feature
+/// reference, or a uuid entry spelled outside the scanned `WASM_CARGO_TOML`.
+fn on_demand_uuid_refusals(sources: &[(String, String)]) -> Vec<String> {
+    let mut refusals = Vec::new();
+    let mut paths = UuidPaths::default();
+    for (name, src) in sources {
+        let file = syn::parse_file(src);
+        assert!(file.is_ok(), "backend {name} does not parse as Rust");
+        let Ok(file) = file else { continue };
+        if name == "crate_specs.rs" {
+            match crate_spec_fields(&file) {
+                Some(fields) if fields == ["name", "version"] => {}
+                Some(fields) => refusals.push(format!(
+                    "crate_specs.rs: `CrateSpec` carries {fields:?}, not a name and a version only"
+                )),
+                None => {
+                    refusals.push("crate_specs.rs: `struct CrateSpec` was not found".to_owned());
+                }
+            }
+            if uuid_spec_name(&file).as_deref() != Some("uuid") {
+                refusals.push(
+                    "crate_specs.rs: `const UUID: CrateSpec = CrateSpec { name: \"uuid\", .. }` \
+                     was not found, so the on-demand uuid entry was not read"
+                        .to_owned(),
+                );
+            }
+        }
+        let start = paths.strings.len();
+        paths.visit_file(&file);
+        for (item, text) in paths.strings.get(start..).into_iter().flatten() {
+            if text.contains("uuid/") || text.contains("uuid?/") {
+                refusals.push(format!(
+                    "{name} `{item}`: a uuid feature reference `{text}`"
+                ));
+            }
+            if spells_a_uuid_entry(text) && !(name == "project.rs" && item == "WASM_CARGO_TOML") {
+                refusals.push(format!(
+                    "{name} `{item}`: a uuid dependency entry outside the scanned manifests"
+                ));
+            }
+        }
+    }
+    if paths.deps_reads.is_empty() {
+        refusals.push(format!(
+            "no `.deps` read was found, so `{ROW_RENDERER}` was not read"
+        ));
+    }
+    for item in paths.deps_reads.iter().filter(|item| *item != ROW_RENDERER) {
+        refusals.push(format!(
+            "`{item}` reads a row's `.deps` outside `{ROW_RENDERER}`"
+        ));
+    }
+    if paths.renderer_features != [true] {
+        refusals.push(format!(
+            "`{ROW_RENDERER}` must build exactly one `PinnedCrate` with `features: &[]`, \
+             found {:?}",
+            paths.renderer_features
+        ));
+    }
+    if paths.renderer_extras.is_empty() || paths.renderer_extras.contains(&false) {
+        refusals.push(format!(
+            "`{ROW_RENDERER}` must render with `dependency_line(&[])`, found {:?}",
+            paths.renderer_extras
+        ));
+    }
+    refusals
+}
+
+/// The backend appends uuid only through [`ROW_RENDERER`], featureless.
+#[test]
+fn on_demand_uuid_entry_carries_no_feature() {
+    assert_eq!(
+        on_demand_uuid_refusals(&backend_sources()),
+        Vec::<String>::new()
+    );
+}
+
+/// Each edit that would let the on-demand uuid entry gain a feature, or hide it
+/// from the proof, is refused.
+#[test]
+fn on_demand_uuid_features_are_refused() {
+    let sources = backend_sources();
+    let edited = |file: &str, from: &str, to: &str| -> Vec<(String, String)> {
+        sources
+            .iter()
+            .map(|(name, src)| {
+                if name == file {
+                    assert!(src.contains(from), "{file}: `{from}` not found");
+                    (name.clone(), src.replacen(from, to, 1))
+                } else {
+                    (name.clone(), src.clone())
+                }
+            })
+            .collect()
+    };
+    let before = "fn vendored_dependencies(";
+    let edits: &[(&str, &str, &str, &str)] = &[
+        (
+            "crate_specs.rs",
+            "pub struct CrateSpec {\n",
+            "pub struct CrateSpec {\n    pub features: &'static [&'static str],\n",
+            "not a name and a version only",
+        ),
+        (
+            "crate_specs.rs",
+            "pub const UUID: CrateSpec",
+            "pub const UUID_SPEC: CrateSpec",
+            "the on-demand uuid entry was not read",
+        ),
+        (
+            "project.rs",
+            "                features: &[],\n            };\n            lines.push_str(",
+            "                features: &[\"v4\"],\n            };\n            lines.push_str(",
+            "exactly one `PinnedCrate` with `features: &[]`",
+        ),
+        (
+            "project.rs",
+            "pinned.dependency_line(&[])",
+            "pinned.dependency_line(&[\"v4\"])",
+            "must render with `dependency_line(&[])`",
+        ),
+        (
+            "project.rs",
+            before,
+            "fn uuid_line() -> &'static str {\n    \"uuid = { version = \\\"1\\\", features = [\\\"v4\\\"] }\"\n}\n\nfn vendored_dependencies(",
+            "`uuid_line`: a uuid dependency entry outside the scanned manifests",
+        ),
+        (
+            "project.rs",
+            before,
+            "fn uuid_feature() -> String {\n    format!(\"server = [\\\"{}\\\"]\", \"uuid/v4\")\n}\n\nfn vendored_dependencies(",
+            "`uuid_feature`: a uuid feature reference `uuid/v4`",
+        ),
+        (
+            "project.rs",
+            before,
+            "fn row_crates(row: &ModAppend) -> usize {\n    row.deps.len()\n}\n\nfn vendored_dependencies(",
+            "`row_crates` reads a row's `.deps` outside",
+        ),
+    ];
+    for (file, from, to, refusal) in edits {
+        let refusals = on_demand_uuid_refusals(&edited(file, from, to));
+        assert!(
+            refusals.len() == 1 && refusals.iter().all(|r| r.contains(refusal)),
+            "{file}: `{to}` must be refused for `{refusal}` alone, got {refusals:?}"
         );
     }
 }
