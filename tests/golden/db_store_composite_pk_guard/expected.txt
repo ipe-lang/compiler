@@ -17,6 +17,10 @@ forged-spec-beside-composite:rejected
 forged-single-spec-mismatch:rejected
 forged-nopk-spec:rejected
 composite-serial:rejected
+serial-text-key:rejected
+repeated-column:rejected
+forged-repeated-column:rejected
+rename-case-collision:rejected
 raw-composite-ddl:ok
 raw-composite-key-order-ddl:ok
 typed-composite2-ddl:ok

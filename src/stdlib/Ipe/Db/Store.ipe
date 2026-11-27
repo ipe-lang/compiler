@@ -390,8 +390,9 @@ boolColumn name =
 -- becomes the typed column list, a non-`SRecord` codec (a bare scalar, a blob)
 -- names no columns and is an `Err`. The table name and every derived column
 -- name are run through `validSqlIdent`; the first non-conforming identifier is
--- an `Err`, and no draft is produced. A returned `Draft` therefore holds only
--- accepted identifiers, and its columns cannot drift from the codec that reads
+-- an `Err`, as are two column names differing only in case (SQL compares
+-- identifiers case-insensitively), and no draft is produced. A returned `Draft`
+-- therefore holds only accepted, distinct identifiers, and its columns cannot drift from the codec that reads
 -- and writes its rows (parse-don't-validate + one source of truth).
 --
 -- A `Draft` is NOT queryable: classify it with `public` (world-open) or
@@ -424,7 +425,8 @@ columnFromShape pair =
 -- the draft is classified: writes bind each declared column, reads decode back
 -- into a `Row`, and the typed `read*` helpers parse a column into its Ipê type.
 -- Like `fromCodec`, the table name and every column name run through
--- `validSqlIdent`, so an invalid identifier fails closed before any SQL is built.
+-- `validSqlIdent`, so an invalid identifier fails closed before any SQL is built,
+-- and two column names differing only in case (one SQL identifier) are refused.
 -- Classify the result with `public` / `secured` before querying (deny-by-default).
 fromColumns : String -> List Column -> Result Error (Draft Row)
 fromColumns table columns =
@@ -446,19 +448,49 @@ buildStore table columns codec =
                 Err (invalidIdentError "column" bad)
 
             Nothing ->
-                Ok
-                    (Draft
-                        { table = table
-                        , frozenTable = table
-                        , frozenColumns = columns
-                        , currentColumns = columns
-                        , codec = codec
-                        , specs = []
-                        , pk = Ok NoPk
-                        , ops = []
-                        , indexes = []
-                        }
-                    )
+                case firstRepeatedName [] (List.map columnName columns) of
+                    Just repeated ->
+                        Err (repeatedColumnError repeated)
+
+                    Nothing ->
+                        Ok
+                            (Draft
+                                { table = table
+                                , frozenTable = table
+                                , frozenColumns = columns
+                                , currentColumns = columns
+                                , codec = codec
+                                , specs = []
+                                , pk = Ok NoPk
+                                , ops = []
+                                , indexes = []
+                                }
+                            )
+
+
+-- Whether two SQL identifiers name the same object. SQLite compares
+-- identifiers case-insensitively and Postgres folds an unquoted one to lower
+-- case, so `user_id` and `USER_ID` are one name; both arguments are plain ASCII
+-- identifiers, so ASCII case folding is exact.
+sameSqlIdent : String -> String -> Bool
+sameSqlIdent a b =
+    String.toLower a == String.toLower b
+
+
+-- The first of `names` that repeats an earlier one or one of `seen` under
+-- `sameSqlIdent`, or `Nothing` when every name is distinct.
+firstRepeatedName : List String -> List String -> Maybe String
+firstRepeatedName seen names =
+    case names of
+        [] ->
+            Nothing
+
+        name :: rest ->
+            if List.any (sameSqlIdent name) seen then
+                Just name
+
+            else
+                firstRepeatedName (name :: seen) rest
 
 
 firstInvalidColumn : List Column -> Maybe String
@@ -688,6 +720,9 @@ compositePrimaryKey3 =
 
 -- | Mark the accessor-named column DB-assigned (serial). `insert` omits it so
 -- the database generates it — a client value can never overwrite a serial column.
+-- The column must be the store's one-column primary key with an `INTEGER` SQL
+-- type (an `Int` field); `createSql` / `migrations` return a typed `Err`
+-- otherwise.
 serial : (row -> t) -> Draft row -> Draft row
 serial =
     Kernel.kernel "Store_serial"
@@ -882,7 +917,7 @@ firstCompositePkFault cols seen names =
             else if Basics.not (hasColumn cols name) then
                 Just (unknownColumnError name)
 
-            else if List.member name seen then
+            else if List.any (sameSqlIdent name) seen then
                 Just (duplicateCompositePkColumnError name)
 
             else if Maybe.withDefault False (Maybe.map isNullableColType (columnTypeOf cols name)) then
@@ -1168,7 +1203,8 @@ addIndex spec draft =
 -- op log unconditionally. Identifier validation happens once, in `migrations`,
 -- which is the only point SQL text is built — an invalid name therefore
 -- surfaces as `Err` there, not here. A rename whose `from` is not a current
--- column, or whose `to` already names one, leaves the current schema unchanged
+-- column, or whose `to` already names one (compared case-insensitively, as SQL
+-- compares identifiers), leaves the current schema unchanged
 -- and is refused by `migrations`, so a store carrying it cannot be migrated.
 --
 -- Example:
@@ -1237,7 +1273,7 @@ renameColumn from to store =
 -- other (`opToEntry`), so the store's live view and its ledger agree.
 renameApplies : List Column -> String -> String -> Bool
 renameApplies cols from to =
-    from /= to && hasColumn cols from && Basics.not (hasColumn cols to)
+    from /= to && hasColumn cols from && Basics.not (List.any (\col -> sameSqlIdent (columnName col) to) cols)
 
 
 renameColumnInList : String -> String -> List Column -> List Column
@@ -1665,7 +1701,7 @@ opToEntry table cols op =
             else if Basics.not (List.member from cols) then
                 Err (unknownColumnError from)
 
-            else if List.member to cols then
+            else if List.any (sameSqlIdent to) cols then
                 Err (renameCollisionError to)
 
             else
@@ -5012,7 +5048,10 @@ readBool name row =
 -- Before rendering, the key is re-proved: the declaration and the store's
 -- primary-key specs agree, a composite key's columns are valid identifiers
 -- naming distinct, non-nullable columns of the table, and a composite key has
--- no `serial` column. The first fault is a typed `Err` and no DDL is produced.
+-- no `serial` column. Every column name is also re-proved distinct under SQL's
+-- case-insensitive identifier comparison, and a `serial` column must be the
+-- one-column `INTEGER` key. The first fault is a typed `Err` and no DDL is
+-- produced.
 --
 -- The DDL is `CREATE TABLE IF NOT EXISTS`: when a table of that name already
 -- exists, `Db.migrate` records the entry as applied without comparing the
@@ -5027,7 +5066,7 @@ createSql store =
 -- The one DDL render for every `PrimaryKeyDecl`. Checks run in a fixed order,
 -- each an `Err` before any text: the recorded key-declaration `Err`, the table
 -- identifier, every spec naming a column, the key facts (`keyedSchemaFault`),
--- then each column definition. The render reads the key from the decl, never
+-- each column definition, then distinct column names. The render reads the key from the decl, never
 -- from the `PrimaryKey` spec, and re-proves every key fact it renders from: the
 -- `Draft` record's constructor is exported, so the declaration-time parse is not
 -- the only boundary.
@@ -5068,15 +5107,20 @@ createSqlFromColumnDefs table cols specs decl =
                                 Err e
 
                             Ok defs ->
-                                Ok
-                                    (String.concat
-                                        [ "CREATE TABLE IF NOT EXISTS "
-                                        , table
-                                        , " ("
-                                        , String.join ", " (defs ++ tableConstraints decl)
-                                        , ")"
-                                        ]
-                                    )
+                                case firstRepeatedName [] (List.map columnName cols) of
+                                    Just repeated ->
+                                        Err (repeatedColumnError repeated)
+
+                                    Nothing ->
+                                        Ok
+                                            (String.concat
+                                                [ "CREATE TABLE IF NOT EXISTS "
+                                                , table
+                                                , " ("
+                                                , String.join ", " (defs ++ tableConstraints decl)
+                                                , ")"
+                                                ]
+                                            )
 
 
 -- The first key fact the render cannot stand on, re-proved from the decl:
@@ -5243,6 +5287,9 @@ columnDef decl specs col =
 
     else if List.any (\s -> specIsSerial s name) specs && Basics.not (isSingleKeyColumn decl name) then
         Err (serialWithoutPkError name)
+
+    else if List.any (\s -> specIsSerial s name) specs && sqlType (columnColType col) /= "INTEGER" then
+        Err (serialNotIntegerError name (sqlType (columnColType col)))
 
     else if List.any (\s -> specHasUnsafeDefaultText s name) specs then
         Err (invalidDefaultTextError name)
@@ -6956,33 +7003,9 @@ firstNonNullableMaskColumnIn view cols =
 -- earlier column-existence check makes that case unreachable for a real policy.
 columnIsNullable : ColumnView -> String -> Bool
 columnIsNullable view name =
-    case Result.map columnColType (resolveColumn view name) of
-        Ok (CNull _) ->
-            True
-
-        Ok CText ->
-            False
-
-        Ok CInt ->
-            False
-
-        Ok CReal ->
-            False
-
-        Ok CBool ->
-            False
-
-        Ok CTime ->
-            False
-
-        Ok CDecimal ->
-            False
-
-        Ok CMoney ->
-            False
-
-        Ok CBlob ->
-            False
+    case resolveColumn view name of
+        Ok col ->
+            isNullableColType (columnColType col)
 
         Err _ ->
             False
@@ -7706,6 +7729,27 @@ noopRenameError : Error
 noopRenameError =
     Error.invalidInput
         "Ipe.Db.Store: rename op has identical from and to — a no-op rename would seed a redundant ledger entry"
+
+
+repeatedColumnError : String -> Error
+repeatedColumnError name =
+    Error.invalidInput
+        (String.concat
+            [ "Ipe.Db.Store: column \"", name, "\" is declared twice — SQL identifiers compare case-insensitively, so two column names differing only in case name one column; give every column a distinct name" ]
+        )
+
+
+serialNotIntegerError : String -> String -> Error
+serialNotIntegerError name sqlTypeName =
+    Error.invalidInput
+        (String.concat
+            [ "Ipe.Db.Store: column \""
+            , name
+            , "\" is marked serial but its SQL type is "
+            , sqlTypeName
+            , " — AUTOINCREMENT needs a one-column INTEGER primary key; make the key an Int column or drop Store.serial"
+            ]
+        )
 
 
 renameCollisionError : String -> Error

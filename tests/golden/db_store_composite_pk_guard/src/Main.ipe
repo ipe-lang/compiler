@@ -15,6 +15,9 @@ module Main exposing (main)
 --     unknown, or nullable key column, a primary-key spec disagreeing with the
 --     declared key (composite, single, none), and a `serial` column beside a
 --     composite key;
+--   * a `serial` column on a non-`INTEGER` single key, and two columns whose
+--     names differ only in case (at declaration, on a forged record, and as a
+--     rename target);
 --   * the exact DDL of the raw and accessor composite forms (declared key order,
 --     not column order), of `migrations`' create entry, and of the no-key,
 --     single-key, and serial-key stores (bytes the migration ledger checksums).
@@ -233,6 +236,40 @@ ticketColumns =
     [ Store.intColumn "id", Store.textColumn "title" ]
 
 
+-- A ticket table whose `id` is text: `AUTOINCREMENT` needs an `INTEGER` key.
+textTicketColumns : List Store.Column
+textTicketColumns =
+    [ Store.textColumn "id", Store.textColumn "title" ]
+
+
+-- Two columns whose names differ only in case: SQL identifiers compare
+-- case-insensitively, so they name one column.
+repeatedColumns : List Store.Column
+repeatedColumns =
+    [ Store.textColumn "user_id", Store.textColumn "USER_ID" ]
+
+
+-- Append one column to the draft's frozen columns, bypassing `fromColumns`.
+forgeColumn : Store.Column -> Draft Store.Row -> Draft Store.Row
+forgeColumn col d =
+    case d of
+        Draft r ->
+            Draft { r | frozenColumns = r.frozenColumns ++ [ col ] }
+
+
+-- The `migrations` of a raw `memberships` store after renaming `from` to `to`,
+-- reported through its create entry's SQL.
+renamedMigrations : String -> String -> Result Error String
+renamedMigrations from to =
+    Store.fromColumns "memberships"
+        [ Store.textColumn "user_id"
+        , Store.textColumn "group_id"
+        , Store.textColumn "role"
+        ]
+        |> Result.andThen (\d -> Store.migrations (Store.renameColumn from to (Store.public d)))
+        |> Result.map (\ms -> String.join "; " (List.map (\m -> m.sql) ms))
+
+
 disagreementNeedle : String
 disagreementNeedle =
     "but its primary-key column specs disagree"
@@ -297,6 +334,18 @@ main =
             , refusedLine "composite-serial"
                 "\"user_id\" is marked serial but the store's key is composite (user_id, group_id)"
                 (rawDdl (\d -> StoreU.serial "user_id" (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d)))
+            , refusedLine "serial-text-key"
+                "\"id\" is marked serial but its SQL type is TEXT"
+                (rawDdlOver "tickets" textTicketColumns (\d -> StoreU.primaryKey "id" (StoreU.serial "id" d)))
+            , refusedLine "repeated-column"
+                "column \"USER_ID\" is declared twice"
+                (rawDdlOver "memberships" repeatedColumns (\d -> d))
+            , refusedLine "forged-repeated-column"
+                "column \"Role\" is declared twice"
+                (rawDdl (forgeColumn (Store.textColumn "Role")))
+            , refusedLine "rename-case-collision"
+                "rename target \"USER_ID\" already names a column"
+                (renamedMigrations "role" "USER_ID")
             , ddlLine "raw-composite-ddl"
                 compositeDdl
                 (rawDdl (StoreU.compositePrimaryKey [ "user_id", "group_id" ]))
