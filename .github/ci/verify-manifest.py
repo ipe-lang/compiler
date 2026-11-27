@@ -586,7 +586,9 @@ skipped. Limits are listed on `check_workflow_steps`. Likewise mold is
       naming `clippy` that `shlex` cannot split is refused.  LIMIT: a cargo
       reached through a variable or script is not read.
   27. Every apt package install runs `.github/actions/apt-install`, the one
-      install that completes an interrupted dpkg, retries with a per-command
+      install that reads only the Ubuntu archive's own source files (so a
+      third-party source the runner image configures can neither fail nor
+      feed it), completes an interrupted dpkg, retries with a per-command
       time cap, repoints each failed attempt from whichever
       `*.archive.ubuntu.com` mirror the runner names to the next independent
       mirror (naming each source it repointed, warning with the hosts it
@@ -8177,13 +8179,19 @@ _APT_INSTALL_RUN = (
     '    exit 1',
     '    ;;',
     'esac',
+    'if [[ ! "${RUNNER_TEMP:-}" =~ ^(/[A-Za-z0-9._-]+)+$ || ! -d "$RUNNER_TEMP" ]]; then',
+    '  echo "::error::apt-install: RUNNER_TEMP must be an existing absolute directory to hold the Ubuntu source list and the signed archive listing" >&2',
+    '  exit 1',
+    'fi',
+    'main_list=/etc/apt/sources.list',
+    'part_list=/etc/apt/sources.list.d/ubuntu.sources',
+    'if [[ ! -f "$main_list" && ! -f "$part_list" ]]; then',
+    '  echo "::error::apt-install: neither ${main_list} nor ${part_list} exists, so there is no Ubuntu source to install from" >&2',
+    '  exit 1',
+    'fi',
     'if [[ -n "$APT_ARCHIVES" ]]; then',
     '  if [[ ! "$APT_ARCHIVES" =~ ^(/[A-Za-z0-9._-]+)+$ || "$APT_ARCHIVES/" == */../* || "$APT_ARCHIVES/" == */./* ]]; then',
     '    echo "::error::apt-install: archives must be an absolute directory with no . or .. segment" >&2',
-    '    exit 1',
-    '  fi',
-    '  if [[ ! "${RUNNER_TEMP:-}" =~ ^(/[A-Za-z0-9._-]+)+$ || ! -d "$RUNNER_TEMP" ]]; then',
-    '    echo "::error::apt-install: RUNNER_TEMP must be an existing absolute directory to list the signed archives in" >&2',
     '    exit 1',
     '  fi',
     '  mkdir -p "$APT_ARCHIVES"',
@@ -8192,7 +8200,15 @@ _APT_INSTALL_RUN = (
     '  mkdir "$listing_dir/partial"',
     '  listing="$listing_dir/uris"',
     'fi',
-    'apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)',
+    'sources_dir="$(mktemp -d -p "$RUNNER_TEMP" apt-sources.XXXXXX)"',
+    'mkdir "$sources_dir/parts"',
+    'if [[ -f "$main_list" ]]; then',
+    '  ln -s -- "$main_list" "$sources_dir/sources.list"',
+    'fi',
+    'if [[ -f "$part_list" ]]; then',
+    '  ln -s -- "$part_list" "$sources_dir/parts/ubuntu.sources"',
+    'fi',
+    'apt_opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o "Dir::Etc::sourcelist=$sources_dir/sources.list" -o "Dir::Etc::sourceparts=$sources_dir/parts" -o APT::Get::List-Cleanup=false)',
     'mirrors=("" archive.ubuntu.com mirrors.edge.kernel.org)',
     "source_host='://([A-Za-z0-9.-]*\\.)?(archive|security)\\.ubuntu\\.com/'",
     'deadline=$((SECONDS + 900))',
@@ -8200,7 +8216,7 @@ _APT_INSTALL_RUN = (
     '  mirror="${mirrors[attempt - 1]}"',
     '  if [[ -n "$mirror" ]]; then',
     '    repointed=0',
-    '    for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do',
+    '    for list in /etc/apt/apt-mirrors.txt "$main_list" "$part_list"; do',
     '      if [[ -f "$list" ]] && grep -qE "$source_host" "$list"; then',
     '        sudo sed -i -E "s#${source_host}#://${mirror}/#g" "$list"',
     '        echo "apt attempt $attempt repoints $list to $mirror"',
@@ -8209,7 +8225,7 @@ _APT_INSTALL_RUN = (
     '    done',
     '    if ((repointed == 0)); then',
     '      found=()',
-    '      for list in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do',
+    '      for list in /etc/apt/apt-mirrors.txt "$main_list" "$part_list"; do',
     '        if [[ -f "$list" ]]; then',
     '          found+=("$list")',
     '        fi',

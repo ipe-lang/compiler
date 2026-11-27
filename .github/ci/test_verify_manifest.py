@@ -5964,15 +5964,35 @@ class TestAptInstallScript(unittest.TestCase):
     it found when an attempt has nothing to repoint, keeps a cached archive
     only when its name, size and SHA-256 or SHA-512 match the signed listing,
     kills a command that ignores its cap's stop, and fails when every attempt
-    fails."""
+    fails. Every apt command reads only the Ubuntu source files, linked into a
+    fresh directory (`SOURCES` in the recorded lines), never the image's other
+    sources."""
 
-    _OPTS = "-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+    _OPTS = (
+        "-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
+        " -o Dir::Etc::sourcelist=SOURCES/sources.list -o Dir::Etc::sourceparts=SOURCES/parts"
+        " -o APT::Get::List-Cleanup=false"
+    )
     _CAP = "timeout -k 30 360"
     # A runner's mirror list and deb822 sources, as the Ubuntu runner images
     # ship them (the mirror host varies with the provider).
     _SOURCES = {
         "apt-mirrors.txt": "http://us-east-2.ec2.archive.ubuntu.com/ubuntu/\tpriority:1\nhttps://archive.ubuntu.com/ubuntu/\tpriority:2\n",
         "sources.list.d/ubuntu.sources": "Types: deb\nURIs: http://security.ubuntu.com/ubuntu/\nSuites: noble-security\n",
+    }
+    # The runner image's Ubuntu deb822 source, which reads its mirrors from
+    # `apt-mirrors.txt`; a run with no `sources` named plants it alone.
+    _RUNNER_SOURCES = {
+        "sources.list.d/ubuntu.sources": (
+            "Types: deb\nURIs: mirror+file:/etc/apt/apt-mirrors.txt\nSuites: noble noble-updates\n"
+            "Components: main universe\nSigned-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg\n"
+        ),
+    }
+    # A runner image's third-party sources beside the Ubuntu ones, one of them
+    # the source whose update answers 403 / "is no longer signed".
+    _THIRD_PARTY = {
+        "sources.list.d/microsoft-prod.list": "deb [arch=amd64] https://packages.microsoft.com/ubuntu/26.04/prod resolute main\n",
+        "sources.list.d/azure-cli.sources": "Types: deb\nURIs: https://packages.microsoft.com/repos/azure-cli/\nSuites: resolute\n",
     }
     # The runner's `/etc/apt/apt-mirrors.txt` on the Azure-hosted image: the
     # 144-byte `Mirrorlist` its apt update fetches, as the runner image's apt
@@ -6005,7 +6025,11 @@ class TestAptInstallScript(unittest.TestCase):
         its durations cut to one second, as a process that ignores the stop
         signal. The signed listing (`--print-uris`) prints `uris` and exits
         `uris_rc`. `debs` are planted in `archives` before the run (`None`
-        plants a directory); `self.left` names what is left there after."""
+        plants a directory); `self.left` names what is left there after.
+        `sources` defaults to `_RUNNER_SOURCES`; `self.source_links` maps each
+        entry of the linked source directory to its link target."""
+        if sources is None:
+            sources = self._RUNNER_SOURCES
         if script is None:
             doc = verify_manifest._read_action(os.path.join(_RT_REPO, ".github", "actions", "apt-install", "action.yml"))
             script = doc["runs"]["steps"][0]["run"]
@@ -6062,12 +6086,58 @@ class TestAptInstallScript(unittest.TestCase):
             done = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, check=False)
             self.stdout, self.stderr = done.stdout, done.stderr
             self.left = sorted(os.listdir(archives)) if archives and os.path.isdir(archives) else []
+            self.source_links = {}
+            temp = env["RUNNER_TEMP"]
+            for made in sorted(os.listdir(temp)) if os.path.isabs(temp) and os.path.isdir(temp) else []:
+                if made.startswith("apt-sources."):
+                    for walked, dirs, files in os.walk(os.path.join(temp, made)):
+                        for entry in dirs + files:
+                            path = os.path.join(walked, entry)
+                            rel = os.path.relpath(path, os.path.join(temp, made))
+                            self.source_links[rel] = os.readlink(path) if os.path.islink(path) else "directory"
             self.edited = {}
             for name in (sources or {}):
                 with open(os.path.join(etc, name), encoding="utf-8") as f:
                     self.edited[name] = f.read()
             calls = open(log, encoding="utf-8").read().splitlines() if os.path.exists(log) else []
+        calls = [re.sub(r"/[^\s=]*/apt-sources\.[A-Za-z0-9]{6}", "SOURCES", c) for c in calls]
         return done.returncode, calls
+
+    def test_apt_reads_only_the_ubuntu_source_files(self) -> None:
+        # The image's third-party sources sit beside the Ubuntu ones; the
+        # linked directory names only the Ubuntu files, and every apt command
+        # reads that directory, never `/etc/apt/sources.list.d`.
+        ubuntu = {"sources.list": "deb http://archive.ubuntu.com/ubuntu/ resolute main\n", **self._RUNNER_SOURCES}
+        for sources, links in (
+            ({**ubuntu, **self._THIRD_PARTY}, {"sources.list": "sources.list", "parts/ubuntu.sources": "sources.list.d/ubuntu.sources"}),
+            ({**self._RUNNER_SOURCES, **self._THIRD_PARTY}, {"parts/ubuntu.sources": "sources.list.d/ubuntu.sources"}),
+            ({"sources.list": ubuntu["sources.list"], **self._THIRD_PARTY}, {"sources.list": "sources.list"}),
+        ):
+            with self.subTest(sources=sorted(sources)):
+                with tempfile.TemporaryDirectory() as archives:
+                    code, calls = self.run_script("bubblewrap", archives=archives, sources=sources)
+                self.assertEqual(code, 0, self.stderr)
+                self.assertEqual(
+                    self.source_links,
+                    {"parts": "directory", **{k: os.path.join(self.etc, v) for k, v in links.items()}},
+                )
+                apt = [c for c in calls if " apt-get " in c]
+                self.assertEqual(len(apt), 3, calls)
+                for call in apt:
+                    self.assertIn(f" apt-get {self._OPTS} ", call)
+                    self.assertNotIn("/etc/apt", call)
+                    self.assertNotIn(self.etc, call)
+
+    def test_no_ubuntu_source_file_refused(self) -> None:
+        # With neither Ubuntu source file there is nothing to install from;
+        # the image's third-party sources are never read in their place.
+        for sources in (self._THIRD_PARTY, {"apt-mirrors.txt": self._AZURE_MIRRORS, **self._THIRD_PARTY}, {}):
+            with self.subTest(sources=sorted(sources)):
+                code, calls = self.run_script("bubblewrap", sources=sources)
+                self.assertNotEqual(code, 0)
+                self.assertEqual(calls, [])
+                self.assertIn("so there is no Ubuntu source to install from", self.stderr)
+                self.assertEqual(self.source_links, {})
 
     def test_control_installs(self) -> None:
         with tempfile.TemporaryDirectory() as archives:
@@ -6161,7 +6231,7 @@ class TestAptInstallScript(unittest.TestCase):
         # instead of claiming a repoint.
         ports = {"sources.list.d/ubuntu.sources": "URIs: http://ports.ubuntu.com/ubuntu-ports/\n"}
         unknown = {"apt-mirrors.txt": "http://mirror.example.net/ubuntu/\tpriority:1\n", **ports}
-        for sources, hosts in ((None, "none"), (ports, "ports.ubuntu.com"), (unknown, "mirror.example.net ports.ubuntu.com")):
+        for sources, hosts in ((self._RUNNER_SOURCES, "none"), (ports, "ports.ubuntu.com"), (unknown, "mirror.example.net ports.ubuntu.com")):
             with self.subTest(sources=sources):
                 code, _calls = self.run_script("bubblewrap", rc=1, sources=sources)
                 self.assertNotEqual(code, 0)
@@ -6173,7 +6243,7 @@ class TestAptInstallScript(unittest.TestCase):
                         for n in (2, 3)
                     ],
                 )
-                self.assertEqual(self.edited, sources or {})
+                self.assertEqual(self.edited, sources)
 
     def test_runner_mirror_lists_are_repointed(self) -> None:
         # The mirror host varies with the provider; each runner list is
@@ -6181,7 +6251,7 @@ class TestAptInstallScript(unittest.TestCase):
         ec2 = self._SOURCES["apt-mirrors.txt"]
         for mirrors in (self._AZURE_MIRRORS, ec2):
             with self.subTest(mirrors=mirrors):
-                code, _calls = self.run_script("bubblewrap", rc=1, sources={"apt-mirrors.txt": mirrors})
+                code, _calls = self.run_script("bubblewrap", rc=1, sources={**self._RUNNER_SOURCES, "apt-mirrors.txt": mirrors})
                 self.assertNotEqual(code, 0)
                 self.assertEqual(
                     [line for line in self.stdout.splitlines() if "repoints" in line],
@@ -7702,6 +7772,26 @@ class TestReleaseTargetParity(unittest.TestCase):
         self.assertRefused("ci.yml job 'release-targets-run' step 3.run is", ci)
         manual = self.swap(_RT_MANUAL, "cargo check --release --locked --features", "cargo build --release --locked --features")
         self.assertRefused("release-targets.yml job 'release-targets-freebsd' step 2.with.run is", manual=manual)
+
+    def test_apt_source_allowlist_drift_refused(self) -> None:
+        # apt reads only the Ubuntu source files with signatures checked; a
+        # whole-system source read, a widened allowlist, or an off switch for
+        # signature checks or update errors is a drift from the pinned text.
+        opts = ' -o "Dir::Etc::sourcelist=$sources_dir/sources.list" -o "Dir::Etc::sourceparts=$sources_dir/parts"'
+        for old, new in (
+            (opts, ""),
+            ('-o "Dir::Etc::sourceparts=$sources_dir/parts"', "-o Dir::Etc::sourceparts=/etc/apt/sources.list.d"),
+            ('ln -s -- "$part_list" "$sources_dir/parts/ubuntu.sources"', 'ln -s -- /etc/apt/sources.list.d/* "$sources_dir/parts/"'),
+            ("part_list=/etc/apt/sources.list.d/ubuntu.sources", "part_list=/etc/apt/sources.list.d/microsoft-prod.list"),
+            ("-o APT::Get::List-Cleanup=false)", "-o APT::Get::List-Cleanup=false -o Acquire::AllowInsecureRepositories=true)"),
+            ("-o APT::Get::List-Cleanup=false)", "-o APT::Get::List-Cleanup=false -o APT::Get::AllowUnauthenticated=true)"),
+            ('install_flags=(-y)', 'install_flags=(-y --allow-unauthenticated)'),
+            ('apt-get "${apt_opts[@]}" update || failed="$stage"', 'apt-get "${apt_opts[@]}" --allow-insecure-repositories update || failed="$stage"'),
+            ('apt-get "${apt_opts[@]}" update || failed="$stage"', 'apt-get "${apt_opts[@]}" update || true'),
+            ('    exit 1\n        fi\n        if [[ -n "$APT_ARCHIVES" ]]; then', '    true\n        fi\n        if [[ -n "$APT_ARCHIVES" ]]; then'),
+        ):
+            with self.subTest(apt=new):
+                self.assertRefused(self._APT_PINNED, apt=self.swap(_RT_APT, old, new))
 
     def test_toolchain_or_musl_drift_refused(self) -> None:
         self.assertRefused(
