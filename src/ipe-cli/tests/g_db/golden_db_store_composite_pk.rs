@@ -1,10 +1,15 @@
 //! Composite primary keys in the `Store` `Draft` model.
 //!
 //! A composite key's column list is parsed once, at declaration, into a typed
-//! key. The runtime refusals (an empty or one-column list, an invalid
-//! identifier, an unknown or repeated column, a second key declaration) are
-//! driven end to end by the `db_store_composite_pk_guard` golden, whose oracle
-//! pins one `:rejected` line per refusal. The `db_store_composite_pk_ops` golden
+//! key, and `createSql` re-proves it before rendering one table-level
+//! `PRIMARY KEY (…)` term with each key column `NOT NULL`. The
+//! `db_store_composite_pk_guard` golden pins the exact rendered DDL (composite,
+//! no-key, single-key, serial-key) and one `:rejected` line per refusal: an
+//! empty or one-column list, an invalid identifier, an unknown, repeated, or
+//! nullable column, a second key declaration, a `serial` column beside a
+//! composite key, and each render-time refusal of a `Draft` record forged past
+//! the declaration parse. The `db_store_composite_pk_ddl` golden runs the
+//! rendered DDL against a live database. The `db_store_composite_pk_ops` golden
 //! drives the database-backed refusals: by-key operations on a composite store,
 //! every key column dropped from an `updateWhere` SET, and every operation on a
 //! store with an illegal key declaration. An accessor naming a field the row
@@ -52,8 +57,9 @@ fn assert_golden_e2e(golden: &str) {
 
 /// Every composite-key refusal returns its typed `Err` from `createSql`.
 ///
-/// The accessor forms lower through the intercept and a single-column key is
-/// unaffected — one oracle line each. Under `IPE_E2E=1` the emitted project is
+/// The accessor forms lower through the intercept and render the exact
+/// composite DDL, and the no-key and single-key DDL bytes are pinned — one
+/// oracle line each. Under `IPE_E2E=1` the emitted project is
 /// built and run, so `ipe` accepting the accessor forms is also proven to
 /// `cargo build`.
 #[test]
@@ -71,6 +77,17 @@ fn composite_pk_refusals_match_oracle() {
 #[test]
 fn composite_pk_db_refusals_match_oracle() {
     assert_golden_e2e("db_store_composite_pk_ops");
+}
+
+/// The rendered composite key holds against a live `sqlite::memory:` table.
+///
+/// `Store.create` runs exactly the `createSql` DDL; the key refuses a repeated
+/// pair and a `NULL` component, backs `upsert`'s conflict target (also after a
+/// key-column rename), a changed key is a ledger `checksum mismatch`, and a
+/// `serial` column beside a composite key is refused with no table created.
+#[test]
+fn composite_pk_ddl_matches_oracle() {
+    assert_golden_e2e("db_store_composite_pk_ddl");
 }
 
 /// A `compositePrimaryKey2` accessor naming a field the row type does not have

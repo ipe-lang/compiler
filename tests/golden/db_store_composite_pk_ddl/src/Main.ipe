@@ -1,0 +1,292 @@
+module Main exposing (main)
+
+-- A composite primary key rendered by `Store.create` against a live
+-- `sqlite::memory:` database. Checks, one line each:
+--
+--   * `create` runs the DDL `createSql` renders, and the table SQLite records
+--     is exactly that DDL;
+--   * the rendered key refuses a repeated pair and admits a pair differing in
+--     one column;
+--   * the rendered `NOT NULL` refuses a `NULL` key column, even through raw SQL;
+--   * `upsert` conflicts on the rendered key: a repeated pair updates in place;
+--   * a renamed key column keeps the key: `migrations` applies the rename and an
+--     upsert on the renamed key still conflicts;
+--   * changing a deployed table's key is refused by the ledger
+--     (`checksum mismatch`);
+--   * a `serial` column beside a composite key is refused before any SQL: no
+--     table and no ledger row is created.
+--
+-- Output: see expected.txt.
+
+import Ipe.Db as Db exposing (Db, DbFailure(..))
+import Ipe.Db.Location as Location
+import Ipe.Db.Store as Store exposing (Draft, Store)
+import Ipe.Db.Store.Unsafe as StoreU
+import Ipe.Db.Unsafe as Unsafe
+import Ipe.Dict as Dict
+import Ipe.Error as Error exposing (Error)
+import Ipe.Io as Io
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
+import Ipe.Result as Result exposing (Result(..))
+import Ipe.String as String
+import Ipe.Task as Task exposing (Task)
+
+
+membershipDraft : String -> Result Error (Draft Store.Row)
+membershipDraft table =
+    Store.fromColumns table
+        [ Store.textColumn "user_id"
+        , Store.textColumn "group_id"
+        , Store.textColumn "role"
+        ]
+
+
+membersStore : Result Error (Store Store.Row)
+membersStore =
+    Result.map
+        (\d -> Store.public (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d))
+        (membershipDraft "memberships")
+
+
+-- The same store after its second key column is renamed.
+renamedStore : Result Error (Store Store.Row)
+renamedStore =
+    Result.map (Store.renameColumn "group_id" "team_id") membersStore
+
+
+-- One table keyed first by a single column, then redeclared with a composite key.
+singleKeyedStore : Result Error (Store Store.Row)
+singleKeyedStore =
+    Result.map (\d -> Store.public (StoreU.primaryKey "user_id" d)) (membershipDraft "keyed")
+
+
+compositeKeyedStore : Result Error (Store Store.Row)
+compositeKeyedStore =
+    Result.map
+        (\d -> Store.public (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d))
+        (membershipDraft "keyed")
+
+
+serialStore : Result Error (Store Store.Row)
+serialStore =
+    Result.map
+        (\d -> Store.public (StoreU.serial "user_id" (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d)))
+        (membershipDraft "serial_members")
+
+
+type alias Fixture =
+    { members : Store Store.Row
+    , renamed : Store Store.Row
+    , singleKeyed : Store Store.Row
+    , compositeKeyed : Store Store.Row
+    , serial : Store Store.Row
+    }
+
+
+fixture : Result Error Fixture
+fixture =
+    Result.map5
+        (\m r s c x -> { members = m, renamed = r, singleKeyed = s, compositeKeyed = c, serial = x })
+        membersStore
+        renamedStore
+        singleKeyedStore
+        compositeKeyedStore
+        serialStore
+
+
+main : Task Error ()
+main =
+    case fixture of
+        Ok fx ->
+            do
+                conn <- Db.open Location.memory
+                Db.withTransaction conn (\tx -> checks tx fx)
+
+        Err e ->
+            Io.println (String.concat [ "fixture:FAIL:", Error.message e ])
+
+
+checks : Db -> Fixture -> Task Error ()
+checks conn fx =
+    do
+        say (succeeded "create" (Store.create conn fx.members))
+        say (schemaLine conn fx.members)
+        say (counted "insert-u1-g1" (Store.insert conn fx.members (member "u1" "g1" "member")))
+        say (refusedBy "dup-key" UniqueViolation (Store.insert conn fx.members (member "u1" "g1" "admin")))
+        say (counted "insert-u1-g2" (Store.insert conn fx.members (member "u1" "g2" "member")))
+        say
+            (refusedBy
+                "null-key"
+                NotNullViolation
+                (Unsafe.unsafeExecRaw conn "INSERT INTO memberships (user_id, group_id, role) VALUES ('u3', NULL, 'member')")
+            )
+        say (counted "upsert-first" (Store.upsert conn fx.members (member "u1" "g1" "owner")))
+        say (counted "upsert-second" (Store.upsert conn fx.members (member "u1" "g1" "admin")))
+        say (snapshot "after-upsert" conn "group_id")
+        say (succeeded "rename-migrate" (migrateAll conn fx.renamed))
+        say (counted "renamed-upsert" (Store.upsert conn fx.renamed (member "u1" "g2" "owner")))
+        say (snapshot "after-renamed-upsert" conn "team_id")
+        say (succeeded "single-key-create" (Store.create conn fx.singleKeyed))
+        say (refused "pk-change" "checksum mismatch" (Store.create conn fx.compositeKeyed))
+        say
+            (refused
+                "serial-create"
+                "\"user_id\" is marked serial but the store's key is composite (user_id, group_id)"
+                (Store.create conn fx.serial)
+            )
+        say (countLine "serial-table" conn "SELECT count(*) AS n FROM sqlite_master WHERE name = 'serial_members'")
+        say (countLine "serial-ledger" conn "SELECT count(*) AS n FROM _ipe_migrations WHERE name = 'create_serial_members'")
+
+
+migrateAll : Db -> Store Store.Row -> Task Error (List String)
+migrateAll conn store =
+    case Store.migrations store of
+        Ok ms ->
+            Db.migrate conn ms
+
+        Err e ->
+            Task.fail e
+
+
+-- The table SQLite recorded is the DDL `createSql` rendered (SQLite stores the
+-- statement without its `IF NOT EXISTS`).
+schemaLine : Db -> Store Store.Row -> Task Error String
+schemaLine conn store =
+    case Store.createSql store of
+        Err e ->
+            Task.succeed (String.concat [ "schema:FAIL-rejected:", Error.message e ])
+
+        Ok ddl ->
+            Task.map
+                (\rows ->
+                    let
+                        recorded =
+                            String.join ";" (List.map (cell "sql") rows)
+
+                        expected =
+                            String.replace "CREATE TABLE IF NOT EXISTS " "CREATE TABLE " ddl
+                    in
+                    if recorded == expected then
+                        "schema:ok"
+
+                    else
+                        String.concat [ "schema:FAIL:", recorded, " vs ", ddl ]
+                )
+                (Unsafe.unsafeQuery conn "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memberships'" [])
+
+
+member : String -> String -> String -> Store.Row
+member user group role =
+    Dict.fromList [ ( "user_id", Just user ), ( "group_id", Just group ), ( "role", Just role ) ]
+
+
+-- Every `memberships` row as `user/group/role`, ordered by the whole key.
+snapshot : String -> Db -> String -> Task Error String
+snapshot label conn groupColumn =
+    Task.map
+        (\rows ->
+            String.concat
+                [ label
+                , ":"
+                , String.join "," (List.map (\row -> String.join "/" [ cell "user_id" row, cell groupColumn row, cell "role" row ]) rows)
+                ]
+        )
+        (Unsafe.unsafeQuery conn
+            (String.concat [ "SELECT user_id, ", groupColumn, ", role FROM memberships ORDER BY user_id, ", groupColumn ])
+            []
+        )
+
+
+countLine : String -> Db -> String -> Task Error String
+countLine label conn sql =
+    Task.map
+        (\rows -> String.concat [ label, ":", String.join "," (List.map (cell "n") rows) ])
+        (Unsafe.unsafeQuery conn sql [])
+
+
+cell : String -> Store.Row -> String
+cell name row =
+    case Dict.get name row of
+        Just (Just s) ->
+            s
+
+        Just Nothing ->
+            "NULL"
+
+        Nothing ->
+            "?"
+
+
+-- ── Line helpers ─────────────────────────────────────────────────────
+
+
+say : Task Error String -> Task Error ()
+say task =
+    Task.andThen Io.println task
+
+
+succeeded : String -> Task Error a -> Task Error String
+succeeded label task =
+    Task.onError
+        (\e -> Task.succeed (String.concat [ label, ":FAIL:", Error.message e ]))
+        (Task.map (\_ -> String.concat [ label, ":ok" ]) task)
+
+
+counted : String -> Task Error Int -> Task Error String
+counted label task =
+    Task.onError
+        (\e -> Task.succeed (String.concat [ label, ":FAIL:", Error.message e ]))
+        (Task.map (\n -> String.concat [ label, ":", String.fromInt n ]) task)
+
+
+-- `label:rejected` when `task` fails with an error whose message contains
+-- `needle`; any success or any other error is a FAIL line.
+refused : String -> String -> Task Error a -> Task Error String
+refused label needle task =
+    Task.onError
+        (\e ->
+            if String.contains needle (Error.message e) then
+                Task.succeed (String.concat [ label, ":rejected" ])
+
+            else
+                Task.succeed (String.concat [ label, ":FAIL-wrong-error:", Error.message e ])
+        )
+        (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) task)
+
+
+-- `label:rejected` when `task` fails with the database failure `expected` in
+-- its details; any success, other failure, or non-database error is a FAIL line.
+refusedBy : String -> DbFailure -> Task Error a -> Task Error String
+refusedBy label expected task =
+    Task.onError
+        (\e ->
+            case e of
+                Error _ info ->
+                    case info.details of
+                        Just (Database failure) ->
+                            if failure == expected then
+                                Task.succeed (String.concat [ label, ":rejected" ])
+
+                            else
+                                Task.succeed (String.concat [ label, ":FAIL-wrong-failure:", Error.message e ])
+
+                        Just (Custom _) ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                        Just (FfiPanic _) ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                        Just (HttpStatus _) ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                        Just (JsonDecode _) ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                        Just (TypeMismatch _) ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+
+                        Nothing ->
+                            Task.succeed (String.concat [ label, ":FAIL-not-database:", Error.message e ])
+        )
+        (Task.map (\_ -> String.concat [ label, ":FAIL-accepted" ]) task)

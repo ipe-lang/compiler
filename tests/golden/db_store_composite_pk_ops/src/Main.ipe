@@ -2,8 +2,9 @@ module Main exposing (main)
 
 -- Composite and illegal primary keys against a live `sqlite::memory:` table.
 -- The `memberships` table is created by raw DDL with a table-level
--- `PRIMARY KEY (user_id, group_id)` (`createSql` does not render one yet), then
--- seeded with two rows. Checks, one line each:
+-- `PRIMARY KEY (user_id, group_id)`, then seeded with two rows (the rendered
+-- `Store.create` DDL is proven by `db_store_composite_pk_ddl`). Checks, one
+-- line each:
 --
 --   * the by-key operations `get` / `update` / `delete` on the composite store
 --     fail with the composite-key error, issuing no SQL;

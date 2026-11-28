@@ -1,23 +1,36 @@
 module Main exposing (main)
 
 -- Composite primary keys in the `Draft` model: the declared column list is
--- parsed once into a typed key, and every illegal declaration is refused with a
--- typed `Err` that `createSql` returns — no DDL is built from it.
+-- parsed once into a typed key, `createSql` renders it as one table-level
+-- `PRIMARY KEY (…)` term with each key column `NOT NULL`, and every illegal
+-- key is refused with a typed `Err` — no DDL is built from it.
 --
 -- Pure checks (no DB connection), one line each:
---   * the refusals: an empty list, a one-column list, an invalid identifier, an
---     unknown column, a repeated column, and every second-key conflict
---     (single then composite, composite then single, single then single);
---   * the accessor forms `compositePrimaryKey2` / `compositePrimaryKey3` lower
---     through the intercept and record the key (the table-level DDL is not
---     rendered yet, so `createSql` fails closed rather than drop the key);
---   * a single-column key is unaffected.
+--   * the declaration refusals: an empty list, a one-column list, an invalid
+--     identifier, an unknown column, a repeated column, a nullable column (raw
+--     and accessor forms), and every second-key conflict (single then
+--     composite, composite then single, single then single);
+--   * the render refusals, each on a `Draft` record forged past the
+--     declaration parse so only the render can refuse it: a repeated, invalid,
+--     unknown, or nullable key column, a primary-key spec disagreeing with the
+--     declared key (composite, single, none), and a `serial` column beside a
+--     composite key;
+--   * a `serial` column on a non-`INTEGER` single key, and two columns whose
+--     names differ only in case (at declaration, on a forged record, and as a
+--     rename target);
+--   * the exact DDL of the raw and accessor composite forms (declared key order,
+--     not column order), of `migrations`' create entry, and of the no-key,
+--     single-key, and serial-key stores (bytes the migration ledger checksums).
 
-import Ipe.Codec as Codec exposing (Codec)
-import Ipe.Db.Store as Store exposing (Draft, Store)
+import Ipe.Codec as Codec exposing (Codec(..), ColType(..), Shape(..))
+import Ipe.Db.Store as Store exposing (Draft(..), Store)
 import Ipe.Db.Store.Unsafe as StoreU
 import Ipe.Error as Error exposing (Error)
 import Ipe.Io as Io
+import Ipe.Json.Decode as Decode
+import Ipe.Json.Encode as Encode
+import Ipe.List as List
+import Ipe.Maybe as Maybe exposing (Maybe(..))
 import Ipe.Result as Result exposing (Result(..))
 import Ipe.String as String
 import Ipe.Task as Task exposing (Task)
@@ -83,18 +96,183 @@ refusedLine label needle ddl =
             String.concat [ label, ":FAIL-accepted:", sql ]
 
 
-singlePkLine : String
-singlePkLine =
-    case typedDdl (\d -> Store.primaryKey .userId d) of
+-- A membership whose `groupId` is optional: a hand-assembled codec pins
+-- `group_id` to a nullable column.
+type alias OptionalMembership =
+    { userId : String
+    , groupId : Maybe String
+    }
+
+
+optionalMembershipCodec : Codec OptionalMembership
+optionalMembershipCodec =
+    Codec
+        { enc =
+            \m ->
+                Encode.object
+                    [ ( "user_id", Encode.string m.userId )
+                    , ( "group_id", encodeMaybeString m.groupId )
+                    ]
+        , mkDec =
+            \_ ->
+                Decode.map2 (\u g -> { userId = u, groupId = g })
+                    (Decode.field "user_id" Decode.string)
+                    (Decode.field "group_id" (Decode.nullable Decode.string))
+        , shp = SRecord [ ( "user_id", CText ), ( "group_id", CNull CText ) ]
+        }
+
+
+encodeMaybeString : Maybe String -> Encode.Value
+encodeMaybeString m =
+    case m of
+        Just s ->
+            Encode.string s
+
+        Nothing ->
+            Encode.null
+
+
+optionalTypedDdl : Result Error String
+optionalTypedDdl =
+    case Store.fromCodec "memberships" optionalMembershipCodec of
         Err e ->
-            String.concat [ "single-pk:FAIL-rejected:", Error.message e ]
+            Err e
+
+        Ok draft ->
+            Store.createSql (Store.public (Store.compositePrimaryKey2 .userId .groupId draft))
+
+
+-- The DDL of a raw-column draft over `columns` shaped by `shape`.
+rawDdlOver : String -> List Store.Column -> (Draft Store.Row -> Draft Store.Row) -> Result Error String
+rawDdlOver table columns shape =
+    case Store.fromColumns table columns of
+        Err e ->
+            Err e
+
+        Ok draft ->
+            Store.createSql (Store.public (shape draft))
+
+
+nullableColumns : List Store.Column
+nullableColumns =
+    [ Store.textColumn "user_id"
+    , Store.column "group_id" (CNull CText)
+    , Store.textColumn "role"
+    ]
+
+
+-- Replace the draft's recorded key, bypassing the declaration parse.
+forgePk : Store.PrimaryKeyDecl -> Draft Store.Row -> Draft Store.Row
+forgePk decl d =
+    case d of
+        Draft r ->
+            Draft { r | pk = Ok decl }
+
+
+-- Replace the draft's recorded key and specs, bypassing the declaration parse.
+forgeKeyAndSpecs : Store.PrimaryKeyDecl -> List Store.ColumnSpec -> Draft Store.Row -> Draft Store.Row
+forgeKeyAndSpecs decl specs d =
+    case d of
+        Draft r ->
+            Draft { r | pk = Ok decl, specs = specs }
+
+
+-- Prepend one spec to the draft's specs, bypassing the builders.
+forgeSpec : Store.ColumnSpec -> Draft Store.Row -> Draft Store.Row
+forgeSpec spec d =
+    case d of
+        Draft r ->
+            Draft { r | specs = spec :: r.specs }
+
+
+-- `label:ok` when the DDL is exactly `expected`.
+ddlLine : String -> String -> Result Error String -> String
+ddlLine label expected ddl =
+    case ddl of
+        Err e ->
+            String.concat [ label, ":FAIL-rejected:", Error.message e ]
 
         Ok sql ->
-            if String.contains "PRIMARY KEY" sql then
-                "single-pk:ok"
+            if sql == expected then
+                String.concat [ label, ":ok" ]
 
             else
-                String.concat [ "single-pk:FAIL-bad-ddl:", sql ]
+                String.concat [ label, ":FAIL-bad-ddl:", sql ]
+
+
+compositeDdl : String
+compositeDdl =
+    "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT NOT NULL, group_id TEXT NOT NULL, role TEXT, PRIMARY KEY (user_id, group_id))"
+
+
+migrationsLine : String
+migrationsLine =
+    case
+        Store.fromColumns "memberships"
+            [ Store.textColumn "user_id"
+            , Store.textColumn "group_id"
+            , Store.textColumn "role"
+            ]
+            |> Result.andThen (\d -> Store.migrations (Store.public (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d)))
+    of
+        Err e ->
+            String.concat [ "migrations-composite:FAIL-rejected:", Error.message e ]
+
+        Ok ms ->
+            case List.head ms of
+                Just m ->
+                    if m.name == "create_memberships" && m.sql == compositeDdl then
+                        "migrations-composite:ok"
+
+                    else
+                        String.concat [ "migrations-composite:FAIL-bad-entry:", m.name, ": ", m.sql ]
+
+                Nothing ->
+                    "migrations-composite:FAIL-no-entry"
+
+
+ticketColumns : List Store.Column
+ticketColumns =
+    [ Store.intColumn "id", Store.textColumn "title" ]
+
+
+-- A ticket table whose `id` is text: `AUTOINCREMENT` needs an `INTEGER` key.
+textTicketColumns : List Store.Column
+textTicketColumns =
+    [ Store.textColumn "id", Store.textColumn "title" ]
+
+
+-- Two columns whose names differ only in case: SQL identifiers compare
+-- case-insensitively, so they name one column.
+repeatedColumns : List Store.Column
+repeatedColumns =
+    [ Store.textColumn "user_id", Store.textColumn "USER_ID" ]
+
+
+-- Append one column to the draft's frozen columns, bypassing `fromColumns`.
+forgeColumn : Store.Column -> Draft Store.Row -> Draft Store.Row
+forgeColumn col d =
+    case d of
+        Draft r ->
+            Draft { r | frozenColumns = r.frozenColumns ++ [ col ] }
+
+
+-- The `migrations` of a raw `memberships` store after renaming `from` to `to`,
+-- reported through its create entry's SQL.
+renamedMigrations : String -> String -> Result Error String
+renamedMigrations from to =
+    Store.fromColumns "memberships"
+        [ Store.textColumn "user_id"
+        , Store.textColumn "group_id"
+        , Store.textColumn "role"
+        ]
+        |> Result.andThen (\d -> Store.migrations (Store.renameColumn from to (Store.public d)))
+        |> Result.map (\ms -> String.join "; " (List.map (\m -> m.sql) ms))
+
+
+disagreementNeedle : String
+disagreementNeedle =
+    "but its primary-key column specs disagree"
 
 
 main : Task Error ()
@@ -126,15 +304,69 @@ main =
             , refusedLine "typed-single-then-composite"
                 "second one was declared after primary key (user_id)"
                 (typedDdl (\d -> Store.compositePrimaryKey2 .userId .groupId (Store.primaryKey .userId d)))
-            , refusedLine "raw-composite-ddl"
-                "composite primary key is not supported yet"
+            , refusedLine "nullable-key-column"
+                "primary-key column \"group_id\" is nullable"
+                (rawDdlOver "memberships" nullableColumns (StoreU.compositePrimaryKey [ "user_id", "group_id" ]))
+            , refusedLine "typed-nullable-key-column"
+                "primary-key column \"group_id\" is nullable"
+                optionalTypedDdl
+            , refusedLine "forged-duplicate"
+                "column \"user_id\" is listed twice"
+                (rawDdl (forgePk (Store.CompositePk "user_id" "user_id" [])))
+            , refusedLine "forged-ident"
+                "rejected primary-key column identifier"
+                (rawDdl (forgePk (Store.CompositePk "user_id" "group_id; DROP TABLE x" [])))
+            , refusedLine "forged-unknown"
+                "\"tenant_id\" is not a column"
+                (rawDdl (forgePk (Store.CompositePk "user_id" "tenant_id" [])))
+            , refusedLine "forged-nullable"
+                "primary-key column \"group_id\" is nullable"
+                (rawDdlOver "memberships" nullableColumns (forgePk (Store.CompositePk "user_id" "group_id" [])))
+            , refusedLine "forged-spec-beside-composite"
+                disagreementNeedle
+                (rawDdl (\d -> forgeSpec (Store.PrimaryKey "role") (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d)))
+            , refusedLine "forged-single-spec-mismatch"
+                disagreementNeedle
+                (rawDdl (forgeKeyAndSpecs (Store.SinglePk "user_id") [ Store.PrimaryKey "role" ]))
+            , refusedLine "forged-nopk-spec"
+                disagreementNeedle
+                (rawDdl (forgeKeyAndSpecs Store.NoPk [ Store.PrimaryKey "role" ]))
+            , refusedLine "composite-serial"
+                "\"user_id\" is marked serial but the store's key is composite (user_id, group_id)"
+                (rawDdl (\d -> StoreU.serial "user_id" (StoreU.compositePrimaryKey [ "user_id", "group_id" ] d)))
+            , refusedLine "serial-text-key"
+                "\"id\" is marked serial but its SQL type is TEXT"
+                (rawDdlOver "tickets" textTicketColumns (\d -> StoreU.primaryKey "id" (StoreU.serial "id" d)))
+            , refusedLine "repeated-column"
+                "column \"USER_ID\" is declared twice"
+                (rawDdlOver "memberships" repeatedColumns (\d -> d))
+            , refusedLine "forged-repeated-column"
+                "column \"Role\" is declared twice"
+                (rawDdl (forgeColumn (Store.textColumn "Role")))
+            , refusedLine "rename-case-collision"
+                "rename target \"USER_ID\" already names a column"
+                (renamedMigrations "role" "USER_ID")
+            , ddlLine "raw-composite-ddl"
+                compositeDdl
                 (rawDdl (StoreU.compositePrimaryKey [ "user_id", "group_id" ]))
-            , refusedLine "typed-composite2-ddl"
-                "composite primary key is not supported yet"
+            , ddlLine "raw-composite-key-order-ddl"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT NOT NULL, group_id TEXT NOT NULL, role TEXT, PRIMARY KEY (group_id, user_id))"
+                (rawDdl (StoreU.compositePrimaryKey [ "group_id", "user_id" ]))
+            , ddlLine "typed-composite2-ddl"
+                compositeDdl
                 (typedDdl (\d -> Store.compositePrimaryKey2 .userId .groupId d))
-            , refusedLine "typed-composite3-ddl"
-                "composite primary key is not supported yet"
+            , ddlLine "typed-composite3-ddl"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT NOT NULL, group_id TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (user_id, group_id, role))"
                 (typedDdl (\d -> Store.compositePrimaryKey3 .userId .groupId .role d))
-            , singlePkLine
+            , migrationsLine
+            , ddlLine "no-pk"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT, group_id TEXT, role TEXT)"
+                (typedDdl (\d -> d))
+            , ddlLine "single-pk"
+                "CREATE TABLE IF NOT EXISTS memberships (user_id TEXT PRIMARY KEY, group_id TEXT, role TEXT)"
+                (typedDdl (\d -> Store.primaryKey .userId d))
+            , ddlLine "single-serial-pk"
+                "CREATE TABLE IF NOT EXISTS tickets (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT)"
+                (rawDdlOver "tickets" ticketColumns (\d -> StoreU.primaryKey "id" (StoreU.serial "id" d)))
             ]
         )

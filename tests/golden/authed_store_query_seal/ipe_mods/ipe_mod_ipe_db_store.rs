@@ -584,21 +584,61 @@ pub(crate) fn user_ipe_db_store_build_store<T1: Clone>(
             IpeMaybe::Just(bad) => IpeResult::Err(
                 crate::user_ipe_db_store_invalid_ident_error("column".to_string(), bad),
             ),
-            IpeMaybe::Nothing => IpeResult::Ok(IpeDbStoreDraft::Draft(
-                RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable {
-                    codec: codec,
-                    currentColumns: columns.clone(),
-                    frozenColumns: columns,
-                    frozenTable: table.clone(),
-                    indexes: Vec::<IpeDbStoreIndexSpec>::new(),
-                    ops: Vec::<IpeDbStoreSchemaOp>::new(),
-                    pk: IpeResult::Ok(IpeDbStorePrimaryKeyDecl::NoPk),
-                    specs: Vec::<IpeDbStoreColumnSpec>::new(),
-                    table: table,
-                },
-            )),
+            IpeMaybe::Nothing => match crate::user_ipe_db_store_first_repeated_name(Vec::<String>::new(), list_map_consume({ let __ipe_fn: Box<dyn Fn(IpeDbStoreColumn) -> String + Send + Sync + 'static> = Box::new(crate::user_ipe_db_store_column_name); __ipe_fn }, columns.clone()))
+            {
+                IpeMaybe::Just(repeated) => {
+                    IpeResult::Err(crate::user_ipe_db_store_repeated_column_error(repeated))
+                }
+                IpeMaybe::Nothing => IpeResult::Ok(IpeDbStoreDraft::Draft(
+                    RecCodecCurrentColumnsFrozenColumnsFrozenTableIndexesOpsPkSpecsTable {
+                        codec: codec,
+                        currentColumns: columns.clone(),
+                        frozenColumns: columns,
+                        frozenTable: table.clone(),
+                        indexes: Vec::<IpeDbStoreIndexSpec>::new(),
+                        ops: Vec::<IpeDbStoreSchemaOp>::new(),
+                        pk: IpeResult::Ok(IpeDbStorePrimaryKeyDecl::NoPk),
+                        specs: Vec::<IpeDbStoreColumnSpec>::new(),
+                        table: table,
+                    },
+                )),
+            },
         }
     })
+}
+
+pub(crate) fn user_ipe_db_store_same_sql_ident(a: String, b: String) -> bool {
+    let _ipe_recursion_guard = crate::recursion_guard();
+    (string_to_lower(a) == string_to_lower(b))
+}
+
+pub(crate) fn user_ipe_db_store_first_repeated_name(
+    seen: Vec<String>,
+    names: Vec<String>,
+) -> IpeMaybe<String> {
+    let _ipe_recursion_guard = crate::recursion_guard();
+    let mut seen = seen;
+    let mut names = names;
+    loop {
+        match (names).as_slice() {
+            [] => {
+                return IpeMaybe::Nothing;
+            }
+            [name, rest @ ..] => {
+                let name = name.clone();
+                let rest = rest.to_vec();
+                if list_any(({ let name = name.clone(); { let __ipe_fn: Box<dyn Fn(String) -> bool + Send + Sync + 'static> = Box::new(move |__u_eta_0: String| -> bool { crate::user_ipe_db_store_same_sql_ident(name.clone(), __u_eta_0) }); __ipe_fn } }), seen.clone()) {
+                    return IpeMaybe::Just(name);
+                } else {
+                    let __tco_0 = ipe_runtime::list::ipe_list_cons(name, seen);
+                    let __tco_1 = rest;
+                    seen = __tco_0;
+                    names = __tco_1;
+                    continue;
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn user_ipe_db_store_first_invalid_column(
@@ -659,6 +699,21 @@ pub(crate) fn user_ipe_db_store_public<T1: Clone>(
                 table: (r).table.clone(),
             },
         ),
+    }
+}
+
+pub(crate) fn user_ipe_db_store_is_nullable_col_type(colType: IpeCodecColType) -> bool {
+    let _ipe_recursion_guard = crate::recursion_guard();
+    match colType {
+        IpeCodecColType::CText => false,
+        IpeCodecColType::CInt => false,
+        IpeCodecColType::CReal => false,
+        IpeCodecColType::CBool => false,
+        IpeCodecColType::CBlob => false,
+        IpeCodecColType::CTime => false,
+        IpeCodecColType::CDecimal => false,
+        IpeCodecColType::CMoney => false,
+        IpeCodecColType::CNull(_) => true,
     }
 }
 
@@ -1942,17 +1997,12 @@ pub(crate) fn user_ipe_db_store_column_is_nullable(
     name: String,
 ) -> bool {
     let _ipe_recursion_guard = crate::recursion_guard();
-    match ipe_result_map(crate::user_ipe_db_store_resolve_column(view, name), { let __ipe_fn: Box<dyn Fn(IpeDbStoreColumn) -> IpeCodecColType + Send + Sync + 'static> = Box::new(crate::user_ipe_db_store_column_col_type); __ipe_fn })
-    {
-        IpeResult::Ok(IpeCodecColType::CNull(_)) => true,
-        IpeResult::Ok(IpeCodecColType::CText) => false,
-        IpeResult::Ok(IpeCodecColType::CInt) => false,
-        IpeResult::Ok(IpeCodecColType::CReal) => false,
-        IpeResult::Ok(IpeCodecColType::CBool) => false,
-        IpeResult::Ok(IpeCodecColType::CTime) => false,
-        IpeResult::Ok(IpeCodecColType::CDecimal) => false,
-        IpeResult::Ok(IpeCodecColType::CMoney) => false,
-        IpeResult::Ok(IpeCodecColType::CBlob) => false,
+    match crate::user_ipe_db_store_resolve_column(view, name) {
+        IpeResult::Ok(col) => {
+            crate::user_ipe_db_store_is_nullable_col_type(
+                crate::user_ipe_db_store_column_col_type(col),
+            )
+        }
         IpeResult::Err(_) => false,
     }
 }
@@ -2275,6 +2325,18 @@ pub(crate) fn user_ipe_db_store_non_nullable_mask_error(
         "Ipe.Db.Store: cannot mask non-nullable column \"".to_string(),
         name,
         "\" — a masked column yields NULL for an unauthorized row, so it must be nullable (its codec column type must be `CNull _`, i.e. a `Maybe`-typed field). Make the field optional, or drop the mask on this column"
+            .to_string(),
+    ]))
+}
+
+pub(crate) fn user_ipe_db_store_repeated_column_error(
+    name: String,
+) -> ipe_runtime::error::IpeError {
+    let _ipe_recursion_guard = crate::recursion_guard();
+    ipe_error_invalid_input(string_concat(vec![
+        "Ipe.Db.Store: column \"".to_string(),
+        name,
+        "\" is declared twice — SQL identifiers compare case-insensitively, so two column names differing only in case name one column; give every column a distinct name"
             .to_string(),
     ]))
 }

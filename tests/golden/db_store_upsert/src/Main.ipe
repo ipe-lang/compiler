@@ -3,9 +3,10 @@ module Main exposing (main)
 -- `Store.upsert` against a live `sqlite::memory:` database. The conflict target
 -- is the store's declared key, never an argument: every refusal is Store's own
 -- typed `Err`, raised before any SQL, and every accepted upsert is one atomic
--- `INSERT … ON CONFLICT (…) DO UPDATE`. Tables a fixture needs that `createSql`
--- does not render (a composite key, a second `UNIQUE`, a renamed column) are
--- created by raw DDL. Checks, one line each:
+-- `INSERT … ON CONFLICT (…) DO UPDATE`. The typed stores are created by
+-- `Store.create`; the raw-column fixtures' tables (`NOT NULL` value columns, a
+-- second `UNIQUE`, a column created under its renamed name) are created by raw
+-- DDL. Checks, one line each:
 --
 --   * refusals, each clearing every earlier guard: no key and no `unique`
 --     column; several `unique` columns; an illegal key declaration; an unknown

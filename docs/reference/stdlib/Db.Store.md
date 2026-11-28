@@ -45,8 +45,9 @@ with it),
 `frozenTable` / `frozenColumns` hold the table name and columns as first
 constructed, `table` / `currentColumns` track the current-schema view after any
 renames, `ops` is the ordered schema-op log, and `indexes` is the ordered index
-specs. Built only through `fromCodec` / `fromColumns`, so every identifier it
-holds has already been accepted by `validSqlIdent`.
+specs. The constructor is exported, so a record built or updated by hand can
+hold any identifier and any key: `createSql` re-validates every identifier and
+re-proves the key before rendering, and fails closed on the first fault.
 
 ## `Store`
 
@@ -71,7 +72,9 @@ so its binds and decoded reads name the current columns while the record it
 reads and writes keeps its declared fields. `ops` is the ordered schema-op
 log folded by `migrations`, threaded from `frozenTable` so each rename entry
 names the table as of its own position. `indexes` is the ordered list of declarative index
-specs emitted after the create entry by `create` / `migrations`.
+specs emitted after the create entry by `create` / `migrations`. The
+constructor is exported, so `createSql` re-proves the key and every
+identifier before rendering rather than trusting the record.
 
 ## `Column`
 
@@ -93,9 +96,12 @@ table-level key. At most one key per table, so the single and composite forms
 are one closed sum rather than two independent flags. `CompositePk first
 second rest` holds the key columns in declared order (order is significant
 for the backing index) and carries at least two columns by construction — a
-one-column key is a `SinglePk`. Reached only through `primaryKeyNamed` /
-`compositePrimaryKeyNamed` (or their accessor forms), which parse the declared
-columns against the draft before recording a key.
+one-column key is a `SinglePk`. The builders `primaryKeyNamed` /
+`compositePrimaryKeyNamed` (and their accessor forms) parse the declared
+columns against the draft before recording a key, and `createSql` re-proves
+every key fact before rendering it. A `SinglePk` renders as an inline
+`PRIMARY KEY` on its column; a `CompositePk` renders each key column
+`NOT NULL` plus one table-level `PRIMARY KEY (first, second, …)` term.
 
 ## `IndexSpec`
 
@@ -209,8 +215,9 @@ closed. The columns are derived from the codec's `Shape`: an `SRecord`
 becomes the typed column list, a non-`SRecord` codec (a bare scalar, a blob)
 names no columns and is an `Err`. The table name and every derived column
 name are run through `validSqlIdent`; the first non-conforming identifier is
-an `Err`, and no draft is produced. A returned `Draft` therefore holds only
-accepted identifiers, and its columns cannot drift from the codec that reads
+an `Err`, as are two column names differing only in case (SQL compares
+identifiers case-insensitively), and no draft is produced. A returned `Draft`
+therefore holds only accepted, distinct identifiers, and its columns cannot drift from the codec that reads
 and writes its rows (parse-don't-validate + one source of truth).
 
 A `Draft` is NOT queryable: classify it with `public` (world-open) or
@@ -230,7 +237,8 @@ derived from `columns` (`rowCodec`), so the same codec-driven CRUD applies once
 the draft is classified: writes bind each declared column, reads decode back
 into a `Row`, and the typed `read*` helpers parse a column into its Ipê type.
 Like `fromCodec`, the table name and every column name run through
-`validSqlIdent`, so an invalid identifier fails closed before any SQL is built.
+`validSqlIdent`, so an invalid identifier fails closed before any SQL is built,
+and two column names differing only in case (one SQL identifier) are refused.
 Classify the result with `public` / `secured` before querying (deny-by-default).
 
 ## `rowCodec`
@@ -315,6 +323,9 @@ serial : (row -> t) -> Draft row -> Draft row
 
 Mark the accessor-named column DB-assigned (serial). `insert` omits it so
 the database generates it — a client value can never overwrite a serial column.
+The column must be the store's one-column primary key with an `INTEGER` SQL
+type (an `Int` field); `createSql` / `migrations` return a typed `Err`
+otherwise.
 
 ## `unique`
 
@@ -419,9 +430,12 @@ with `findWhere` / `updateWhere` / `deleteWhere` naming every key column;
 a key column listed twice, records a typed `Err` that every read and write on
 the store fails with.
 
-`createSql` / `migrations` do not yet render a table-level
-`PRIMARY KEY (...)` clause: for a composite key they ALWAYS return a typed
-`Err`, so the table must already exist (created outside `Ipe.Db.Store`).
+`createSql` / `migrations` render the key as a table-level
+`PRIMARY KEY (first, second)` term in declared order, with each key column
+`NOT NULL`. They return a typed `Err` instead when a key column is a `Maybe`
+field (a nullable key column is refused when the key is declared) or when the
+store also marks a column `serial` (`AUTOINCREMENT` needs a one-column
+`INTEGER` key).
 
 Example:
 
@@ -446,9 +460,10 @@ rules as `compositePrimaryKey2`: key order is significant, an accessor naming
 a missing field is a type error, the by-key operations return a typed `Err`
 on the resulting store, `updateWhere` never writes any key column, and a
 second key declaration records a typed `Err` that every read and write fails
-with. `createSql` / `migrations` ALWAYS return a typed `Err` for a composite
-key (no table-level `PRIMARY KEY (...)` clause is rendered yet), so the table
-must already exist. For more than three columns, or a raw-column
+with. `createSql` / `migrations` render the key as a table-level
+`PRIMARY KEY (first, second, third)` term with each key column `NOT NULL`,
+and return a typed `Err` for a nullable key column or a `serial` column on the
+same store. For more than three columns, or a raw-column
 `fromColumns` draft, use `compositePrimaryKeyNamed`.
 
 Example:
@@ -496,7 +511,14 @@ SQL runs:
 * a name that is not a valid SQL identifier;
 * a name that is not a column of the draft;
 * a column listed twice;
+* a nullable column (a `CNull` type, a `Maybe` field) — SQLite admits `NULL`
+  in such a key and a key holding `NULL` never conflicts;
 * a draft that already declares a primary key (single or composite).
+
+`createSql` / `migrations` render the key as one table-level
+`PRIMARY KEY (…)` term in declared order, each key column `NOT NULL`. A store
+that also marks a column `serial` has its DDL refused with a typed `Err`
+(`AUTOINCREMENT` needs a one-column `INTEGER` key).
 
 Example:
 
@@ -644,6 +666,27 @@ The DDL is the store's FROZEN schema — the table name, columns, and specs as
 first constructed — and is exactly the create entry `migrations` emits first.
 A rename never edits it (the renames are later ledger entries), so the table
 name, the columns, and the specs it names always belong to one schema.
+
+The primary key renders from the store's key declaration:
+
+* no key — the column definitions alone;
+* a single key — `col TYPE PRIMARY KEY` inline (`PRIMARY KEY AUTOINCREMENT`
+  for a `serial` key);
+* a composite key — each key column `col TYPE NOT NULL`, then one
+  table-level `PRIMARY KEY (first, second, …)` in declared order, e.g.
+  `CREATE TABLE IF NOT EXISTS memberships (user_id TEXT NOT NULL, group_id TEXT NOT NULL, role TEXT, PRIMARY KEY (user_id, group_id))`.
+
+Before rendering, the key is re-proved: the declaration and the store's
+primary-key specs agree, a composite key's columns are valid identifiers
+naming distinct, non-nullable columns of the table, and a composite key has
+no `serial` column. Every column name is also re-proved distinct under SQL's
+case-insensitive identifier comparison, and a `serial` column must be the
+one-column `INTEGER` key. The first fault is a typed `Err` and no DDL is
+produced.
+
+The DDL is `CREATE TABLE IF NOT EXISTS`: when a table of that name already
+exists, `Db.migrate` records the entry as applied without comparing the
+existing table's columns or key to the declared ones.
 
 ## `readText`
 
@@ -1032,7 +1075,8 @@ This function is a total constructor: `from` and `to` are admitted into the
 op log unconditionally. Identifier validation happens once, in `migrations`,
 which is the only point SQL text is built — an invalid name therefore
 surfaces as `Err` there, not here. A rename whose `from` is not a current
-column, or whose `to` already names one, leaves the current schema unchanged
+column, or whose `to` already names one (compared case-insensitively, as SQL
+compares identifiers), leaves the current schema unchanged
 and is refused by `migrations`, so a store carrying it cannot be migrated.
 
 Example:

@@ -1,0 +1,17 @@
+create:ok
+schema:ok
+insert-u1-g1:1
+dup-key:rejected
+insert-u1-g2:2
+null-key:rejected
+upsert-first:1
+upsert-second:1
+after-upsert:u1/g1/admin,u1/g2/member
+rename-migrate:ok
+renamed-upsert:1
+after-renamed-upsert:u1/g1/admin,u1/g2/owner
+single-key-create:ok
+pk-change:rejected
+serial-create:rejected
+serial-table:0
+serial-ledger:0
