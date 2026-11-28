@@ -22,11 +22,12 @@ Three knots.
   instants, or subtracting a span from a span as if it were an instant, is a
   compile-time type error — the arithmetic that makes sense is the only arithmetic
   the types allow. `Duration` is non-negative, so spans move an instant *forward*.
-- **UTC formatters are deterministic; local formatters are not.** `formatISO8601`
-  and `formatRFC3339` render an instant in UTC, identically on every machine.
-  `timeString` and a strftime `format` render in local time, which depends on the
-  host timezone — reach for those for human display, and for the UTC forms when the
-  output must be stable (logs, wire formats, tests).
+- **Every formatter renders UTC, identically on every machine.** `timeString`,
+  `format`, `formatHTTP`, `formatISO8601`, and `formatRFC3339` all render their
+  instant in UTC; none reads the host's timezone, so the same instant prints the
+  same text everywhere (logs, wire formats, tests included). `format` takes a Go
+  reference-time layout, not a `strftime` pattern — see `ipe doc
+  Ipe.Time.format` for the token table.
 
 ## A worked example: a launch window
 
