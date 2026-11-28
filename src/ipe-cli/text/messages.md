@@ -957,6 +957,10 @@ module-discovery walk aborted: {detail}
 
 error[IPE-E0004]: no package.ipe at {dir}; run `ipe init` there
 
+## project-no-manifest-source-dir
+
+error[IPE-E0004]: {dir} is a project's source directory, not a project; run ipe from {project}, or name a module file such as {dir}/Main.ipe
+
 ## project-no-src-dir
 
 error[IPE-E0005]: {root} has no `src/` directory (a symbolic link named `src` counts as none); create `src/` beside package.ipe and keep the modules in it

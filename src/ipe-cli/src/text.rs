@@ -1077,6 +1077,8 @@ messages! {
     cli_device_named_module(path, segment) = "cli-device-named-module";
     /// The project directory holds no `package.ipe`.
     project_no_manifest(dir) = "project-no-manifest";
+    /// The directory without `package.ipe` is spelled as a project's `src/` or `tests/`.
+    project_no_manifest_source_dir(dir, project) = "project-no-manifest-source-dir";
     /// The project directory has no `src/` directory.
     project_no_src_dir(root) = "project-no-src-dir";
     /// A `programs` entry names a file `src/` does not hold.

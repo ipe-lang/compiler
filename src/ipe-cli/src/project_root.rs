@@ -115,6 +115,23 @@ pub enum SourceDir {
 }
 
 impl SourceDir {
+    /// Every source directory a project holds.
+    const ALL: [Self; 2] = [Self::Src, Self::Tests];
+
+    /// The source directory `dir` is spelled as, read from its last component alone.
+    ///
+    /// Nothing is opened: a path ending in `src` or `tests` names one by
+    /// spelling, whether or not a project holds it.
+    #[must_use]
+    pub fn spelled_by(dir: &Path) -> Option<Self> {
+        let Some(Component::Normal(leaf)) = dir.components().next_back() else {
+            return None;
+        };
+        Self::ALL
+            .into_iter()
+            .find(|source| leaf == OsStr::new(source.name()))
+    }
+
     /// The directory's name below the project root.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -278,8 +295,8 @@ impl ProjectRoot {
         let fs_root = ipe_fs_open::HeldDir::open_root(&path)
             .map_err(|r| io_bounded::refusal_error(&path, r))?;
         let source = read_manifest(&fs_root, &path)?;
-        let dir = HeldDir::open_following(&path)?
-            .ok_or_else(|| CliError::NoManifest { dir: path.clone() })?;
+        let dir =
+            HeldDir::open_following(&path)?.ok_or_else(|| CliError::no_manifest(path.clone()))?;
         let fs_id = fs_root
             .id()
             .map_err(|r| io_bounded::refusal_error(&path, r))?;
@@ -496,9 +513,7 @@ impl ProjectRoot {
 /// Read `package.ipe` through `root`, refusing a link and capping its size.
 fn read_manifest(root: &ipe_fs_open::HeldDir, dir: &Path) -> Result<String, CliError> {
     let manifest_path = dir.join(PACKAGE_IPE);
-    let no_manifest = || CliError::NoManifest {
-        dir: dir.to_path_buf(),
-    };
+    let no_manifest = || CliError::no_manifest(dir.to_path_buf());
     let name = EntryName::new(OsStr::new(PACKAGE_IPE)).ok_or_else(no_manifest)?;
     match root.open_regular(&name) {
         Ok(file) => file
@@ -698,6 +713,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::ManifestHint;
 
     const MANIFEST: &str = "module Package exposing (package)\n\npackage =\n    { name = \"x\" }\n";
     const MODULE: &str = "module Main exposing (main)\n\nmain =\n    1\n";
@@ -779,7 +795,9 @@ mod tests {
         let s = Scratch::new("no-manifest");
         s.write("src/Main.ipe", MODULE);
         let err = resolve_err(s.path());
-        assert!(matches!(&err, CliError::NoManifest { dir } if dir == s.path()));
+        assert!(
+            matches!(&err, CliError::NoManifest { dir, hint: ManifestHint::Init } if dir == s.path())
+        );
         assert_eq!(
             err.to_string(),
             format!(
@@ -795,8 +813,99 @@ mod tests {
         s.write("inner/src/Main.ipe", MODULE);
         let inner = s.path().join("inner");
         let err = resolve_err(&inner);
-        assert!(matches!(&err, CliError::NoManifest { dir } if *dir == inner));
+        assert!(matches!(&err, CliError::NoManifest { dir, .. } if *dir == inner));
         assert!(err.to_string().contains("IPE-E0004"));
+    }
+
+    /// The refusal `ipe <verb> <arg>` from `cwd` resolves to.
+    fn refusal_of(cwd: &Path, arg: &str) -> CliError {
+        let (root, file) = RootArg::of(cwd, Some(Path::new(arg)));
+        assert!(file.is_none(), "{arg} must be read as a directory argument");
+        resolve_err(root.dir())
+    }
+
+    /// A project's `tests/` or `src/` named as the directory argument is still
+    /// refused (it holds no manifest), but the remedy names the project to run
+    /// ipe from, never `ipe init`, which would nest a second project inside it.
+    #[test]
+    fn a_tests_dir_argument_is_refused_with_the_project_remedy() {
+        let s = app("source-dir-arg");
+        s.write("tests/Main.ipe", MODULE);
+        for (arg, source) in [("tests", "tests"), ("src", "src"), ("./tests/", "tests")] {
+            let err = refusal_of(s.path(), arg);
+            let project = s.path().to_path_buf();
+            assert!(
+                matches!(
+                    &err,
+                    CliError::NoManifest { dir, hint: ManifestHint::SourceDirOf { project: p } }
+                        if *dir == s.path().join(source) && *p == project
+                ),
+                "{arg}: {err:?}"
+            );
+            let dir = s.path().join(source);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "error[IPE-E0004]: {} is a project's source directory, not a project; run ipe from {}, or name a module file such as {}/Main.ipe",
+                    dir.display(),
+                    project.display(),
+                    dir.display()
+                ),
+                "{arg}"
+            );
+            assert!(!err.to_string().contains("ipe init"), "{arg}: {err}");
+        }
+    }
+
+    /// A manifest-less directory spelled as nothing a project holds keeps the
+    /// `ipe init` remedy.
+    #[test]
+    fn an_unrelated_empty_dir_keeps_the_init_remedy() {
+        let s = app("unrelated-dir-arg");
+        s.mkdir("app");
+        let err = refusal_of(s.path(), "app");
+        assert!(
+            matches!(
+                &err,
+                CliError::NoManifest {
+                    hint: ManifestHint::Init,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().ends_with("run `ipe init` there"), "{err}");
+        for spelled in ["x/tests/..", "x/tests.d", "x/Tests/Main", "x/src/Main.ipe"] {
+            assert_eq!(
+                ManifestHint::of(Path::new(spelled)),
+                ManifestHint::Init,
+                "{spelled}"
+            );
+        }
+    }
+
+    /// The hint reads the spelling alone: a `tests` directory whose parent holds
+    /// no `package.ipe` still gets the source-directory remedy, and is still
+    /// refused. No directory above the argument is opened or loaded.
+    #[test]
+    fn the_hint_never_reads_above() {
+        let s = Scratch::new("hint-spelling-only");
+        s.write("tests/Main.ipe", MODULE);
+        let err = refusal_of(s.path(), "tests");
+        assert!(
+            matches!(
+                &err,
+                CliError::NoManifest { hint: ManifestHint::SourceDirOf { project }, .. }
+                    if project == s.path()
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            ManifestHint::of(Path::new("tests")),
+            ManifestHint::SourceDirOf {
+                project: PathBuf::from(".")
+            }
+        );
     }
 
     #[test]
@@ -959,10 +1068,7 @@ mod tests {
     fn each_project_refusal_renders_the_code_the_diagnostics_table_defines() {
         let p = PathBuf::from("/p");
         let cases = [
-            (
-                CliError::NoManifest { dir: p.clone() },
-                ipe_diagnostics::IPE_E0004,
-            ),
+            (CliError::no_manifest(p.clone()), ipe_diagnostics::IPE_E0004),
             (
                 CliError::NoSrcDir { root: p.clone() },
                 ipe_diagnostics::IPE_E0005,

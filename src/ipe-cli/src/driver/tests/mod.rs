@@ -3900,12 +3900,9 @@ fn outside_root_text(cwd: &Path, arg: &str, root: &Path) -> String {
     )
 }
 
-/// The `NoManifest` refusal text for `dir`.
+/// The `NoManifest` refusal text for `dir`, its remedy chosen by the producer.
 fn no_manifest_text(dir: &Path) -> String {
-    format!(
-        "error[IPE-E0004]: no package.ipe at {}; run `ipe init` there",
-        dir.display()
-    )
+    CliError::no_manifest(dir.to_path_buf()).to_string()
 }
 
 /// `--emit-ir` over the root `cwd` and its optional file argument `arg`.

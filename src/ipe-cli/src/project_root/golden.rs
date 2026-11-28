@@ -26,9 +26,7 @@ pub fn build_golden_dir(
 ) -> Result<(), CliError> {
     let package_ipe = dir.join(PACKAGE_IPE);
     if !package_ipe.is_file() {
-        return Err(CliError::NoManifest {
-            dir: dir.to_path_buf(),
-        });
+        return Err(CliError::no_manifest(dir.to_path_buf()));
     }
     build_project_with_options(&package_ipe, out, runtime, options)
 }
@@ -62,7 +60,7 @@ mod tests {
         let out = scratch.path().join("out-loose");
         let err = build_golden_dir(&loose, &out, &runtime, &BuildOptions::default())
             .expect_err("a manifestless directory is not a golden");
-        assert!(matches!(&err, CliError::NoManifest { dir } if *dir == loose));
+        assert!(matches!(&err, CliError::NoManifest { dir, .. } if *dir == loose));
         assert_eq!(
             err.to_string(),
             format!(

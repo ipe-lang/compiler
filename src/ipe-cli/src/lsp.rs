@@ -615,11 +615,8 @@ impl ProjectLoader for DriverLoader {
         open_file: &Path,
         _open_text: Option<&str>,
     ) -> Result<LoadedProject, LoadError> {
-        let dir = root_dir(workspace_roots, open_file).ok_or_else(|| {
-            load_error(&CliError::NoManifest {
-                dir: open_file.to_path_buf(),
-            })
-        })?;
+        let dir = root_dir(workspace_roots, open_file)
+            .ok_or_else(|| load_error(&CliError::no_manifest(open_file.to_path_buf())))?;
         let root = ProjectRoot::resolve(RootArg::at(&dir)).map_err(|e| load_error(&e))?;
         let manifest_path = root.path().join(PACKAGE_IPE);
         // The module set is the source snapshot `ipe dev build` reads for this
@@ -773,7 +770,7 @@ mod tests {
             );
         }
         for project in [
-            CliError::NoManifest { dir: root.clone() },
+            CliError::no_manifest(root.clone()),
             CliError::NoSrcDir { root: root.clone() },
             CliError::EntryMissing {
                 entry: "Cli/Main.ipe".to_owned(),
@@ -1029,7 +1026,7 @@ mod tests {
         let folder = fixture.path().join("src");
         let main = folder.join("Main.ipe");
         let loaded = NO_STDLIB_CACHE.load(std::slice::from_ref(&folder), &main, Some(MAIN));
-        let expected = CliError::NoManifest { dir: folder }.to_string();
+        let expected = CliError::no_manifest(folder).to_string();
         let err = loaded.err();
         assert_eq!(err, Some(LoadError::RootRefused(expected)));
         assert_eq!(

@@ -1,4 +1,5 @@
 use super::{nearest_command, nearest_group_member};
+use crate::project_root::SourceDir;
 use crate::style::TerminalSafe;
 use crate::{
     Diagnostic, Path, PathBuf, Write, api_surface, audit, build_plan, contained_path, delivery,
@@ -19,6 +20,37 @@ pub struct RuntimeContext {
     pub root: TerminalSafe,
     /// The version that crate declares.
     pub version: TerminalSafe,
+}
+
+/// The remedy a [`CliError::NoManifest`] refusal names.
+///
+/// It is chosen from the refused directory's spelling alone: nothing above the
+/// directory is opened, so the fixed-root rule holds and only the advice
+/// follows the cause.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManifestHint {
+    /// No sign of a project: start one here.
+    Init,
+    /// The directory is spelled as a project's `src/` or `tests/`.
+    SourceDirOf {
+        /// The directory's lexical parent, the project to run ipe from.
+        project: PathBuf,
+    },
+}
+
+impl ManifestHint {
+    /// The hint for the manifest-less `dir`, from its last component only.
+    #[must_use]
+    pub fn of(dir: &Path) -> Self {
+        if SourceDir::spelled_by(dir).is_none() {
+            return Self::Init;
+        }
+        let project = dir
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+        Self::SourceDirOf { project }
+    }
 }
 
 /// The payload of [`CliError::AdvisoryVulnerable`], boxed to keep `CliError`
@@ -573,9 +605,13 @@ pub enum CliError {
     ///
     /// The project is the directory ipe was pointed at; no directory above it
     /// is ever searched.
+    ///
+    /// Built only through [`CliError::no_manifest`], which picks the remedy.
     NoManifest {
         /// The directory that holds no manifest.
         dir: PathBuf,
+        /// The remedy the directory's spelling calls for.
+        hint: ManifestHint,
     },
     /// The project directory has no `src/` directory, or `src` is a link (`IPE-E0005`).
     NoSrcDir {
@@ -822,6 +858,15 @@ pub fn emit_machine_error(
 }
 
 impl CliError {
+    /// The refusal for a directory holding no `package.ipe`.
+    ///
+    /// Its remedy is chosen by [`ManifestHint::of`].
+    #[must_use]
+    pub fn no_manifest(dir: PathBuf) -> Self {
+        let hint = ManifestHint::of(&dir);
+        Self::NoManifest { dir, hint }
+    }
+
     /// A consent gate's refusal, framed by the shared diagnostic renderer.
     ///
     /// The refusal has no source location, so the entry path and source are empty.
@@ -1407,7 +1452,12 @@ impl std::fmt::Display for CliError {
                 let raw = format!("{raw:?}");
                 f.write_str(&text::cli_path_escape(&raw, reason))
             }
-            Self::NoManifest { dir } => f.write_str(&text::project_no_manifest(&dir.display())),
+            Self::NoManifest { dir, hint } => match hint {
+                ManifestHint::Init => f.write_str(&text::project_no_manifest(&dir.display())),
+                ManifestHint::SourceDirOf { project } => f.write_str(
+                    &text::project_no_manifest_source_dir(&dir.display(), &project.display()),
+                ),
+            },
             Self::NoSrcDir { root } => f.write_str(&text::project_no_src_dir(&root.display())),
             Self::EntryMissing { entry } => {
                 f.write_str(&text::project_entry_missing(&format!("{entry:?}")))

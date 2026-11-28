@@ -637,7 +637,8 @@ fn relative_nested_src_file_argument_is_analysed_against_the_src_tree() -> TestR
     );
     let (ok, stderr) = dotted?;
     assert!(
-        !ok && stderr.contains("IPE-E0004") && stderr.contains("no package.ipe at"),
+        !ok && stderr.contains("IPE-E0004")
+            && stderr.contains("is a project's source directory, not a project"),
         "a subdirectory of a project is no root, got:\n{stderr}"
     );
     Ok(())
@@ -970,6 +971,40 @@ fn qualified_reimported_type_is_refused_at_type_check() -> TestResult {
     assert!(
         stderr.contains("IPE-N0005") && !stderr.contains("IPE-I0001"),
         "the refusal must be IPE-N0005 and never an internal error, got:\n{stderr}"
+    );
+    Ok(())
+}
+
+/// The `src`/`tests` directory refusal's remedy clears it: `ipe type-check
+/// tests` names the project to run ipe from and a module file to name, and
+/// running exactly that reaches the type checker.
+#[test]
+fn the_source_dir_remedy_clears() -> TestResult {
+    const CLEAN: &str = "module Main exposing (main)\n\nmain =\n    1\n";
+    let project = SourceTree::main(CLEAN)
+        .test_module("Main", CLEAN)
+        .resolve()?;
+    let dir = project_dir(&project)?;
+    let tests = dir.join("tests");
+    let (ok, refused) = type_check_from(&dir, "tests")?;
+    let advised_file = format!("{}/Main.ipe", tests.display());
+    assert!(
+        !ok && refused.contains("IPE-E0004")
+            && refused.contains(&format!("run ipe from {}", dir.display()))
+            && refused.contains(&advised_file)
+            && !refused.contains("ipe init"),
+        "`ipe type-check tests` must name the project and a module file, got:\n{refused}"
+    );
+    let (ok, stderr) = type_check_from(&dir, &advised_file)?;
+    assert!(
+        ok,
+        "the advised `ipe type-check {advised_file}` from {} must pass, got:\n{stderr}",
+        dir.display()
+    );
+    let (ok, stderr) = type_check_from(&dir, "tests/Main.ipe")?;
+    assert!(
+        ok,
+        "`ipe type-check tests/Main.ipe` must pass, got:\n{stderr}"
     );
     Ok(())
 }

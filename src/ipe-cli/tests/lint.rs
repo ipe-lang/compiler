@@ -376,12 +376,9 @@ fn two_module_project(tag: &str) -> Result<PathBuf, Box<dyn Error>> {
     )
 }
 
-/// The exact `NoManifest` refusal text for `dir`.
+/// The `NoManifest` refusal text for `dir`, its remedy chosen by the producer.
 fn no_manifest_text(dir: &Path) -> String {
-    format!(
-        "error[IPE-E0004]: no package.ipe at {}; run `ipe init` there",
-        dir.display()
-    )
+    ipe::CliError::no_manifest(dir.to_path_buf()).to_string()
 }
 
 /// A file argument names one module of the current directory's project: every
